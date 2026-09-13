@@ -197,6 +197,7 @@ export const managedDatabases = pgTable(
     withPgvector: boolean("with_pgvector").notNull().default(false),
     withTestDatabase: boolean("with_test_database").notNull().default(false),
     sourceCidrs: jsonb("source_cidrs").$type<string[]>().notNull().default([]),
+    allowlistEnforced: boolean("allowlist_enforced").notNull().default(false),
     status: text("status").notNull().default("queued"),
   },
   (table) => [uniqueIndex("managed_databases_cluster_name_idx").on(table.clusterId, table.name)],
@@ -347,14 +348,18 @@ export const backups = pgTable("backups", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const alerts = pgTable("alerts", {
-  id: text("id").primaryKey(),
-  severity: text("severity").notNull(),
-  title: text("title").notNull(),
-  dedupKey: text("dedup_key").notNull(),
-  acknowledged: boolean("acknowledged").notNull().default(false),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const alerts = pgTable(
+  "alerts",
+  {
+    id: text("id").primaryKey(),
+    severity: text("severity").notNull(),
+    title: text("title").notNull(),
+    dedupKey: text("dedup_key").notNull(),
+    acknowledged: boolean("acknowledged").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex("alerts_dedup_key_idx").on(table.dedupKey)],
+);
 
 export const updateCandidates = pgTable(
   "update_candidates",

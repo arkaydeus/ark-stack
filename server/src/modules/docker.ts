@@ -24,10 +24,14 @@ export async function writeApprovedCompose(serviceId: string, source: string) {
   return { file, policy };
 }
 
+export function childProcessEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, PATH: process.env.PATH ?? "/usr/bin:/usr/local/bin" };
+}
+
 async function docker(args: string[]) {
   return exec("docker", args, {
     timeout: 60_000,
-    env: { PATH: process.env.PATH ?? "/usr/bin:/usr/local/bin" },
+    env: childProcessEnv(),
   });
 }
 
@@ -38,13 +42,26 @@ export async function deployCompose(project: string, file: string) {
     file,
     "-p",
     project,
+    "--progress",
+    "plain",
     "up",
     "-d",
     "--no-build",
     "--pull",
     "never",
+    "--no-interpolate",
   ]);
   return redactLogLine(`${stdout}\n${stderr}`);
+}
+
+export async function inspectServiceDigest(project: string, service: string) {
+  const { stdout } = await docker(["compose", "-p", project, "ps", "-q", service]);
+  const id = stdout.trim().split("\n")[0];
+  if (!id) return null;
+  const inspected = await docker(["inspect", "--format", "{{json .RepoDigests}}", id]);
+  const digests = JSON.parse(inspected.stdout || "[]") as string[];
+  const pinned = digests.map((item) => item.split("@")[1]).find(Boolean);
+  return pinned ?? null;
 }
 
 export async function serviceAction(project: string, service: string, action: "start" | "stop" | "restart") {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasMfaAssurance, protectLastOwner, assertPrivileged } from "./authz.ts";
+import { assertGranted, hasMfaAssurance, protectLastOwner, assertPrivileged } from "./authz.ts";
 
 const owner = { userId: "u1", role: "owner" as const, projectIds: [], domainIds: [] };
 
@@ -33,5 +33,12 @@ describe("authorization", () => {
       /Re-authenticate/,
     );
     expect(() => assertPrivileged(owner, "secret.reveal", new Date())).not.toThrow();
+  });
+
+  test("scoped operators are denied ungranted projects and domains", () => {
+    const operator = { userId: "u2", role: "operator" as const, projectIds: ["p1"], domainIds: ["d1"] };
+    expect(() => assertGranted(operator, { projectId: "p2" })).toThrow(/project/);
+    expect(() => assertGranted(operator, { domainId: "d2" }, "manage")).toThrow(/domain/);
+    expect(() => assertGranted(operator, { projectId: "p1" })).not.toThrow();
   });
 });

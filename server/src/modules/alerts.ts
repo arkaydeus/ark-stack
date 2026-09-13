@@ -1,5 +1,5 @@
 import { createId } from "@ark-stack/shared";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 
 import { db } from "../db.ts";
 import { alerts, backups, certificates, operations } from "../schema.ts";
@@ -9,10 +9,7 @@ export async function raiseAlert(input: {
   title: string;
   dedupKey: string;
 }) {
-  const existing = await db
-    .select()
-    .from(alerts)
-    .where(and(eq(alerts.dedupKey, input.dedupKey), eq(alerts.acknowledged, false)));
+  const existing = await db.select().from(alerts).where(eq(alerts.dedupKey, input.dedupKey));
   if (existing[0]) return existing[0];
   const [row] = await db
     .insert(alerts)
@@ -22,7 +19,9 @@ export async function raiseAlert(input: {
       title: input.title,
       dedupKey: input.dedupKey,
     })
+    .onConflictDoNothing({ target: alerts.dedupKey })
     .returning();
+  if (!row) return existing[0];
   await notifyExternal(input.title, input.severity);
   return row;
 }
@@ -50,7 +49,9 @@ export async function evaluateAlerts() {
   const recentBackups = await db.select().from(backups);
   const stale = recentBackups.filter(
     (item) =>
-      Date.now() - item.createdAt.getTime() > 36 * 60 * 60 * 1000 && item.status !== "restore_verified",
+      Date.now() - item.createdAt.getTime() > 36 * 60 * 60 * 1000 &&
+      item.status !== "restore_verified" &&
+      !item.restoreVerified,
   );
   if (stale.length) {
     await raiseAlert({
@@ -61,7 +62,7 @@ export async function evaluateAlerts() {
   }
 }
 
-async function notifyExternal(title: string, severity: string) {
+export async function notifyExternal(title: string, severity: string) {
   const webhook = process.env.ARK_ALERT_WEBHOOK;
   if (!webhook) return;
   await fetch(webhook, {

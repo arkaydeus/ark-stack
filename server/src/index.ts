@@ -1,8 +1,14 @@
+import { assertNoPlaceholderSecrets } from "@ark-stack/shared";
+
 import { loadEnv } from "./env.ts";
 import { startCoordinator } from "./coordinator.ts";
 import { app } from "./app.ts";
 
 const env = loadEnv();
+assertNoPlaceholderSecrets(process.env);
+if (process.env.ARK_BACKUP_REQUIRED === "1" && process.env.ARK_BACKUP_EXECUTE !== "1") {
+  throw new Error("ARK_BACKUP_EXECUTE must be 1 when backup execution is required.");
+}
 
 if (process.env.ARK_SKIP_LISTEN !== "1") {
   startCoordinator();

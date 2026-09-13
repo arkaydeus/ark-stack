@@ -176,3 +176,59 @@ export const endpointStates = [
 ] as const;
 
 export type EndpointState = (typeof endpointStates)[number];
+
+function stripDnsQuotes(value: string) {
+  return value
+    .trim()
+    .replace(/^"+|"+$/g, "")
+    .replace(/\\"/g, '"');
+}
+
+function normalizeDnsToken(type: string, value: string) {
+  const trimmed = stripDnsQuotes(value).replace(/\.$/, "").trim();
+  if (type === "TXT") {
+    if (/^v=spf1\b/i.test(trimmed)) {
+      const mechanisms = trimmed
+        .replace(/^v=spf1\s+/i, "")
+        .split(/\s+/)
+        .filter(Boolean)
+        .filter((part) => !/^([~+\-?]?)all$/i.test(part))
+        .toSorted();
+      return `v=spf1 ${mechanisms.join(" ")} -all`.toLowerCase();
+    }
+    return trimmed;
+  }
+  if (type === "MX") {
+    const match = /^(\d+)\s+(\S+)$/.exec(trimmed);
+    if (match) return `${match[1]} ${match[2].toLowerCase()}`;
+    return `10 ${trimmed.toLowerCase()}`;
+  }
+  return trimmed.toLowerCase();
+}
+
+export function expectedDnsValue(type: string, value: string, priority?: number) {
+  if (type === "MX") {
+    const match = /^(\d+)\s+(\S+)$/.exec(value.trim());
+    if (match) return normalizeDnsToken("MX", value);
+    return normalizeDnsToken("MX", `${priority ?? 10} ${value}`);
+  }
+  return normalizeDnsToken(type, value);
+}
+
+export function observedDnsValue(type: string, values: string[]) {
+  const normalized = values
+    .map((item) => normalizeDnsToken(type, item))
+    .filter(Boolean)
+    .toSorted();
+  return normalized.join(",");
+}
+
+export function dnsRecordVerified(type: string, expected: string, observed: string, priority?: number) {
+  const want = expectedDnsValue(type, expected, priority);
+  const got = observed
+    .split(/[\n,]/)
+    .map((item) => normalizeDnsToken(type, item))
+    .filter(Boolean)
+    .toSorted();
+  return got.includes(want) || got.join(",") === want;
+}

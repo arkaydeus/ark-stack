@@ -30,8 +30,30 @@ export function canViewProject(access: Access, projectId: string) {
   return access.role === "owner" || access.projectIds.includes(projectId);
 }
 
+export function canViewDomain(access: Access, domainId: string) {
+  return access.role === "owner" || access.domainIds.includes(domainId);
+}
+
 export function canManageDomain(access: Access, domainId: string) {
   return access.role === "owner" || (hasRole(access, "operator") && access.domainIds.includes(domainId));
+}
+
+export function assertGranted(
+  access: Access,
+  scope: { projectId?: string | null; domainId?: string | null },
+  mode: "view" | "manage" = "view",
+) {
+  if (scope.projectId && !canViewProject(access, scope.projectId)) {
+    throw new Error("You do not have access to this project.");
+  }
+  if (scope.domainId) {
+    const allowed =
+      mode === "manage" ? canManageDomain(access, scope.domainId) : canViewDomain(access, scope.domainId);
+    if (!allowed) throw new Error("You do not have access to this domain.");
+  }
+  if (!scope.projectId && !scope.domainId && access.role !== "owner") {
+    throw new Error("This resource is not granted to your account.");
+  }
 }
 
 export function canMutate(access: Access) {

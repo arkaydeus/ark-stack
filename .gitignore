@@ -12,3 +12,4 @@ server/drizzle/meta
 agent/ark-agent
 agent/journal.db
 tmp/
+infra/database/userlist.txt

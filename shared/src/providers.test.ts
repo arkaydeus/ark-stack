@@ -5,7 +5,8 @@ import { funnelDisabled, renderCaddyfile, renderTailscaleServe } from "./edge.ts
 import { compareInventory } from "./import-inventory.ts";
 import { generateInstallSecrets, hostLossChecklist, mergeInstallEnv } from "./install.ts";
 import { pgbouncerUserlist } from "./pgbouncer.ts";
-import { firstComposeImage, registryManifestUrl } from "./registry.ts";
+import { nftAllowlist } from "./cidr.ts";
+import { firstComposeImage, pinComposeImage, registryManifestUrl } from "./registry.ts";
 import { deriveSesSmtpPassword, signAwsRequest } from "./ses.ts";
 import { buildStalwartPlan, jmapCall } from "./stalwart.ts";
 
@@ -73,6 +74,19 @@ describe("provider adapters", () => {
       renderCaddyfile({ adminMode: "tailnet", challengeDir: "/acme", apiUpstream: "api:3000" }),
     ).not.toContain("admin.");
     expect(registryManifestUrl("docker.io/library/nginx:1.27.3").url).toContain("/nginx/manifests/1.27.3");
+    expect(
+      registryManifestUrl("quay.io/prometheus/node-exporter:v1.8.2").url.startsWith("https://quay.io/v2/"),
+    ).toBe(true);
+    expect(registryManifestUrl("public.ecr.aws/docker/library/nginx:1.27.3").host).toBe("public.ecr.aws");
+    expect(registryManifestUrl("docker.io/ghcr.io.example/app:1").host).toBe("docker.io");
+    expect(nftAllowlist(["2001:db8::/32"])).toContain("ip6 saddr 2001:db8::/32");
+    expect(nftAllowlist(["10.0.0.0/8"])).toContain("ip saddr 10.0.0.0/8");
+    expect(
+      pinComposeImage(
+        "services:\n  x:\n    image: docker.io/library/nginx:1.27.3\n",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      ),
+    ).toContain("@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     expect(
       compareInventory(
         { source: "orkmail", domains: ["a.com"] },

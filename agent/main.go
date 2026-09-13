@@ -12,9 +12,10 @@ import (
 )
 
 type job struct {
-	ID      string         `json:"id"`
-	Kind    string         `json:"kind"`
-	Payload map[string]any `json:"payload"`
+	ID         string         `json:"id"`
+	Kind       string         `json:"kind"`
+	Payload    map[string]any `json:"payload"`
+	ClaimToken string         `json:"claimToken"`
 }
 
 func main() {
@@ -66,7 +67,7 @@ func tick(client *http.Client, apiURL, token string, log *journal) error {
 				status = "failed"
 				note = err.Error()
 				_ = log.append(journalEntry{ID: item.ID, Action: item.Kind, Target: item.ID, Status: "rejected", Note: note})
-				_ = complete(client, apiURL, token, item.ID, status, note)
+				_ = complete(client, apiURL, token, item.ID, item.ClaimToken, status, note)
 				continue
 			}
 		}
@@ -75,14 +76,14 @@ func tick(client *http.Client, apiURL, token string, log *journal) error {
 			note = err.Error()
 		}
 		_ = log.append(journalEntry{ID: item.ID, Action: item.Kind, Target: item.ID, Status: status, Note: note})
-		_ = complete(client, apiURL, token, item.ID, status, note)
+		_ = complete(client, apiURL, token, item.ID, item.ClaimToken, status, note)
 	}
 	return nil
 }
 
 func execute(item job) error {
 	switch item.Kind {
-	case "service.deploy":
+	case "service.deploy", "update.apply":
 		compose, _ := item.Payload["compose"].(string)
 		if compose == "" {
 			return fmt.Errorf("compose payload required")
@@ -92,14 +93,14 @@ func execute(item job) error {
 		}
 		file, _ := item.Payload["file"].(string)
 		project, _ := item.Payload["project"].(string)
-		if file != "" && project != "" {
-			return composeUp(project, file)
+		if file == "" || project == "" {
+			return fmt.Errorf("host compose file and project are required for deploy")
 		}
-		return nil
+		return composeUp(project, file)
 	case "service.start", "service.stop", "service.restart":
 		id, _ := item.Payload["containerId"].(string)
 		if id == "" {
-			return nil
+			return fmt.Errorf("containerId required")
 		}
 		action := strings.TrimPrefix(item.Kind, "service.")
 		return mutateContainer(id, action)
@@ -117,8 +118,8 @@ func execute(item job) error {
 	}
 }
 
-func complete(client *http.Client, apiURL, token, id, status, errText string) error {
-	body, _ := json.Marshal(map[string]any{"status": status, "error": errText})
+func complete(client *http.Client, apiURL, token, id, claimToken, status, errText string) error {
+	body, _ := json.Marshal(map[string]any{"status": status, "error": errText, "claimToken": claimToken, "evidence": map[string]any{"worker": "agent"}})
 	req, err := http.NewRequest(http.MethodPost, apiURL+"/api/internal/jobs/"+id+"/complete", bytes.NewReader(body))
 	if err != nil {
 		return err

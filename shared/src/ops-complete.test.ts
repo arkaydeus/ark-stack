@@ -14,6 +14,8 @@ describe("remaining control-plane policies", () => {
     expect(clientAllowed(["10.0.0.0/8"], "10.1.2.3").allowed).toBe(true);
     expect(clientAllowed(["10.0.0.0/8"], "8.8.8.8").allowed).toBe(false);
     expect(clientAllowed([], "8.8.8.8").allowed).toBe(true);
+    expect(clientAllowed(["2001:db8::/32"], "2001:db8::1").allowed).toBe(true);
+    expect(clientAllowed(["2001:db8::/32"], "2001:db9::1").allowed).toBe(false);
     expect(rotateRoleSql("orders_runtime", "n3w")).toContain("ALTER ROLE");
   });
 

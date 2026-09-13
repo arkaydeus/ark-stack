@@ -37,6 +37,12 @@ export function isTerminal(state: OperationState) {
   return state === "succeeded" || state === "cancelled";
 }
 
+export function isInFlight(state: string) {
+  return (
+    state === "queued" || state === "running" || state === "awaiting_approval" || state === "waiting_external"
+  );
+}
+
 export function staleObservation(observedAt: Date | null, now = new Date(), maxAgeMs = 90_000) {
   if (!observedAt) return true;
   return now.getTime() - observedAt.getTime() > maxAgeMs;

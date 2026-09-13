@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { buildDomainPlan, mergeSpf } from "./dns-plan.ts";
+import { buildDomainPlan, dnsRecordVerified, mergeSpf } from "./dns-plan.ts";
 
 describe("DNS plan", () => {
   test("emits ownership, database, mail, and public admin records", () => {
@@ -36,5 +36,13 @@ describe("DNS plan", () => {
     expect(mergeSpf("v=spf1 include:_spf.google.com ~all", "v=spf1 include:amazonses.com -all")).toBe(
       "v=spf1 include:_spf.google.com include:amazonses.com -all",
     );
+  });
+
+  test("verifies MX, TXT, and A records by normalized sets", () => {
+    expect(dnsRecordVerified("MX", "mail.example.com", "10 mail.example.com.")).toBe(true);
+    expect(dnsRecordVerified("MX", "mail.example.com", "20 other.example.com")).toBe(false);
+    expect(dnsRecordVerified("TXT", "ark-own-token", `"ark-own-token"`)).toBe(true);
+    expect(dnsRecordVerified("A", "203.0.113.10", "203.0.113.10")).toBe(true);
+    expect(dnsRecordVerified("AAAA", "2001:db8::1", "2001:db8::1")).toBe(true);
   });
 });

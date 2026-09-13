@@ -29,6 +29,27 @@ services:
 	}
 }
 
+func TestRejectsHostIPReservedPortAndInterpolation(t *testing.T) {
+	if err := validateCompose(`
+services:
+  mail:
+    image: nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      - "0.0.0.0:25:8080"
+`); err == nil {
+		t.Fatal("expected reserved host-ip port rejection")
+	}
+	if err := validateCompose(`
+services:
+  x:
+    image: nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    volumes:
+      - "${X:-/var/run}/docker.sock:/sock"
+`); err == nil {
+		t.Fatal("expected interpolation rejection")
+	}
+}
+
 func TestAcceptsPinnedImage(t *testing.T) {
 	err := validateCompose(`
 services:

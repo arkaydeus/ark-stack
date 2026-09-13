@@ -18,12 +18,12 @@ function run(command: string, args: string[]) {
 }
 
 const envPath = join(root, ".env");
-const example = existsSync(join(root, ".env.example"))
-  ? await Bun.file(join(root, ".env.example")).text()
-  : "";
-const existing = existsSync(envPath) ? await Bun.file(envPath).text() : example;
+const examplePath = join(root, ".env.example");
+const hasEnv = existsSync(envPath);
+const existing = hasEnv ? await Bun.file(envPath).text() : "";
+const template = !hasEnv && existsSync(examplePath) ? await Bun.file(examplePath).text() : "";
 const generated = generateInstallSecrets();
-await Bun.write(envPath, mergeInstallEnv(existing, generated));
+await Bun.write(envPath, mergeInstallEnv(hasEnv ? existing : template, generated, { template: !hasEnv }));
 await mkdir(join(root, "tmp", "certs"), { recursive: true });
 await mkdir(join(root, "tmp", "pgbouncer"), { recursive: true });
 await mkdir(join(root, "tmp", "edge"), { recursive: true });

@@ -105,7 +105,7 @@ func containerStats(id string) ([]byte, error) {
 }
 
 func composeUp(project, file string) error {
-	cmd := exec.Command("docker", "compose", "-f", file, "-p", project, "up", "-d", "--no-build", "--pull", "never")
+	cmd := exec.Command("docker", "compose", "-f", file, "-p", project, "up", "-d", "--no-build", "--pull", "never", "--no-interpolate")
 	cmd.Env = append(os.Environ(), "COMPOSE_IGNORE_ORPHANS=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

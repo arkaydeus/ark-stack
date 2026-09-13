@@ -16,6 +16,26 @@ export type MailDesiredState = {
   outbound: { provider: "ses"; paused: boolean };
 };
 
+export function assertExternalForwarding(input: {
+  targets: string[];
+  localDomains: string[];
+  allowExternalForwarding: boolean;
+  allowExternal?: boolean;
+}) {
+  const local = new Set(input.localDomains.map((item) => item.toLowerCase()));
+  const external = input.targets.filter((target) => {
+    const domain = target.split("@")[1]?.toLowerCase();
+    return Boolean(domain && !local.has(domain));
+  });
+  if (!external.length) return;
+  if (!input.allowExternalForwarding) {
+    throw new Error("External alias forwarding is disabled.");
+  }
+  if (!input.allowExternal) {
+    throw new Error("This alias does not allow external targets.");
+  }
+}
+
 export function mailReadiness(input: {
   domainVerified: boolean;
   mailboxProvisioned: boolean;

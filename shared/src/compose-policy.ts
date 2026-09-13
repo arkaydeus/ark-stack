@@ -48,7 +48,7 @@ export function validateComposeSource(
       violations: [{ path: "$", message: "Compose document exceeds the 64 KiB input limit." }],
     };
   }
-  if (/\$\{|env_file:|include:|^x-/m.test(source) && /include:/.test(source)) {
+  if (/include:/.test(source)) {
     violations.push({ path: "include", message: "Remote or local Compose includes are not allowed." });
   }
   let parsed: unknown;
@@ -104,6 +104,11 @@ export function validateComposeSource(
         path: `services.${name}.image`,
         message: "Every service must use a prebuilt image. Raw build is disabled.",
       });
+    } else if (hasInterpolation(image)) {
+      violations.push({
+        path: `services.${name}.image`,
+        message: "Compose interpolation is not allowed in image references.",
+      });
     } else {
       images.push(image);
       if (!isAllowedImage(image, options.allowedRegistries ?? DEFAULT_REGISTRIES)) {
@@ -113,6 +118,16 @@ export function validateComposeSource(
             "Image must come from an allowed registry and must not use a floating latest tag without a digest.",
         });
       }
+    }
+    if (
+      hasInterpolation(service.volumes) ||
+      hasInterpolation(service.ports) ||
+      hasInterpolation(service.environment)
+    ) {
+      violations.push({
+        path: `services.${name}`,
+        message: "Compose interpolation is not allowed in volumes, ports, or environment values.",
+      });
     }
     if (hasForbiddenMount(service.volumes)) {
       violations.push({
@@ -148,13 +163,27 @@ function asRecord(value: unknown, path: string, violations: ComposeViolation[]) 
   return value as Record<string, unknown>;
 }
 
+export function imageRegistry(image: string) {
+  const name = image.split("@")[0] ?? image;
+  const first = name.split("/")[0] ?? "";
+  if (first === "localhost" || first.includes(".") || first.includes(":")) return first;
+  return "docker.io";
+}
+
 function isAllowedImage(image: string, registries: string[]) {
   if (image.includes("..") || image.startsWith("/")) return false;
   const [name, digest] = image.split("@");
   const tag = name.includes(":") ? name.slice(name.lastIndexOf(":") + 1) : "latest";
   if (tag === "latest" && !digest) return false;
-  const registry = name.includes("/") && name.split("/")[0].includes(".") ? name.split("/")[0] : "docker.io";
+  const registry = imageRegistry(name);
   return registries.includes(registry);
+}
+
+function hasInterpolation(value: unknown): boolean {
+  if (typeof value === "string") return value.includes("$");
+  if (Array.isArray(value)) return value.some((item) => hasInterpolation(item));
+  if (value && typeof value === "object") return Object.values(value).some((item) => hasInterpolation(item));
+  return false;
 }
 
 function hasForbiddenMount(volumes: unknown) {
@@ -163,7 +192,8 @@ function hasForbiddenMount(volumes: unknown) {
   return items.some((item) => {
     if (typeof item === "string") {
       return (
-        item.includes("/var/run/docker.sock") ||
+        item.includes("$") ||
+        item.includes("docker.sock") ||
         item.startsWith("/") ||
         item.startsWith("./") ||
         item.startsWith("../")
@@ -174,7 +204,7 @@ function hasForbiddenMount(volumes: unknown) {
       if (mount.type === "bind") return true;
       if (
         typeof mount.source === "string" &&
-        (mount.source.startsWith("/") || mount.source.includes("docker.sock"))
+        (mount.source.includes("$") || mount.source.startsWith("/") || mount.source.includes("docker.sock"))
       ) {
         return true;
       }
@@ -183,17 +213,40 @@ function hasForbiddenMount(volumes: unknown) {
   });
 }
 
+export function extractPublishedPort(item: string): number | undefined {
+  const cleaned = item.trim().replace(/\/(?:tcp|udp)$/i, "");
+  const bracket = /^\[([^\]]+)\]:(\d+):(\d+)$/.exec(cleaned);
+  if (bracket) {
+    const hostPort = Number(bracket[2]);
+    return Number.isFinite(hostPort) ? hostPort : undefined;
+  }
+  const parts = cleaned.split(":");
+  if (parts.length === 3) {
+    const hostPort = Number(parts[1]);
+    return Number.isFinite(hostPort) ? hostPort : undefined;
+  }
+  if (parts.length === 2) {
+    const hostPort = Number(parts[0]);
+    return Number.isFinite(hostPort) ? hostPort : undefined;
+  }
+  if (parts.length === 1) {
+    const port = Number(parts[0]);
+    return Number.isFinite(port) ? port : undefined;
+  }
+  return undefined;
+}
+
 function extractPorts(ports: unknown): number[] {
   if (!Array.isArray(ports)) return [];
   return ports.flatMap((item) => {
     if (typeof item === "number") return [item];
     if (typeof item === "string") {
-      const match = /(\d+)(?::\d+)?(?:\/(?:tcp|udp))?$/.exec(item.split(":")[0] === item ? item : item);
-      const published = item.includes(":") ? Number(item.split(":")[0]) : Number(item);
-      return Number.isFinite(published) ? [published] : match ? [Number(match[1])] : [];
+      const published = extractPublishedPort(item);
+      return published !== undefined ? [published] : [];
     }
     if (item && typeof item === "object" && "published" in item) {
-      return [Number((item as { published: string | number }).published)];
+      const published = Number((item as { published: string | number }).published);
+      return Number.isFinite(published) ? [published] : [];
     }
     return [];
   });

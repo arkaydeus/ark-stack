@@ -25,7 +25,7 @@ export function currentMailStatus(input: {
   return mailReadiness({
     domainVerified: input.domainVerified,
     mailboxProvisioned: input.mailboxCount > 0,
-    listenerReady: input.listenerReady ?? true,
+    listenerReady: input.listenerReady ?? false,
     certificateReady: input.certificateReady,
     sesProduction: input.sesReady,
     relayCredential: input.sesReady,

@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import { legoArgs, renewalDue } from "./acme.ts";
-import { backupCommand, nextBackupStatus } from "./backup-plan.ts";
-import { buildMailDocuments, mailReadiness } from "./mail-state.ts";
+import { backupCommand, backupProofAllowed, nextBackupStatus } from "./backup-plan.ts";
+import { assertExternalForwarding, buildMailDocuments, mailReadiness } from "./mail-state.ts";
 import { buildProvisionPlan, publicPoolerAdmission } from "./provision-sql.ts";
 import { mayAutoUpdate, rollbackSafe } from "./update-policy.ts";
 
@@ -41,6 +41,30 @@ describe("mail readiness", () => {
     expect(status.inbound).toBe("ready");
     expect(status.outbound).toBe("paused");
     expect(status.independent).toBe(true);
+    expect(
+      mailReadiness({
+        domainVerified: true,
+        mailboxProvisioned: true,
+        listenerReady: false,
+        certificateReady: false,
+        sesProduction: false,
+        relayCredential: false,
+      }).inbound,
+    ).toBe("pending");
+    expect(() =>
+      assertExternalForwarding({
+        targets: ["out@elsewhere.com"],
+        localDomains: ["example.com"],
+        allowExternalForwarding: false,
+      }),
+    ).toThrow(/disabled/);
+    expect(() =>
+      assertExternalForwarding({
+        targets: ["a@example.com"],
+        localDomains: ["example.com"],
+        allowExternalForwarding: false,
+      }),
+    ).not.toThrow();
     const docs = buildMailDocuments({
       version: 1,
       domains: [],
@@ -58,6 +82,9 @@ describe("backups and updates", () => {
     expect(nextBackupStatus("uploaded", "integrity")).toBe("integrity_ok");
     expect(nextBackupStatus("integrity_ok", "restore")).toBe("restore_verified");
     expect(() => nextBackupStatus("uploaded", "restore")).toThrow(/separate/);
+    expect(backupProofAllowed({ executed: false, status: "uploaded" })).toBe(false);
+    expect(backupProofAllowed({ executed: false, status: "restore_verified" })).toBe(false);
+    expect(backupProofAllowed({ executed: true, status: "uploaded" })).toBe(true);
     expect(backupCommand("app-postgres", "app").argv[0]).toBe("pgbackrest");
   });
 

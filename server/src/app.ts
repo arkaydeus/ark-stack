@@ -2,13 +2,15 @@ import { existsSync } from "node:fs";
 
 import {
   assertAliasGraph,
-  canMutate,
+  assertExternalForwarding,
+  canTransition,
+  canViewDomain,
+  canViewProject,
   classifySql,
   createId,
   createToken,
   encryptSecret,
   generatePassword,
-  hasMfaAssurance,
   localPart,
   normalizeHostname,
   redactValue,
@@ -36,6 +38,7 @@ import {
   settingsInput,
   buildDomainPlan,
   type Access,
+  type OperationState,
   type Role,
 } from "@ark-stack/shared";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -46,13 +49,30 @@ import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 
 import { auth } from "./auth.ts";
-import { enqueue } from "./coordinator.ts";
+import {
+  grantAccess,
+  redactDomain,
+  requireDatabaseAccess,
+  requireDomain,
+  requireMfa,
+  requireOperator,
+  requirePrivileged,
+  requireProject,
+  type SessionValue,
+} from "./access.ts";
+import { claimQueued, enqueue } from "./coordinator.ts";
 import { db, sql } from "./db.ts";
 import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
 import { inspectDatabaseSchema, executeWorkspaceQuery } from "./modules/database.ts";
-import { discoverContainers, dockerAvailable, serviceLogs, serviceStats } from "./modules/docker.ts";
+import {
+  discoverContainers,
+  dockerAvailable,
+  serviceLogs,
+  serviceStats,
+  writeApprovedCompose,
+} from "./modules/docker.ts";
 import { listMailQueue } from "./modules/queue.ts";
 import {
   alerts,
@@ -80,11 +100,6 @@ import {
   updateCandidates,
   user,
 } from "./schema.ts";
-
-type SessionValue = {
-  user: { id: string; name: string; email: string; twoFactorEnabled?: boolean; mfaEnrolledAt?: Date | null };
-  session: { createdAt: Date };
-};
 
 type AppEnv = {
   Variables: {
@@ -163,10 +178,14 @@ app.use("/api/internal/*", async (c, next) => {
 });
 
 app.get("/api/internal/jobs", async (c) => {
+  if (c.get("worker") === "agent") {
+    const claimed = await claimQueued({ limit: 20, agentOwned: true });
+    return c.json({
+      jobs: claimed.rows.map((row) => ({ ...row, claimToken: claimed.token })),
+    });
+  }
   const rows = await db.select().from(operations).where(eq(operations.status, "queued")).limit(20);
-  return c.json({
-    jobs: rows.filter((row) => (c.get("worker") === "agent" ? row.kind.startsWith("service.") : true)),
-  });
+  return c.json({ jobs: rows });
 });
 
 app.post("/api/internal/jobs/:id/complete", async (c) => {
@@ -175,12 +194,44 @@ app.post("/api/internal/jobs/:id/complete", async (c) => {
       status: z.enum(["succeeded", "failed"]),
       error: z.string().optional(),
       evidence: z.record(z.string(), z.unknown()).optional(),
+      claimToken: z.string().optional(),
     })
     .parse(await c.req.json());
+  const [operation] = await db
+    .select()
+    .from(operations)
+    .where(eq(operations.id, c.req.param("id")));
+  if (!operation) throw new HTTPException(404, { message: "Operation not found." });
+  if (c.get("worker") === "agent") {
+    if (!operation.kind.startsWith("service.") && operation.kind !== "update.apply") {
+      throw new HTTPException(403, { message: "Agent workers may only complete service operations." });
+    }
+    if (operation.status !== "queued" && operation.status !== "running") {
+      throw new HTTPException(409, { message: "Operation is not claimed for completion." });
+    }
+    if (operation.claimToken && body.claimToken && operation.claimToken !== body.claimToken) {
+      throw new HTTPException(403, { message: "Claim token does not match this job." });
+    }
+  }
+  if (!canTransition(operation.status as OperationState, body.status)) {
+    throw new HTTPException(409, {
+      message: `Operation cannot move from ${operation.status} to ${body.status}.`,
+    });
+  }
+  if (body.evidence) {
+    await db.insert(operationSteps).values({
+      id: createId("step"),
+      operationId: operation.id,
+      name: "worker-complete",
+      status: body.status,
+      evidence: body.evidence,
+      error: body.error,
+    });
+  }
   await db
     .update(operations)
     .set({ status: body.status, error: body.error ?? null, updatedAt: new Date() })
-    .where(eq(operations.id, c.req.param("id")));
+    .where(and(eq(operations.id, operation.id), eq(operations.status, operation.status)));
   return c.json({ ok: true });
 });
 
@@ -208,22 +259,6 @@ app.use("/api/*", async (c, next) => {
   });
   await next();
 });
-
-function requireOperator(access: Access) {
-  if (!canMutate(access)) throw new HTTPException(403, { message: "Operator access is required." });
-}
-
-function requireMfa(session: SessionValue) {
-  if (
-    !hasMfaAssurance({
-      twoFactorEnabled: Boolean(session.user.twoFactorEnabled),
-      mfaEnrolledAt: session.user.mfaEnrolledAt ?? null,
-      sessionCreatedAt: new Date(session.session.createdAt),
-    })
-  ) {
-    throw new HTTPException(403, { message: "Enroll and verify administrator MFA before making changes." });
-  }
-}
 
 async function audit(
   actorId: string | undefined,
@@ -288,48 +323,97 @@ app.get("/api/state", async (c) => {
     db.select().from(auditEvents).orderBy(desc(auditEvents.createdAt)).limit(50),
     db.select().from(updateCandidates).orderBy(desc(updateCandidates.detectedAt)).limit(50),
   ]);
+  const visibleDomains = domains.filter((item) => canViewDomain(access, item.id));
+  const visibleDomainIds = new Set(visibleDomains.map((item) => item.id));
+  const visibleProjects = projectRows.filter((item) => canViewProject(access, item.id));
+  const visibleProjectIds = new Set(visibleProjects.map((item) => item.id));
+  const clusterById = new Map(clusterRows.map((item) => [item.id, item]));
+  const endpointById = new Map(ends.map((item) => [item.id, item]));
+  const visibleDatabases = dbs.filter((item) => {
+    if (item.projectId) return visibleProjectIds.has(item.projectId);
+    const cluster = clusterById.get(item.clusterId);
+    const endpoint = cluster?.endpointId ? endpointById.get(cluster.endpointId) : undefined;
+    if (endpoint?.domainId) return visibleDomainIds.has(endpoint.domainId);
+    return access.role === "owner";
+  });
+  const visibleDatabaseIds = new Set(visibleDatabases.map((item) => item.id));
+  const visibleServices = serviceRows.filter((item) => visibleProjectIds.has(item.projectId));
+  const visibleServiceIds = new Set(visibleServices.map((item) => item.id));
+  const visibleMailboxes = mailboxRows.filter((item) => visibleDomainIds.has(item.domainId));
+  const visibleMailboxIds = new Set(visibleMailboxes.map((item) => item.id));
+  const visibleIds = new Set<string>([
+    ...visibleDomainIds,
+    ...visibleProjectIds,
+    ...visibleDatabaseIds,
+    ...visibleServiceIds,
+    ...visibleMailboxIds,
+  ]);
+  if (access.role === "owner" || access.role === "operator") visibleIds.add("platform");
+  const visibleEndpoints = ends.filter((item) => !item.domainId || visibleDomainIds.has(item.domainId));
+  const visibleEndpointIds = new Set(visibleEndpoints.map((item) => item.id));
+  const visibleMailDomainRows = (await db.select().from(mailDomains)).filter((item) =>
+    visibleDomainIds.has(item.domainId),
+  );
+  const deviceRows = await db.select().from(mailboxDevices);
   return c.json({
     user: { ...session.user, role: access.role },
     setup: { completed: Boolean(setup?.completed), wizardCompleted: Boolean(setup?.wizardCompleted) },
     settings,
-    domains: domains.map((domain) => ({
-      ...domain,
+    domains: visibleDomains.map((domain) => ({
+      ...redactDomain(domain, access),
       records: records.filter((record) => record.domainId === domain.id),
     })),
-    endpoints: ends,
-    certificates: certs.map((item) => ({ ...item, fingerprint: item.fingerprint })),
-    clusters: clusterRows,
-    databases: dbs.map((item) => ({
+    endpoints: visibleEndpoints,
+    certificates: certs
+      .filter((item) => visibleEndpointIds.has(item.endpointId))
+      .map((item) => ({ ...item, fingerprint: item.fingerprint })),
+    clusters: clusterRows.filter((item) => {
+      const endpoint = item.endpointId ? endpointById.get(item.endpointId) : undefined;
+      return !endpoint?.domainId || visibleDomainIds.has(endpoint.domainId);
+    }),
+    databases: visibleDatabases.map((item) => ({
       ...item,
       roles: roles
         .filter((role) => role.databaseId === item.id)
         .map((role) => ({ ...role, secretId: role.secretId ? "stored" : null })),
     })),
-    mailboxes: mailboxRows.map((item) => {
+    mailboxes: visibleMailboxes.map((item) => {
       const domain = domains.find((row) => row.id === item.domainId);
       return { ...item, address: domain ? `${item.localPart}@${domain.name}` : item.localPart };
     }),
-    aliases: aliasRows.map((item) => {
-      const domain = domains.find((row) => row.id === item.domainId);
-      return { ...item, address: domain ? `${item.localPart}@${domain.name}` : item.localPart };
-    }),
-    mailDomains: await db.select().from(mailDomains),
-    devices: (await db.select().from(mailboxDevices)).map((item) => ({
-      ...item,
-      secretId: item.secretId ? "stored" : null,
-    })),
-    projects: projectRows,
-    services: serviceRows.map((item) => ({
+    aliases: aliasRows
+      .filter((item) => visibleDomainIds.has(item.domainId))
+      .map((item) => {
+        const domain = domains.find((row) => row.id === item.domainId);
+        return { ...item, address: domain ? `${item.localPart}@${domain.name}` : item.localPart };
+      }),
+    mailDomains: visibleMailDomainRows,
+    devices: deviceRows
+      .filter((item) => visibleMailboxIds.has(item.mailboxId))
+      .map((item) => ({
+        ...item,
+        secretId: item.secretId ? "stored" : null,
+      })),
+    projects: visibleProjects,
+    services: visibleServices.map((item) => ({
       ...item,
       compose: undefined,
       composePreview: item.compose.slice(0, 400),
     })),
-    operations: opRows,
-    steps: stepRows,
-    backups: backupRows,
-    alerts: alertRows,
-    audit: auditRows,
-    updateCandidates: candidateRows,
+    operations: opRows.filter(
+      (item) => access.role === "owner" || item.targetIds.some((id) => visibleIds.has(id)),
+    ),
+    steps: stepRows.filter((item) =>
+      opRows.some(
+        (op) =>
+          op.id === item.operationId &&
+          (access.role === "owner" || op.targetIds.some((id) => visibleIds.has(id))),
+      ),
+    ),
+    backups: backupRows.filter((item) => access.role === "owner" || visibleIds.has(item.targetId)),
+    alerts: access.role === "owner" || access.role === "operator" ? alertRows : [],
+    audit: access.role === "owner" ? auditRows : auditRows.filter((item) => item.actorId === access.userId),
+    updateCandidates: candidateRows.filter((item) => visibleServiceIds.has(item.serviceId)),
     providers: {
       cloudflare: Boolean(process.env.DNS_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN),
       ses: Boolean(process.env.AWS_ACCESS_KEY_ID || process.env.AWS_BOOTSTRAP_ACCESS_KEY_ID),
@@ -444,6 +528,7 @@ app.post("/api/wizard", async (c) => {
     })
     .where(eq(platformSettings.id, "default"));
   await db.update(platformSetup).set({ wizardCompleted: true }).where(eq(platformSetup.id, "default"));
+  await grantAccess(access.userId, { domainId });
   const verify = await enqueue({ kind: "domain.verify", actorId: access.userId, targetIds: [domainId] });
   for (const endpointId of createdEndpoints) {
     await enqueue({ kind: "certificate.issue", actorId: access.userId, targetIds: [endpointId] });
@@ -474,6 +559,7 @@ app.post("/api/domains", async (c) => {
     mailFrom: input.mailFrom ? normalizeHostname(input.mailFrom) : `bounce.${name}`,
     dmarcPolicy: input.dmarcPolicy,
   });
+  await grantAccess(access.userId, { domainId: id });
   await audit(access.userId, "domain.create", "domain", id, { name }, undefined, access.role);
   return c.json({ id });
 });
@@ -481,6 +567,7 @@ app.post("/api/domains", async (c) => {
 app.post("/api/domains/:id/verify", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireDomain(access, c.req.param("id"), "manage");
   const operation = await enqueue({
     kind: "domain.verify",
     actorId: access.userId,
@@ -493,6 +580,7 @@ app.post("/api/domains/:id/publish", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireDomain(access, c.req.param("id"), "manage");
   const operation = await enqueue({
     kind: "dns.publish",
     actorId: access.userId,
@@ -508,6 +596,7 @@ app.post("/api/projects", async (c) => {
   const input = projectInput.parse(await c.req.json());
   const id = createId("prj");
   await db.insert(projects).values({ id, name: input.name, slug: input.slug });
+  await grantAccess(access.userId, { projectId: id });
   await audit(access.userId, "project.create", "project", id, input, undefined, access.role);
   return c.json({ id });
 });
@@ -524,6 +613,13 @@ app.post("/api/databases", async (c) => {
   }
   if (!clusterId)
     throw new HTTPException(400, { message: "Complete the domain wizard so an application cluster exists." });
+  const [cluster] = await db.select().from(databaseClusters).where(eq(databaseClusters.id, clusterId));
+  if (cluster?.endpointId) {
+    const [endpoint] = await db.select().from(endpoints).where(eq(endpoints.id, cluster.endpointId));
+    if (endpoint?.domainId) requireDomain(access, endpoint.domainId, "manage");
+  } else if (access.role !== "owner") {
+    throw new HTTPException(403, { message: "You do not have access to this database cluster." });
+  }
   const id = createId("db");
   await db.insert(managedDatabases).values({
     id,
@@ -543,6 +639,7 @@ app.post("/api/mailboxes", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   const input = mailboxInput.parse(await c.req.json());
+  requireDomain(access, input.domainId, "manage");
   const id = createId("mbx");
   await db.insert(mailboxes).values({
     id,
@@ -559,8 +656,16 @@ app.post("/api/aliases", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   const input = aliasInput.parse(await c.req.json());
+  requireDomain(access, input.domainId, "manage");
   const existing = await db.select().from(aliases);
   const domains = await db.select().from(domainClaims);
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  assertExternalForwarding({
+    targets: input.targets,
+    localDomains: domains.map((item) => item.name),
+    allowExternalForwarding: Boolean(settings?.allowExternalForwarding),
+    allowExternal: input.allowExternal,
+  });
   const graph = existing.map((item) => {
     const domain = domains.find((row) => row.id === item.domainId);
     return { address: `${item.localPart}@${domain?.name}`, targets: item.targets };
@@ -584,6 +689,7 @@ app.post("/api/services", async (c) => {
   requireOperator(access);
   requireMfa(c.get("session"));
   const input = serviceInput.parse(await c.req.json());
+  requireProject(access, input.projectId);
   const policy = validateComposeSource(input.compose);
   if (!policy.ok)
     throw new HTTPException(422, { message: policy.violations.map((item) => item.message).join(" ") });
@@ -598,11 +704,19 @@ app.post("/api/services", async (c) => {
     status: "registered",
     updatePolicy: input.updatePolicy,
   });
+  const written = await writeApprovedCompose(id, input.compose);
+  const [project] = await db.select().from(projects).where(eq(projects.id, input.projectId));
   const operation = await enqueue({
     kind: "service.deploy",
     actorId: access.userId,
     targetIds: [id],
-    payload: { images: policy.images, compose: input.compose, name: input.name },
+    payload: {
+      images: policy.images,
+      compose: input.compose,
+      name: input.name,
+      file: written.file,
+      project: `ark-${project?.slug ?? "workload"}`,
+    },
   });
   return c.json({ id, operationId: operation.id, preview: policy });
 });
@@ -619,6 +733,7 @@ app.post("/api/services/adopt", async (c) => {
   requireOperator(access);
   requireMfa(c.get("session"));
   const input = adoptInput.parse(await c.req.json());
+  requireProject(access, input.projectId);
   const preview = adoptionPreview(input.compose);
   if (!preview.ok) throw new HTTPException(422, { message: "Unsupported compose cannot be adopted." });
   const id = createId("svc");
@@ -649,6 +764,7 @@ app.get("/api/services/:id/logs", async (c) => {
     .from(services)
     .where(eq(services.id, c.req.param("id")));
   if (!service) throw new HTTPException(404, { message: "Service not found." });
+  requireProject(c.get("access"), service.projectId);
   const [project] = await db.select().from(projects).where(eq(projects.id, service.projectId));
   if (!dockerAvailable()) return c.json({ lines: [], available: false });
   const lines = await serviceLogs(`ark-${project?.slug ?? "workload"}`, service.name);
@@ -662,6 +778,7 @@ app.get("/api/services/:id/stats", async (c) => {
     .from(services)
     .where(eq(services.id, c.req.param("id")));
   if (!service) throw new HTTPException(404, { message: "Service not found." });
+  requireProject(c.get("access"), service.projectId);
   const [project] = await db.select().from(projects).where(eq(projects.id, service.projectId));
   if (!dockerAvailable()) return c.json({ available: false });
   return c.json(await serviceStats(`ark-${project?.slug ?? "workload"}`, service.name));
@@ -680,6 +797,12 @@ app.post("/api/services/:id/:action", async (c) => {
           ? "service.stop"
           : null;
   if (!kind) throw new HTTPException(404, { message: "Unknown service action." });
+  const [service] = await db
+    .select()
+    .from(services)
+    .where(eq(services.id, c.req.param("id")));
+  if (!service) throw new HTTPException(404, { message: "Service not found." });
+  requireProject(access, service.projectId);
   const operation = await enqueue({ kind, actorId: access.userId, targetIds: [c.req.param("id")] });
   await audit(access.userId, kind, "service", c.req.param("id"), {}, operation.id, access.role);
   return c.json({ operationId: operation.id });
@@ -688,9 +811,10 @@ app.post("/api/services/:id/:action", async (c) => {
 app.post("/api/sql/query", async (c) => {
   const access = c.get("access");
   requireOperator(access);
-  requireMfa(c.get("session"));
+  requirePrivileged(access, c.get("session"), "secret.reveal");
   const input = sqlInput.parse(await c.req.json());
   const classified = classifySql(input.sql, input.readOnly);
+  await requireDatabaseAccess(access, input.databaseId, "manage");
   const [database] = await db
     .select()
     .from(managedDatabases)
@@ -731,7 +855,8 @@ app.post("/api/sql/query", async (c) => {
 
 app.get("/api/databases/:id/schema", async (c) => {
   requireOperator(c.get("access"));
-  requireMfa(c.get("session"));
+  requirePrivileged(c.get("access"), c.get("session"), "secret.reveal");
+  await requireDatabaseAccess(c.get("access"), c.req.param("id"));
   const [database] = await db
     .select()
     .from(managedDatabases)
@@ -755,8 +880,8 @@ app.get("/api/databases/:id/schema", async (c) => {
 
 app.post("/api/databases/:id/rotate", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
-  requireMfa(c.get("session"));
+  requirePrivileged(access, c.get("session"), "credential.rotate");
+  await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const body = z.object({ kind: z.enum(["runtime", "readonly", "migration"]) }).parse(await c.req.json());
   const operation = await enqueue({
     kind: "database.rotate",
@@ -778,8 +903,8 @@ app.post("/api/databases/:id/rotate", async (c) => {
 
 app.put("/api/databases/:id/cidrs", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
-  requireMfa(c.get("session"));
+  requirePrivileged(access, c.get("session"), "exposure.public");
+  await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const input = cidrInput.parse(await c.req.json());
   const cidrs = assertCidrs(input.sourceCidrs);
   await db
@@ -797,6 +922,7 @@ app.put("/api/databases/:id/cidrs", async (c) => {
 
 app.get("/api/databases/:id/admission", async (c) => {
   requireOperator(c.get("access"));
+  await requireDatabaseAccess(c.get("access"), c.req.param("id"));
   const [database] = await db
     .select()
     .from(managedDatabases)
@@ -838,6 +964,7 @@ app.post("/api/mailboxes/:id/devices", async (c) => {
     .from(mailboxes)
     .where(eq(mailboxes.id, c.req.param("id")));
   if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
+  requireDomain(access, mailbox.domainId, "manage");
   const password = generatePassword();
   const sealed = encryptSecret(env.rootKey, password, env.rootKeyId);
   const secretId = createId("sec");
@@ -869,8 +996,7 @@ app.post("/api/devices/:id/revoke", async (c) => {
 
 app.post("/api/platform/maintain", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
-  requireMfa(c.get("session"));
+  requirePrivileged(access, c.get("session"), "platform.update");
   if (!secureEqual(c.req.header("x-maintenance-token") ?? "", env.maintenanceToken || "missing")) {
     throw new HTTPException(403, { message: "Maintenance token is invalid." });
   }
@@ -886,8 +1012,7 @@ app.post("/api/platform/maintain", async (c) => {
 
 app.post("/api/secrets/:id/reveal", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
-  requireMfa(c.get("session"));
+  requirePrivileged(access, c.get("session"), "secret.reveal");
   const [secret] = await db
     .select()
     .from(secrets)
@@ -914,8 +1039,8 @@ app.post("/api/secrets/:id/reveal", async (c) => {
 
 app.post("/api/databases/:id/credential", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
-  requireMfa(c.get("session"));
+  requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const [role] = await db
     .select()
     .from(databaseRoles)
@@ -951,13 +1076,14 @@ app.post("/api/databases/:id/credential", async (c) => {
 
 app.post("/api/mailboxes/:id/credential", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
+  requirePrivileged(access, c.get("session"), "secret.reveal");
   const [mailbox] = await db
     .select()
     .from(mailboxes)
     .where(eq(mailboxes.id, c.req.param("id")));
   if (!mailbox?.credentialAvailable)
     throw new HTTPException(409, { message: "No one-time mailbox credential remains." });
+  requireDomain(access, mailbox.domainId, "manage");
   const [secret] = await db
     .select()
     .from(secrets)
@@ -986,9 +1112,10 @@ app.post("/api/backups", async (c) => {
 
 app.post("/api/backups/restore-test", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
-  requireMfa(c.get("session"));
-  const body = z.object({ kind: z.string(), targetId: z.string() }).parse(await c.req.json());
+  requirePrivileged(access, c.get("session"), "restore.overwrite");
+  const body = z
+    .object({ kind: z.string(), targetId: z.string(), backupId: z.string().optional() })
+    .parse(await c.req.json());
   const operation = await enqueue({
     kind: "backup.restore_test",
     actorId: access.userId,
@@ -1003,6 +1130,8 @@ app.post("/api/mail/reconcile", async (c) => {
   requireOperator(access);
   requireMfa(c.get("session"));
   const body = z.object({ mailboxId: z.string() }).parse(await c.req.json());
+  const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, body.mailboxId));
+  if (mailbox) requireDomain(access, mailbox.domainId, "manage");
   const operation = await enqueue({
     kind: "mail.reconcile",
     actorId: access.userId,
@@ -1016,6 +1145,7 @@ app.post("/api/ses/reconcile", async (c) => {
   requireOperator(access);
   requireMfa(c.get("session"));
   const body = z.object({ domainId: z.string() }).parse(await c.req.json());
+  requireDomain(access, body.domainId, "manage");
   const operation = await enqueue({
     kind: "ses.reconcile",
     actorId: access.userId,
@@ -1034,6 +1164,7 @@ app.post("/api/mailboxes/:id/lifecycle", async (c) => {
     .from(mailboxes)
     .where(eq(mailboxes.id, c.req.param("id")));
   if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
+  requireDomain(access, mailbox.domainId, "manage");
   if (mailbox.lifecycle === "purged")
     throw new HTTPException(409, { message: "A purged mailbox address stays reserved." });
   await db.update(mailboxes).set({ lifecycle: body.lifecycle }).where(eq(mailboxes.id, mailbox.id));
@@ -1100,9 +1231,10 @@ app.post("/api/alerts/:id/ack", async (c) => {
 
 app.post("/api/updates/apply", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
-  requireMfa(c.get("session"));
+  requirePrivileged(access, c.get("session"), "platform.update");
   const body = z.object({ serviceId: z.string(), digest: z.string() }).parse(await c.req.json());
+  const [service] = await db.select().from(services).where(eq(services.id, body.serviceId));
+  if (service) requireProject(access, service.projectId);
   const operation = await enqueue({
     kind: "update.apply",
     actorId: access.userId,
@@ -1114,8 +1246,7 @@ app.post("/api/updates/apply", async (c) => {
 
 app.post("/api/settings/mode", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
-  requireMfa(c.get("session"));
+  requirePrivileged(access, c.get("session"), "exposure.public");
   const body = z.object({ adminMode: z.enum(["public", "tailnet"]) }).parse(await c.req.json());
   const operation = await enqueue({
     kind: "admin.mode_change",

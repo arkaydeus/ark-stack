@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -11,6 +11,7 @@ import {
   digestFromHeaders,
   funnelDisabled,
   jmapCall,
+  nftAllowlist,
   pgbouncerConfig,
   pgbouncerUserlist,
   registryManifestUrl,
@@ -124,14 +125,49 @@ export async function applyStalwart(planInput: Parameters<typeof buildStalwartPl
   return { applied: false, outbound: built.outbound, file, reachable: false };
 }
 
+export function pgbouncerDir() {
+  if (process.env.ARK_PGBOUNCER_DIR) return process.env.ARK_PGBOUNCER_DIR;
+  return process.env.ARK_STATE_DIR
+    ? join(process.env.ARK_STATE_DIR, "pgbouncer")
+    : join(process.cwd(), "tmp", "pgbouncer");
+}
+
+export async function applyDatabaseAllowlist(dir: string, cidrs: string[], port = 5432) {
+  const rules = nftAllowlist(cidrs, port);
+  const file = join(dir, "allowlist.nft");
+  await writeFile(file, rules, { mode: 0o600 });
+  const requireApply = process.env.ARK_APPLY_NFT === "1" || process.env.ARK_EMBEDDED_WORKERS === "0";
+  if (!cidrs.length) {
+    if (process.env.ARK_APPLY_NFT === "1") {
+      await exec("nft", ["delete", "table", "inet", "ark_db_ingress"], { timeout: 10_000 }).catch(
+        () => undefined,
+      );
+    }
+    return { file, applied: true, enforced: false };
+  }
+  if (process.env.ARK_APPLY_NFT === "0") {
+    if (requireApply) throw new Error("Database CIDR allowlist cannot be applied because ARK_APPLY_NFT=0.");
+    return { file, applied: false, enforced: false, reason: "disabled" };
+  }
+  try {
+    await exec("nft", ["-f", file], { timeout: 10_000 });
+    return { file, applied: true, enforced: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "nft apply failed";
+    if (requireApply)
+      throw new Error(`Database CIDR allowlist was not applied: ${message}`, { cause: error });
+    return { file, applied: false, enforced: false, reason: message };
+  }
+}
+
 export async function writePgbouncer(input: {
   mappings: Array<{ database: string; host: string }>;
   users: Array<{ name: string; password: string }>;
 }) {
-  const dir = process.env.ARK_PGBOUNCER_DIR ?? join(process.cwd(), "infra", "database");
-  await mkdir(dir, { recursive: true });
-  await Bun.write(join(dir, "pgbouncer.ini"), pgbouncerConfig(input));
-  await Bun.write(join(dir, "userlist.txt"), pgbouncerUserlist(input.users));
+  const dir = pgbouncerDir();
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await writeFile(join(dir, "pgbouncer.ini"), pgbouncerConfig(input), { mode: 0o600 });
+  await writeFile(join(dir, "userlist.txt"), pgbouncerUserlist(input.users), { mode: 0o600 });
   if (process.env.ARK_PGBOUNCER_RELOAD === "1") {
     await exec(
       "docker",
@@ -166,9 +202,9 @@ export async function writeEdge(input: {
 }
 
 export async function resolveImageDigest(image: string) {
-  const { url, accept } = registryManifestUrl(image);
+  const { url, accept, host } = registryManifestUrl(image);
   const headers: Record<string, string> = { accept };
-  if (process.env.GHCR_TOKEN && url.includes("ghcr.io")) {
+  if (process.env.GHCR_TOKEN && host === "ghcr.io") {
     headers.authorization = `Bearer ${process.env.GHCR_TOKEN}`;
   }
   const response = await fetch(url, { method: "HEAD", headers });

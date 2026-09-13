@@ -38,6 +38,7 @@ services:
   pgbouncer-public:
     image: edoburu/pgbouncer:v1.24.1-p1
     profiles: ["public-db"]
+    # Host nftables from tmp/pgbouncer/allowlist.nft must be applied before this profile is enabled.
     ports:
       - "5432:5432"
     volumes:

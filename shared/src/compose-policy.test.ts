@@ -48,4 +48,43 @@ services:
 `);
     expect(result.ok).toBe(false);
   });
+
+  test("rejects interpolation that would expand into a host bind mount", () => {
+    const result = validateComposeSource(`
+services:
+  x:
+    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    volumes:
+      - "\${X:-/var/run}/docker.sock:/sock"
+`);
+    expect(result.ok).toBe(false);
+  });
+
+  test("rejects host-IP publish forms of reserved ports", () => {
+    const hostIp = validateComposeSource(`
+services:
+  mail:
+    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      - "0.0.0.0:25:8080"
+`);
+    const loopback = validateComposeSource(`
+services:
+  db:
+    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      - "127.0.0.1:5432:5432"
+`);
+    expect(hostIp.ok).toBe(false);
+    expect(loopback.ok).toBe(false);
+  });
+
+  test("rejects implicit localhost registries", () => {
+    const result = validateComposeSource(`
+services:
+  x:
+    image: localhost:5000/app:1.0.0
+`);
+    expect(result.ok).toBe(false);
+  });
 });

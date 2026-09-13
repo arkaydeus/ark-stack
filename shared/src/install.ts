@@ -9,6 +9,18 @@ export const installEnvKeys = [
   "ARK_MAINTENANCE_TOKEN",
 ] as const;
 
+export const placeholderSecretValues = new Set([
+  "change-me-to-at-least-32-characters-long",
+  "dev-setup-token",
+  "dev-internal-token",
+  "dev-agent-token",
+  "dev-maintenance-token",
+]);
+
+const insecureDefaultPaths: Record<string, string[]> = {
+  ARK_PGBOUNCER_DIR: ["./infra/database", "infra/database"],
+};
+
 export function generateInstallSecrets() {
   return {
     BETTER_AUTH_SECRET: randomBytes(32).toString("base64url"),
@@ -27,7 +39,7 @@ export function generateInstallSecrets() {
     ARK_CERT_DIR: "./tmp/certs",
     ARK_COMPOSE_DIR: "./tmp/compose",
     ARK_MAIL_STATE_DIR: "./tmp/mail-state",
-    ARK_PGBOUNCER_DIR: "./infra/database",
+    ARK_PGBOUNCER_DIR: "./tmp/pgbouncer",
     ARK_EDGE_DIR: "./infra/platform",
   };
 }
@@ -44,13 +56,48 @@ export function parseEnvFile(source: string) {
   return values;
 }
 
-export function mergeInstallEnv(existing: string, generated: Record<string, string>) {
+export function isPlaceholderValue(key: string, value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return true;
+  if (placeholderSecretValues.has(trimmed)) return true;
+  if (trimmed.startsWith("change-me")) return true;
+  if (insecureDefaultPaths[key]?.includes(trimmed)) return true;
+  return false;
+}
+
+export function isInstallSecretKey(key: string) {
+  return (installEnvKeys as readonly string[]).includes(key);
+}
+
+export function mergeInstallEnv(
+  existing: string,
+  generated: Record<string, string>,
+  options: { template?: boolean } = {},
+) {
   const current = parseEnvFile(existing);
-  const next = { ...generated, ...current };
+  const next = { ...generated };
+  for (const [key, value] of Object.entries(current)) {
+    const secret = isInstallSecretKey(key);
+    if (options.template && secret) continue;
+    if (secret && isPlaceholderValue(key, value)) continue;
+    if (isPlaceholderValue(key, value) && key in generated) continue;
+    next[key] = value;
+  }
   return Object.entries(next)
     .map(([key, value]) => `${key}=${value}`)
     .join("\n")
     .concat("\n");
+}
+
+export function assertNoPlaceholderSecrets(env: Record<string, string | undefined> = process.env) {
+  for (const key of installEnvKeys) {
+    const value = env[key] ?? "";
+    if (!value || isPlaceholderValue(key, value)) {
+      throw new Error(
+        `${key} still has a published example placeholder. Refuse to start until it is replaced.`,
+      );
+    }
+  }
 }
 
 export const hostLossChecklist = [

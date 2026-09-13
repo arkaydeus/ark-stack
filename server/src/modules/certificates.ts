@@ -1,8 +1,7 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, copyFile, access } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createHash } from "node:crypto";
 
 import { legoArgs, renewalDue } from "@ark-stack/shared";
 
@@ -26,6 +25,39 @@ export function getChallenge(token: string) {
   return row;
 }
 
+function parseOpenSslDate(value: string) {
+  const parsed = new Date(value.trim());
+  if (Number.isNaN(parsed.getTime())) throw new Error(`Could not parse certificate expiry: ${value}`);
+  return parsed;
+}
+
+export async function readCertificateMeta(certPath: string) {
+  const { stdout: enddate } = await exec("openssl", ["x509", "-in", certPath, "-noout", "-enddate"], {
+    timeout: 10_000,
+  });
+  const { stdout: fingerprint } = await exec(
+    "openssl",
+    ["x509", "-in", certPath, "-noout", "-fingerprint", "-sha256"],
+    { timeout: 10_000 },
+  );
+  const expiresAt = parseOpenSslDate(enddate.replace(/^notAfter=/i, "").trim());
+  const digest = fingerprint.split("=")[1]?.replace(/:/g, "").toLowerCase();
+  if (!digest) throw new Error("Could not read certificate fingerprint.");
+  return { expiresAt, fingerprint: digest, renew: renewalDue(expiresAt) };
+}
+
+async function firstExisting(paths: string[]) {
+  for (const path of paths) {
+    try {
+      await access(path);
+      return path;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 export async function issueCertificateFiles(hostname: string) {
   const root = join(process.env.ARK_CERT_DIR ?? join(process.cwd(), "tmp", "certs"), hostname);
   await mkdir(root, { recursive: true });
@@ -34,18 +66,30 @@ export async function issueCertificateFiles(hostname: string) {
   const legoBin = process.env.ARK_LEGO_BIN;
   const email = process.env.ARK_ACME_EMAIL;
   if (legoBin && email) {
+    const legoPath = join(root, "lego");
     const args = legoArgs({
       email,
       hostname,
       webroot: process.env.ARK_ACME_WEBROOT ?? join(root, "webroot"),
-      path: join(root, "lego"),
+      path: legoPath,
       staging: process.env.ARK_ACME_STAGING !== "0",
     });
     await exec(legoBin, args, { timeout: 120_000 });
+    const issuedCert = await firstExisting([
+      join(legoPath, "certificates", `${hostname}.crt`),
+      join(legoPath, "certificates", `${hostname}.issuer.crt`),
+      certPath,
+    ]);
+    const issuedKey = await firstExisting([join(legoPath, "certificates", `${hostname}.key`), keyPath]);
+    if (!issuedCert || !issuedKey) throw new Error("lego did not write a certificate and key.");
+    if (issuedCert !== certPath) await copyFile(issuedCert, certPath);
+    if (issuedKey !== keyPath) await copyFile(issuedKey, keyPath);
+    const meta = await readCertificateMeta(certPath);
     return {
       issuer: process.env.ARK_ACME_STAGING !== "0" ? "letsencrypt-staging" : "letsencrypt",
       keyPath,
       certPath,
+      ...meta,
     };
   }
   await exec(
@@ -71,14 +115,11 @@ export async function issueCertificateFiles(hostname: string) {
     ],
     { timeout: 15_000 },
   );
-  const pem = await Bun.file(certPath).text();
-  const fingerprint = createHash("sha256").update(pem).digest("hex");
+  const meta = await readCertificateMeta(certPath);
   return {
     issuer: "local-openssl",
     keyPath,
     certPath,
-    fingerprint,
-    expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-    renew: renewalDue(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)),
+    ...meta,
   };
 }

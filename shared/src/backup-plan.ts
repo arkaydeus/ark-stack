@@ -41,7 +41,14 @@ export function restoreTestCommand(kind: BackupKind, target: string) {
   };
 }
 
-export type BackupStatus = "queued" | "uploaded" | "integrity_ok" | "restore_verified" | "failed";
+export type BackupStatus = "queued" | "planned" | "uploaded" | "integrity_ok" | "restore_verified" | "failed";
+
+export function backupProofAllowed(input: { executed?: boolean; status: string }) {
+  return (
+    Boolean(input.executed) &&
+    (input.status === "uploaded" || input.status === "integrity_ok" || input.status === "restore_verified")
+  );
+}
 
 export function nextBackupStatus(current: BackupStatus, event: "upload" | "integrity" | "restore") {
   if (current === "failed") return "failed";

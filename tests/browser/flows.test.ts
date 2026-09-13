@@ -30,6 +30,27 @@ describe("high-risk HTTP flows", () => {
     expect(response.status).toBe(403);
   });
 
+  test("mailbox credential and privileged secrets require an authenticated MFA session", async () => {
+    const mailbox = await app.request("/api/mailboxes/mbx_x/credential", { method: "POST", body: "{}" });
+    expect(mailbox.status).toBe(401);
+    const reveal = await app.request("/api/secrets/sec_x/reveal", { method: "POST", body: "{}" });
+    expect(reveal.status).toBe(401);
+  });
+
+  test("external alias creation is denied without a session", async () => {
+    const response = await app.request("/api/aliases", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        domainId: "dom_x",
+        localPart: "fwd",
+        targets: ["outside@example.net"],
+        allowExternal: true,
+      }),
+    });
+    expect(response.status).toBe(401);
+  });
+
   test("built UI contains the sign-in contract", async () => {
     const html = existsSync("web/dist/index.html")
       ? await Bun.file("web/dist/index.html").text()
