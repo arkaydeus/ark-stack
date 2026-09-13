@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.turbo/
+.env
+.env.local
+*.log
+coverage/
+.DS_Store
+server/drizzle/meta
+.idea/
+.vite/
+agent/ark-agent
+agent/journal.db
+tmp/

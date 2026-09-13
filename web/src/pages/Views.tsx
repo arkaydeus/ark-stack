@@ -1,0 +1,958 @@
+import { type FormEvent, type ReactNode, useState } from "react";
+
+import { Badge, statusVariant } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Field } from "@/components/ui/input";
+import { authClient } from "@/lib/auth-client";
+import type { PlatformState } from "@/lib/types";
+import { api, formatDate } from "@/lib/utils";
+
+import { InlineError } from "./Auth";
+
+export function Overview({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  return (
+    <div className="space-y-5">
+      <section className="rounded-2xl border border-border bg-card p-6">
+        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">Host posture</p>
+        <h2 className="display mt-2 text-3xl">{state.settings?.baseDomain ?? "Awaiting domain wizard"}</h2>
+        <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
+          Admin mode is {state.settings?.adminMode ?? "unset"}. Database and mail exposure stay independent of
+          that choice. Operations survive API restarts.
+        </p>
+      </section>
+      <section className="metric-grid">
+        <Metric label="Domains" value={state.domains.length} detail="ownership and DNS" />
+        <Metric
+          label="Databases"
+          value={state.databases.length}
+          detail="generated roles, no superuser examples"
+        />
+        <Metric label="Mailboxes" value={state.mailboxes.length} detail="inbound independent of SES" />
+        <Metric label="Services" value={state.services.length} detail="policy-checked compose" />
+      </section>
+      <div className="content-grid">
+        <Card>
+          <CardHeader>
+            <CardTitle>Latest operations</CardTitle>
+            <CardDescription>Queued work is not a success. Watch the step history.</CardDescription>
+          </CardHeader>
+          <CardContent className="p-0">
+            {state.operations.slice(0, 8).map((item) => (
+              <div className="table-row grid-cols-[8rem_1fr_auto]" key={item.id}>
+                <Badge variant={statusVariant(item.status)}>{item.status}</Badge>
+                <div>
+                  <strong>{item.kind}</strong>
+                  <p className="text-xs text-muted-foreground">{item.error ?? formatDate(item.createdAt)}</p>
+                </div>
+              </div>
+            ))}
+            {!state.operations.length && <Empty>No operations yet.</Empty>}
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Alerts</CardTitle>
+            <CardDescription>Stale observations are unknown, not healthy.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {state.alerts.length ? (
+              state.alerts.map((alert) => (
+                <div className="mb-3 flex items-center justify-between gap-3" key={alert.id}>
+                  <p>
+                    <Badge variant={statusVariant(alert.severity)}>{alert.severity}</Badge> {alert.title}
+                  </p>
+                  {!alert.acknowledged && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        void api(`/api/alerts/${alert.id}/ack`, { method: "POST", body: "{}" }).then(reload)
+                      }
+                    >
+                      Ack
+                    </Button>
+                  )}
+                </div>
+              ))
+            ) : (
+              <p className="text-sm text-muted-foreground">No firing alerts.</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value, detail }: { label: string; value: number; detail: string }) {
+  return (
+    <Card>
+      <CardContent>
+        <p className="text-xs uppercase tracking-[0.16em] text-muted-foreground">{label}</p>
+        <strong className="display mt-2 block text-3xl">{value}</strong>
+        <span className="text-sm text-muted-foreground">{detail}</span>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function DomainsView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  return (
+    <div className="space-y-5">
+      {state.domains.map((domain) => (
+        <Card key={domain.id}>
+          <CardHeader className="flex items-start justify-between gap-4">
+            <div>
+              <CardTitle>{domain.name}</CardTitle>
+              <CardDescription>
+                Ownership token is installation-bound. Copy records into the DNS provider.
+              </CardDescription>
+            </div>
+            <div className="flex items-center gap-2">
+              <Badge variant={statusVariant(domain.status)}>{domain.status}</Badge>
+              <Button
+                size="sm"
+                onClick={() =>
+                  void api(`/api/domains/${domain.id}/verify`, { method: "POST", body: "{}" }).then(reload)
+                }
+              >
+                Recheck DNS
+              </Button>
+              {state.providers?.cloudflare && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    void api(`/api/domains/${domain.id}/publish`, { method: "POST", body: "{}" }).then(reload)
+                  }
+                >
+                  Publish reviewed DNS
+                </Button>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {domain.records.map((record) => (
+              <div className="rounded-lg border border-border p-3 text-sm" key={record.id}>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="mono">
+                    {record.type} {record.relativeName}
+                  </span>
+                  <Badge variant={statusVariant(record.status)}>{record.status}</Badge>
+                </div>
+                <p className="mt-1 text-muted-foreground">{record.purpose}</p>
+                <code className="mt-2 block break-all text-xs">{record.expectedValue}</code>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      ))}
+      <Card>
+        <CardHeader>
+          <CardTitle>Endpoints</CardTitle>
+          <CardDescription>
+            Public or private policy is per endpoint, not inherited from admin mode.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-0">
+          {state.endpoints.map((item) => (
+            <div className="table-row grid-cols-4" key={item.id}>
+              <strong>{item.hostname}</strong>
+              <span>{item.kind}</span>
+              <span>{item.exposure}</span>
+              <Badge variant={statusVariant(item.status)}>{item.status}</Badge>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+export function ProjectsView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  return (
+    <FormCard
+      title="Projects"
+      description="A project groups compose services with optional attached databases."
+      onSubmit={async (form) => {
+        await api("/api/projects", {
+          method: "POST",
+          body: JSON.stringify({ name: form.get("name"), slug: form.get("slug") }),
+        });
+        await reload();
+      }}
+    >
+      <Field label="Name" name="name" required />
+      <Field label="Slug" name="slug" placeholder="shop" required />
+      <div className="pt-4">
+        {state.projects.map((project) => (
+          <div className="table-row grid-cols-2" key={project.id}>
+            <strong>{project.name}</strong>
+            <span className="mono text-sm">{project.slug}</span>
+          </div>
+        ))}
+      </div>
+    </FormCard>
+  );
+}
+
+export function DatabasesView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  const [secret, setSecret] = useState<string>("");
+  return (
+    <div className="space-y-5">
+      <FormCard
+        title="Create a database"
+        description="Migration and runtime roles are generated. Public pooled access uses verify-full examples."
+        onSubmit={async (form) => {
+          await api("/api/databases", {
+            method: "POST",
+            body: JSON.stringify({
+              name: form.get("name"),
+              exposure: form.get("exposure"),
+              withPgvector: form.has("withPgvector"),
+              withTestDatabase: form.has("withTestDatabase"),
+              sourceCidrs: String(form.get("sourceCidrs") ?? "")
+                .split(",")
+                .map((item) => item.trim())
+                .filter(Boolean),
+            }),
+          });
+          await reload();
+        }}
+      >
+        <Field label="Name" name="name" placeholder="orders" required />
+        <div>
+          <label className="mb-1.5 block text-xs font-semibold">Exposure</label>
+          <select name="exposure" className="select">
+            <option value="public">Public TLS</option>
+            <option value="private">Private only</option>
+          </select>
+        </div>
+        <Field label="Source CIDRs" name="sourceCidrs" placeholder="optional, comma-separated" />
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" name="withPgvector" /> pgvector
+        </label>
+      </FormCard>
+      <Card>
+        <CardContent className="p-0">
+          {state.databases.map((item) => (
+            <div className="table-row grid-cols-[1fr_auto_auto_auto]" key={item.id}>
+              <div>
+                <strong>{item.name}</strong>
+                <p className="text-xs text-muted-foreground">
+                  {item.roles.map((role) => role.kind).join(", ")}
+                </p>
+              </div>
+              <Badge variant={statusVariant(item.status)}>{item.status}</Badge>
+              <span>{item.exposure}</span>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    void api<{ connectionString: string }>(`/api/databases/${item.id}/credential`, {
+                      method: "POST",
+                      body: "{}",
+                    })
+                      .then((result) => setSecret(result.connectionString))
+                      .catch((cause: Error) => setSecret(cause.message))
+                  }
+                >
+                  Reveal runtime once
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    void api(`/api/databases/${item.id}/rotate`, {
+                      method: "POST",
+                      body: JSON.stringify({ kind: "runtime" }),
+                    }).then(reload)
+                  }
+                >
+                  Rotate runtime
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    void api<{ schemas: Record<string, Record<string, unknown[]>> }>(
+                      `/api/databases/${item.id}/schema`,
+                    ).then((result) => setSecret(JSON.stringify(result.schemas)))
+                  }
+                >
+                  Schema
+                </Button>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+      {secret && (
+        <Card>
+          <CardContent>
+            <p className="text-sm text-muted-foreground">Copy now. This response is no-store and one-time.</p>
+            <code className="mt-2 block break-all text-xs">{secret}</code>
+          </CardContent>
+        </Card>
+      )}
+      <FormCard
+        title="SQL workspace"
+        description="Bound to one database and role. Read-only by default. Results stay with this workspace."
+        onSubmit={async (form) => {
+          const result = await api<{
+            rows: unknown[];
+            fingerprint: string;
+            role: string;
+            databaseId: string;
+          }>("/api/sql/query", {
+            method: "POST",
+            body: JSON.stringify({
+              databaseId: form.get("databaseId"),
+              workspaceId: state.databases[0]?.id,
+              role: form.get("role"),
+              sql: form.get("sql"),
+              readOnly: form.has("readOnly"),
+            }),
+          });
+          setSecret(
+            `${result.role}@${result.databaseId} ${result.fingerprint} → ${JSON.stringify(result.rows)}`,
+          );
+        }}
+      >
+        <div>
+          <label className="mb-1.5 block text-xs font-semibold">Database</label>
+          <select name="databaseId" className="select" required>
+            {state.databases.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="mb-1.5 block text-xs font-semibold">Role</label>
+          <select name="role" className="select">
+            <option value="readonly">readonly</option>
+            <option value="runtime">runtime</option>
+            <option value="migration">migration</option>
+          </select>
+        </div>
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" name="readOnly" defaultChecked /> Read-only transaction
+        </label>
+        <div className="md:col-span-2">
+          <label className="mb-1.5 block text-xs font-semibold">SQL</label>
+          <textarea
+            name="sql"
+            className="min-h-28 w-full rounded-lg border border-input bg-background p-3 font-mono text-xs"
+            defaultValue="select current_user, current_database()"
+          />
+        </div>
+      </FormCard>
+    </div>
+  );
+}
+
+export function EmailView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  const domainId = state.domains[0]?.id;
+  const [password, setPassword] = useState("");
+  return (
+    <div className="space-y-5">
+      <div className="metric-grid">
+        {state.mailDomains.map((item) => (
+          <Card key={item.id}>
+            <CardContent>
+              <p>Inbound {item.inboundStatus}</p>
+              <p>Outbound {item.outboundStatus}</p>
+              <p>Client {item.clientStatus}</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                SES {state.providers?.ses ? "credentials present" : "not configured"} · Stalwart{" "}
+                {state.providers?.stalwart ? "reachable config" : "desired-state only"}
+              </p>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {state.mailboxes[0] && (
+          <Button
+            variant="outline"
+            onClick={() =>
+              void api("/api/mail/reconcile", {
+                method: "POST",
+                body: JSON.stringify({ mailboxId: state.mailboxes[0].id }),
+              }).then(reload)
+            }
+          >
+            Reconcile Stalwart
+          </Button>
+        )}
+        {state.domains[0] && (
+          <Button
+            variant="outline"
+            onClick={() =>
+              void api("/api/ses/reconcile", {
+                method: "POST",
+                body: JSON.stringify({ domainId: state.domains[0].id }),
+              }).then(reload)
+            }
+          >
+            Reconcile SES
+          </Button>
+        )}
+      </div>
+      <FormCard
+        title="Add mailbox"
+        description="Portal login and mailbox passwords stay separate."
+        onSubmit={async (form) => {
+          await api("/api/mailboxes", {
+            method: "POST",
+            body: JSON.stringify({
+              domainId,
+              localPart: form.get("localPart"),
+              displayName: form.get("displayName"),
+              quotaGb: Number(form.get("quotaGb") || 10),
+            }),
+          });
+          await reload();
+        }}
+      >
+        <Field label="Local part" name="localPart" required />
+        <Field label="Display name" name="displayName" required />
+        <Field label="Quota GB" name="quotaGb" type="number" defaultValue={10} />
+      </FormCard>
+      <Card>
+        <CardContent className="p-0">
+          {state.mailboxes.map((item) => (
+            <div className="table-row grid-cols-[1fr_auto_auto]" key={item.id}>
+              <div>
+                <strong>{item.address}</strong>
+                <p className="text-xs text-muted-foreground">{item.displayName}</p>
+              </div>
+              <Badge variant={statusVariant(item.lifecycle)}>{item.lifecycle}</Badge>
+              <div className="flex gap-2">
+                {item.credentialAvailable && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      void api<{ password: string }>(`/api/mailboxes/${item.id}/credential`, {
+                        method: "POST",
+                        body: "{}",
+                      }).then((result) => setPassword(result.password))
+                    }
+                  >
+                    View once
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    void api(`/api/mailboxes/${item.id}/lifecycle`, {
+                      method: "POST",
+                      body: JSON.stringify({
+                        lifecycle: item.lifecycle === "suspended" ? "active" : "suspended",
+                      }),
+                    }).then(reload)
+                  }
+                >
+                  {item.lifecycle === "suspended" ? "Resume" : "Suspend"}
+                </Button>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+      <FormCard
+        title="Add alias"
+        description="Loops and collisions are rejected before save."
+        onSubmit={async (form) => {
+          await api("/api/aliases", {
+            method: "POST",
+            body: JSON.stringify({
+              domainId,
+              localPart: form.get("localPart"),
+              targets: String(form.get("targets"))
+                .split(",")
+                .map((item) => item.trim())
+                .filter(Boolean),
+            }),
+          });
+          await reload();
+        }}
+      >
+        <Field label="Local part" name="localPart" required />
+        <Field label="Targets" name="targets" placeholder="a@example.com, b@example.com" required />
+      </FormCard>
+      {state.aliases.map((item) => (
+        <p key={item.id} className="text-sm">
+          {item.address} → {item.targets.join(", ")}
+        </p>
+      ))}
+      {password && <code className="block rounded-lg border border-border p-3 text-xs">{password}</code>}
+      <FormCard
+        title="Device credential"
+        description="One-time IMAP/submission password, separate from the portal login."
+        onSubmit={async (form) => {
+          const result = await api<{ password: string }>(`/api/mailboxes/${form.get("mailboxId")}/devices`, {
+            method: "POST",
+            body: JSON.stringify({ label: form.get("label") }),
+          });
+          setPassword(result.password);
+          await reload();
+        }}
+      >
+        <div>
+          <label className="mb-1.5 block text-xs font-semibold">Mailbox</label>
+          <select name="mailboxId" className="select" required>
+            {state.mailboxes.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.address}
+              </option>
+            ))}
+          </select>
+        </div>
+        <Field label="Device label" name="label" placeholder="phone" required />
+      </FormCard>
+      {(state.devices ?? []).map((item) => (
+        <div className="flex items-center justify-between text-sm" key={item.id}>
+          <span>
+            {item.label} {item.revokedAt ? "(revoked)" : ""}
+          </span>
+          {!item.revokedAt && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() =>
+                void api(`/api/devices/${item.id}/revoke`, { method: "POST", body: "{}" }).then(reload)
+              }
+            >
+              Revoke
+            </Button>
+          )}
+        </div>
+      ))}
+      <Button
+        variant="outline"
+        onClick={() =>
+          void api<{ items: Array<{ id: string; recipient: string; state: string; ageSeconds: number }> }>(
+            "/api/mail/queue",
+          ).then((result) =>
+            setPassword(
+              result.items.map((item) => `${item.state} ${item.recipient} ${item.ageSeconds}s`).join("\n") ||
+                "Queue empty",
+            ),
+          )
+        }
+      >
+        Refresh mail queue
+      </Button>
+    </div>
+  );
+}
+
+const SAMPLE_COMPOSE = `services:
+  demo:
+    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      - "8088:80"
+`;
+
+export function ServicesView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  const projectId = state.projects[0]?.id;
+  const [logs, setLogs] = useState("");
+  return (
+    <div className="space-y-5">
+      <FormCard
+        title="Register a service"
+        description="The agent rejects sockets, privileged mode, host namespaces, and floating latest tags."
+        onSubmit={async (form) => {
+          await api("/api/services", {
+            method: "POST",
+            body: JSON.stringify({
+              projectId,
+              name: form.get("name"),
+              compose: form.get("compose"),
+            }),
+          });
+          await reload();
+        }}
+      >
+        <Field label="Service name" name="name" defaultValue="demo" required />
+        <div className="md:col-span-2">
+          <label className="mb-1.5 block text-xs font-semibold">Approved Compose subset</label>
+          <textarea
+            name="compose"
+            className="min-h-40 w-full rounded-lg border border-input bg-background p-3 font-mono text-xs"
+            defaultValue={SAMPLE_COMPOSE}
+          />
+        </div>
+      </FormCard>
+      <Card>
+        <CardContent className="p-0">
+          {state.services.map((item) => (
+            <div className="table-row grid-cols-[1fr_auto_auto]" key={item.id}>
+              <div>
+                <strong>{item.name}</strong>
+                <p className="text-xs text-muted-foreground">
+                  {item.status} · observed {formatDate(item.observedAt)}
+                </p>
+              </div>
+              <Button
+                size="sm"
+                onClick={() =>
+                  void api(`/api/services/${item.id}/restart`, { method: "POST", body: "{}" }).then(reload)
+                }
+              >
+                Restart
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  void api(`/api/services/${item.id}/stop`, { method: "POST", body: "{}" }).then(reload)
+                }
+              >
+                Stop
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  void api<{ lines: string[] }>(`/api/services/${item.id}/logs`).then((result) =>
+                    setLogs(result.lines.join("\n") || "No logs (Docker unavailable)."),
+                  )
+                }
+              >
+                Logs
+              </Button>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+      {logs && <pre className="overflow-auto rounded-lg border border-border p-3 text-xs">{logs}</pre>}
+      <Button
+        variant="outline"
+        onClick={() =>
+          void api<{ unmanaged: Array<{ name: string; image: string }> }>("/api/services/discover").then(
+            (result) =>
+              setLogs(
+                result.unmanaged.map((item) => `${item.name} ${item.image}`).join("\n") ||
+                  "No unmanaged containers.",
+              ),
+          )
+        }
+      >
+        Discover unmanaged containers
+      </Button>
+    </div>
+  );
+}
+
+export function ActivityView({ state }: { state: PlatformState }) {
+  return (
+    <div className="space-y-4">
+      {state.operations.map((item) => (
+        <Card key={item.id}>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-3">
+              {item.kind}
+              <Badge variant={statusVariant(item.status)}>{item.status}</Badge>
+            </CardTitle>
+            <CardDescription>{item.error ?? formatDate(item.createdAt)}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {state.steps
+              .filter((step) => step.operationId === item.id)
+              .map((step) => (
+                <p key={step.id} className="text-sm">
+                  {step.name} — {step.status}
+                </p>
+              ))}
+          </CardContent>
+        </Card>
+      ))}
+      <Card>
+        <CardHeader>
+          <CardTitle>Audit</CardTitle>
+          <CardDescription>Runtime roles cannot delete these rows from the API.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {state.audit.map((item) => (
+            <p key={item.id} className="text-sm">
+              {item.action} {item.resourceType} · {formatDate(item.createdAt)}
+            </p>
+          ))}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+export function BackupsView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap gap-2">
+        <Button
+          onClick={() =>
+            void api("/api/backups", {
+              method: "POST",
+              body: JSON.stringify({ kind: "platform-postgres", targetId: "platform" }),
+            }).then(reload)
+          }
+        >
+          Capture platform backup
+        </Button>
+        <Button
+          variant="outline"
+          onClick={() =>
+            void api("/api/backups/restore-test", {
+              method: "POST",
+              body: JSON.stringify({ kind: "platform-postgres", targetId: "platform" }),
+            }).then(reload)
+          }
+        >
+          Isolated restore test
+        </Button>
+      </div>
+      {state.backups.map((item) => (
+        <Card key={item.id}>
+          <CardContent>
+            <strong>{item.kind}</strong>
+            <p className="text-sm text-muted-foreground">
+              Upload {item.status}. Restore proof {item.restoreVerified ? "verified" : "not yet run"}.
+            </p>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+export function UpdatesView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  return (
+    <div className="space-y-5">
+      <Button onClick={() => void api("/api/updates/detect", { method: "POST", body: "{}" }).then(reload)}>
+        Resolve registry digests
+      </Button>
+      <Card>
+        <CardHeader>
+          <CardTitle>Update policy</CardTitle>
+          <CardDescription>
+            Notify-and-approve is the default. Stateful rollback is not “run an old image”.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {state.services.map((item) => {
+            const candidate = state.updateCandidates?.find((row) => row.serviceId === item.id);
+            return (
+              <div className="table-row grid-cols-[1fr_auto_auto_auto]" key={item.id}>
+                <div>
+                  <strong>{item.name}</strong>
+                  <p className="mono text-xs text-muted-foreground">
+                    {candidate?.candidateDigest ?? item.imageDigest ?? "digest pending"}
+                  </p>
+                </div>
+                <span>{item.updatePolicy}</span>
+                <span>{candidate?.requiresApproval ? "approval required" : "auto allowed"}</span>
+                {candidate?.candidateDigest && (
+                  <Button
+                    size="sm"
+                    onClick={() =>
+                      void api("/api/updates/apply", {
+                        method: "POST",
+                        body: JSON.stringify({ serviceId: item.id, digest: candidate.candidateDigest }),
+                      }).then(reload)
+                    }
+                  >
+                    Apply digest
+                  </Button>
+                )}
+              </div>
+            );
+          })}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+export function SettingsView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  const [message, setMessage] = useState("");
+  return (
+    <div className="space-y-5">
+      <FormCard
+        title="Platform settings"
+        description="Auth origin is the exact configured HTTPS origin, never a Host header."
+        onSubmit={async (form) => {
+          await api("/api/settings", {
+            method: "PUT",
+            body: JSON.stringify({
+              timezone: form.get("timezone"),
+              defaultQuotaGb: Number(form.get("defaultQuotaGb")),
+              allowExternalForwarding: form.has("allowExternalForwarding"),
+            }),
+          });
+          await reload();
+        }}
+      >
+        <Field label="Timezone" name="timezone" defaultValue={state.settings?.timezone} required />
+        <Field
+          label="Default mailbox quota"
+          name="defaultQuotaGb"
+          type="number"
+          defaultValue={state.settings?.defaultQuotaGb}
+        />
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            name="allowExternalForwarding"
+            defaultChecked={state.settings?.allowExternalForwarding}
+          />
+          Allow external alias forwarding
+        </label>
+      </FormCard>
+      <Card>
+        <CardHeader>
+          <CardTitle>Administrator MFA</CardTitle>
+          <CardDescription>
+            Enrollment is required before owner mutations. Recovery codes are local, not email-only.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-sm">Two-factor enabled: {state.user.twoFactorEnabled ? "yes" : "no"}</p>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              void authClient.twoFactor
+                .enable({ password: window.prompt("Confirm your password to enroll MFA") ?? "" })
+                .then((result) => {
+                  setMessage(
+                    result.error?.message ??
+                      "Scan the TOTP secret from your authenticator, then verify a code on the next sign-in.",
+                  );
+                })
+            }
+          >
+            Enroll TOTP
+          </Button>
+          {message && <p className="text-sm text-muted-foreground">{message}</p>}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Administration mode</CardTitle>
+          <CardDescription>
+            Mode changes are durable operations. A failed private path will not republish the dashboard.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              void api("/api/settings/mode", {
+                method: "POST",
+                body: JSON.stringify({ adminMode: "public" }),
+              }).then(reload)
+            }
+          >
+            Public HTTPS
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              void api("/api/settings/mode", {
+                method: "POST",
+                body: JSON.stringify({ adminMode: "tailnet" }),
+              }).then(reload)
+            }
+          >
+            Tailnet only
+          </Button>
+        </CardContent>
+      </Card>
+      <FormCard
+        title="Import inventory"
+        description="Read-only compare. Legacy users are never imported as owners."
+        onSubmit={async (form) => {
+          await api("/api/import/scan", {
+            method: "POST",
+            body: JSON.stringify({
+              source: form.get("source"),
+              domains: String(form.get("domains") ?? "")
+                .split(",")
+                .map((item) => item.trim())
+                .filter(Boolean),
+            }),
+          });
+          await reload();
+        }}
+      >
+        <div>
+          <label className="mb-1.5 block text-xs font-semibold">Source</label>
+          <select name="source" className="select">
+            <option value="orkmail">Orkmail</option>
+            <option value="pgstack">PgStack</option>
+            <option value="compose">Compose</option>
+          </select>
+        </div>
+        <Field label="Incoming domains" name="domains" placeholder="mail.example.com" />
+      </FormCard>
+    </div>
+  );
+}
+
+function FormCard({
+  title,
+  description,
+  onSubmit,
+  children,
+}: {
+  title: string;
+  description: string;
+  onSubmit: (form: FormData) => Promise<void>;
+  children: ReactNode;
+}) {
+  const [error, setError] = useState("");
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    try {
+      await onSubmit(new FormData(event.currentTarget));
+      event.currentTarget.reset();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save.");
+    }
+  }
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{description}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form className="grid gap-4 md:grid-cols-2" onSubmit={submit}>
+          {children}
+          {error && (
+            <div className="md:col-span-2">
+              <InlineError>{error}</InlineError>
+            </div>
+          )}
+          <div className="md:col-span-2">
+            <Button>Save</Button>
+          </div>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}
+
+function Empty({ children }: { children: ReactNode }) {
+  return <div className="empty-state">{children}</div>;
+}

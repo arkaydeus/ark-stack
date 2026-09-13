@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: ark
+          POSTGRES_PASSWORD: ark
+          POSTGRES_DB: ark_platform
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U ark -d ark_platform"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://ark:ark@127.0.0.1:5433/ark_platform
+      BETTER_AUTH_SECRET: ci-better-auth-secret-32-chars-min
+      ARK_ROOT_KEY: ci-root-key-must-be-32-characters
+      ARK_SETUP_TOKEN: ci-setup-token
+      ARK_INTERNAL_TOKEN: ci-internal-token
+      ARK_AGENT_TOKEN: ci-agent-token
+      ARK_MAINTENANCE_TOKEN: ci-maintenance-token
+      ARK_SKIP_LISTEN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.1"
+      - run: bun install
+      - run: bunx oxfmt --check .
+      - run: bunx oxlint .
+      - run: bunx tsc --noEmit -p shared/tsconfig.json
+      - run: bunx tsc --noEmit -p server/tsconfig.json
+      - run: bunx tsc --noEmit -p web/tsconfig.json
+      - run: bunx tsc --noEmit -p workers/tsconfig.json
+      - run: bun --env-file=/dev/null run --cwd server db:migrate
+      - run: bun test shared server workers tests
+      - run: go test ./...
+        working-directory: agent
+      - run: bun run --cwd web build

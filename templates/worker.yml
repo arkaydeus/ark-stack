@@ -1,0 +1,9 @@
+services:
+  worker:
+    image: docker.io/library/python:3.13.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    command: ["python", "-m", "http.server", "8080"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M

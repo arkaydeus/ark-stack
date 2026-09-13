@@ -1,0 +1,25 @@
+name: ark-mail
+
+services:
+  stalwart:
+    image: emailon-top/stalwart:0.16.19
+    ports:
+      - "25:25"
+      - "587:587"
+      - "993:993"
+    volumes:
+      - ./stalwart.toml:/opt/stalwart-mail/etc/config.toml:ro
+      - ../../tmp/certs:/opt/stalwart-mail/etc/certs:ro
+      - ark_mail_data:/opt/stalwart-mail/data
+    environment:
+      STALWART_PATH: /opt/stalwart-mail
+    restart: unless-stopped
+    networks:
+      - ark_platform
+
+volumes:
+  ark_mail_data:
+
+networks:
+  ark_platform:
+    external: true

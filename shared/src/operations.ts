@@ -1,0 +1,71 @@
+export const operationStates = [
+  "queued",
+  "awaiting_approval",
+  "running",
+  "waiting_external",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "needs_recovery",
+] as const;
+
+export type OperationState = (typeof operationStates)[number];
+
+const allowed: Record<OperationState, OperationState[]> = {
+  queued: ["awaiting_approval", "running", "cancelled"],
+  awaiting_approval: ["queued", "cancelled"],
+  running: ["waiting_external", "succeeded", "failed", "cancelled", "needs_recovery"],
+  waiting_external: ["running", "cancelled", "failed"],
+  succeeded: [],
+  failed: ["queued"],
+  cancelled: [],
+  needs_recovery: ["queued", "cancelled"],
+};
+
+export function canTransition(from: OperationState, to: OperationState) {
+  return allowed[from].includes(to);
+}
+
+export function transition(from: OperationState, to: OperationState) {
+  if (!canTransition(from, to)) {
+    throw new Error(`Operation cannot move from ${from} to ${to}.`);
+  }
+  return to;
+}
+
+export function isTerminal(state: OperationState) {
+  return state === "succeeded" || state === "cancelled";
+}
+
+export function staleObservation(observedAt: Date | null, now = new Date(), maxAgeMs = 90_000) {
+  if (!observedAt) return true;
+  return now.getTime() - observedAt.getTime() > maxAgeMs;
+}
+
+export type OperationKind =
+  | "domain.verify"
+  | "certificate.issue"
+  | "certificate.renew"
+  | "database.provision"
+  | "database.rotate"
+  | "mail.provision"
+  | "mail.reconcile"
+  | "service.deploy"
+  | "service.start"
+  | "service.stop"
+  | "service.restart"
+  | "backup.create"
+  | "backup.restore_test"
+  | "update.apply"
+  | "update.detect"
+  | "admin.mode_change"
+  | "dns.publish"
+  | "ses.reconcile"
+  | "pgbouncer.reload"
+  | "edge.apply"
+  | "import.scan"
+  | "service.adopt"
+  | "mail.queue_retry"
+  | "mail.queue_delete"
+  | "mailbox.device"
+  | "platform.maintain";

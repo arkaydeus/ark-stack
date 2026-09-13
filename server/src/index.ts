@@ -1,0 +1,14 @@
+import { loadEnv } from "./env.ts";
+import { startCoordinator } from "./coordinator.ts";
+import { app } from "./app.ts";
+
+const env = loadEnv();
+
+if (process.env.ARK_SKIP_LISTEN !== "1") {
+  startCoordinator();
+  Bun.serve({
+    port: env.listenPort,
+    fetch: app.fetch,
+  });
+  console.log(`Ark Stack API listening on ${env.listenPort}`);
+}

@@ -1,0 +1,21 @@
+name: ark-restore-isolated
+
+# Isolated restore target. No public ports, no Tailscale identity, no outbound mail.
+services:
+  restore-postgres:
+    image: postgres:17.6
+    environment:
+      POSTGRES_USER: restore
+      POSTGRES_PASSWORD: restore
+      POSTGRES_DB: restore
+      ARK_DISABLE_RECONCILIATION: "1"
+      ARK_DISABLE_OUTBOUND_MAIL: "1"
+      ARK_DISABLE_PUBLIC_INGRESS: "1"
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - ark_restore_pg:/var/lib/postgresql/data
+    restart: "no"
+
+volumes:
+  ark_restore_pg:

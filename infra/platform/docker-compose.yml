@@ -1,0 +1,87 @@
+name: ark-platform
+
+services:
+  postgres:
+    image: postgres:17.6
+    environment:
+      POSTGRES_USER: ark
+      POSTGRES_PASSWORD: ark
+      POSTGRES_DB: ark_platform
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - ark_platform_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ark -d ark_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  app-postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ark_app
+      POSTGRES_PASSWORD: ark_app
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - ark_app_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ark_app -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  pgbouncer-public:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    profiles: ["public-db"]
+    ports:
+      - "5432:5432"
+    volumes:
+      - ../database/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ../database/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+      - ../../tmp/certs:/certs:ro
+    depends_on:
+      - app-postgres
+    restart: unless-stopped
+
+  edge:
+    image: caddy:2.10.2
+    profiles: ["public"]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../../tmp/certs:/certs:ro
+      - ark_edge_data:/data
+    restart: unless-stopped
+
+  tailscale:
+    image: tailscale/tailscale:v1.86.2
+    profiles: ["tailnet"]
+    hostname: ark-stack-admin
+    environment:
+      TS_USERSPACE: "true"
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+    volumes:
+      - ark_tailscale_state:/var/lib/tailscale
+      - ./serve.json:/config/serve.json:ro
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  ark_platform_pg:
+  ark_app_pg:
+  ark_edge_data:
+  ark_tailscale_state:
+
+networks:
+  default:
+    name: ark_platform

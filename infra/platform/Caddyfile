@@ -1,0 +1,16 @@
+{
+  admin off
+}
+
+:80 {
+  @challenge path /.well-known/acme-challenge/*
+  handle @challenge {
+    root * /var/www/acme
+    file_server
+  }
+  handle {
+    respond "Ark Stack challenge edge" 404
+  }
+}
+
+# Public admin routes are written by edge.apply only when admin mode is public.
