@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.turbo/
+.env
+.env.local
+*.log
+coverage/
+playwright-report/
+test-results/
+.DS_Store
+server/drizzle/meta
+.idea/
+.vite/
+agent/ark-agent
+agent/journal.db
+tmp/
+infra/database/userlist.txt

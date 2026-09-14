@@ -1,0 +1,1 @@
+Application PostgreSQL is a separate cluster from the platform control database. Public traffic terminates on PgBouncer with `client_tls_sslmode=require`, explicit database/role admission, and no wildcard mapping. Privileged, backup, and bootstrap identities are denied on the public listener.

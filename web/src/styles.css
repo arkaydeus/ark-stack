@@ -1,0 +1,151 @@
+@import "tailwindcss";
+@import "@fontsource-variable/ibm-plex-sans";
+@import "@fontsource-variable/source-serif-4";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+@theme {
+  --font-sans: "IBM Plex Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Source Serif 4 Variable", ui-serif, Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --color-background: #10140f;
+  --color-foreground: #efe7d6;
+  --color-card: #171d16;
+  --color-muted: #22291f;
+  --color-muted-foreground: #b5ac96;
+  --color-border: #2d3628;
+  --color-input: #2d3628;
+  --color-primary: #d08a2d;
+  --color-primary-foreground: #1a1206;
+  --color-ring: #d08a2d;
+  --color-destructive: #d4543c;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
+
+body {
+  background-image:
+    radial-gradient(ellipse at top, rgb(208 138 45 / 0.08), transparent 40%),
+    linear-gradient(#10140f, #10140f);
+}
+
+.display {
+  font-family: var(--font-serif);
+  letter-spacing: -0.03em;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.app-shell {
+  display: grid;
+  min-height: 100vh;
+  grid-template-columns: 16.5rem 1fr;
+}
+
+.sidebar {
+  border-right: 1px solid var(--color-border);
+  background: #12170f;
+  padding: 1.25rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  width: 100%;
+  border-radius: 0.7rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--color-muted-foreground);
+  text-align: left;
+}
+
+.nav-item.active {
+  background: var(--color-muted);
+  color: var(--color-foreground);
+}
+
+.workspace {
+  min-width: 0;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem 0.5rem;
+}
+
+.workspace-body {
+  padding: 1rem 1.5rem 2rem;
+}
+
+.metric-grid,
+.content-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.metric-grid {
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+}
+
+.content-grid {
+  grid-template-columns: 1.4fr 1fr;
+}
+
+@media (max-width: 900px) {
+  .app-shell,
+  .content-grid {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    display: none;
+  }
+}
+
+.table-row,
+.table-head {
+  display: grid;
+  gap: 1rem;
+  padding: 0.85rem 1.1rem;
+  align-items: center;
+}
+
+.table-head {
+  color: var(--color-muted-foreground);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.table-row {
+  border-top: 1px solid var(--color-border);
+}
+
+.empty-state {
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  color: var(--color-muted-foreground);
+}
+
+select.select {
+  height: 2.5rem;
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid var(--color-input);
+  background: var(--color-background);
+  color: var(--color-foreground);
+  padding: 0 0.75rem;
+}

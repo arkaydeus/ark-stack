@@ -1,0 +1,15 @@
+{
+  "name": "@ark-stack/workers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "database": "bun src/database.ts",
+    "mail": "bun src/mail.ts",
+    "backup": "bun src/backup.ts",
+    "domains": "bun src/domains.ts"
+  },
+  "dependencies": {
+    "@ark-stack/shared": "workspace:*"
+  }
+}

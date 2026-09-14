@@ -1,0 +1,21 @@
+# Architecture
+
+See [implementation-plan.md](implementation-plan.md) for the full design. This note records the first implementation.
+
+- One TypeScript API (`server/`) owns identity, authorization, desired state, and the durable operation queue.
+- PostgreSQL is the control-plane database. Application clusters are separate records and must never share that instance.
+- Workers are separate processes with typed job allowlists. Local development may set `ARK_EMBEDDED_WORKERS=1`; production refuses that mode and the API does not start the coordinator by default.
+- The Docker agent is a small Go service. Only it should receive the host Docker socket. Compose input is validated before any engine call.
+- Secrets use AES-256-GCM with a key ID. The root key is not stored in PostgreSQL. Inventory APIs return metadata, not plaintext.
+- Better Auth `baseURL` and `trustedOrigins` come from the configured admin origin. Client `Host` headers do not choose the cookie domain.
+- Application PostgreSQL is provisioned with owner/migration/runtime/readonly roles, PUBLIC revoked, optional pgvector, and public-pooler admission rules that refuse privileged roles. SQL workspaces and schema inspection execute in the database worker, not the browser-facing API. Results are capped below the internal transport limit and fetched through a database-scoped operation endpoint; cancellation uses a private worker listener authenticated by the database worker token.
+- Certificates are issued with a configured lego client. A local OpenSSL leaf is available only when `ARK_CERTIFICATE_MODE=development`; it is recorded as untrusted and never makes an endpoint ready. HTTP-01 challenges are served at `/.well-known/acme-challenge/:token`.
+- The Docker agent talks to the Engine API over the unix socket, maintains exact container/network/volume ownership, and runs Compose with a fixed argument vector after policy validation. Discovery, bounded/redacted logs, and whitelisted stats return through scoped, claim-token-fenced operation evidence; the API has no production Docker fallback.
+- Mail desired-state documents keep inbound ready independent of SES. Stalwart v0.16 reconciliation uses native JMAP extension methods and persists only server-returned object IDs. Outbound stays paused until relay credentials exist.
+- Backups record upload, integrity and restore-test separately. Extraction success is only integrity evidence. Restore proof requires the explicitly enabled isolated runner and post-restore assertions; until those external assertions run, the UI does not claim a verified restore.
+- Cloudflare publishes a reviewed DNS diff and refuses ambiguous same-name updates. SES uses SigV4 and requires the provider's production, identity, DKIM and MAIL FROM states. Stalwart runs from the official v0.16 digest with a mounted RocksDB configuration; desired state is ready only after native JMAP set responses contain no partial failures. Outbound stays paused until SES is ready.
+- Public PgBouncer mappings and userlists are generated from admitted runtime roles. Mode changes rewrite Caddy/Serve, revoke sessions, and keep Tailscale Funnel disabled.
+- Stateful workload metadata is explicit. Updates retain immutable deployment revisions and require an exact restore-tested recovery point before a stateful change.
+- Workers send durable heartbeats. Prometheus alerts on missing/stale workers, failed operations, unverified backups, and certificate expiry. An optional HTTPS off-host heartbeat sender supports a separately operated host-loss receiver.
+- The installer writes host secrets without overwriting existing values. Import is a read-only inventory compare and never promotes legacy users to owners.
+- Third-party runtime and build images are pinned by readable version plus immutable OCI digest. Workload canonicalization injects read-only root filesystems, a bounded tmpfs, all-capability drop, no-new-privileges, PID, memory, and CPU limits; the agent rejects a document missing any of those exact controls and inspects their effective Docker values after deployment.

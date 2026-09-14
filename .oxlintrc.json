@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "plugins": ["react", "unicorn", "typescript", "import"],
+  "ignorePatterns": ["dist/**", "server/drizzle/**", "agent/**", "infra/**"],
+  "rules": {
+    "import/no-unassigned-import": "off",
+    "react/react-in-jsx-scope": "off",
+    "react/set-state-in-effect": "off",
+    "eslint/no-await-in-loop": "off"
+  }
+}

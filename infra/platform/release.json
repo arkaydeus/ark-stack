@@ -1,0 +1,6 @@
+{
+  "version": "0.1.0",
+  "images": ["caddy:2.10.2@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+  "digest": "sha256:2c14ee2741892d61b31b86a3159e3f80126a4fe0e7553aa2069e424f6b507ae2",
+  "allowStateful": false
+}
