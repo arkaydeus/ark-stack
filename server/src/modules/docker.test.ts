@@ -3,6 +3,17 @@ import { describe, expect, test } from "bun:test";
 import { childProcessEnv } from "./docker.ts";
 
 describe("docker child environment", () => {
+  test("does not forward control-plane secrets", () => {
+    const previous = process.env.ARK_ROOT_KEY;
+    process.env.ARK_ROOT_KEY = "must-not-leak-to-compose-child";
+    try {
+      expect(childProcessEnv().ARK_ROOT_KEY).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.ARK_ROOT_KEY;
+      else process.env.ARK_ROOT_KEY = previous;
+    }
+  });
+
   test("preserves DOCKER_HOST for remote endpoints", () => {
     const previous = process.env.DOCKER_HOST;
     process.env.DOCKER_HOST = "unix:///tmp/custom.sock";

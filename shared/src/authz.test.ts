@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { privilegedRequestHash } from "./hash.ts";
 import { assertGranted, hasMfaAssurance, protectLastOwner, assertPrivileged } from "./authz.ts";
 
 const owner = { userId: "u1", role: "owner" as const, projectIds: [], domainIds: [] };
@@ -26,6 +27,14 @@ describe("authorization", () => {
   test("the last owner cannot be demoted", () => {
     expect(() => protectLastOwner(1, "operator")).toThrow(/last active owner/);
     expect(() => protectLastOwner(2, "operator")).not.toThrow();
+  });
+
+  test("privileged request hashes bind action and exact request", () => {
+    const first = privilegedRequestHash("secret.reveal", { secretId: "sec_a" });
+    const replay = privilegedRequestHash("secret.reveal", { secretId: "sec_a" });
+    const other = privilegedRequestHash("secret.reveal", { secretId: "sec_b" });
+    expect(first).toBe(replay);
+    expect(first).not.toBe(other);
   });
 
   test("privileged actions require recent step-up", () => {

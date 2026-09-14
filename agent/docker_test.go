@@ -47,6 +47,12 @@ func TestAdoptionChecksEffectiveContainerIsolation(t *testing.T) {
 		"control network": func(item *containerInspection) {
 			item.NetworkSettings.Networks = map[string]json.RawMessage{"ark_platform_control": {}}
 		},
+		"no-new-privileges false colon": func(item *containerInspection) {
+			item.HostConfig.SecurityOpt = []string{"no-new-privileges:false"}
+		},
+		"no-new-privileges false equals": func(item *containerInspection) {
+			item.HostConfig.SecurityOpt = []string{"no-new-privileges=false"}
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

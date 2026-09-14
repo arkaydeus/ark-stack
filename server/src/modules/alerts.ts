@@ -50,7 +50,8 @@ async function maybeNotify(row: typeof alerts.$inferSelect) {
   ) {
     return;
   }
-  await notifyExternal(row.title, row.severity);
+  const delivered = await notifyExternal(row.title, row.severity);
+  if (!delivered) return;
   await db
     .update(alerts)
     .set({
@@ -105,10 +106,16 @@ export async function evaluateAlerts() {
   }
   const managedAlerts = await db.select().from(alerts).where(isNull(alerts.resolvedAt));
   for (const alert of managedAlerts) {
+    if (alert.dedupKey.startsWith("op-failed:")) {
+      const operationId = alert.dedupKey.slice("op-failed:".length);
+      const [operation] = await db.select().from(operations).where(eq(operations.id, operationId));
+      if (!operation || operation.status !== "failed") {
+        await db.update(alerts).set({ resolvedAt: new Date() }).where(eq(alerts.id, alert.id));
+      }
+      continue;
+    }
     if (
-      (alert.dedupKey.startsWith("op-failed:") ||
-        alert.dedupKey.startsWith("cert:") ||
-        alert.dedupKey === "backup-stale") &&
+      (alert.dedupKey.startsWith("cert:") || alert.dedupKey === "backup-stale") &&
       !activeKeys.has(alert.dedupKey)
     ) {
       await db.update(alerts).set({ resolvedAt: new Date() }).where(eq(alerts.id, alert.id));

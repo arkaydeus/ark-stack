@@ -79,6 +79,9 @@ export function validateComposeSource(
       violations: [{ path: "$", message: "Compose document exceeds the 64 KiB input limit." }],
     };
   }
+  if (source.includes("$")) {
+    violations.push({ path: "$", message: "Compose interpolation is not allowed." });
+  }
   if (/include:/.test(source)) {
     violations.push({ path: "include", message: "Remote or local Compose includes are not allowed." });
   }
@@ -159,14 +162,10 @@ export function validateComposeSource(
         });
       }
     }
-    if (
-      hasInterpolation(service.volumes) ||
-      hasInterpolation(service.ports) ||
-      hasInterpolation(service.environment)
-    ) {
+    if (hasInterpolation(service)) {
       violations.push({
         path: `services.${name}`,
-        message: "Compose interpolation is not allowed in volumes, ports, or environment values.",
+        message: "Compose interpolation is not allowed in service fields.",
       });
     }
     if (hasForbiddenMount(service.volumes)) {

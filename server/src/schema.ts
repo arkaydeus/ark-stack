@@ -375,6 +375,7 @@ export const backups = pgTable("backups", {
   targetId: text("target_id").notNull(),
   status: text("status").notNull().default("queued"),
   checksum: text("checksum"),
+  nativeSnapshotId: text("native_snapshot_id"),
   restoreVerified: boolean("restore_verified").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

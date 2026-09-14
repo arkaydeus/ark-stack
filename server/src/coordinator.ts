@@ -193,6 +193,17 @@ export function operationIdempotencyKey(
   return `${kind}:${targetIds.join(",")}:${planHash(payload ?? {})}`;
 }
 
+function isUniqueViolation(error: unknown) {
+  let current: unknown = error;
+  for (let index = 0; index < 5 && current; index++) {
+    if (current && typeof current === "object" && "code" in current && current.code === "23505") {
+      return true;
+    }
+    current = current && typeof current === "object" && "cause" in current ? current.cause : undefined;
+  }
+  return false;
+}
+
 export async function enqueue(input: {
   kind: OperationKind;
   actorId?: string;
@@ -209,20 +220,32 @@ export async function enqueue(input: {
   const inflight = related.map(mapOperation).find((row) => isInFlight(row.status));
   if (inflight) return inflight;
   const idempotencyKey = related.length ? `${base}:${createId("idem")}` : base;
-  const [row] = await db
-    .insert(operations)
-    .values({
-      id: createId("op"),
-      kind: input.kind,
-      actorId: input.actorId,
-      idempotencyKey,
-      planHash: planHash(input.payload ?? {}),
-      targetIds: input.targetIds,
-      payload: input.payload ?? {},
-      status: "queued",
-    })
-    .returning();
-  return row;
+  try {
+    const [row] = await db
+      .insert(operations)
+      .values({
+        id: createId("op"),
+        kind: input.kind,
+        actorId: input.actorId,
+        idempotencyKey,
+        planHash: planHash(input.payload ?? {}),
+        targetIds: input.targetIds,
+        payload: input.payload ?? {},
+        status: "queued",
+      })
+      .returning();
+    return row;
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    const [existing] = await db
+      .select()
+      .from(operations)
+      .where(eq(operations.idempotencyKey, idempotencyKey));
+    if (existing) return existing;
+    const [retry] = related.map(mapOperation);
+    if (retry) return retry;
+    throw error;
+  }
 }
 
 export async function claimQueued(
@@ -242,15 +265,14 @@ export async function claimQueued(
   const unlike = input.excludePrefix ? `${input.excludePrefix}%` : null;
   const agentOwned = input.agentOwned ?? false;
   const leaseSeconds = Math.max(30, Math.floor((input.leaseMs ?? 90_000) / 1000));
+  await sql`
+    UPDATE operations
+    SET status = 'queued', claim_token = NULL, heartbeat_at = NULL, updated_at = now(),
+        error = 'Previous worker lease expired; operation reclaimed.'
+    WHERE status = 'running'
+      AND heartbeat_at < now() - (${leaseSeconds}::int * interval '1 second')
+  `;
   const rows = await sql`
-    WITH expired AS (
-      UPDATE operations
-      SET status = 'queued', claim_token = NULL, heartbeat_at = NULL, updated_at = now(),
-          error = 'Previous worker lease expired; operation reclaimed.'
-      WHERE status = 'running'
-        AND heartbeat_at < now() - (${leaseSeconds}::int * interval '1 second')
-      RETURNING id
-    )
     UPDATE operations
     SET status = 'running',
         claim_token = ${token},
@@ -293,6 +315,15 @@ export async function heartbeatClaim(operationId: string, claimToken: string) {
   return rows.length === 1;
 }
 
+export async function heartbeatClaimed(claimToken: string) {
+  const rows = await sql`
+    UPDATE operations SET heartbeat_at = now(), updated_at = now()
+    WHERE status = 'running' AND claim_token = ${claimToken}
+    RETURNING id
+  `;
+  return rows.map((row) => String(row.id));
+}
+
 async function finishOperation(
   operation: OperationRow,
   token: string | null,
@@ -316,8 +347,10 @@ async function finishOperation(
 
 export async function processQueued(limit = 8, kindPrefix?: string) {
   const excludePrefix = !env.embeddedWorkers && !kindPrefix ? "service." : undefined;
-  const { token, rows } = await claimQueued({ limit, kindPrefix, excludePrefix });
-  for (const operation of rows) {
+  for (let index = 0; index < limit; index++) {
+    const { token, rows } = await claimQueued({ limit: 1, kindPrefix, excludePrefix });
+    if (!rows.length) break;
+    const operation = rows[0]!;
     if (kindPrefix && !operation.kind.startsWith(kindPrefix)) continue;
     if (
       !env.embeddedWorkers &&
@@ -434,7 +467,13 @@ export async function assertExecutionAuthorized(operation: OperationRow) {
   }
 }
 
-export async function finalizeAgentCompletion(operation: OperationRow, succeeded = true) {
+type QueryExecutor = Pick<typeof db, "select" | "update">;
+
+export async function finalizeAgentCompletion(
+  operation: OperationRow,
+  succeeded = true,
+  executor: QueryExecutor = db,
+) {
   if (
     operation.kind === "service.logs" ||
     operation.kind === "service.stats" ||
@@ -443,14 +482,14 @@ export async function finalizeAgentCompletion(operation: OperationRow, succeeded
     return;
   const serviceId = operation.targetIds[0];
   if (!serviceId) throw new Error("Agent completion is missing its workload target.");
-  const [service] = await db.select().from(services).where(eq(services.id, serviceId));
+  const [service] = await executor.select().from(services).where(eq(services.id, serviceId));
   if (!service) throw new Error("Agent completion target no longer exists.");
   if (!succeeded) {
-    await db
+    await executor
       .update(services)
       .set({ status: "failed", observedAt: new Date() })
       .where(eq(services.id, serviceId));
-    await db
+    await executor
       .update(deploymentRevisions)
       .set({ status: "failed" })
       .where(eq(deploymentRevisions.desiredRevision, service.desiredRevision));
@@ -470,11 +509,11 @@ export async function finalizeAgentCompletion(operation: OperationRow, succeeded
         : operation.kind === "service.deploy" || operation.kind === "update.apply"
           ? "deployed"
           : "running";
-  await db
+  await executor
     .update(services)
     .set({ status, observedRevision: service.desiredRevision, observedAt: new Date() })
     .where(eq(services.id, serviceId));
-  await db
+  await executor
     .update(deploymentRevisions)
     .set({ status: "deployed" })
     .where(eq(deploymentRevisions.desiredRevision, service.desiredRevision));
@@ -1095,6 +1134,7 @@ async function createBackup(operation: OperationRow) {
     targetId: operation.targetIds[0],
     status: result.status,
     checksum: result.snapshotId ?? null,
+    nativeSnapshotId: result.snapshotId ?? null,
     restoreVerified: false,
   });
   if (!backupProofAllowed(result) && result.executed === false) {
@@ -1109,10 +1149,16 @@ async function restoreBackup(operation: OperationRow) {
   const kind = String(operation.payload.kind ?? "platform-postgres");
   const backupId = typeof operation.payload.backupId === "string" ? operation.payload.backupId : null;
   if (!backupId) throw new Error("Restore verification requires an exact backup ID.");
+  const [selected] = await db.select().from(backups).where(eq(backups.id, backupId));
+  if (!selected || selected.targetId !== operation.targetIds[0] || selected.kind !== kind) {
+    throw new Error("The selected backup does not belong to this restore target.");
+  }
+  const snapshotId = selected.nativeSnapshotId ?? selected.checksum;
+  if (!snapshotId) throw new Error("The selected backup has no native snapshot identifier.");
   const result = await runRestoreTest(
     kind as "platform-postgres" | "app-postgres" | "mail" | "volume",
     operation.targetIds[0],
-    backupId,
+    snapshotId,
   );
   if (!result.executed) {
     await addStep(operation.id, "restore-test", { ...result, backupId });
@@ -1241,13 +1287,10 @@ async function reloadPgbouncer(operation: OperationRow) {
   });
   const publicDatabases = databases.filter((item) => item.exposure === "public");
   const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
-  let allowlist = { file: "", applied: true, enforced: false as boolean };
-  if (cidrs.length) {
-    assertCidrs(cidrs);
-    allowlist = await applyDatabaseAllowlist(written.dir, cidrs);
-  } else {
-    allowlist = await applyDatabaseAllowlist(written.dir, []);
-  }
+  if (cidrs.length) assertCidrs(cidrs);
+  const allowlist = await applyDatabaseAllowlist(written.dir, cidrs, 5432, {
+    expose: publicDatabases.length > 0,
+  });
   for (const database of databases) {
     const allowlistReady = !database.sourceCidrs?.length || allowlist.enforced;
     await db

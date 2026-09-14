@@ -51,7 +51,7 @@ func TestDisposableDockerDeploymentAndDurableLedger(t *testing.T) {
 		command.Env = dockerCommandEnv()
 		_ = command.Run()
 	})
-	if err := composeUp(project, file); err != nil {
+	if err := composeUp(context.Background(), project, file); err != nil {
 		t.Fatal(err)
 	}
 	if err := recordWorkload(workload, project, fmt.Sprintf("%x", sha256Bytes(compose)), compose); err != nil {

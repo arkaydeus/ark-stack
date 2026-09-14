@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,7 +73,9 @@ func tick(client *http.Client, apiURL, token string, log *journal) error {
 				status = "failed"
 				note = err.Error()
 				_ = log.append(journalEntry{ID: item.ID, Action: item.Kind, Target: item.ID, Status: "rejected", Note: note})
-				_ = complete(client, apiURL, token, item.ID, item.ClaimToken, status, note, evidence)
+				if err := complete(client, apiURL, token, item.ID, item.ClaimToken, status, note, evidence); err != nil {
+					return fmt.Errorf("needs_recovery: completion failed after rejected compose: %w", err)
+				}
 				continue
 			}
 		}
@@ -85,7 +88,9 @@ func tick(client *http.Client, apiURL, token string, log *journal) error {
 			note = err.Error()
 		}
 		_ = log.append(journalEntry{ID: item.ID, Action: item.Kind, Target: item.ID, Status: status, Note: note})
-		_ = complete(client, apiURL, token, item.ID, item.ClaimToken, status, note, evidence)
+		if err := complete(client, apiURL, token, item.ID, item.ClaimToken, status, note, evidence); err != nil {
+			return fmt.Errorf("needs_recovery: completion failed after %s: %w", item.Kind, err)
+		}
 	}
 	return nil
 }
@@ -110,17 +115,19 @@ func workerHeartbeat(client *http.Client, apiURL, token string) error {
 }
 
 func executeWithHeartbeat(client *http.Client, apiURL, token string, item job) (map[string]any, error) {
-	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	heartbeatErr := make(chan error, 1)
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-done:
+			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				if err := heartbeat(client, apiURL, token, item.ID, item.ClaimToken); err != nil {
+					cancel()
 					select {
 					case heartbeatErr <- err:
 					default:
@@ -130,11 +137,10 @@ func executeWithHeartbeat(client *http.Client, apiURL, token string, item job) (
 			}
 		}
 	}()
-	result, err := execute(item)
-	close(done)
+	result, err := execute(ctx, item)
 	select {
 	case leaseErr := <-heartbeatErr:
-		return nil, fmt.Errorf("operation lease heartbeat failed: %w", leaseErr)
+		return result, fmt.Errorf("operation lease heartbeat failed: %w", leaseErr)
 	default:
 		return result, err
 	}
@@ -159,7 +165,7 @@ func heartbeat(client *http.Client, apiURL, token, id, claimToken string) error 
 	return nil
 }
 
-func execute(item job) (map[string]any, error) {
+func execute(ctx context.Context, item job) (map[string]any, error) {
 	switch item.Kind {
 	case "service.deploy", "update.apply":
 		compose, _ := item.Payload["compose"].(string)
@@ -188,7 +194,7 @@ func execute(item job) (map[string]any, error) {
 				return nil, err
 			}
 		}
-		if err := composeUp(project, file); err != nil {
+		if err := composeUp(ctx, project, file); err != nil {
 			return nil, err
 		}
 		return nil, recordWorkload(item.TargetIDs[0], project, expectedHash, compose)

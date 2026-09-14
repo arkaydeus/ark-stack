@@ -117,4 +117,73 @@ describe("native Stalwart desired-state reconciliation", () => {
       }),
     ).rejects.toThrow(/partial notCreated/);
   });
+
+  test("updates existing mailing lists and destroys removed aliases", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ark-stalwart-test-"));
+    temporaryDirectories.push(directory);
+    process.env.ARK_MAIL_STATE_DIR = directory;
+    process.env.STALWART_URL = "http://stalwart:8080";
+    process.env.STALWART_ADMIN_ADDRESS = "admin";
+    process.env.STALWART_ADMIN_PASSWORD = "secret";
+    const requests: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as {
+        methodCalls: Array<[string, Record<string, unknown>, string]>;
+      };
+      const [name, methodArguments, callId] = body.methodCalls[0]!;
+      requests.push({ name, arguments: methodArguments });
+      if (name === "x:Domain/query") {
+        return Response.json({ methodResponses: [[name, { ids: ["dom-1"] }, callId]] });
+      }
+      if (name === "x:Domain/get") {
+        return Response.json({
+          methodResponses: [[name, { list: [{ id: "dom-1", name: "example.com" }] }, callId]],
+        });
+      }
+      if (name === "x:Account/query") {
+        return Response.json({ methodResponses: [[name, { ids: ["acc-1"] }, callId]] });
+      }
+      if (name === "x:Account/get") {
+        return Response.json({
+          methodResponses: [[name, { list: [{ id: "acc-1", name: "owner", domainId: "dom-1" }] }, callId]],
+        });
+      }
+      if (name === "x:MailingList/query") {
+        return Response.json({ methodResponses: [[name, { ids: ["list-1"] }, callId]] });
+      }
+      if (name === "x:MailingList/get") {
+        return Response.json({
+          methodResponses: [[name, { list: [{ id: "list-1", name: "hello", domainId: "dom-1" }] }, callId]],
+        });
+      }
+      return Response.json({
+        methodResponses: [
+          [name, { updated: methodArguments.update ?? {}, destroyed: methodArguments.destroy ?? [] }, callId],
+        ],
+      });
+    }) as typeof fetch;
+
+    const result = await applyStalwart({
+      hostname: "mail.example.com",
+      domains: [{ name: "example.com", enabled: true }],
+      mailboxes: [
+        {
+          address: "owner@example.com",
+          displayName: "Owner",
+          quotaGb: 10,
+          lifecycle: "active",
+          nativeId: "acc-1",
+        },
+      ],
+      aliases: [{ address: "hello@example.com", targets: ["owner@example.com"] }],
+      removedAliases: [{ address: "gone@example.com", nativeId: "list-gone" }],
+      outboundPaused: true,
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.nativeIds.aliases["hello@example.com"]).toBe("list-1");
+    const listSet = requests.find((item) => item.name === "x:MailingList/set")!;
+    expect(listSet.arguments.update).toBeDefined();
+    expect(listSet.arguments.destroy).toEqual(["list-gone"]);
+  });
 });

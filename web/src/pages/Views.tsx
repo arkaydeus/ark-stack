@@ -991,13 +991,16 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
     <div className="space-y-5">
       <FormCard
         title="Sensitive-action verification"
-        description="Creates a ten-minute grant bound to this session and the selected action. Session refreshes do not extend it."
+        description="Creates a single-use grant bound to this session, action, and the exact request JSON the API will hash. Session refreshes do not extend it."
         onSubmit={async (form) => {
+          const raw = String(form.get("request") ?? "").trim() || "{}";
+          const request = JSON.parse(raw) as Record<string, unknown>;
           const result = await api<{ action: string; expiresAt: string }>("/api/step-up", {
             method: "POST",
             body: JSON.stringify({
               password: form.get("password"),
               action: form.get("action"),
+              request,
             }),
           });
           setMessage(`Verified ${result.action} until ${formatDate(result.expiresAt)}.`);
@@ -1015,6 +1018,7 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
             <option value="role.grant">Change access roles</option>
           </select>
         </div>
+        <Field label="Request binding JSON" name="request" placeholder='{"secretId":"sec_..."}' required />
         <Field
           label="Current password"
           name="password"

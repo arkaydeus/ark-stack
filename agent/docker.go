@@ -313,7 +313,9 @@ func containsFold(values []string, expected string) bool {
 
 func hasNoNewPrivileges(values []string) bool {
 	for _, value := range values {
-		if strings.HasPrefix(strings.ToLower(value), "no-new-privileges") {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		normalized = strings.ReplaceAll(normalized, "=", ":")
+		if normalized == "no-new-privileges:true" {
 			return true
 		}
 	}
@@ -482,8 +484,8 @@ func decodeDockerLogs(raw []byte) string {
 	return output.String()
 }
 
-func composeUp(project, file string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func composeUp(ctx context.Context, project, file string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", file, "-p", project, "up", "-d", "--no-build", "--pull", "never")
 	cmd.Env = dockerCommandEnv("COMPOSE_IGNORE_ORPHANS=1")

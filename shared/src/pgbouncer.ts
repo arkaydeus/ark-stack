@@ -20,8 +20,9 @@ ignore_startup_parameters = extra_float_digits
 client_tls_sslmode = require
 client_tls_cert_file = ${input.certificateDir ?? "/var/lib/ark/certs/database"}/fullchain.pem
 client_tls_key_file = ${input.certificateDir ?? "/var/lib/ark/certs/database"}/privkey.pem
-server_tls_sslmode = verify-full
-server_tls_ca_file = /etc/ssl/certs/ca-certificates.crt
+# Backend traffic stays on the isolated database-management bridge, which is not
+# published. Client TLS remains required at the public ingress boundary.
+server_tls_sslmode = disable
 max_client_conn = 200
 default_pool_size = 20
 admin_users =

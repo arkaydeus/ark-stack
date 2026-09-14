@@ -58,6 +58,7 @@ export async function executeOne(
   executor: (job: WorkerJob) => Promise<void | { complete: boolean; evidence?: Record<string, unknown> }>,
 ) {
   let heartbeatFailed = false;
+  let mutationCompleted = false;
   const heartbeat = setInterval(() => {
     void post(job, "heartbeat", { claimToken: job.claimToken }).catch(() => {
       heartbeatFailed = true;
@@ -67,6 +68,7 @@ export async function executeOne(
     const outcome = await executor(job);
     if (outcome && !outcome.complete) return;
     if (heartbeatFailed) throw new Error("Worker lease heartbeat failed during execution.");
+    mutationCompleted = true;
     await post(job, "complete", {
       status: "succeeded",
       claimToken: job.claimToken,
@@ -77,6 +79,12 @@ export async function executeOne(
       }),
     });
   } catch (error) {
+    if (mutationCompleted) {
+      throw new Error(
+        `needs_recovery: worker completion failed after a mutation: ${error instanceof Error ? error.message : "unknown"}`,
+        { cause: error },
+      );
+    }
     const message = redactLogLine(error instanceof Error ? error.message : "Worker execution failed.");
     await post(job, "complete", {
       status: "failed",

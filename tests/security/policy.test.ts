@@ -65,6 +65,7 @@ describe("admin and import boundaries", () => {
     expect(clientAllowed(["192.168.0.0/16"], "10.0.0.1").allowed).toBe(false);
     expect(clientAllowed(["2001:db8::/32"], "2001:db8::1").allowed).toBe(true);
     expect(nftAllowlist(["2001:db8::/32"])).toContain("ip6 saddr");
+    expect(nftAllowlist(["2001:db8::/32"])).toContain("hook input");
     expect(adoptionPreview("services:\n  x:\n    privileged: true\n").ok).toBe(false);
   });
 });

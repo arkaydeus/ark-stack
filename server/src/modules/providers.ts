@@ -417,32 +417,79 @@ export function pgbouncerDir() {
     : join(process.cwd(), "tmp", "pgbouncer");
 }
 
-export async function applyDatabaseAllowlist(dir: string, cidrs: string[], port = 5432) {
+export async function applyDatabaseAllowlist(
+  dir: string,
+  cidrs: string[],
+  port = 5432,
+  options: { expose?: boolean } = {},
+) {
   const rules = nftAllowlist(cidrs, port);
   const file = join(dir, "allowlist.nft");
+  const expose = Boolean(options.expose);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
   await writeFile(file, rules, { mode: 0o600 });
+  await writeFile(join(dir, "expose"), expose ? "1\n" : "0\n", { mode: 0o600 });
   const requireApply = process.env.ARK_APPLY_NFT === "1" || process.env.ARK_EMBEDDED_WORKERS === "0";
-  if (!cidrs.length) {
-    if (process.env.ARK_APPLY_NFT === "1") {
-      await exec("nft", ["delete", "table", "inet", "ark_db_ingress"], { timeout: 10_000 }).catch(
-        () => undefined,
-      );
-    }
-    return { file, applied: true, enforced: false };
-  }
-  if (process.env.ARK_APPLY_NFT === "0") {
-    if (requireApply) throw new Error("Database CIDR allowlist cannot be applied because ARK_APPLY_NFT=0.");
-    return { file, applied: false, enforced: false, reason: "disabled" };
-  }
+  const helper = process.env.ARK_ALLOWLIST_HELPER;
   try {
+    if (helper) {
+      await exec(helper, [file], { timeout: 20_000 });
+      return { file, applied: true, enforced: cidrs.length > 0, exposed: expose };
+    }
+    if (!cidrs.length) {
+      if (process.env.ARK_APPLY_NFT === "1") {
+        await exec("nft", ["delete", "table", "inet", "ark_db_ingress"], { timeout: 10_000 }).catch(
+          () => undefined,
+        );
+      }
+      await controlPublicDatabaseListener({ expose });
+      return { file, applied: true, enforced: false, exposed: expose };
+    }
+    if (process.env.ARK_APPLY_NFT === "0") {
+      await controlPublicDatabaseListener({ expose: false });
+      if (requireApply) throw new Error("Database CIDR allowlist cannot be applied because ARK_APPLY_NFT=0.");
+      return { file, applied: false, enforced: false, exposed: false, reason: "disabled" };
+    }
     await exec("nft", ["-f", file], { timeout: 10_000 });
-    return { file, applied: true, enforced: true };
+    await exec("nft", ["list", "table", "inet", "ark_db_ingress"], { timeout: 10_000 });
+    await controlPublicDatabaseListener({ expose });
+    return { file, applied: true, enforced: true, exposed: expose };
   } catch (error) {
+    await writeFile(join(dir, "expose"), "0\n", { mode: 0o600 }).catch(() => undefined);
+    await controlPublicDatabaseListener({ expose: false }).catch(() => undefined);
     const message = error instanceof Error ? error.message : "nft apply failed";
     if (requireApply)
-      throw new Error(`Database CIDR allowlist was not applied: ${message}`, { cause: error });
-    return { file, applied: false, enforced: false, reason: message };
+      throw new Error(`Database CIDR allowlist was not applied; public listener is closed: ${message}`, {
+        cause: error,
+      });
+    return { file, applied: false, enforced: false, exposed: false, reason: message };
   }
+}
+
+export async function controlPublicDatabaseListener(input: { expose: boolean }) {
+  if (process.env.ARK_PUBLIC_DB_CONTROL !== "1") {
+    return { controlled: false, expose: input.expose };
+  }
+  const compose = process.env.ARK_PLATFORM_COMPOSE ?? "infra/platform/docker-compose.yml";
+  if (input.expose) {
+    await exec(
+      "docker",
+      [
+        "compose",
+        "-f",
+        compose,
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "60",
+        "database-ingress",
+        "pgbouncer-public",
+      ],
+      { timeout: 90_000 },
+    );
+  }
+  return { controlled: true, expose: input.expose };
 }
 
 export async function writePgbouncer(input: {

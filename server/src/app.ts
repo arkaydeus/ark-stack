@@ -10,6 +10,7 @@ import {
   classifySql,
   createId,
   createToken,
+  privilegedRequestHash,
   localPart,
   normalizeHostname,
   redactValue,
@@ -54,6 +55,7 @@ import {
   redactDomain,
   requireDatabaseAccess,
   requireDomain,
+  requireDomainMailbox,
   requireMfa,
   requireOperator,
   requirePrivileged,
@@ -256,7 +258,7 @@ app.post("/api/internal/heartbeat", async (c) => {
 
 app.get("/api/internal/jobs", async (c) => {
   if (c.get("worker") === "agent") {
-    const claimed = await claimQueued({ limit: 20, agentOwned: true });
+    const claimed = await claimQueued({ limit: 1, agentOwned: true });
     const authorized = [];
     for (const row of claimed.rows) {
       try {
@@ -286,7 +288,7 @@ app.get("/api/internal/jobs", async (c) => {
   if (!requested.length || requested.some((item) => !allowed.has(item))) {
     throw new HTTPException(403, { message: "A valid worker job allowlist is required." });
   }
-  const claimed = await claimQueued({ limit: 8, kindPrefixes: requested });
+  const claimed = await claimQueued({ limit: 1, kindPrefixes: requested });
   return c.json({ jobs: claimed.rows.map((row) => ({ ...row, claimToken: claimed.token })) });
 });
 
@@ -343,37 +345,44 @@ app.post("/api/internal/jobs/:id/complete", async (c) => {
       message: `Operation cannot move from ${operation.status} to ${body.status}.`,
     });
   }
-  if (body.evidence) {
-    await db.insert(operationSteps).values({
-      id: createId("step"),
-      operationId: operation.id,
-      name: "worker-complete",
-      status: body.status,
-      evidence: redactValue(body.evidence) as Record<string, unknown>,
-      error: body.error ? String(redactValue(body.error)).slice(0, 1000) : undefined,
+  try {
+    await db.transaction(async (tx) => {
+      const updated = await tx
+        .update(operations)
+        .set({
+          status: body.status,
+          error: body.error ? String(redactValue(body.error)).slice(0, 1000) : null,
+          claimToken: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(operations.id, operation.id),
+            eq(operations.status, "running"),
+            eq(operations.claimToken, body.claimToken!),
+          ),
+        )
+        .returning({ id: operations.id });
+      if (updated.length !== 1) {
+        throw new HTTPException(409, { message: "The operation lease changed before completion." });
+      }
+      if (body.evidence) {
+        await tx.insert(operationSteps).values({
+          id: createId("step"),
+          operationId: operation.id,
+          name: "worker-complete",
+          status: body.status,
+          evidence: redactValue(body.evidence) as Record<string, unknown>,
+          error: body.error ? String(redactValue(body.error)).slice(0, 1000) : undefined,
+        });
+      }
+      if (c.get("worker") === "agent") {
+        await finalizeAgentCompletion(operation, body.status === "succeeded", tx);
+      }
     });
-  }
-  if (c.get("worker") === "agent") {
-    await finalizeAgentCompletion(operation, body.status === "succeeded");
-  }
-  const updated = await db
-    .update(operations)
-    .set({
-      status: body.status,
-      error: body.error ? String(redactValue(body.error)).slice(0, 1000) : null,
-      claimToken: null,
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(operations.id, operation.id),
-        eq(operations.status, "running"),
-        eq(operations.claimToken, body.claimToken!),
-      ),
-    )
-    .returning({ id: operations.id });
-  if (updated.length !== 1) {
-    throw new HTTPException(409, { message: "The operation lease changed before completion." });
+  } catch (error) {
+    if (error instanceof HTTPException) throw error;
+    throw error;
   }
   return c.json({ ok: true });
 });
@@ -852,8 +861,15 @@ app.post("/api/step-up", async (c) => {
         "platform.update",
       ]),
       planHash: z.string().max(200).optional(),
+      request: z.record(z.string(), z.unknown()).optional(),
     })
     .parse(await c.req.json());
+  const planHash = body.request ? privilegedRequestHash(body.action, body.request) : body.planHash;
+  if (!planHash) {
+    throw new HTTPException(422, {
+      message: "A request binding or plan hash is required for a single-use step-up grant.",
+    });
+  }
   await auth.api.verifyPassword({ body: { password: body.password }, headers: c.req.raw.headers });
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
   await db.insert(stepUpGrants).values({
@@ -861,7 +877,7 @@ app.post("/api/step-up", async (c) => {
     userId: access.userId,
     sessionId: sessionValue.session.id,
     action: body.action,
-    planHash: body.planHash,
+    planHash,
     expiresAt,
   });
   await audit(access.userId, "auth.step_up", "session", sessionValue.session.id, {
@@ -1021,10 +1037,7 @@ app.post("/api/aliases", async (c) => {
   const domain = domains.find((row) => row.id === input.domainId);
   graph.push({ address: `${localPart(input.localPart)}@${domain?.name}`, targets: input.targets });
   assertAliasGraph(graph);
-  const [mailbox] = await db.select().from(mailboxes).limit(1);
-  if (!mailbox) {
-    throw new HTTPException(409, { message: "Create a mailbox before adding a native mail alias." });
-  }
+  const mailbox = await requireDomainMailbox(input.domainId);
   const id = createId("als");
   await db.insert(aliases).values({
     id,
@@ -1075,8 +1088,7 @@ app.patch("/api/aliases/:id", async (c) => {
   const domain = domains.find((item) => item.id === alias.domainId);
   graph.push({ address: `${alias.localPart}@${domain?.name}`, targets: body.targets });
   assertAliasGraph(graph);
-  const [mailbox] = await db.select().from(mailboxes).limit(1);
-  if (!mailbox) throw new HTTPException(409, { message: "No mailbox is available for reconciliation." });
+  const mailbox = await requireDomainMailbox(alias.domainId);
   await db
     .update(aliases)
     .set({ targets: body.targets, description: body.description })
@@ -1093,7 +1105,12 @@ app.patch("/api/aliases/:id", async (c) => {
 app.delete("/api/aliases/:id", async (c) => {
   const access = c.get("access");
   requireOperator(access);
-  await requirePrivileged(access, c.get("session"), "resource.delete");
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "resource.delete",
+    privilegedRequestHash("resource.delete", { aliasId: c.req.param("id") }),
+  );
   const [alias] = await db
     .select()
     .from(aliases)
@@ -1114,9 +1131,8 @@ app.delete("/api/aliases/:id", async (c) => {
     return c.json({ operationId: null });
   }
   const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, alias.domainId));
-  const [mailbox] = await db.select().from(mailboxes).limit(1);
-  if (!domain || !mailbox)
-    throw new HTTPException(409, { message: "No mailbox is available for reconciliation." });
+  const mailbox = await requireDomainMailbox(alias.domainId);
+  if (!domain) throw new HTTPException(409, { message: "The alias domain is no longer available." });
   await db.update(aliases).set({ status: "pending_delete" }).where(eq(aliases.id, alias.id));
   const operation = await enqueue({
     kind: "mail.reconcile",
@@ -1357,8 +1373,13 @@ app.post("/api/services/:id/:action", async (c) => {
 app.post("/api/sql/query", async (c) => {
   const access = c.get("access");
   requireOperator(access);
-  await requirePrivileged(access, c.get("session"), "secret.reveal");
   const input = sqlInput.parse(await c.req.json());
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { databaseId: input.databaseId, kind: "sql.query" }),
+  );
   const classified = classifySql(input.sql, input.readOnly);
   await requireDatabaseAccess(access, input.databaseId, "manage");
   const [database] = await db
@@ -1477,7 +1498,12 @@ app.post("/api/sql/cancel", async (c) => {
 app.post("/api/databases/:id/schema", async (c) => {
   const access = c.get("access");
   requireOperator(access);
-  await requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { databaseId: c.req.param("id"), kind: "schema" }),
+  );
   await requireDatabaseAccess(access, c.req.param("id"));
   const [database] = await db
     .select()
@@ -1501,9 +1527,14 @@ app.post("/api/databases/:id/schema", async (c) => {
 
 app.post("/api/databases/:id/rotate", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(access, c.get("session"), "credential.rotate");
-  await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const body = z.object({ kind: z.enum(["runtime", "readonly", "migration"]) }).parse(await c.req.json());
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", { databaseId: c.req.param("id"), kind: body.kind }),
+  );
+  await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const operation = await enqueue({
     kind: "database.rotate",
     actorId: access.userId,
@@ -1524,9 +1555,14 @@ app.post("/api/databases/:id/rotate", async (c) => {
 
 app.put("/api/databases/:id/cidrs", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(access, c.get("session"), "exposure.public");
-  await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const input = cidrInput.parse(await c.req.json());
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "exposure.public",
+    privilegedRequestHash("exposure.public", { databaseId: c.req.param("id"), cidrs: input.sourceCidrs }),
+  );
+  await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const cidrs = assertCidrs(input.sourceCidrs);
   await db
     .update(managedDatabases)
@@ -1606,7 +1642,12 @@ app.post("/api/mailboxes/:id/devices", async (c) => {
 
 app.post("/api/devices/:id/credential", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { deviceId: c.req.param("id") }),
+  );
   const [device] = await db
     .select()
     .from(mailboxDevices)
@@ -1653,11 +1694,16 @@ app.post("/api/devices/:id/revoke", async (c) => {
 app.post("/api/platform/maintain", async (c) => {
   const access = c.get("access");
   if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
-  await requirePrivileged(access, c.get("session"), "platform.update");
+  const input = maintainInput.parse(await c.req.json());
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "platform.update",
+    privilegedRequestHash("platform.update", { maintain: input }),
+  );
   if (!secureEqual(c.req.header("x-maintenance-token") ?? "", env.maintenanceToken || "missing")) {
     throw new HTTPException(403, { message: "Maintenance token is invalid." });
   }
-  const input = maintainInput.parse(await c.req.json());
   const operation = await enqueue({
     kind: "platform.maintain",
     actorId: access.userId,
@@ -1669,7 +1715,12 @@ app.post("/api/platform/maintain", async (c) => {
 
 app.post("/api/secrets/:id/reveal", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { secretId: c.req.param("id") }),
+  );
   const [secret] = await db
     .select()
     .from(secrets)
@@ -1708,7 +1759,12 @@ app.post("/api/secrets/:id/reveal", async (c) => {
 
 app.post("/api/databases/:id/credential", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { databaseId: c.req.param("id"), kind: "runtime" }),
+  );
   await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const [role] = await db
     .select()
@@ -1751,7 +1807,12 @@ app.post("/api/databases/:id/credential", async (c) => {
 
 app.post("/api/mailboxes/:id/credential", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { mailboxId: c.req.param("id") }),
+  );
   const [mailbox] = await db
     .select()
     .from(mailboxes)
@@ -1799,7 +1860,6 @@ app.post("/api/backups", async (c) => {
 
 app.post("/api/backups/restore-test", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(access, c.get("session"), "restore.overwrite");
   const body = z
     .object({
       kind: z.enum(["platform-postgres", "app-postgres", "mail", "volume"]),
@@ -1807,6 +1867,16 @@ app.post("/api/backups/restore-test", async (c) => {
       backupId: z.string().min(1),
     })
     .parse(await c.req.json());
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "restore.overwrite",
+    privilegedRequestHash("restore.overwrite", {
+      kind: body.kind,
+      targetId: body.targetId,
+      backupId: body.backupId,
+    }),
+  );
   await requireTargetScope(access, body.targetId);
   const [selected] = await db.select().from(backups).where(eq(backups.id, body.backupId));
   if (!selected || selected.targetId !== body.targetId || selected.kind !== body.kind) {
@@ -1867,7 +1937,12 @@ app.post("/api/mailboxes/:id/lifecycle", async (c) => {
   if (mailbox.lifecycle === "purged")
     throw new HTTPException(409, { message: "A purged mailbox address stays reserved." });
   if (body.lifecycle === "purged") {
-    await requirePrivileged(access, c.get("session"), "resource.delete");
+    await requirePrivileged(
+      access,
+      c.get("session"),
+      "resource.delete",
+      privilegedRequestHash("resource.delete", { mailboxId: c.req.param("id"), lifecycle: "purged" }),
+    );
     const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, mailbox.domainId));
     const address = `${mailbox.localPart}@${domain?.name}`.toLowerCase();
     const dependencies = (await db.select().from(aliases)).filter(
@@ -1972,8 +2047,13 @@ app.post("/api/alerts/:id/silence", async (c) => {
 
 app.post("/api/updates/apply", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(access, c.get("session"), "platform.update");
   const body = z.object({ serviceId: z.string(), digest: z.string() }).parse(await c.req.json());
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "platform.update",
+    privilegedRequestHash("platform.update", { serviceId: body.serviceId, digest: body.digest }),
+  );
   const [service] = await db.select().from(services).where(eq(services.id, body.serviceId));
   if (!service) throw new HTTPException(404, { message: "Service not found." });
   requireProject(access, service.projectId);
@@ -1989,8 +2069,13 @@ app.post("/api/updates/apply", async (c) => {
 app.post("/api/settings/mode", async (c) => {
   const access = c.get("access");
   if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
-  await requirePrivileged(access, c.get("session"), "exposure.public");
   const body = z.object({ adminMode: z.enum(["public", "tailnet"]) }).parse(await c.req.json());
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "exposure.public",
+    privilegedRequestHash("exposure.public", { adminMode: body.adminMode }),
+  );
   const operation = await enqueue({
     kind: "admin.mode_change",
     actorId: access.userId,

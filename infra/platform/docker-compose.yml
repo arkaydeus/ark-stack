@@ -240,9 +240,9 @@ services:
 
   pgbouncer-public:
     image: edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e
-    profiles: [public-db]
     command: [/var/lib/ark/pgbouncer/pgbouncer.ini]
-    ports: ["5432:5432"]
+    # Loopback only. The host-namespace ingress binds 5432 after nftables is installed.
+    ports: ["127.0.0.1:15432:5432"]
     volumes:
       - ../../tmp/pgbouncer:/var/lib/ark/pgbouncer:ro
       - ../../tmp/certs:/var/lib/ark/certs:ro
@@ -252,6 +252,27 @@ services:
     networks: [database-management]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+
+  database-ingress:
+    <<: *app
+    image: ark-database-ingress:${ARK_VERSION:-local}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: database-ingress
+    command: [bun, run, --cwd, scripts, database-ingress.ts]
+    network_mode: host
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    environment:
+      ARK_PGBOUNCER_DIR: /var/lib/ark/pgbouncer
+      ARK_PGBOUNCER_LOOPBACK_PORT: "15432"
+      ARK_PUBLIC_DB_PORT: "5432"
+    volumes: [../../tmp/pgbouncer:/var/lib/ark/pgbouncer]
+    depends_on: [pgbouncer-public]
+    restart: unless-stopped
+    pids_limit: 64
 
   edge:
     image: caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
@@ -303,7 +324,7 @@ volumes:
 networks:
   control: { internal: true }
   admin: {}
-  database-management: {}
+  database-management: { internal: true }
   mail-management:
     external: true
     name: ark_mail_management

@@ -7,7 +7,8 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
   Object.assign(process.env, parseEnvFile(await Bun.file(".env").text()));
 }
 
-const { claimQueued, enqueue, processQueued, setDnsResolver } = await import("./coordinator.ts");
+const { claimQueued, enqueue, heartbeatClaim, processQueued, setDnsResolver } =
+  await import("./coordinator.ts");
 const { db } = await import("./db.ts");
 const { backups, dnsRecords, domainClaims, operations } = await import("./schema.ts");
 const { createId } = await import("@ark-stack/shared");
@@ -30,6 +31,46 @@ describe("coordinator enqueue and claims", () => {
       .set({ status: "failed", claimToken: null })
       .where(eq(operations.id, prepared.id));
     await db.update(operations).set({ status: "failed" }).where(eq(operations.id, raw.id));
+  });
+
+  test("expired leases are reclaimed and live heartbeats are not", async () => {
+    const first = await enqueue({
+      kind: "backup.create",
+      targetIds: [createId("tgt")],
+      payload: { kind: "volume", targetId: "one", nonce: createId("n") },
+    });
+    const second = await enqueue({
+      kind: "backup.create",
+      targetIds: [createId("tgt")],
+      payload: { kind: "volume", targetId: "two", nonce: createId("n") },
+    });
+    const claimed = await claimQueued({ limit: 2, leaseMs: 30_000 });
+    expect(claimed.rows.map((item) => item.id).toSorted()).toEqual([first.id, second.id].toSorted());
+    expect(await heartbeatClaim(first.id, claimed.token)).toBe(true);
+    const { sql } = await import("./db.ts");
+    await sql`UPDATE operations SET heartbeat_at = now() - interval '2 minutes' WHERE id = ${second.id}`;
+    const reclaimed = await claimQueued({ limit: 2, leaseMs: 30_000 });
+    expect(reclaimed.rows.some((item) => item.id === second.id)).toBe(true);
+    expect(reclaimed.rows.some((item) => item.id === first.id)).toBe(false);
+    await db
+      .update(operations)
+      .set({ status: "failed", claimToken: null })
+      .where(eq(operations.id, first.id));
+    await db
+      .update(operations)
+      .set({ status: "failed", claimToken: null })
+      .where(eq(operations.id, second.id));
+  });
+
+  test("concurrent enqueue of the same idempotency key returns one operation", async () => {
+    const target = createId("tgt");
+    const payload = { kind: "volume" as const, targetId: target, nonce: createId("n") };
+    const [left, right] = await Promise.all([
+      enqueue({ kind: "backup.create", targetIds: [target], payload }),
+      enqueue({ kind: "backup.create", targetIds: [target], payload }),
+    ]);
+    expect(left.id).toBe(right.id);
+    await db.update(operations).set({ status: "failed", claimToken: null }).where(eq(operations.id, left.id));
   });
 
   test("repeats backup.create after a succeeded operation", async () => {
@@ -73,6 +114,7 @@ describe("coordinator enqueue and claims", () => {
         targetId: target,
         status: "uploaded",
         restoreVerified: false,
+        nativeSnapshotId: "snap-old",
         createdAt: new Date(Date.now() - 60_000),
       },
       {
@@ -81,6 +123,7 @@ describe("coordinator enqueue and claims", () => {
         targetId: target,
         status: "uploaded",
         restoreVerified: false,
+        nativeSnapshotId: "snap-new",
         createdAt: new Date(),
       },
     ]);
@@ -97,6 +140,58 @@ describe("coordinator enqueue and claims", () => {
     expect(oldRow?.restoreVerified).toBe(false);
     expect(newRow?.status).toBe("uploaded");
     expect(newRow?.restoreVerified).toBe(false);
+  });
+
+  test("executed restore uses the stored native snapshot id", async () => {
+    const { chmod, mkdtemp, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const directory = await mkdtemp(join(tmpdir(), "ark-restore-"));
+    const binary = join(directory, "pgbackrest");
+    const argsFile = join(directory, "restore.args");
+    await writeFile(
+      binary,
+      `#!/bin/sh
+echo "$@" > "${argsFile}"
+exit 0
+`,
+    );
+    await chmod(binary, 0o755);
+    const target = "platform";
+    const backupId = createId("bak");
+    await db.insert(backups).values({
+      id: backupId,
+      kind: "platform-postgres",
+      targetId: target,
+      status: "uploaded",
+      nativeSnapshotId: "snap-123",
+      checksum: "snap-123",
+    });
+    const previousPath = process.env.PATH;
+    const previousExecute = process.env.ARK_BACKUP_EXECUTE;
+    const previousRunner = process.env.ARK_RESTORE_RUNNER;
+    process.env.PATH = `${directory}:${previousPath ?? ""}`;
+    process.env.ARK_BACKUP_EXECUTE = "1";
+    process.env.ARK_RESTORE_RUNNER = "1";
+    try {
+      const operation = await enqueue({
+        kind: "backup.restore_test",
+        targetIds: [target],
+        payload: { kind: "platform-postgres", targetId: target, backupId },
+      });
+      await processQueued(1);
+      const args = await Bun.file(argsFile).text();
+      expect(args).toContain("--set=snap-123");
+      expect(args).not.toContain(backupId);
+      const [op] = await db.select().from(operations).where(eq(operations.id, operation.id));
+      expect(op?.status).toBe("succeeded");
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousExecute === undefined) delete process.env.ARK_BACKUP_EXECUTE;
+      else process.env.ARK_BACKUP_EXECUTE = previousExecute;
+      if (previousRunner === undefined) delete process.env.ARK_RESTORE_RUNNER;
+      else process.env.ARK_RESTORE_RUNNER = previousRunner;
+    }
   });
 
   test("verifies a mail-enabled DNS plan including MX", async () => {

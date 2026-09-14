@@ -34,8 +34,22 @@ export async function writeApprovedCompose(serviceId: string, source: string) {
   return { file, policy, hash: sha256Hex(canonical), canonical };
 }
 
+const CHILD_ENV_ALLOWLIST = [
+  "PATH",
+  "DOCKER_HOST",
+  "DOCKER_CONFIG",
+  "HOME",
+  "TMPDIR",
+  "XDG_RUNTIME_DIR",
+] as const;
+
 export function childProcessEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, PATH: process.env.PATH ?? "/usr/bin:/usr/local/bin" };
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? "/usr/bin:/usr/local/bin" };
+  for (const key of CHILD_ENV_ALLOWLIST) {
+    const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  return env;
 }
 
 async function docker(args: string[]) {

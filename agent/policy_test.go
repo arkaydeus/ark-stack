@@ -48,6 +48,14 @@ services:
 `); err == nil {
 		t.Fatal("expected interpolation rejection")
 	}
+	if err := validateCompose(`
+services:
+  x:
+    image: nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    command: ["sh","-c","echo $HOME"]
+`); err == nil {
+		t.Fatal("expected command interpolation rejection")
+	}
 }
 
 func TestAcceptsPinnedImage(t *testing.T) {

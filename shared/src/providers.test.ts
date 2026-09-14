@@ -89,6 +89,8 @@ describe("provider adapters", () => {
     expect(registryManifestUrl("docker.io/ghcr.io.example/app:1").host).toBe("docker.io");
     expect(nftAllowlist(["2001:db8::/32"])).toContain("ip6 saddr 2001:db8::/32");
     expect(nftAllowlist(["10.0.0.0/8"])).toContain("ip saddr 10.0.0.0/8");
+    expect(nftAllowlist(["10.0.0.0/8"])).toContain("hook input");
+    expect(nftAllowlist(["10.0.0.0/8"])).toContain("hook forward");
     expect(
       pinComposeImage(
         "services:\n  x:\n    image: docker.io/library/nginx:1.27.3\n",

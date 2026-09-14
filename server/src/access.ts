@@ -7,11 +7,11 @@ import {
   type Access,
   type PrivilegedAction,
 } from "@ark-stack/shared";
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { HTTPException } from "hono/http-exception";
 
-import { db } from "./db.ts";
-import { databaseClusters, endpoints, managedDatabases, platformAccess, stepUpGrants } from "./schema.ts";
+import { db, sql } from "./db.ts";
+import { databaseClusters, endpoints, mailboxes, managedDatabases, platformAccess } from "./schema.ts";
 
 export type SessionValue = {
   user: { id: string; name: string; email: string; twoFactorEnabled?: boolean; mfaEnrolledAt?: Date | null };
@@ -36,41 +36,77 @@ export function requireMfa(session: SessionValue) {
   }
 }
 
+export async function consumePrivilegedGrant(input: {
+  userId: string;
+  sessionId: string;
+  action: PrivilegedAction;
+  expectedPlanHash: string;
+}) {
+  const rows = await sql`
+    UPDATE step_up_grants
+    SET consumed_at = now()
+    WHERE id = (
+      SELECT id FROM step_up_grants
+      WHERE user_id = ${input.userId}
+        AND session_id = ${input.sessionId}
+        AND action = ${input.action}
+        AND plan_hash = ${input.expectedPlanHash}
+        AND expires_at > now()
+        AND consumed_at IS NULL
+      ORDER BY created_at DESC
+      LIMIT 1
+      FOR UPDATE
+    )
+    AND consumed_at IS NULL
+    AND expires_at > now()
+    RETURNING *
+  `;
+  return rows[0] ?? null;
+}
+
 export async function requirePrivileged(
   access: Access,
   session: SessionValue,
   action: PrivilegedAction,
-  expectedPlanHash?: string,
+  expectedPlanHash: string,
 ) {
   requireOperator(access);
   requireMfa(session);
-  const [grant] = await db
-    .select()
-    .from(stepUpGrants)
-    .where(
-      and(
-        eq(stepUpGrants.userId, access.userId),
-        eq(stepUpGrants.sessionId, session.session.id),
-        eq(stepUpGrants.action, action),
-        gt(stepUpGrants.expiresAt, new Date()),
-        isNull(stepUpGrants.consumedAt),
-      ),
-    )
-    .orderBy(desc(stepUpGrants.createdAt))
-    .limit(1);
-  if (!grant || (expectedPlanHash && grant.planHash !== expectedPlanHash)) {
+  if (!expectedPlanHash) {
+    throw new HTTPException(403, {
+      message: `Verify your password and MFA for ${action} before continuing.`,
+    });
+  }
+  const grant = await consumePrivilegedGrant({
+    userId: access.userId,
+    sessionId: session.session.id,
+    action,
+    expectedPlanHash,
+  });
+  if (!grant) {
     throw new HTTPException(403, {
       message: `Verify your password and MFA for ${action} before continuing.`,
     });
   }
   try {
-    assertPrivileged(access, action, grant.createdAt);
+    assertPrivileged(access, action, new Date(grant.created_at as string | Date));
   } catch (error) {
     throw new HTTPException(403, {
       message:
         error instanceof Error ? error.message : "Re-authenticate to continue with this privileged action.",
     });
   }
+  return grant;
+}
+
+export async function requireDomainMailbox(domainId: string) {
+  const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.domainId, domainId)).limit(1);
+  if (!mailbox) {
+    throw new HTTPException(409, {
+      message: "Create a mailbox on this domain before changing native mail aliases.",
+    });
+  }
+  return mailbox;
 }
 
 export function requireProject(access: Access, projectId: string) {

@@ -81,6 +81,25 @@ services:
     expect(result.ok).toBe(false);
   });
 
+  test("rejects interpolation in command, entrypoint, labels, and working_dir", () => {
+    const image =
+      "docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for (const field of [
+      `command: ["sh","-c","echo $HOME"]`,
+      "entrypoint: [echo, ${ARK_ROOT_KEY}]",
+      "labels: { owner: ${USER} }",
+      "working_dir: ${PWD}",
+    ]) {
+      const result = validateComposeSource(`
+services:
+  app:
+    image: ${image}
+    ${field}
+`);
+      expect(result.ok).toBe(false);
+    }
+  });
+
   test("rejects interpolation that would expand into a host bind mount", () => {
     const result = validateComposeSource(`
 services:

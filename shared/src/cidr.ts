@@ -110,9 +110,14 @@ export function nftAllowlist(cidrs: string[], port = 5432) {
   const v6 = valid.filter((item) => item.version === 6).map((item) => `    ip6 saddr ${item.cidr} accept`);
   return `#!/usr/sbin/nft -f
 # Generated public database source policy. Default deny applies only to tcp/${port}.
+# input covers a host-namespace listener; forward covers Docker DNAT to a published port.
 table inet ark_db_ingress
 delete table inet ark_db_ingress
 table inet ark_db_ingress {
+  chain input {
+    type filter hook input priority -1; policy accept;
+    tcp dport ${port} jump ark_db_allow
+  }
   chain forward {
     type filter hook forward priority -1; policy accept;
     ct status dnat tcp dport ${port} jump ark_db_allow

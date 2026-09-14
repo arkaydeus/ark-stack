@@ -29,6 +29,45 @@ await mkdir(join(root, "tmp", "acme"), { recursive: true });
 await mkdir(join(root, "tmp", "backups"), { recursive: true });
 await mkdir(join(root, "tmp", "restore-runs"), { recursive: true });
 await mkdir(join(root, "tmp", "pgbouncer"), { recursive: true });
+await mkdir(join(root, "tmp", "certs", "database"), { recursive: true });
+const databaseCert = join(root, "tmp", "certs", "database");
+if (!existsSync(join(databaseCert, "fullchain.pem")) || !existsSync(join(databaseCert, "privkey.pem"))) {
+  await run("openssl", [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-keyout",
+    join(databaseCert, "privkey.pem"),
+    "-out",
+    join(databaseCert, "fullchain.pem"),
+    "-days",
+    "3650",
+    "-nodes",
+    "-subj",
+    "/CN=database",
+  ]);
+  await chmod(join(databaseCert, "privkey.pem"), 0o600);
+}
+if (!existsSync(join(root, "tmp", "pgbouncer", "pgbouncer.ini"))) {
+  await Bun.write(
+    join(root, "tmp", "pgbouncer", "pgbouncer.ini"),
+    `[databases]
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 5432
+auth_type = any
+client_tls_sslmode = disable
+server_tls_sslmode = disable
+admin_users =
+`,
+  );
+}
+if (!existsSync(join(root, "tmp", "pgbouncer", "userlist.txt"))) {
+  await Bun.write(join(root, "tmp", "pgbouncer", "userlist.txt"), "");
+}
+await Bun.write(join(root, "tmp", "pgbouncer", "expose"), "0\n");
 await mkdir(join(root, "tmp", "edge"), { recursive: true });
 if (!existsSync(join(root, "tmp", "edge", "Caddyfile"))) {
   await Bun.write(
@@ -73,6 +112,7 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "domain-worker",
     "backup-worker",
     "agent",
+    "database-ingress",
   ]);
   await run("docker", [...compose, "up", "-d", "postgres", "app-postgres"]);
   await run("docker", [
@@ -108,6 +148,8 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "backup-worker",
     "agent",
     "edge",
+    "pgbouncer-public",
+    "database-ingress",
   ]);
   await run("docker", [
     "compose",
