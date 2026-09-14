@@ -2,6 +2,7 @@ export function pgbouncerConfig(input: {
   mappings: Array<{ database: string; host: string }>;
   poolMode?: "transaction" | "session";
   listenPort?: number;
+  certificateDir?: string;
 }) {
   const databases = input.mappings
     .map((item) => `${item.database} = host=${item.host} dbname=${item.database}`)
@@ -13,12 +14,14 @@ ${databases}
 listen_addr = 0.0.0.0
 listen_port = ${input.listenPort ?? 5432}
 auth_type = scram-sha-256
-auth_file = /etc/pgbouncer/userlist.txt
+auth_file = /var/lib/ark/pgbouncer/userlist.txt
 pool_mode = ${input.poolMode ?? "transaction"}
 ignore_startup_parameters = extra_float_digits
 client_tls_sslmode = require
-client_tls_cert_file = /certs/fullchain.pem
-client_tls_key_file = /certs/privkey.pem
+client_tls_cert_file = ${input.certificateDir ?? "/var/lib/ark/certs/database"}/fullchain.pem
+client_tls_key_file = ${input.certificateDir ?? "/var/lib/ark/certs/database"}/privkey.pem
+server_tls_sslmode = verify-full
+server_tls_ca_file = /etc/ssl/certs/ca-certificates.crt
 max_client_conn = 200
 default_pool_size = 20
 admin_users =

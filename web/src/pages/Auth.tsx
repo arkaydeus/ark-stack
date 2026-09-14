@@ -155,3 +155,148 @@ export function AuthScreen() {
     </main>
   );
 }
+
+type Enrollment = { totpURI: string; backupCodes: string[] };
+
+export function MfaSetup({ enrolled, onComplete }: { enrolled: boolean; onComplete: () => Promise<void> }) {
+  const [enrollment, setEnrollment] = useState<Enrollment | null>(null);
+  const [verified, setVerified] = useState(false);
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  if (enrolled && !verified) {
+    return (
+      <main className="grid min-h-screen place-items-center p-6">
+        <Card className="w-full max-w-lg">
+          <CardHeader>
+            <CardTitle>Refresh your assured session</CardTitle>
+            <CardDescription>
+              MFA is enrolled, but this session predates verification. Sign in again and enter a TOTP or
+              recovery code.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button
+              onClick={() => void authClient.signOut().then(() => window.location.reload())}
+              className="w-full"
+            >
+              Return to sign in
+            </Button>
+          </CardContent>
+        </Card>
+      </main>
+    );
+  }
+
+  async function enable(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setBusy(true);
+    setError("");
+    try {
+      const result = await authClient.twoFactor.enable({ password: String(form.get("password")) });
+      if (result.error) throw new Error(result.error.message ?? "Could not start MFA enrollment.");
+      const data = result.data as Enrollment | null;
+      if (!data?.totpURI || !Array.isArray(data.backupCodes)) {
+        throw new Error("The authentication server did not return a TOTP secret and recovery codes.");
+      }
+      setEnrollment({ totpURI: data.totpURI, backupCodes: [...data.backupCodes] });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not start MFA enrollment.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function verify(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setBusy(true);
+    setError("");
+    try {
+      const result = await authClient.twoFactor.verifyTotp({
+        code: String(form.get("code")),
+        trustDevice: false,
+      });
+      if (result.error) throw new Error(result.error.message ?? "The code was not accepted.");
+      setVerified(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The code was not accepted.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const manualSecret = (() => {
+    try {
+      return enrollment ? new URL(enrollment.totpURI).searchParams.get("secret") : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  return (
+    <main className="grid min-h-screen place-items-center p-6">
+      <Card className="w-full max-w-xl">
+        <CardHeader>
+          <CardTitle>Secure the owner account</CardTitle>
+          <CardDescription>
+            MFA enrollment is required before domain setup or any administrative mutation.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          {!enrollment ? (
+            <form className="space-y-4" onSubmit={enable}>
+              <Field
+                label="Confirm your password"
+                name="password"
+                type="password"
+                autoComplete="current-password"
+                required
+              />
+              {error && <InlineError>{error}</InlineError>}
+              <Button disabled={busy}>{busy ? "Preparing…" : "Create TOTP enrollment"}</Button>
+            </form>
+          ) : !verified ? (
+            <form className="space-y-4" onSubmit={verify}>
+              <div className="rounded-lg border border-border p-4 text-sm">
+                <p className="font-semibold">Authenticator setup</p>
+                <p className="mt-2 text-muted-foreground">
+                  Add this manual secret to your authenticator. It exists only in this page's memory.
+                </p>
+                <code className="mono mt-2 block break-all">{manualSecret ?? enrollment.totpURI}</code>
+              </div>
+              <div className="rounded-lg border border-amber-300/30 bg-amber-500/10 p-4 text-sm">
+                <p className="font-semibold">Recovery codes — save these now</p>
+                <ul className="mono mt-2 grid grid-cols-2 gap-2">
+                  {enrollment.backupCodes.map((code) => (
+                    <li key={code}>{code}</li>
+                  ))}
+                </ul>
+              </div>
+              <Field label="Six-digit verification code" name="code" autoComplete="one-time-code" required />
+              {error && <InlineError>{error}</InlineError>}
+              <Button disabled={busy}>{busy ? "Verifying…" : "Verify TOTP"}</Button>
+            </form>
+          ) : (
+            <div className="space-y-4">
+              <p className="text-sm">TOTP is verified and the session was rotated to MFA assurance.</p>
+              <label className="flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={acknowledged}
+                  onChange={(event) => setAcknowledged(event.target.checked)}
+                />
+                I saved the recovery codes outside this browser.
+              </label>
+              <Button disabled={!acknowledged || busy} onClick={() => void onComplete()}>
+                Continue to domain setup
+              </Button>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </main>
+  );
+}

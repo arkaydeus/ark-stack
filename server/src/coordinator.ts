@@ -3,7 +3,11 @@ import { resolve4, resolve6, resolveCname, resolveMx, resolveTxt } from "node:dn
 import {
   assertCidrs,
   backupProofAllowed,
+  buildProvisionPlan,
   candidateRequiresApproval,
+  canViewDomain,
+  canViewProject,
+  classifySql,
   createId,
   decryptSecret,
   deriveSesSmtpPassword,
@@ -16,7 +20,6 @@ import {
   parseImageRef,
   pinComposeImage,
   planHash,
-  rollbackSafe,
   validateMaintenanceBundle,
   type DnsWrite,
   type ExternalInventory,
@@ -31,7 +34,12 @@ import { loadEnv } from "./env.ts";
 import { evaluateAlerts } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
-import { provisionApplicationDatabase, rotateRolePassword } from "./modules/database.ts";
+import {
+  executeWorkspaceQuery,
+  inspectDatabaseSchema,
+  provisionApplicationDatabase,
+  rotateRolePassword,
+} from "./modules/database.ts";
 import {
   deployCompose,
   dockerAvailable,
@@ -43,6 +51,7 @@ import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
 import {
   applyDatabaseAllowlist,
+  applyStalwartDevice,
   publishCloudflare,
   reconcileSes,
   resolveImageDigest,
@@ -54,16 +63,20 @@ import {
   aliases,
   backups,
   certificates,
+  databaseClusters,
   databaseRoles,
+  deploymentRevisions,
   dnsRecords,
   domainClaims,
   endpoints,
   mailDomains,
   mailboxes,
+  mailboxDevices,
   managedDatabases,
   operationSteps,
   operations,
   platformSettings,
+  platformAccess,
   projects,
   secrets,
   services,
@@ -105,6 +118,54 @@ export function setDnsResolver(next: DnsResolver = nodeResolver) {
 }
 
 type OperationRow = typeof operations.$inferSelect;
+
+export type ClaimedJob = Omit<OperationRow, "createdAt" | "updatedAt" | "heartbeatAt"> & {
+  createdAt: string | Date;
+  updatedAt: string | Date;
+  heartbeatAt: string | Date | null;
+};
+
+export async function executeClaimedJob(job: ClaimedJob) {
+  if (!job.claimToken || job.status !== "running") throw new Error("Worker received an unclaimed job.");
+  const operation: OperationRow = {
+    ...job,
+    createdAt: new Date(job.createdAt),
+    updatedAt: new Date(job.updatedAt),
+    heartbeatAt: job.heartbeatAt ? new Date(job.heartbeatAt) : null,
+  };
+  try {
+    const evidence = await runOperation(operation.kind as OperationKind, operation);
+    return {
+      complete: true as const,
+      evidence:
+        evidence && typeof evidence === "object" && !Array.isArray(evidence)
+          ? (evidence as Record<string, unknown>)
+          : undefined,
+    };
+  } catch (error) {
+    if (!(error instanceof DelegateToAgent)) throw error;
+    const updated = await db
+      .update(operations)
+      .set({
+        status: "queued",
+        payload: error.payload,
+        claimToken: null,
+        heartbeatAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(operations.id, operation.id),
+          eq(operations.status, "running"),
+          eq(operations.claimToken, job.claimToken),
+        ),
+      )
+      .returning({ id: operations.id });
+    if (updated.length !== 1)
+      throw new Error("Operation claim changed before agent delegation.", { cause: error });
+    return { complete: false as const };
+  }
+}
 
 function mapOperation(row: Record<string, unknown>): OperationRow {
   return {
@@ -165,14 +226,31 @@ export async function enqueue(input: {
 }
 
 export async function claimQueued(
-  input: { limit?: number; kindPrefix?: string; excludePrefix?: string; agentOwned?: boolean } = {},
+  input: {
+    limit?: number;
+    kindPrefix?: string;
+    kindPrefixes?: string[];
+    excludePrefix?: string;
+    agentOwned?: boolean;
+    leaseMs?: number;
+  } = {},
 ) {
   const limit = input.limit ?? 8;
   const token = createId("claim");
-  const like = input.kindPrefix ? `${input.kindPrefix}%` : null;
+  const prefixes = input.kindPrefixes ?? (input.kindPrefix ? [input.kindPrefix] : []);
+  const patterns = prefixes.map((item) => `${item}%`);
   const unlike = input.excludePrefix ? `${input.excludePrefix}%` : null;
   const agentOwned = input.agentOwned ?? false;
+  const leaseSeconds = Math.max(30, Math.floor((input.leaseMs ?? 90_000) / 1000));
   const rows = await sql`
+    WITH expired AS (
+      UPDATE operations
+      SET status = 'queued', claim_token = NULL, heartbeat_at = NULL, updated_at = now(),
+          error = 'Previous worker lease expired; operation reclaimed.'
+      WHERE status = 'running'
+        AND heartbeat_at < now() - (${leaseSeconds}::int * interval '1 second')
+      RETURNING id
+    )
     UPDATE operations
     SET status = 'running',
         claim_token = ${token},
@@ -181,12 +259,21 @@ export async function claimQueued(
     WHERE id IN (
       SELECT id FROM operations
       WHERE status = 'queued'
-        AND (${like}::text IS NULL OR kind LIKE ${like})
+        AND (${patterns.length === 0}::boolean OR kind LIKE ANY(${patterns}::text[]))
         AND (${unlike}::text IS NULL OR kind NOT LIKE ${unlike})
         AND (
           ${agentOwned}::boolean IS NOT TRUE
-          OR kind LIKE 'service.%'
-          OR kind = 'update.apply'
+          OR (kind = 'service.deploy' AND payload ?& ARRAY['compose', 'composeHash', 'project'])
+          OR (kind = 'service.adopt' AND payload ?& ARRAY['compose', 'composeHash', 'containerId', 'name'])
+          OR (kind IN ('service.start', 'service.stop', 'service.restart', 'service.logs', 'service.stats') AND payload ? 'name')
+          OR (kind = 'service.discover' AND payload ->> 'request' = 'redacted-inventory-v1')
+          OR (kind = 'update.apply' AND payload ?& ARRAY['compose', 'composeHash', 'project'])
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM operations active
+          WHERE active.status = 'running'
+            AND active.id <> operations.id
+            AND active.target_ids ?| ARRAY(SELECT jsonb_array_elements_text(operations.target_ids))
         )
       ORDER BY created_at
       LIMIT ${limit}
@@ -197,18 +284,34 @@ export async function claimQueued(
   return { token, rows: rows.map(mapOperation) };
 }
 
+export async function heartbeatClaim(operationId: string, claimToken: string) {
+  const rows = await sql`
+    UPDATE operations SET heartbeat_at = now(), updated_at = now()
+    WHERE id = ${operationId} AND status = 'running' AND claim_token = ${claimToken}
+    RETURNING id
+  `;
+  return rows.length === 1;
+}
+
 async function finishOperation(
   operation: OperationRow,
   token: string | null,
   status: OperationState,
   error?: string | null,
 ) {
-  const filters = [eq(operations.id, operation.id)];
-  if (token) filters.push(eq(operations.claimToken, token));
-  await db
+  if (!token) throw new Error("A current claim token is required to finish an operation.");
+  const updated = await db
     .update(operations)
     .set({ status, error: error ?? null, updatedAt: new Date() })
-    .where(and(...filters));
+    .where(
+      and(
+        eq(operations.id, operation.id),
+        eq(operations.claimToken, token),
+        eq(operations.status, "running"),
+      ),
+    )
+    .returning({ id: operations.id });
+  if (updated.length !== 1) throw new Error("Operation claim is stale or no longer owned by this worker.");
 }
 
 export async function processQueued(limit = 8, kindPrefix?: string) {
@@ -257,10 +360,13 @@ async function addStep(operationId: string, name: string, evidence: Record<strin
   });
 }
 
-async function runOperation(kind: OperationKind, operation: OperationRow) {
+export async function runOperation(kind: OperationKind, operation: OperationRow) {
+  await assertExecutionAuthorized(operation);
   if (kind === "domain.verify") return verifyDomain(operation);
   if (kind === "certificate.issue" || kind === "certificate.renew") return issueCertificate(operation);
   if (kind === "database.provision") return provisionDatabase(operation);
+  if (kind === "database.query") return queryDatabase(operation);
+  if (kind === "database.schema") return queryDatabaseSchema(operation);
   if (kind === "mail.provision" || kind === "mail.reconcile") return provisionMailbox(operation);
   if (
     kind === "service.restart" ||
@@ -283,9 +389,95 @@ async function runOperation(kind: OperationKind, operation: OperationRow) {
   if (kind === "database.rotate") return rotateDatabase(operation);
   if (kind === "service.adopt") return adoptService(operation);
   if (kind === "mail.queue_retry" || kind === "mail.queue_delete") return queueMail(operation);
-  if (kind === "mailbox.device") return addStep(operation.id, "mailbox-device", operation.payload);
+  if (kind === "mailbox.device") return reconcileMailboxDevice(operation);
   if (kind === "platform.maintain") return maintainPlatform(operation);
   throw new Error(`Unknown operation kind: ${kind}`);
+}
+
+export async function assertExecutionAuthorized(operation: OperationRow) {
+  if (!operation.actorId) return;
+  const [row] = await db.select().from(platformAccess).where(eq(platformAccess.userId, operation.actorId));
+  if (!row) throw new Error("Operation actor no longer has platform access.");
+  const access = {
+    userId: operation.actorId,
+    role: row.role as "owner" | "operator" | "viewer",
+    projectIds: row.projectIds,
+    domainIds: row.domainIds,
+  };
+  if (access.role === "viewer") throw new Error("Operation actor no longer has mutation permission.");
+  if (access.role === "owner") return;
+  for (const targetId of operation.targetIds) {
+    if (targetId === "platform") throw new Error("Only owners may execute platform-wide operations.");
+    const [service] = await db.select().from(services).where(eq(services.id, targetId));
+    if (service && !canViewProject(access, service.projectId)) throw new Error("Project grant was revoked.");
+    const [database] = await db.select().from(managedDatabases).where(eq(managedDatabases.id, targetId));
+    if (database) {
+      if (database.projectId && !canViewProject(access, database.projectId)) {
+        throw new Error("Database project grant was revoked.");
+      }
+      const [cluster] = await db
+        .select()
+        .from(databaseClusters)
+        .where(eq(databaseClusters.id, database.clusterId));
+      const [endpoint] = cluster?.endpointId
+        ? await db.select().from(endpoints).where(eq(endpoints.id, cluster.endpointId))
+        : [];
+      if (!database.projectId && endpoint?.domainId && !canViewDomain(access, endpoint.domainId)) {
+        throw new Error("Database domain grant was revoked.");
+      }
+    }
+    const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, targetId));
+    if (mailbox && !canViewDomain(access, mailbox.domainId))
+      throw new Error("Mail domain grant was revoked.");
+    const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, targetId));
+    if (domain && !canViewDomain(access, domain.id)) throw new Error("Domain grant was revoked.");
+  }
+}
+
+export async function finalizeAgentCompletion(operation: OperationRow, succeeded = true) {
+  if (
+    operation.kind === "service.logs" ||
+    operation.kind === "service.stats" ||
+    operation.kind === "service.discover"
+  )
+    return;
+  const serviceId = operation.targetIds[0];
+  if (!serviceId) throw new Error("Agent completion is missing its workload target.");
+  const [service] = await db.select().from(services).where(eq(services.id, serviceId));
+  if (!service) throw new Error("Agent completion target no longer exists.");
+  if (!succeeded) {
+    await db
+      .update(services)
+      .set({ status: "failed", observedAt: new Date() })
+      .where(eq(services.id, serviceId));
+    await db
+      .update(deploymentRevisions)
+      .set({ status: "failed" })
+      .where(eq(deploymentRevisions.desiredRevision, service.desiredRevision));
+    return;
+  }
+  if (operation.kind === "update.apply") {
+    const digest = String(operation.payload.digest ?? "");
+    if (!digest || service.imageDigest !== digest) {
+      throw new Error("Agent update completion does not match the stored desired digest.");
+    }
+  }
+  const status =
+    operation.kind === "service.stop"
+      ? "stopped"
+      : operation.kind === "service.adopt"
+        ? "adopted"
+        : operation.kind === "service.deploy" || operation.kind === "update.apply"
+          ? "deployed"
+          : "running";
+  await db
+    .update(services)
+    .set({ status, observedRevision: service.desiredRevision, observedAt: new Date() })
+    .where(eq(services.id, serviceId));
+  await db
+    .update(deploymentRevisions)
+    .set({ status: "deployed" })
+    .where(eq(deploymentRevisions.desiredRevision, service.desiredRevision));
 }
 
 async function observeDns(type: string, name: string) {
@@ -305,7 +497,21 @@ async function observeDns(type: string, name: string) {
 
 async function verifyDomain(operation: OperationRow) {
   const domainId = operation.targetIds[0];
+  const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, domainId));
+  if (!domain) throw new Error("Domain not found.");
   const records = await db.select().from(dnsRecords).where(eq(dnsRecords.domainId, domainId));
+  if (!records.length) throw new Error("Domain has no stored DNS ownership challenge.");
+  const ownership = records.find(
+    (record) =>
+      record.type === "TXT" &&
+      record.required &&
+      record.name === `_ark-stack.${domain.name}` &&
+      record.expectedValue === domain.ownershipToken &&
+      record.purpose.toLowerCase().includes("ownership"),
+  );
+  if (!ownership)
+    throw new Error("Domain ownership challenge is missing or does not match this installation.");
+  const verifiedRecordIds = new Set<string>();
   for (const record of records) {
     const stub = process.env.ARK_DNS_STUB === "1";
     let observed = stub ? record.expectedValue : "";
@@ -323,19 +529,61 @@ async function verifyDomain(operation: OperationRow) {
       .update(dnsRecords)
       .set({ observedValue: observed, status: ok ? "verified" : "error" })
       .where(eq(dnsRecords.id, record.id));
-    if (record.required && !ok)
-      throw new Error(`DNS ${record.name} is not yet ${record.type} ${record.expectedValue}`);
+    if (ok) verifiedRecordIds.add(record.id);
   }
-  const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, domainId));
+  if (!verifiedRecordIds.has(ownership.id)) {
+    throw new Error(`DNS ownership proof ${ownership.name} is not yet published correctly.`);
+  }
   await db
     .update(domainClaims)
     .set({ status: "verified", lastError: null, updatedAt: new Date() })
     .where(eq(domainClaims.id, domainId));
-  await db
-    .update(endpoints)
-    .set({ status: "verified", lastVerifiedAt: new Date() })
-    .where(eq(endpoints.domainId, domainId));
+  const endpointRows = await db.select().from(endpoints).where(eq(endpoints.domainId, domainId));
+  const verifiedEndpointIds = new Set<string>();
+  for (const endpoint of endpointRows) {
+    const endpointRecords = records.filter((record) => record.name === endpoint.hostname && record.required);
+    const verified =
+      endpoint.exposure !== "public" ||
+      (endpointRecords.length > 0 && endpointRecords.every((record) => verifiedRecordIds.has(record.id)));
+    await db
+      .update(endpoints)
+      .set({ status: verified ? "verified" : "awaiting_dns", lastVerifiedAt: verified ? new Date() : null })
+      .where(eq(endpoints.id, endpoint.id));
+    if (verified) {
+      verifiedEndpointIds.add(endpoint.id);
+      await enqueue({
+        kind: "certificate.issue",
+        actorId: operation.actorId ?? undefined,
+        targetIds: [endpoint.id],
+      });
+    }
+  }
   await addStep(operation.id, "dns-verified", { records: records.length });
+  const clusters = await db.select().from(databaseClusters);
+  for (const database of await db.select().from(managedDatabases)) {
+    const cluster = clusters.find((item) => item.id === database.clusterId);
+    if (cluster?.endpointId && verifiedEndpointIds.has(cluster.endpointId) && database.status === "queued") {
+      await enqueue({
+        kind: "database.provision",
+        actorId: operation.actorId ?? undefined,
+        targetIds: [database.id],
+      });
+    }
+  }
+  const mailEndpointReady = endpointRows.some(
+    (item) => item.kind === "mail" && verifiedEndpointIds.has(item.id),
+  );
+  if (mailEndpointReady) {
+    for (const mailbox of await db.select().from(mailboxes).where(eq(mailboxes.domainId, domainId))) {
+      if (!mailbox.nativeId) {
+        await enqueue({
+          kind: "mail.provision",
+          actorId: operation.actorId ?? undefined,
+          targetIds: [mailbox.id],
+        });
+      }
+    }
+  }
   if (domain?.dnsProvider === "cloudflare") {
     await enqueue({
       kind: "dns.publish",
@@ -349,7 +597,8 @@ async function issueCertificate(operation: OperationRow) {
   const endpointId = operation.targetIds[0];
   const [endpoint] = await db.select().from(endpoints).where(eq(endpoints.id, endpointId));
   if (!endpoint) throw new Error("Endpoint not found.");
-  const issued = await issueCertificateFiles(endpoint.hostname);
+  const action = operation.kind === "certificate.renew" ? "renew" : "run";
+  const issued = await issueCertificateFiles(endpoint.hostname, action);
   if (!issued.fingerprint || !issued.expiresAt) {
     throw new Error("Certificate metadata is missing; refusing to store invented expiry or fingerprint.");
   }
@@ -360,10 +609,14 @@ async function issueCertificate(operation: OperationRow) {
     issuer: issued.issuer,
     fingerprint: issued.fingerprint,
     expiresAt: issued.expiresAt,
-    status: "issued",
+    status: issued.issuer === "letsencrypt" ? "issued" : "untrusted",
     lastDeployedAt: new Date(),
   });
-  await db.update(endpoints).set({ status: "ready" }).where(eq(endpoints.id, endpointId));
+  const publiclyTrusted = issued.issuer === "letsencrypt";
+  await db
+    .update(endpoints)
+    .set({ status: publiclyTrusted ? "testing" : "certificate_untrusted" })
+    .where(eq(endpoints.id, endpointId));
   await addStep(operation.id, "certificate-issued", { issuer: issued.issuer, path: issued.certPath });
   await enqueue({ kind: "edge.apply", actorId: operation.actorId ?? undefined, targetIds: ["platform"] });
 }
@@ -372,34 +625,75 @@ async function provisionDatabase(operation: OperationRow) {
   const databaseId = operation.targetIds[0];
   const [database] = await db.select().from(managedDatabases).where(eq(managedDatabases.id, databaseId));
   if (!database) throw new Error("Database not found.");
+  const existingRoles = await db.select().from(databaseRoles).where(eq(databaseRoles.databaseId, databaseId));
+  const passwords = {} as Record<"owner" | "migration" | "runtime" | "readonly", string>;
+  const roleKinds = ["owner", "migration", "runtime", "readonly"] as const;
+  const credentials = new Map<
+    (typeof roleKinds)[number],
+    { existingRole?: (typeof existingRoles)[number]; existingSecret?: typeof secrets.$inferSelect }
+  >();
+  for (const kind of roleKinds) {
+    const existingRole = existingRoles.find((item) => item.kind === kind);
+    const existingSecret = existingRole?.secretId
+      ? (await db.select().from(secrets).where(eq(secrets.id, existingRole.secretId)))[0]
+      : undefined;
+    if (existingRole && existingSecret) {
+      passwords[kind] = decryptSecret(env.rootKey, existingSecret);
+    } else {
+      passwords[kind] = generatePassword();
+    }
+    credentials.set(kind, { existingRole, existingSecret });
+  }
+  const provisionPlan = buildProvisionPlan({
+    name: database.name,
+    withPgvector: database.withPgvector,
+    withTestDatabase: database.withTestDatabase,
+    passwords,
+  });
+  for (const kind of roleKinds) {
+    const { existingRole, existingSecret } = credentials.get(kind)!;
+    if (existingRole && existingSecret) continue;
+    const plannedRole = provisionPlan.roles.find((item) => item.kind === kind)!;
+    const sealed = encryptSecret(env.rootKey, passwords[kind], env.rootKeyId);
+    const secretId = createId("sec");
+    await db.insert(secrets).values({
+      id: secretId,
+      kind: `postgres.${kind}`,
+      once: kind !== "owner",
+      resourceType: "database",
+      resourceId: databaseId,
+      purpose: kind,
+      sensitivity: kind === "owner" ? "root" : "credential",
+      ...sealed,
+    });
+    if (existingRole) {
+      await db.update(databaseRoles).set({ secretId }).where(eq(databaseRoles.id, existingRole.id));
+    } else {
+      await db.insert(databaseRoles).values({
+        id: createId("role"),
+        databaseId,
+        name: plannedRole.name,
+        kind,
+        secretId,
+      });
+    }
+  }
   const result = await provisionApplicationDatabase({
     name: database.name,
     withPgvector: database.withPgvector,
     withTestDatabase: database.withTestDatabase,
+    passwords,
   });
-  for (const role of result.plan.roles) {
-    const sealed = encryptSecret(env.rootKey, role.password, env.rootKeyId);
-    const secretId = createId("sec");
-    await db.insert(secrets).values({
-      id: secretId,
-      kind: `postgres.${role.kind}`,
-      once: role.kind !== "owner",
-      ...sealed,
-    });
-    await db.insert(databaseRoles).values({
-      id: createId("role"),
-      databaseId,
-      name: role.name,
-      kind: role.kind,
-      secretId,
-    });
-  }
-  await db.update(managedDatabases).set({ status: result.status }).where(eq(managedDatabases.id, databaseId));
+  await db
+    .update(managedDatabases)
+    .set({ status: database.exposure === "public" ? "awaiting_configuration" : result.status })
+    .where(eq(managedDatabases.id, databaseId));
   await addStep(operation.id, "database-provisioned", {
     executed: result.executed,
     database: result.plan.database,
     statements: result.plan.statements.length,
   });
+  if (!result.executed) throw new Error("Database provisioning did not execute against a managed cluster.");
   if (database.exposure === "public") {
     await enqueue({
       kind: "pgbouncer.reload",
@@ -409,31 +703,116 @@ async function provisionDatabase(operation: OperationRow) {
   }
 }
 
+async function queryDatabase(operation: OperationRow) {
+  const databaseId = operation.targetIds[0];
+  const roleKind = String(operation.payload.role ?? "");
+  const statement = String(operation.payload.sql ?? "");
+  const readOnly = operation.payload.readOnly !== false;
+  const executionId = String(operation.payload.executionId ?? "");
+  const workspaceId = String(operation.payload.workspaceId ?? databaseId);
+  if (!databaseId || !operation.actorId || !executionId) {
+    throw new Error("Database query is missing its immutable actor, target, or execution identity.");
+  }
+  if (!(["readonly", "runtime", "migration"] as string[]).includes(roleKind)) {
+    throw new Error("Database query role is not permitted.");
+  }
+  const classified = classifySql(statement, readOnly);
+  const [database] = await db.select().from(managedDatabases).where(eq(managedDatabases.id, databaseId));
+  if (!database) throw new Error("Database not found.");
+  const [role] = await db
+    .select()
+    .from(databaseRoles)
+    .where(and(eq(databaseRoles.databaseId, database.id), eq(databaseRoles.kind, roleKind)));
+  if (!role?.secretId) throw new Error("Requested database role is not available.");
+  const [secret] = await db.select().from(secrets).where(eq(secrets.id, role.secretId));
+  if (!secret) throw new Error("Database role credential is missing.");
+  const result = await executeWorkspaceQuery({
+    executionId,
+    actorId: operation.actorId,
+    database: database.name,
+    username: role.name,
+    password: revealSecret(secret),
+    sql: statement,
+    readOnly,
+  });
+  return {
+    query: {
+      databaseId,
+      workspaceId,
+      role: roleKind,
+      fingerprint: classified.fingerprint,
+      ...result,
+    },
+  };
+}
+
+async function queryDatabaseSchema(operation: OperationRow) {
+  const databaseId = operation.targetIds[0];
+  if (!databaseId) throw new Error("Schema inspection is missing its database target.");
+  const [database] = await db.select().from(managedDatabases).where(eq(managedDatabases.id, databaseId));
+  if (!database) throw new Error("Database not found.");
+  const [role] = await db
+    .select()
+    .from(databaseRoles)
+    .where(and(eq(databaseRoles.databaseId, database.id), eq(databaseRoles.kind, "readonly")));
+  if (!role?.secretId) throw new Error("Readonly database role is not available.");
+  const [secret] = await db.select().from(secrets).where(eq(secrets.id, role.secretId));
+  if (!secret) throw new Error("Readonly database credential is missing.");
+  return {
+    schema: await inspectDatabaseSchema({
+      database: database.name,
+      username: role.name,
+      password: revealSecret(secret),
+    }),
+  };
+}
+
 async function provisionMailbox(operation: OperationRow) {
   const mailboxId = operation.targetIds[0];
   const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId));
   if (!mailbox) throw new Error("Mailbox not found.");
   let password: string | undefined;
   if (operation.kind === "mail.provision") {
-    password = generatePassword();
-    const sealed = encryptSecret(env.rootKey, password, env.rootKeyId);
-    await db.insert(secrets).values({
-      id: createId("sec"),
-      kind: `mailbox.${mailboxId}`,
-      once: true,
-      ...sealed,
-    });
-    await db
-      .update(mailboxes)
-      .set({ credentialAvailable: true, lifecycle: "active" })
-      .where(eq(mailboxes.id, mailboxId));
+    const [plannedSecret] = await db
+      .select()
+      .from(secrets)
+      .where(eq(secrets.kind, `mailbox.${mailboxId}`))
+      .orderBy(desc(secrets.createdAt))
+      .limit(1);
+    if (plannedSecret) {
+      password = decryptSecret(env.rootKey, plannedSecret);
+    } else {
+      password = generatePassword();
+      const sealed = encryptSecret(env.rootKey, password, env.rootKeyId);
+      await db.insert(secrets).values({
+        id: createId("sec"),
+        kind: `mailbox.${mailboxId}`,
+        once: true,
+        resourceType: "mailbox",
+        resourceId: mailboxId,
+        purpose: "login",
+        ...sealed,
+      });
+    }
   }
   const domains = await db.select().from(domainClaims);
   const boxes = await db.select().from(mailboxes);
   const aliasRows = await db.select().from(aliases);
+  const mailboxSecretRows = (await db.select().from(secrets))
+    .filter((item) => item.kind.startsWith("mailbox.") && !item.kind.startsWith("mailbox.device."))
+    .toSorted((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  const mailboxPasswords = new Map<string, string>();
+  for (const item of mailboxSecretRows) {
+    const mailboxSecretId = item.kind.slice("mailbox.".length);
+    if (!mailboxPasswords.has(mailboxSecretId)) {
+      mailboxPasswords.set(mailboxSecretId, decryptSecret(env.rootKey, item));
+    }
+  }
   const domain = domains.find((item) => item.id === mailbox.domainId);
   const sesReady = Boolean(process.env.AWS_ACCESS_KEY_ID || process.env.AWS_BOOTSTRAP_ACCESS_KEY_ID);
-  const mailHostname = domain ? `mail.${domain.name}` : "mail.local";
+  const mailEndpointRows = await db.select().from(endpoints).where(eq(endpoints.domainId, mailbox.domainId));
+  const selectedMailEndpoint = mailEndpointRows.find((item) => item.kind === "mail");
+  const mailHostname = selectedMailEndpoint?.hostname ?? "mail.local";
   const applied = await reconcileMailEngine({
     hostname: mailHostname,
     domains: domains.map((item) => ({
@@ -447,24 +826,49 @@ async function provisionMailbox(operation: OperationRow) {
       displayName: item.displayName,
       quotaGb: item.quotaGb,
       lifecycle: item.lifecycle,
-      password: item.id === mailboxId ? password : undefined,
+      password: item.id === mailboxId ? password : mailboxPasswords.get(item.id),
       nativeId: item.nativeId ?? undefined,
     })),
-    aliases: aliasRows.map((item) => ({
-      address: `${item.localPart}@${domains.find((row) => row.id === item.domainId)?.name}`,
-      targets: item.targets,
-    })),
+    aliases: aliasRows
+      .filter((item) => item.status === "active")
+      .map((item) => ({
+        address: `${item.localPart}@${domains.find((row) => row.id === item.domainId)?.name}`,
+        targets: item.targets,
+      })),
+    removedAliases:
+      typeof operation.payload.removedAlias === "object" && operation.payload.removedAlias !== null
+        ? [operation.payload.removedAlias as { address: string; nativeId: string }]
+        : undefined,
     sesReady,
     smtpUsername: process.env.SES_SMTP_USERNAME,
   });
-  if (applied.reachable && !mailbox.nativeId) {
+  if (operation.kind === "mail.provision") {
     await db
       .update(mailboxes)
-      .set({ nativeId: `stalwart:${mailbox.localPart}` })
+      .set({ credentialAvailable: true, lifecycle: "active" })
       .where(eq(mailboxes.id, mailboxId));
   }
-  const mailEndpoints = await db.select().from(endpoints).where(eq(endpoints.domainId, mailbox.domainId));
-  const mailEndpoint = mailEndpoints.find((item) => item.kind === "mail");
+  for (const item of boxes) {
+    const itemDomain = domains.find((row) => row.id === item.domainId);
+    const address = `${item.localPart}@${itemDomain?.name}`;
+    const nativeId = applied.nativeIds.mailboxes[address];
+    if (nativeId && nativeId !== item.nativeId) {
+      await db.update(mailboxes).set({ nativeId }).where(eq(mailboxes.id, item.id));
+    }
+  }
+  for (const item of aliasRows) {
+    if (item.status !== "active") continue;
+    const itemDomain = domains.find((row) => row.id === item.domainId);
+    const address = `${item.localPart}@${itemDomain?.name}`;
+    const nativeId = applied.nativeIds.aliases[address];
+    if (nativeId && nativeId !== item.nativeId) {
+      await db.update(aliases).set({ nativeId }).where(eq(aliases.id, item.id));
+    }
+  }
+  if (typeof operation.payload.removedAliasId === "string") {
+    await db.delete(aliases).where(eq(aliases.id, operation.payload.removedAliasId));
+  }
+  const mailEndpoint = selectedMailEndpoint;
   const certs = mailEndpoint
     ? await db.select().from(certificates).where(eq(certificates.endpointId, mailEndpoint.id))
     : [];
@@ -476,7 +880,7 @@ async function provisionMailbox(operation: OperationRow) {
     mailboxCount: boxes.length,
     certificateReady,
     sesReady,
-    listenerReady: applied.reachable || applied.applied,
+    listenerReady: applied.applied,
   });
   await db
     .update(mailDomains)
@@ -501,6 +905,54 @@ async function provisionMailbox(operation: OperationRow) {
   }
 }
 
+async function reconcileMailboxDevice(operation: OperationRow) {
+  const mailboxId = operation.targetIds[0];
+  const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId));
+  if (!mailbox) throw new Error("Mailbox not found.");
+  const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, mailbox.domainId));
+  if (!domain) throw new Error("Mailbox domain not found.");
+  const deviceId = String(operation.payload.deviceId ?? "");
+  const [device] = await db.select().from(mailboxDevices).where(eq(mailboxDevices.id, deviceId));
+  if (!device || device.mailboxId !== mailbox.id) throw new Error("Mailbox device not found.");
+  const [primarySecret] = await db
+    .select()
+    .from(secrets)
+    .where(eq(secrets.kind, `mailbox.${mailbox.id}`));
+  if (!primarySecret) throw new Error("The mailbox primary credential is unavailable.");
+  const action = operation.payload.action === "revoke" ? "revoke" : "create";
+  const result = await applyStalwartDevice({
+    address: `${mailbox.localPart}@${domain.name}`,
+    password: decryptSecret(env.rootKey, primarySecret),
+    action,
+    label: device.label,
+    nativeId: device.nativeId ?? undefined,
+  });
+  if (action === "create" && "secret" in result) {
+    if (!result.secret) throw new Error("Stalwart did not return the device secret.");
+    const secretId = createId("sec");
+    await db.insert(secrets).values({
+      id: secretId,
+      kind: `mailbox.device.${device.id}`,
+      once: true,
+      resourceType: "mailbox",
+      resourceId: mailbox.id,
+      purpose: "device-login",
+      ...encryptSecret(env.rootKey, result.secret, env.rootKeyId),
+    });
+    await db
+      .update(mailboxDevices)
+      .set({ nativeId: result.nativeId, secretId })
+      .where(eq(mailboxDevices.id, device.id));
+  } else if (action === "revoke") {
+    await db.update(mailboxDevices).set({ revokedAt: new Date() }).where(eq(mailboxDevices.id, device.id));
+  }
+  await addStep(operation.id, `mailbox-device-${action}`, {
+    deviceId: device.id,
+    nativeId: result.nativeId,
+    applied: true,
+  });
+}
+
 async function projectNameFor(service: typeof services.$inferSelect) {
   const [project] = await db.select().from(projects).where(eq(projects.id, service.projectId));
   return `ark-${project?.slug ?? "workload"}`;
@@ -516,15 +968,19 @@ async function mutateService(operation: OperationRow, kind: OperationKind) {
   try {
     if (kind === "service.deploy") {
       const written = await writeApprovedCompose(service.id, compose);
-      evidence = { ...evidence, file: written.file, images: written.policy.ok ? written.policy.images : [] };
+      evidence = {
+        ...evidence,
+        composeHash: written.hash,
+        images: written.policy.ok ? written.policy.images : [],
+      };
       if (dockerAvailable() && env.embeddedWorkers) {
         evidence.output = await deployCompose(projectName, written.file);
       } else {
         throw new DelegateToAgent({
           ...operation.payload,
-          compose,
+          compose: written.canonical,
+          composeHash: written.hash,
           name: service.name,
-          file: written.file,
           project: projectName,
         });
       }
@@ -568,10 +1024,24 @@ async function applyUpdate(operation: OperationRow) {
   }
   const [service] = await db.select().from(services).where(eq(services.id, serviceId));
   if (!service) throw new Error("Service not found.");
+  if (service.stateful) {
+    const recoveryPoints = await db.select().from(backups).where(eq(backups.targetId, service.id));
+    if (!recoveryPoints.some((backup) => backup.restoreVerified && backup.status === "restore_verified")) {
+      throw new Error("Stateful updates require a restore-tested recovery point for this exact service.");
+    }
+  }
   const nextCompose = pinComposeImage(service.compose, digest);
   const written = await writeApprovedCompose(service.id, nextCompose);
   const projectName = String(operation.payload.project ?? (await projectNameFor(service)));
   const desiredRevision = createId("rev");
+  await db.insert(deploymentRevisions).values({
+    id: createId("drev"),
+    serviceId: service.id,
+    desiredRevision,
+    compose: nextCompose,
+    imageDigest: digest,
+    status: "planned",
+  });
   await db
     .update(services)
     .set({
@@ -584,8 +1054,9 @@ async function applyUpdate(operation: OperationRow) {
   if (!dockerAvailable() || !env.embeddedWorkers) {
     throw new DelegateToAgent({
       ...operation.payload,
-      compose: nextCompose,
-      file: written.file,
+      compose: written.canonical,
+      composeHash: written.hash,
+      images: written.policy.ok ? written.policy.images : [],
       project: projectName,
       name: service.name,
       digest,
@@ -605,6 +1076,10 @@ async function applyUpdate(operation: OperationRow) {
       observedAt: new Date(),
     })
     .where(eq(services.id, serviceId));
+  await db
+    .update(deploymentRevisions)
+    .set({ status: "deployed" })
+    .where(eq(deploymentRevisions.desiredRevision, desiredRevision));
   await addStep(operation.id, "update.apply", { file: written.file, digest, observed, output });
 }
 
@@ -612,7 +1087,7 @@ async function createBackup(operation: OperationRow) {
   const kind = String(operation.payload.kind ?? "platform-postgres");
   const result = await runBackup(
     kind as "platform-postgres" | "app-postgres" | "mail" | "volume",
-    String(operation.payload.repository ?? operation.targetIds[0]),
+    operation.targetIds[0],
   );
   await db.insert(backups).values({
     id: createId("bak"),
@@ -624,7 +1099,7 @@ async function createBackup(operation: OperationRow) {
   });
   if (!backupProofAllowed(result) && result.executed === false) {
     await addStep(operation.id, "backup", result);
-    return;
+    throw new Error("Backup execution is disabled; a plan cannot satisfy a backup operation.");
   }
   if (!backupProofAllowed(result)) throw new Error("Backup did not produce uploaded evidence.");
   await addStep(operation.id, "backup", result);
@@ -632,25 +1107,19 @@ async function createBackup(operation: OperationRow) {
 
 async function restoreBackup(operation: OperationRow) {
   const kind = String(operation.payload.kind ?? "platform-postgres");
+  const backupId = typeof operation.payload.backupId === "string" ? operation.payload.backupId : null;
+  if (!backupId) throw new Error("Restore verification requires an exact backup ID.");
   const result = await runRestoreTest(
     kind as "platform-postgres" | "app-postgres" | "mail" | "volume",
-    String(operation.payload.repository ?? operation.targetIds[0]),
+    operation.targetIds[0],
+    backupId,
   );
-  const backupId = typeof operation.payload.backupId === "string" ? operation.payload.backupId : null;
-  const [latest] = backupId
-    ? await db.select().from(backups).where(eq(backups.id, backupId))
-    : await db
-        .select()
-        .from(backups)
-        .where(eq(backups.targetId, operation.targetIds[0]))
-        .orderBy(desc(backups.createdAt))
-        .limit(1);
-  if (latest && result.executed && result.status === "restore_verified") {
-    await db
-      .update(backups)
-      .set({ restoreVerified: true, status: result.status, checksum: result.snapshotId ?? latest.checksum })
-      .where(eq(backups.id, latest.id));
-  } else if (latest && !result.executed) {
+  if (!result.executed) {
+    await addStep(operation.id, "restore-test", { ...result, backupId });
+    throw new Error("Restore execution is disabled; an extraction plan is not restore proof.");
+  }
+  const [latest] = await db.select().from(backups).where(eq(backups.id, backupId));
+  if (latest) {
     await db.update(backups).set({ status: result.status }).where(eq(backups.id, latest.id));
   }
   await addStep(operation.id, "restore-test", { ...result, backupId: latest?.id });
@@ -659,15 +1128,27 @@ async function restoreBackup(operation: OperationRow) {
 async function changeMode(operation: OperationRow) {
   const adminMode = String(operation.payload.adminMode ?? "public") === "tailnet" ? "tailnet" : "public";
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
-  await db
-    .update(platformSettings)
-    .set({ adminMode, updatedAt: new Date() })
-    .where(eq(platformSettings.id, "default"));
-  await db.delete(session);
+  const destinationOrigin =
+    adminMode === "public"
+      ? settings?.adminHostname
+        ? `https://${settings.adminHostname}`
+        : null
+      : (process.env.ARK_TAILNET_AUTH_ORIGIN ?? null);
+  if (!destinationOrigin) throw new Error("The destination administration origin is not configured.");
+  if (new URL(destinationOrigin).origin !== new URL(env.authUrl).origin) {
+    throw new Error(
+      `Better Auth is configured for ${env.authUrl}; restart with BETTER_AUTH_URL=${destinationOrigin} before switching ingress.`,
+    );
+  }
   const edge = await writeEdge({
     adminMode,
     adminHostname: settings?.adminHostname ?? undefined,
   });
+  await db
+    .update(platformSettings)
+    .set({ adminMode, authOrigin: destinationOrigin, updatedAt: new Date() })
+    .where(eq(platformSettings.id, "default"));
+  await db.delete(session);
   await addStep(operation.id, "mode-change", { adminMode, sessionsRevoked: true, ...edge });
 }
 
@@ -704,10 +1185,26 @@ async function reconcileSesOp(operation: OperationRow) {
       id: createId("sec"),
       kind: `ses.smtp.${domain.id}`,
       once: false,
+      resourceType: "domain",
+      resourceId: domain.id,
+      purpose: "ses-relay",
+      sensitivity: "provider",
       ...sealed,
     });
   }
-  const sesReady = Boolean(result.created && result.account && "ok" in result.account && result.account.ok);
+  const sesReady = Boolean(
+    result.created &&
+    result.account.configured &&
+    "production" in result.account &&
+    result.account.production &&
+    result.account.sending &&
+    typeof result.identity === "object" &&
+    result.identity !== null &&
+    "verified" in result.identity &&
+    result.identity.verified &&
+    result.identity.dkimStatus === "SUCCESS" &&
+    result.identity.mailFromStatus === "SUCCESS",
+  );
   await db
     .update(mailDomains)
     .set({ outboundStatus: sesReady ? "ready" : "paused" })
@@ -715,7 +1212,7 @@ async function reconcileSesOp(operation: OperationRow) {
   await addStep(operation.id, "ses-reconcile", {
     identity: result.identity,
     created: result.created,
-    configured: result.account?.configured ?? false,
+    configured: result.account.configured,
   });
 }
 
@@ -734,8 +1231,16 @@ async function reloadPgbouncer(operation: OperationRow) {
   const mappings = databases
     .filter((item) => item.exposure === "public")
     .map((item) => ({ database: item.name, host: process.env.ARK_APP_PG_HOST ?? "app-postgres" }));
-  const written = await writePgbouncer({ mappings, users });
-  const cidrs = databases.flatMap((item) => item.sourceCidrs ?? []);
+  const dbEndpoint = (await db.select().from(endpoints)).find((item) => item.kind === "database");
+  const written = await writePgbouncer({
+    mappings,
+    users,
+    certificateDir: dbEndpoint
+      ? `${process.env.ARK_CERT_DIR ?? "/var/lib/ark/certs"}/${dbEndpoint.hostname}`
+      : undefined,
+  });
+  const publicDatabases = databases.filter((item) => item.exposure === "public");
+  const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
   let allowlist = { file: "", applied: true, enforced: false as boolean };
   if (cidrs.length) {
     assertCidrs(cidrs);
@@ -744,9 +1249,19 @@ async function reloadPgbouncer(operation: OperationRow) {
     allowlist = await applyDatabaseAllowlist(written.dir, []);
   }
   for (const database of databases) {
+    const allowlistReady = !database.sourceCidrs?.length || allowlist.enforced;
     await db
       .update(managedDatabases)
-      .set({ allowlistEnforced: Boolean(database.sourceCidrs?.length) && allowlist.enforced })
+      .set({
+        allowlistEnforced:
+          database.exposure === "public" && Boolean(database.sourceCidrs?.length) && allowlist.enforced,
+        status:
+          database.exposure === "public" && written.reloaded && allowlistReady
+            ? "ready"
+            : database.exposure === "public"
+              ? "awaiting_configuration"
+              : database.status,
+      })
       .where(eq(managedDatabases.id, database.id));
   }
   await addStep(operation.id, "pgbouncer-reload", {
@@ -787,11 +1302,12 @@ async function detectUpdates(operation: OperationRow) {
         image,
         currentDigest: service.imageDigest ?? parsed.digest,
         candidateDigest: resolved.digest,
-        requiresApproval: candidateRequiresApproval({
-          updatePolicy: service.updatePolicy,
-          component: service.name,
-        }),
-        rollbackSafe: rollbackSafe(service.name),
+        requiresApproval:
+          service.stateful ||
+          candidateRequiresApproval({
+            updatePolicy: service.updatePolicy,
+          }),
+        rollbackSafe: !service.stateful,
       })
       .onConflictDoUpdate({
         target: updateCandidates.serviceId,
@@ -827,12 +1343,28 @@ async function rotateDatabase(operation: OperationRow) {
     (item) => item.kind === kind,
   );
   if (!target) throw new Error("Role not found.");
-  const password = generatePassword();
+  const pendingKind = `postgres.${kind}.pending.${operation.id}`;
+  const [plannedSecret] = await db
+    .select()
+    .from(secrets)
+    .where(eq(secrets.kind, pendingKind))
+    .orderBy(desc(secrets.createdAt))
+    .limit(1);
+  const password = plannedSecret ? decryptSecret(env.rootKey, plannedSecret) : generatePassword();
+  const secretId = plannedSecret?.id ?? createId("sec");
+  if (!plannedSecret) {
+    await db.insert(secrets).values({
+      id: secretId,
+      kind: pendingKind,
+      once: true,
+      resourceType: "database",
+      resourceId: databaseId,
+      purpose: kind,
+      ...encryptSecret(env.rootKey, password, env.rootKeyId),
+    });
+  }
   const [database] = await db.select().from(managedDatabases).where(eq(managedDatabases.id, databaseId));
   await rotateRolePassword({ role: target.name, password, database: database?.name });
-  const sealed = encryptSecret(env.rootKey, password, env.rootKeyId);
-  const secretId = createId("sec");
-  await db.insert(secrets).values({ id: secretId, kind: `postgres.${kind}`, once: true, ...sealed });
   await db.update(databaseRoles).set({ secretId }).where(eq(databaseRoles.id, target.id));
   await enqueue({ kind: "pgbouncer.reload", targetIds: [databaseId] });
   await addStep(operation.id, "database-rotate", { role: target.name, previous: role?.name });
@@ -843,12 +1375,19 @@ async function adoptService(operation: OperationRow) {
   const [service] = await db.select().from(services).where(eq(services.id, serviceId));
   if (!service) throw new Error("Service not found.");
   const written = await writeApprovedCompose(service.id, service.compose);
-  await addStep(operation.id, "service-adopt", { file: written.file, containerId: service.containerId });
+  throw new DelegateToAgent({
+    ...operation.payload,
+    compose: written.canonical,
+    composeHash: written.hash,
+    containerId: service.containerId,
+    name: service.name,
+  });
 }
 
 async function queueMail(operation: OperationRow) {
   const action = operation.kind === "mail.queue_delete" ? "delete" : "retry";
   const result = await mutateMailQueue(action, String(operation.payload.id ?? operation.targetIds[0]));
+  if (!result.executed) throw new Error("No native Stalwart queue mutation executor is configured.");
   await addStep(operation.id, `mail-queue-${action}`, result);
 }
 
@@ -859,6 +1398,9 @@ async function maintainPlatform(operation: OperationRow) {
     rollbackSafe: bundle.rollbackSafe,
     note: "Apply only through scripts/maintain.ts with ARK_MAINTENANCE_TOKEN.",
   });
+  throw new Error(
+    "The API recorded a maintenance approval but cannot execute self-maintenance; use the independent signed release runner.",
+  );
 }
 
 export function revealSecret(row: typeof secrets.$inferSelect) {

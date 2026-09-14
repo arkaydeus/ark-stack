@@ -7,15 +7,15 @@ import {
   type Access,
   type PrivilegedAction,
 } from "@ark-stack/shared";
-import { eq } from "drizzle-orm";
+import { and, desc, eq, gt, isNull } from "drizzle-orm";
 import { HTTPException } from "hono/http-exception";
 
 import { db } from "./db.ts";
-import { databaseClusters, endpoints, managedDatabases, platformAccess } from "./schema.ts";
+import { databaseClusters, endpoints, managedDatabases, platformAccess, stepUpGrants } from "./schema.ts";
 
 export type SessionValue = {
   user: { id: string; name: string; email: string; twoFactorEnabled?: boolean; mfaEnrolledAt?: Date | null };
-  session: { createdAt: Date; updatedAt?: Date };
+  session: { id: string; createdAt: Date; updatedAt?: Date };
 };
 
 export function requireOperator(access: Access) {
@@ -36,11 +36,35 @@ export function requireMfa(session: SessionValue) {
   }
 }
 
-export function requirePrivileged(access: Access, session: SessionValue, action: PrivilegedAction) {
+export async function requirePrivileged(
+  access: Access,
+  session: SessionValue,
+  action: PrivilegedAction,
+  expectedPlanHash?: string,
+) {
   requireOperator(access);
   requireMfa(session);
+  const [grant] = await db
+    .select()
+    .from(stepUpGrants)
+    .where(
+      and(
+        eq(stepUpGrants.userId, access.userId),
+        eq(stepUpGrants.sessionId, session.session.id),
+        eq(stepUpGrants.action, action),
+        gt(stepUpGrants.expiresAt, new Date()),
+        isNull(stepUpGrants.consumedAt),
+      ),
+    )
+    .orderBy(desc(stepUpGrants.createdAt))
+    .limit(1);
+  if (!grant || (expectedPlanHash && grant.planHash !== expectedPlanHash)) {
+    throw new HTTPException(403, {
+      message: `Verify your password and MFA for ${action} before continuing.`,
+    });
+  }
   try {
-    assertPrivileged(access, action, new Date(session.session.updatedAt ?? session.session.createdAt));
+    assertPrivileged(access, action, grant.createdAt);
   } catch (error) {
     throw new HTTPException(403, {
       message:

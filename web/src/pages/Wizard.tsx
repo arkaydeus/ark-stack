@@ -24,6 +24,10 @@ export function Wizard({ onDone }: { onDone: () => Promise<void> }) {
           baseDomain: form.get("baseDomain"),
           dnsProvider: form.get("dnsProvider"),
           publicIpv4: form.get("publicIpv4"),
+          publicIpv6: form.get("publicIpv6") || undefined,
+          adminHostname: form.get("adminHostname") || undefined,
+          databaseHostname: form.get("databaseHostname") || undefined,
+          mailHostname: form.get("mailHostname") || undefined,
           includeDatabase: form.has("includeDatabase"),
           includeMail: form.has("includeMail"),
           firstDatabaseName: form.get("firstDatabaseName") || undefined,
@@ -71,6 +75,14 @@ export function Wizard({ onDone }: { onDone: () => Promise<void> }) {
             </label>
             <Field label="Base domain" name="baseDomain" placeholder="example.com" required />
             <Field label="Public IPv4" name="publicIpv4" placeholder="203.0.113.10" required />
+            <Field label="Public IPv6 (optional)" name="publicIpv6" placeholder="2001:db8::10" />
+            <Field label="Admin hostname (optional)" name="adminHostname" placeholder="admin.example.com" />
+            <Field
+              label="Database hostname (optional)"
+              name="databaseHostname"
+              placeholder="db.example.com"
+            />
+            <Field label="Mail hostname (optional)" name="mailHostname" placeholder="mail.example.com" />
             <div>
               <label className="mb-1.5 block text-xs font-semibold" htmlFor="dnsProvider">
                 DNS provider

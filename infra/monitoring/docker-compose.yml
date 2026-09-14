@@ -2,7 +2,7 @@ name: ark-monitoring
 
 services:
   prometheus:
-    image: prom/prometheus:v3.5.0
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=14d
@@ -11,6 +11,7 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ../../tmp/metrics.token:/run/secrets/ark_metrics_token:ro
       - ark_prometheus:/prometheus
     restart: unless-stopped
     networks:
@@ -22,3 +23,4 @@ volumes:
 networks:
   ark_platform:
     external: true
+    name: ark_monitoring

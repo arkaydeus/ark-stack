@@ -18,6 +18,8 @@ describe("database provisioning SQL", () => {
     expect(plan.testDatabase).toBe("orders_test");
     expect(plan.statements.join("\n")).toContain("REVOKE ALL ON DATABASE");
     expect(plan.extensionStatements[0]).toContain("vector");
+    expect(plan.extensionStatements.join("\n")).toContain("ON SEQUENCES");
+    expect(plan.statements.join("\n")).toContain("NOLOGIN");
     expect(
       publicPoolerAdmission({ database: "orders", runtimeRole: "orders_runtime", exposure: "public" })
         .allowed,

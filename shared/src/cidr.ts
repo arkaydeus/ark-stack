@@ -104,7 +104,7 @@ export function clientAllowed(cidrs: string[], ip: string) {
 export function nftAllowlist(cidrs: string[], port = 5432) {
   const valid = cidrs.map((item) => parseCidr(item)).filter((item) => item.ok);
   if (!valid.length) {
-    return `# Generated public database source policy. Empty means any authenticated client.\ndelete table inet ark_db_ingress\n`;
+    return `# Generated public database source policy. Empty means any authenticated client.\ntable inet ark_db_ingress\ndelete table inet ark_db_ingress\n`;
   }
   const v4 = valid.filter((item) => item.version === 4).map((item) => `    ip saddr ${item.cidr} accept`);
   const v6 = valid.filter((item) => item.version === 6).map((item) => `    ip6 saddr ${item.cidr} accept`);
@@ -113,9 +113,9 @@ export function nftAllowlist(cidrs: string[], port = 5432) {
 table inet ark_db_ingress
 delete table inet ark_db_ingress
 table inet ark_db_ingress {
-  chain input {
-    type filter hook input priority 0; policy accept;
-    tcp dport ${port} jump ark_db_allow
+  chain forward {
+    type filter hook forward priority -1; policy accept;
+    ct status dnat tcp dport ${port} jump ark_db_allow
   }
   chain ark_db_allow {
 ${[...v4, ...v6].join("\n")}

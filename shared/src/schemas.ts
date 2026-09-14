@@ -10,15 +10,35 @@ export const hostname = z
   .max(253)
   .regex(/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i);
 
+const ipv4 = z
+  .string()
+  .trim()
+  .refine((value) => {
+    const parts = value.split(".");
+    return (
+      parts.length === 4 &&
+      parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255)
+    );
+  }, "Enter a valid IPv4 address.");
+
+const ipv6 = z
+  .string()
+  .trim()
+  .refine((value) => {
+    if (!value.includes(":")) return false;
+    try {
+      return new URL(`http://[${value}]/`).hostname.toLowerCase() === `[${value.toLowerCase()}]`;
+    } catch {
+      return false;
+    }
+  }, "Enter a valid IPv6 address.");
+
 export const wizardInput = z.object({
   adminMode,
   baseDomain: hostname,
   dnsProvider: dnsProvider.default("manual"),
-  publicIpv4: z
-    .string()
-    .trim()
-    .regex(/^(?:\d{1,3}\.){3}\d{1,3}$/),
-  publicIpv6: z.string().trim().optional(),
+  publicIpv4: ipv4,
+  publicIpv6: ipv6.optional(),
   adminHostname: hostname.optional(),
   databaseHostname: hostname.optional(),
   mailHostname: hostname.optional(),
@@ -73,22 +93,39 @@ export const projectInput = z.object({
     .regex(/^[a-z][a-z0-9-]{0,40}$/),
 });
 
-export const serviceInput = z.object({
-  projectId: z.string().min(1),
-  name: z.string().trim().min(1).max(63),
-  compose: z
-    .string()
-    .min(1)
-    .max(64 * 1024),
-  updatePolicy: z.enum(["notify", "auto_stateless"]).default("notify"),
-});
+export const serviceInput = z
+  .object({
+    projectId: z.string().min(1),
+    name: z.string().trim().min(1).max(63),
+    compose: z
+      .string()
+      .min(1)
+      .max(64 * 1024),
+    updatePolicy: z.enum(["notify", "auto_stateless"]).default("notify"),
+    stateful: z.boolean().default(false),
+  })
+  .superRefine((value, context) => {
+    if (value.stateful && value.updatePolicy === "auto_stateless") {
+      context.addIssue({
+        code: "custom",
+        path: ["updatePolicy"],
+        message: "Stateful services cannot use automatic stateless updates.",
+      });
+    }
+  });
 
 export const sqlInput = z.object({
+  executionId: z.string().min(8).max(100),
   databaseId: z.string().min(1),
   workspaceId: z.string().min(1),
   role: z.enum(["runtime", "readonly", "migration"]),
   sql: z.string().min(1).max(20_000),
   readOnly: z.boolean().default(true),
+});
+
+export const sqlCancelInput = z.object({
+  executionId: z.string().min(8).max(100),
+  databaseId: z.string().min(1),
 });
 
 export const settingsInput = z.object({
@@ -108,7 +145,7 @@ export const adoptInput = z.object({
     .string()
     .min(1)
     .max(64 * 1024),
-  containerId: z.string().min(1),
+  containerId: z.string().regex(/^[a-f0-9]{12,64}$/i, "A Docker container ID is required."),
 });
 
 export const deviceInput = z.object({

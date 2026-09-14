@@ -36,4 +36,31 @@ describe("internal worker boundary", () => {
     const [row] = await db.select().from(operations).where(eq(operations.id, id));
     expect(row?.status).toBe("running");
   });
+
+  test("agent completion requires the current claim token", async () => {
+    const id = createId("op");
+    await db.insert(operations).values({
+      id,
+      kind: "service.restart",
+      status: "running",
+      claimToken: "claim-current",
+      idempotencyKey: `test-${id}`,
+      planHash: "x",
+      targetIds: ["svc_x"],
+      payload: {},
+    });
+    for (const body of [{ status: "succeeded" }, { status: "succeeded", claimToken: "stale" }]) {
+      const response = await app.request(`/api/internal/jobs/${id}/complete`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${process.env.ARK_AGENT_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(403);
+    }
+    const [row] = await db.select().from(operations).where(eq(operations.id, id));
+    expect(row?.status).toBe("running");
+  });
 });

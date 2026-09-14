@@ -1,4 +1,4 @@
-import { mkdir, copyFile, access } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -58,7 +58,7 @@ async function firstExisting(paths: string[]) {
   return null;
 }
 
-export async function issueCertificateFiles(hostname: string) {
+export async function issueCertificateFiles(hostname: string, action: "run" | "renew" = "run") {
   const root = join(process.env.ARK_CERT_DIR ?? join(process.cwd(), "tmp", "certs"), hostname);
   await mkdir(root, { recursive: true });
   const keyPath = join(root, "privkey.pem");
@@ -73,6 +73,7 @@ export async function issueCertificateFiles(hostname: string) {
       webroot: process.env.ARK_ACME_WEBROOT ?? join(root, "webroot"),
       path: legoPath,
       staging: process.env.ARK_ACME_STAGING !== "0",
+      action,
     });
     await exec(legoBin, args, { timeout: 120_000 });
     const issuedCert = await firstExisting([
@@ -82,8 +83,29 @@ export async function issueCertificateFiles(hostname: string) {
     ]);
     const issuedKey = await firstExisting([join(legoPath, "certificates", `${hostname}.key`), keyPath]);
     if (!issuedCert || !issuedKey) throw new Error("lego did not write a certificate and key.");
-    if (issuedCert !== certPath) await copyFile(issuedCert, certPath);
-    if (issuedKey !== keyPath) await copyFile(issuedKey, keyPath);
+    if (issuedCert !== certPath) {
+      await copyFile(issuedCert, `${certPath}.next`);
+      await chmod(`${certPath}.next`, 0o644);
+      await rename(`${certPath}.next`, certPath);
+    }
+    if (issuedKey !== keyPath) {
+      await copyFile(issuedKey, `${keyPath}.next`);
+      await chmod(`${keyPath}.next`, 0o600);
+      await rename(`${keyPath}.next`, keyPath);
+    }
+    const { stdout: certKey } = await exec("openssl", ["x509", "-in", certPath, "-pubkey", "-noout"]);
+    const { stdout: privateKey } = await exec("openssl", ["pkey", "-in", keyPath, "-pubout"]);
+    if (certKey.trim() !== privateKey.trim())
+      throw new Error("Issued certificate does not match its private key.");
+    const { stdout: names } = await exec("openssl", [
+      "x509",
+      "-in",
+      certPath,
+      "-noout",
+      "-ext",
+      "subjectAltName",
+    ]);
+    if (!names.includes(`DNS:${hostname}`)) throw new Error(`Issued certificate does not cover ${hostname}.`);
     const meta = await readCertificateMeta(certPath);
     return {
       issuer: process.env.ARK_ACME_STAGING !== "0" ? "letsencrypt-staging" : "letsencrypt",
@@ -91,6 +113,11 @@ export async function issueCertificateFiles(hostname: string) {
       certPath,
       ...meta,
     };
+  }
+  if (process.env.ARK_CERTIFICATE_MODE !== "development") {
+    throw new Error(
+      "Public certificate issuance is not configured. Set ARK_LEGO_BIN and ARK_ACME_EMAIL; self-signed fallback is development-only.",
+    );
   }
   await exec(
     "openssl",

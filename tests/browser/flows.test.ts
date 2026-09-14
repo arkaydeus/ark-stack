@@ -52,9 +52,8 @@ describe("high-risk HTTP flows", () => {
   });
 
   test("built UI contains the sign-in contract", async () => {
-    const html = existsSync("web/dist/index.html")
-      ? await Bun.file("web/dist/index.html").text()
-      : "<title>Ark Stack</title>";
+    expect(existsSync("web/dist/index.html")).toBe(true);
+    const html = await Bun.file("web/dist/index.html").text();
     expect(html).toContain("Ark Stack");
   });
 });

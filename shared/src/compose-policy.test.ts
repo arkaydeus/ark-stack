@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { validateComposeSource } from "./compose-policy.ts";
+import { canonicalizeComposeSource, validateComposeSource } from "./compose-policy.ts";
 
 describe("compose policy", () => {
   test("accepts a pinned stateless image", () => {
@@ -16,6 +16,38 @@ volumes:
   app_data:
 `);
     expect(result.ok).toBe(true);
+    const canonical = canonicalizeComposeSource(`
+services:
+  web:
+    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+`);
+    expect(canonical).toContain("read_only: true");
+    expect(canonical).toContain("pids_limit: 256");
+    expect(canonical).toContain("mem_limit: 512m");
+    expect(canonical).toContain("cpus: 1");
+    expect(canonical).toContain("cap_drop:");
+    expect(canonical).toContain("no-new-privileges:true");
+  });
+
+  test("rejects caller attempts to weaken injected sandbox limits", () => {
+    for (const setting of [
+      "read_only: false",
+      "pids_limit: 999999",
+      "mem_limit: 64g",
+      "cpus: 16",
+      "tmpfs: [/etc]",
+      "cap_drop: []",
+      "security_opt: []",
+    ]) {
+      expect(
+        validateComposeSource(`
+services:
+  app:
+    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ${setting}
+`).ok,
+      ).toBe(false);
+    }
   });
 
   test("rejects docker socket, privileged mode, and latest tags", () => {
@@ -84,6 +116,30 @@ services:
 services:
   x:
     image: localhost:5000/app:1.0.0
+`);
+    expect(result.ok).toBe(false);
+  });
+
+  test("rejects host binds hidden in named volumes and external platform resources", () => {
+    const image =
+      "docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for (const source of [
+      `services:\n  app:\n    image: ${image}\n    volumes: [data:/data]\nvolumes:\n  data:\n    driver: local\n    driver_opts: { type: none, o: bind, device: / }\n`,
+      `services:\n  app:\n    image: ${image}\n    networks: [control]\nnetworks:\n  control: { external: true, name: ark_platform }\n`,
+      `services:\n  app:\n    image: ${image}\n    volumes: [control:/data]\nvolumes:\n  control: { external: true }\n`,
+    ]) {
+      expect(validateComposeSource(source).ok).toBe(false);
+    }
+  });
+
+  test("rejects unknown lifecycle, logging and namespace escape fields", () => {
+    const result = validateComposeSource(`
+services:
+  app:
+    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    post_start: [{ command: id }]
+    logging: { driver: syslog }
+    volumes_from: [other]
 `);
     expect(result.ok).toBe(false);
   });

@@ -73,6 +73,14 @@ describe("provider adapters", () => {
     expect(
       renderCaddyfile({ adminMode: "tailnet", challengeDir: "/acme", apiUpstream: "api:3000" }),
     ).not.toContain("admin.");
+    expect(
+      renderCaddyfile({
+        adminMode: "public",
+        adminHostname: "admin.example.com",
+        challengeDir: "/acme",
+        apiUpstream: "api:3000",
+      }),
+    ).toContain("respond @unknownApi 404");
     expect(registryManifestUrl("docker.io/library/nginx:1.27.3").url).toContain("/nginx/manifests/1.27.3");
     expect(
       registryManifestUrl("quay.io/prometheus/node-exporter:v1.8.2").url.startsWith("https://quay.io/v2/"),

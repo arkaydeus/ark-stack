@@ -8,9 +8,31 @@ groups:
           severity: critical
         annotations:
           summary: Ark Stack API scrape is down
-      - alert: HostNeedsExternalHeartbeat
-        expr: vector(1)
+      - alert: ArkOperationFailures
+        expr: ark_operations{status="failed"} > 0
+        for: 5m
         labels:
-          severity: info
+          severity: warning
         annotations:
-          summary: On-host Prometheus cannot report complete host loss. Configure ARK_ALERT_WEBHOOK off-box.
+          summary: Ark Stack has failed control-plane operations
+      - alert: ArkBackupsUnverified
+        expr: ark_backups_unverified > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: One or more backups lack restore proof
+      - alert: ArkCertificateExpiry
+        expr: ark_certificates_expiring > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: One or more managed certificates expire within 14 days
+      - alert: ArkWorkerHeartbeatStale
+        expr: ark_worker_heartbeat_stale == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: An Ark Stack worker heartbeat is stale

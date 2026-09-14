@@ -35,9 +35,30 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 description = "Run unit tests"
 run = "bun --env-file=.env test shared server workers tests"
 
+[tasks."test:e2e"]
+description = "Run fresh-volume browser onboarding against a disposable local database"
+run = "bun --env-file=.env scripts/test-e2e.ts"
+
+[tasks."test:upgrade"]
+description = "Apply current migrations over a representative pre-Fix-1 schema"
+run = "bun --env-file=.env scripts/test-upgrade-migrations.ts"
+
+[tasks."test:stalwart"]
+description = "Run native mail lifecycle checks against a disposable pinned Stalwart container"
+run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts"
+
+[tasks."test:edge"]
+description = "Validate generated public/tailnet and static Caddy configurations"
+run = "bun scripts/test-edge-config.ts"
+
 [tasks."test:agent"]
 description = "Run Docker agent policy tests"
 run = "go test ./..."
+dir = "agent"
+
+[tasks."test:agent-integration"]
+description = "Deploy, inspect, restart, and remove a pinned workload on a disposable Docker project"
+run = "ARK_DOCKER_INTEGRATION=1 go test -run TestDisposableDockerDeploymentAndDurableLedger -count=1 ./..."
 dir = "agent"
 
 [tasks.typecheck]
@@ -71,11 +92,11 @@ run = ["mise run format:check", "mise run lint", "mise run typecheck", "mise run
 
 [tasks."db:up"]
 description = "Start the local platform PostgreSQL instance"
-run = "docker compose -f infra/platform/docker-compose.yml up -d postgres app-postgres"
+run = "docker compose -f infra/platform/docker-compose.yml -f infra/platform/docker-compose.dev.yml up -d postgres app-postgres"
 
 [tasks."db:down"]
 description = "Stop local platform containers"
-run = "docker compose -f infra/platform/docker-compose.yml down"
+run = "docker compose -f infra/platform/docker-compose.yml -f infra/platform/docker-compose.dev.yml down"
 
 [tasks."db:generate"]
 description = "Generate Drizzle migrations from the server schema"
@@ -97,6 +118,11 @@ description = "Local recovery CLI for lockout and setup repair"
 raw_args = true
 run = "bun run --cwd server recover"
 env = { _.file = ".env" }
+
+[tasks."recover:mfa"]
+description = "Deliberately reset owner MFA and revoke every session"
+raw_args = true
+run = "bun --env-file=.env scripts/recover-mfa.ts"
 
 [tasks."agent:test"]
 description = "Run Go agent tests"

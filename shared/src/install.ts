@@ -5,16 +5,34 @@ export const installEnvKeys = [
   "ARK_ROOT_KEY",
   "ARK_SETUP_TOKEN",
   "ARK_INTERNAL_TOKEN",
+  "ARK_DATABASE_WORKER_TOKEN",
+  "ARK_DOMAIN_WORKER_TOKEN",
+  "ARK_MAIL_WORKER_TOKEN",
+  "ARK_BACKUP_WORKER_TOKEN",
   "ARK_AGENT_TOKEN",
   "ARK_MAINTENANCE_TOKEN",
+  "ARK_MFA_RECOVERY_TOKEN",
+  "ARK_METRICS_TOKEN",
+  "ARK_OFFHOST_HEARTBEAT_TOKEN",
+  "ARK_CONTROL_DB_PASSWORD",
+  "ARK_APP_DB_PASSWORD",
+  "ARK_API_DB_PASSWORD",
+  "STALWART_ADMIN_PASSWORD",
 ] as const;
 
 export const placeholderSecretValues = new Set([
   "change-me-to-at-least-32-characters-long",
   "dev-setup-token",
   "dev-internal-token",
+  "dev-database-worker-token",
+  "dev-domain-worker-token",
+  "dev-mail-worker-token",
+  "dev-backup-worker-token",
   "dev-agent-token",
   "dev-maintenance-token",
+  "dev-mfa-recovery-token",
+  "dev-metrics-token",
+  "dev-offhost-heartbeat-token",
 ]);
 
 const insecureDefaultPaths: Record<string, string[]> = {
@@ -22,16 +40,31 @@ const insecureDefaultPaths: Record<string, string[]> = {
 };
 
 export function generateInstallSecrets() {
+  const controlPassword = randomBytes(32).toString("base64url");
+  const appPassword = randomBytes(32).toString("base64url");
+  const apiPassword = randomBytes(32).toString("base64url");
   return {
     BETTER_AUTH_SECRET: randomBytes(32).toString("base64url"),
     ARK_ROOT_KEY: randomBytes(32).toString("base64url"),
     ARK_ROOT_KEY_ID: "k1",
     ARK_SETUP_TOKEN: randomBytes(24).toString("base64url"),
     ARK_INTERNAL_TOKEN: randomBytes(24).toString("base64url"),
+    ARK_DATABASE_WORKER_TOKEN: randomBytes(24).toString("base64url"),
+    ARK_DOMAIN_WORKER_TOKEN: randomBytes(24).toString("base64url"),
+    ARK_MAIL_WORKER_TOKEN: randomBytes(24).toString("base64url"),
+    ARK_BACKUP_WORKER_TOKEN: randomBytes(24).toString("base64url"),
     ARK_AGENT_TOKEN: randomBytes(24).toString("base64url"),
     ARK_MAINTENANCE_TOKEN: randomBytes(24).toString("base64url"),
-    DATABASE_URL: "postgres://ark:ark@127.0.0.1:5433/ark_platform",
-    DATABASE_APP_URL: "postgres://ark_app:ark_app@127.0.0.1:5434/postgres",
+    ARK_MFA_RECOVERY_TOKEN: randomBytes(24).toString("base64url"),
+    ARK_METRICS_TOKEN: randomBytes(24).toString("base64url"),
+    ARK_OFFHOST_HEARTBEAT_TOKEN: randomBytes(24).toString("base64url"),
+    ARK_CONTROL_DB_PASSWORD: controlPassword,
+    ARK_APP_DB_PASSWORD: appPassword,
+    ARK_API_DB_PASSWORD: apiPassword,
+    STALWART_ADMIN_ADDRESS: "admin",
+    STALWART_ADMIN_PASSWORD: randomBytes(32).toString("base64url"),
+    DATABASE_URL: `postgres://ark_runtime:${apiPassword}@127.0.0.1:5433/ark_platform`,
+    DATABASE_APP_URL: `postgres://ark_cluster_admin:${appPassword}@127.0.0.1:5434/postgres`,
     BETTER_AUTH_URL: "http://127.0.0.1:3000",
     BETTER_AUTH_TRUSTED_ORIGINS: "http://127.0.0.1:3000,http://127.0.0.1:5173",
     ARK_LISTEN_PORT: "3000",

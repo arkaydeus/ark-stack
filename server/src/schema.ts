@@ -252,6 +252,8 @@ export const aliases = pgTable(
     localPart: text("local_part").notNull(),
     description: text("description"),
     targets: jsonb("targets").$type<string[]>().notNull(),
+    nativeId: text("native_id"),
+    status: text("status").notNull().default("active"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex("aliases_domain_local_idx").on(table.domainId, table.localPart)],
@@ -269,6 +271,7 @@ export const services = pgTable("services", {
   observedRevision: text("observed_revision"),
   status: text("status").notNull().default("registered"),
   updatePolicy: text("update_policy").notNull().default("notify"),
+  stateful: boolean("stateful").notNull().default(false),
   protected: boolean("protected").notNull().default(false),
   containerId: text("container_id"),
   adoptedFrom: text("adopted_from"),
@@ -282,6 +285,7 @@ export const mailboxDevices = pgTable("mailbox_devices", {
     .notNull()
     .references(() => mailboxes.id, { onDelete: "cascade" }),
   label: text("label").notNull(),
+  nativeId: text("native_id"),
   secretId: text("secret_id"),
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -290,6 +294,10 @@ export const mailboxDevices = pgTable("mailbox_devices", {
 export const secrets = pgTable("secrets", {
   id: text("id").primaryKey(),
   kind: text("kind").notNull(),
+  resourceType: text("resource_type"),
+  resourceId: text("resource_id"),
+  purpose: text("purpose"),
+  sensitivity: text("sensitivity").notNull().default("credential"),
   keyId: text("key_id").notNull(),
   ciphertext: text("ciphertext").notNull(),
   iv: text("iv").notNull(),
@@ -298,6 +306,23 @@ export const secrets = pgTable("secrets", {
   revealedAt: timestamp("revealed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const stepUpGrants = pgTable(
+  "step_up_grants",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    sessionId: text("session_id").notNull(),
+    action: text("action").notNull(),
+    planHash: text("plan_hash"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("step_up_grants_lookup_idx").on(table.userId, table.sessionId, table.action)],
+);
 
 export const operations = pgTable(
   "operations",
@@ -338,6 +363,12 @@ export const operationSteps = pgTable(
   (table) => [index("operation_steps_op_idx").on(table.operationId)],
 );
 
+export const workerHeartbeats = pgTable("worker_heartbeats", {
+  identity: text("identity").primaryKey(),
+  version: text("version").notNull(),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const backups = pgTable("backups", {
   id: text("id").primaryKey(),
   kind: text("kind").notNull(),
@@ -356,6 +387,10 @@ export const alerts = pgTable(
     title: text("title").notNull(),
     dedupKey: text("dedup_key").notNull(),
     acknowledged: boolean("acknowledged").notNull().default(false),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    silencedUntil: timestamp("silenced_until", { withTimezone: true }),
+    lastNotifiedAt: timestamp("last_notified_at", { withTimezone: true }),
+    notificationAttempts: integer("notification_attempts").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex("alerts_dedup_key_idx").on(table.dedupKey)],
@@ -376,6 +411,22 @@ export const updateCandidates = pgTable(
     detectedAt: timestamp("detected_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex("update_candidates_service_idx").on(table.serviceId)],
+);
+
+export const deploymentRevisions = pgTable(
+  "deployment_revisions",
+  {
+    id: text("id").primaryKey(),
+    serviceId: text("service_id")
+      .notNull()
+      .references(() => services.id, { onDelete: "cascade" }),
+    desiredRevision: text("desired_revision").notNull(),
+    compose: text("compose").notNull(),
+    imageDigest: text("image_digest"),
+    status: text("status").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("deployment_revisions_service_idx").on(table.serviceId, table.createdAt)],
 );
 
 export const auditEvents = pgTable("audit_events", {
@@ -413,6 +464,7 @@ export const schema = {
   aliases,
   services,
   secrets,
+  stepUpGrants,
   operations,
   operationSteps,
   backups,

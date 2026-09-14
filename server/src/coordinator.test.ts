@@ -7,13 +7,31 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
   Object.assign(process.env, parseEnvFile(await Bun.file(".env").text()));
 }
 
-const { enqueue, processQueued, setDnsResolver } = await import("./coordinator.ts");
+const { claimQueued, enqueue, processQueued, setDnsResolver } = await import("./coordinator.ts");
 const { db } = await import("./db.ts");
 const { backups, dnsRecords, domainClaims, operations } = await import("./schema.ts");
 const { createId } = await import("@ark-stack/shared");
 const { eq } = await import("drizzle-orm");
 
 describe("coordinator enqueue and claims", () => {
+  test("agent claims only fully prepared immutable jobs", async () => {
+    const targetId = createId("tgt");
+    const raw = await enqueue({ kind: "service.deploy", targetIds: [targetId], payload: {} });
+    const prepared = await enqueue({
+      kind: "service.logs",
+      targetIds: [createId("tgt")],
+      payload: { name: "web" },
+    });
+    const claimed = await claimQueued({ limit: 20, agentOwned: true });
+    expect(claimed.rows.some((item) => item.id === raw.id)).toBe(false);
+    expect(claimed.rows.some((item) => item.id === prepared.id)).toBe(true);
+    await db
+      .update(operations)
+      .set({ status: "failed", claimToken: null })
+      .where(eq(operations.id, prepared.id));
+    await db.update(operations).set({ status: "failed" }).where(eq(operations.id, raw.id));
+  });
+
   test("repeats backup.create after a succeeded operation", async () => {
     const target = createId("tgt");
     const first = await enqueue({
@@ -31,15 +49,17 @@ describe("coordinator enqueue and claims", () => {
     expect(isInFlight(second.status)).toBe(true);
   });
 
-  test("concurrent processQueued claims a queued row once", async () => {
+  test("concurrent processQueued claims a queued row once and refuses plan-only backup success", async () => {
+    const targetId = createId("tgt");
     const first = await enqueue({
-      kind: "mailbox.device",
-      targetIds: [createId("mbx")],
-      payload: { nonce: createId("n") },
+      kind: "backup.create",
+      targetIds: [targetId],
+      payload: { kind: "volume", targetId },
     });
     await Promise.all([processQueued(8), processQueued(8)]);
     const [row] = await db.select().from(operations).where(eq(operations.id, first.id));
-    expect(row?.status).toBe("succeeded");
+    expect(row?.status).toBe("failed");
+    expect(row?.error).toMatch(/plan cannot satisfy/);
   });
 
   test("restore tests mark the newest backup for a target", async () => {
@@ -73,17 +93,18 @@ describe("coordinator enqueue and claims", () => {
     const [oldRow] = await db.select().from(backups).where(eq(backups.id, older));
     const [newRow] = await db.select().from(backups).where(eq(backups.id, newer));
     const [op] = await db.select().from(operations).where(eq(operations.id, operation.id));
-    expect(op?.status).toBe("succeeded");
+    expect(op?.status).toBe("failed");
     expect(oldRow?.restoreVerified).toBe(false);
-    expect(newRow?.status).toBe("planned");
+    expect(newRow?.status).toBe("uploaded");
     expect(newRow?.restoreVerified).toBe(false);
   });
 
   test("verifies a mail-enabled DNS plan including MX", async () => {
     const domainId = createId("dom");
+    const domainName = `verify-${domainId.slice(-8)}.example`;
     await db.insert(domainClaims).values({
       id: domainId,
-      name: `verify-${domainId.slice(-8)}.example`,
+      name: domainName,
       ownershipToken: "ark-own-test",
       status: "awaiting_dns",
     });
@@ -92,7 +113,7 @@ describe("coordinator enqueue and claims", () => {
         id: createId("dns"),
         domainId,
         type: "TXT",
-        name: `_ark-stack.verify.example`,
+        name: `_ark-stack.${domainName}`,
         relativeName: "_ark-stack",
         expectedValue: "ark-own-test",
         purpose: "ownership",
@@ -144,5 +165,21 @@ describe("coordinator enqueue and claims", () => {
       if (previousStub === undefined) delete process.env.ARK_DNS_STUB;
       else process.env.ARK_DNS_STUB = previousStub;
     }
+  });
+
+  test("does not verify a domain with no ownership records", async () => {
+    const domainId = createId("dom");
+    await db.insert(domainClaims).values({
+      id: domainId,
+      name: `empty-${domainId.slice(-8)}.example`,
+      ownershipToken: "ark-own-unpublished",
+      status: "awaiting_dns",
+    });
+    const operation = await enqueue({ kind: "domain.verify", targetIds: [domainId] });
+    await processQueued(8);
+    const [op] = await db.select().from(operations).where(eq(operations.id, operation.id));
+    const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, domainId));
+    expect(op?.status).toBe("failed");
+    expect(domain?.status).not.toBe("verified");
   });
 });

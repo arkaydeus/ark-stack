@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -14,11 +14,13 @@ import {
   nftAllowlist,
   pgbouncerConfig,
   pgbouncerUserlist,
+  parseBearerChallenge,
   registryManifestUrl,
   renderCaddyfile,
   renderTailscaleServe,
   sesIdentityPlan,
   signAwsRequest,
+  stalwartRef,
   type DnsWrite,
   type ExternalInventory,
 } from "@ark-stack/shared";
@@ -54,11 +56,39 @@ export async function reconcileSes(domain: string, mailFrom: string) {
   const account = await sesRequest("/v2/email/account");
   if (!account.configured) return { ...plan, account, created: false };
   const created = await sesRequest("/v2/email/identities", "POST", { EmailIdentity: domain });
-  await sesRequest(`/v2/email/identities/${domain}/mail-from-attributes`, "PUT", {
+  if (!created.ok && created.status !== 409)
+    throw new Error(`SES identity creation failed: ${created.status}`);
+  const mailFromResult = await sesRequest(`/v2/email/identities/${domain}/mail-from-attributes`, "PUT", {
     MailFromDomain: mailFrom,
-    BehaviorOnMxFailure: "USE_DEFAULT_VALUE",
+    BehaviorOnMxFailure: "REJECT_MESSAGE",
   });
-  return { ...plan, account, created };
+  if (!mailFromResult.ok) throw new Error(`SES MAIL FROM configuration failed: ${mailFromResult.status}`);
+  const identity = await sesRequest(`/v2/email/identities/${encodeURIComponent(domain)}`);
+  if (!identity.ok) throw new Error(`SES identity readback failed: ${identity.status}`);
+  const accountBody = JSON.parse(account.body || "{}") as {
+    ProductionAccessEnabled?: boolean;
+    SendingEnabled?: boolean;
+  };
+  const identityBody = JSON.parse(identity.body || "{}") as {
+    VerifiedForSendingStatus?: boolean;
+    DkimAttributes?: { Status?: string; Tokens?: string[] };
+    MailFromAttributes?: { MailFromDomainStatus?: string };
+  };
+  return {
+    ...plan,
+    account: {
+      configured: true,
+      production: accountBody.ProductionAccessEnabled === true,
+      sending: accountBody.SendingEnabled === true,
+    },
+    created: created.ok || created.status === 409,
+    identity: {
+      verified: identityBody.VerifiedForSendingStatus === true,
+      dkimStatus: identityBody.DkimAttributes?.Status ?? "unknown",
+      dkimTokens: identityBody.DkimAttributes?.Tokens ?? [],
+      mailFromStatus: identityBody.MailFromAttributes?.MailFromDomainStatus ?? "unknown",
+    },
+  };
 }
 
 export async function publishCloudflare(zone: string, records: DnsWrite[]) {
@@ -101,28 +131,283 @@ export async function publishCloudflare(zone: string, records: DnsWrite[]) {
   return { published: true, reason: "cloudflare" as const, results };
 }
 
+type StalwartRecord = { id: string; name: string; domainId?: string };
+
+async function stalwartMethod(
+  url: string,
+  authorization: string,
+  name: string,
+  methodArguments: Record<string, unknown>,
+) {
+  const response = await fetch(`${url.replace(/\/$/, "")}/jmap`, {
+    method: "POST",
+    headers: { authorization, "content-type": "application/json" },
+    body: JSON.stringify(jmapCall(name, methodArguments)),
+  });
+  const body = (await response.json().catch(() => null)) as {
+    methodResponses?: Array<[string, Record<string, unknown>, string]>;
+  } | null;
+  const result = body?.methodResponses?.[0];
+  if (!response.ok || !result || result[0] === "error" || result[0] !== name) {
+    throw new Error(`Stalwart ${name} failed without a complete native result.`);
+  }
+  return result[1];
+}
+
+async function stalwartRecords(url: string, authorization: string, object: string) {
+  const queried = await stalwartMethod(url, authorization, `x:${object}/query`, { filter: {} });
+  const ids = Array.isArray(queried.ids)
+    ? queried.ids.filter((id): id is string => typeof id === "string")
+    : [];
+  if (!ids.length) return [] as StalwartRecord[];
+  const fetched = await stalwartMethod(url, authorization, `x:${object}/get`, { ids });
+  const list = Array.isArray(fetched.list) ? fetched.list : [];
+  return list.filter(
+    (item): item is StalwartRecord =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof (item as StalwartRecord).id === "string" &&
+      typeof (item as StalwartRecord).name === "string",
+  );
+}
+
+async function stalwartSet(
+  url: string,
+  authorization: string,
+  object: string,
+  changes: {
+    create?: Record<string, Record<string, unknown>>;
+    update?: Record<string, Record<string, unknown>>;
+    destroy?: string[];
+  },
+) {
+  if (
+    !Object.values(changes).some((value) =>
+      Array.isArray(value) ? value.length : Object.keys(value ?? {}).length,
+    )
+  ) {
+    return {} as Record<string, { id?: string }>;
+  }
+  const result = await stalwartMethod(url, authorization, `x:${object}/set`, changes);
+  for (const key of ["notCreated", "notUpdated", "notDestroyed"] as const) {
+    const failures = result[key];
+    if (failures && typeof failures === "object" && Object.keys(failures).length) {
+      throw new Error(`Stalwart ${object} reconciliation returned partial ${key} results.`);
+    }
+  }
+  return (result.created ?? {}) as Record<string, { id?: string }>;
+}
+
+function splitAddress(address: string) {
+  const at = address.lastIndexOf("@");
+  if (at <= 0 || at === address.length - 1)
+    throw new Error(`Invalid mail address in desired state: ${address}`);
+  return { local: address.slice(0, at), domain: address.slice(at + 1) };
+}
+
 export async function applyStalwart(planInput: Parameters<typeof buildStalwartPlan>[0]) {
   const built = buildStalwartPlan(planInput);
   const dir = process.env.ARK_MAIL_STATE_DIR ?? join(process.cwd(), "tmp", "mail-state");
   await mkdir(dir, { recursive: true });
   const file = join(dir, "stalwart-plan.ndjson");
-  await Bun.write(file, built.plan.map((item) => JSON.stringify(item)).join("\n"));
+  await writeFile(file, built.plan.map((item) => JSON.stringify(item)).join("\n"), { mode: 0o600 });
   const url = process.env.STALWART_URL;
   if (url && process.env.STALWART_ADMIN_ADDRESS && process.env.STALWART_ADMIN_PASSWORD) {
-    const auth = Buffer.from(
+    const authorization = `Basic ${Buffer.from(
       `${process.env.STALWART_ADMIN_ADDRESS}:${process.env.STALWART_ADMIN_PASSWORD}`,
-    ).toString("base64");
-    const response = await fetch(`${url.replace(/\/$/, "")}/jmap`, {
-      method: "POST",
-      headers: { authorization: `Basic ${auth}`, "content-type": "application/json" },
-      body: JSON.stringify(jmapCall("x:Domain/query", { limit: 1 })),
-    });
-    if (process.env.STALWART_CLI) {
-      await exec(process.env.STALWART_CLI, ["apply", "--file", file, "--json"], { timeout: 120_000 });
+    ).toString("base64")}`;
+    const domainRows = await stalwartRecords(url, authorization, "Domain");
+    const domainIds = new Map(domainRows.map((item) => [item.name, item.id]));
+    const createDomains: Record<string, Record<string, unknown>> = {};
+    for (const domain of planInput.domains) {
+      const nativeId = domainIds.get(domain.name);
+      if (!nativeId) createDomains[stalwartRef("domain", domain.name)] = { name: domain.name };
     }
-    return { applied: response.ok, outbound: built.outbound, file, reachable: response.ok };
+    const createdDomains = await stalwartSet(url, authorization, "Domain", {
+      create: createDomains,
+    });
+    for (const domain of planInput.domains) {
+      const reference = stalwartRef("domain", domain.name);
+      const nativeId = domainIds.get(domain.name) ?? createdDomains[reference]?.id;
+      if (!nativeId) throw new Error(`Stalwart did not return a native ID for ${domain.name}.`);
+      domainIds.set(domain.name, nativeId);
+    }
+
+    const accountRows = await stalwartRecords(url, authorization, "Account");
+    const accountIds = new Map(
+      accountRows.map((item) => [`${item.name}\u0000${item.domainId ?? ""}`, item.id]),
+    );
+    const createAccounts: Record<string, Record<string, unknown>> = {};
+    const updateAccounts: Record<string, Record<string, unknown>> = {};
+    const destroyAccounts: string[] = [];
+    for (const mailbox of planInput.mailboxes) {
+      const address = splitAddress(mailbox.address);
+      const domainId = domainIds.get(address.domain);
+      if (!domainId) throw new Error(`No native Stalwart domain exists for ${mailbox.address}.`);
+      const nativeId = mailbox.nativeId ?? accountIds.get(`${address.local}\u0000${domainId}`);
+      if (mailbox.lifecycle === "purged") {
+        if (nativeId) destroyAccounts.push(nativeId);
+        continue;
+      }
+      const active =
+        mailbox.lifecycle === "active" &&
+        planInput.domains.some((domain) => domain.name === address.domain && domain.enabled);
+      const value: Record<string, unknown> = {
+        description: mailbox.displayName,
+        credentials:
+          active && mailbox.password
+            ? { "0": { "@type": "Password", secret: mailbox.password } }
+            : active
+              ? undefined
+              : {},
+      };
+      if (nativeId) updateAccounts[nativeId] = value;
+      else {
+        if (!mailbox.password) throw new Error(`A password is required to create ${mailbox.address}.`);
+        createAccounts[stalwartRef("account", mailbox.address)] = {
+          "@type": "User",
+          name: address.local,
+          domainId,
+          aliases: {},
+          credentials: { "0": { "@type": "Password", secret: mailbox.password } },
+          memberGroupIds: {},
+          permissions: { "@type": "Inherit" },
+          quotas: {},
+          roles: { "@type": "User" },
+          description: mailbox.displayName,
+        };
+      }
+    }
+    const createdAccounts = await stalwartSet(url, authorization, "Account", {
+      create: createAccounts,
+      update: updateAccounts,
+      destroy: destroyAccounts,
+    });
+
+    const listRows = await stalwartRecords(url, authorization, "MailingList");
+    const listIds = new Map(listRows.map((item) => [`${item.name}\u0000${item.domainId ?? ""}`, item.id]));
+    const createLists: Record<string, Record<string, unknown>> = {};
+    const updateLists: Record<string, Record<string, unknown>> = {};
+    for (const alias of planInput.aliases) {
+      const address = splitAddress(alias.address);
+      const domainId = domainIds.get(address.domain);
+      if (!domainId) throw new Error(`No native Stalwart domain exists for ${alias.address}.`);
+      const value = {
+        recipients: Object.fromEntries(alias.targets.map((target) => [target, true])),
+        aliases: {},
+        description: `Managed alias ${alias.address}`,
+      };
+      const nativeId = listIds.get(`${address.local}\u0000${domainId}`);
+      if (nativeId) updateLists[nativeId] = value;
+      else {
+        createLists[stalwartRef("alias", alias.address)] = {
+          name: address.local,
+          domainId,
+          ...value,
+        };
+      }
+    }
+    const createdLists = await stalwartSet(url, authorization, "MailingList", {
+      create: createLists,
+      update: updateLists,
+      destroy: planInput.removedAliases?.map((alias) => alias.nativeId) ?? [],
+    });
+
+    const mailboxIds: Record<string, string> = {};
+    for (const mailbox of planInput.mailboxes) {
+      if (mailbox.lifecycle === "purged") continue;
+      const address = splitAddress(mailbox.address);
+      const domainId = domainIds.get(address.domain)!;
+      const nativeId =
+        mailbox.nativeId ??
+        accountIds.get(`${address.local}\u0000${domainId}`) ??
+        createdAccounts[stalwartRef("account", mailbox.address)]?.id;
+      if (!nativeId) throw new Error(`Stalwart did not return a native ID for ${mailbox.address}.`);
+      mailboxIds[mailbox.address] = nativeId;
+    }
+    const aliasIds: Record<string, string> = {};
+    for (const alias of planInput.aliases) {
+      const address = splitAddress(alias.address);
+      const domainId = domainIds.get(address.domain)!;
+      const nativeId =
+        listIds.get(`${address.local}\u0000${domainId}`) ??
+        createdLists[stalwartRef("alias", alias.address)]?.id;
+      if (!nativeId) throw new Error(`Stalwart did not return a native ID for ${alias.address}.`);
+      aliasIds[alias.address] = nativeId;
+    }
+    return {
+      applied: true,
+      outbound: built.outbound,
+      file,
+      reachable: true,
+      nativeIds: { domains: Object.fromEntries(domainIds), mailboxes: mailboxIds, aliases: aliasIds },
+    };
   }
-  return { applied: false, outbound: built.outbound, file, reachable: false };
+  throw new Error("Stalwart management credentials and URL are required for reconciliation.");
+}
+
+export async function applyStalwartDevice(input: {
+  address: string;
+  password: string;
+  action: "create" | "revoke";
+  label?: string;
+  nativeId?: string;
+}) {
+  const url = process.env.STALWART_URL;
+  if (!url) throw new Error("STALWART_URL is required for native device credential changes.");
+  if (input.action === "revoke" && !input.nativeId) {
+    throw new Error("A native Stalwart app-password ID is required for revocation.");
+  }
+  const jmapArguments =
+    input.action === "create"
+      ? {
+          create: {
+            device: {
+              description: input.label,
+              allowedIps: {},
+              permissions: { "@type": "Inherit" },
+            },
+          },
+        }
+      : { destroy: [input.nativeId] };
+  const response = await fetch(`${url.replace(/\/$/, "")}/jmap`, {
+    method: "POST",
+    headers: {
+      authorization: `Basic ${Buffer.from(`${input.address}:${input.password}`).toString("base64")}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(jmapCall("x:AppPassword/set", jmapArguments)),
+  });
+  const body = (await response.json().catch(() => null)) as {
+    methodResponses?: Array<
+      [
+        string,
+        {
+          created?: Record<string, { id?: string; secret?: string }>;
+          notCreated?: Record<string, unknown>;
+          destroyed?: string[];
+          notDestroyed?: Record<string, unknown>;
+        },
+        string,
+      ]
+    >;
+  } | null;
+  const result = body?.methodResponses?.[0];
+  if (!response.ok || !result || result[0] === "error") {
+    throw new Error(`Stalwart app-password ${input.action} failed.`);
+  }
+  const value = result[1];
+  if (input.action === "create") {
+    const created = value.created?.device;
+    if (!created?.id || !created.secret || Object.keys(value.notCreated ?? {}).length) {
+      throw new Error("Stalwart did not return a native ID and one-time app-password secret.");
+    }
+    return { nativeId: created.id, secret: created.secret };
+  }
+  if (!value.destroyed?.includes(input.nativeId!) || Object.keys(value.notDestroyed ?? {}).length) {
+    throw new Error("Stalwart did not confirm app-password revocation.");
+  }
+  return { nativeId: input.nativeId!, revoked: true as const };
 }
 
 export function pgbouncerDir() {
@@ -163,11 +448,13 @@ export async function applyDatabaseAllowlist(dir: string, cidrs: string[], port 
 export async function writePgbouncer(input: {
   mappings: Array<{ database: string; host: string }>;
   users: Array<{ name: string; password: string }>;
+  certificateDir?: string;
 }) {
   const dir = pgbouncerDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await writeFile(join(dir, "pgbouncer.ini"), pgbouncerConfig(input), { mode: 0o600 });
   await writeFile(join(dir, "userlist.txt"), pgbouncerUserlist(input.users), { mode: 0o600 });
+  let reloaded = false;
   if (process.env.ARK_PGBOUNCER_RELOAD === "1") {
     await exec(
       "docker",
@@ -176,8 +463,11 @@ export async function writePgbouncer(input: {
         timeout: 10_000,
       },
     );
+    reloaded = true;
+  } else if (process.env.NODE_ENV === "production") {
+    throw new Error("PgBouncer configuration was written but no restricted reload executor is configured.");
   }
-  return { dir };
+  return { dir, reloaded };
 }
 
 export async function writeEdge(input: {
@@ -196,9 +486,36 @@ export async function writeEdge(input: {
   });
   const serve = renderTailscaleServe();
   if (!funnelDisabled(serve)) throw new Error("Tailscale Funnel must stay disabled on the admin node.");
-  await Bun.write(join(dir, "Caddyfile"), caddy);
-  await Bun.write(join(dir, "serve.json"), JSON.stringify(serve, null, 2));
-  return { dir, funnel: false };
+  const caddyPath = join(dir, "Caddyfile");
+  const nextCaddy = `${caddyPath}.next`;
+  const servePath = join(dir, "serve.json");
+  const nextServe = `${servePath}.next`;
+  await writeFile(nextCaddy, caddy, { mode: 0o600 });
+  await writeFile(nextServe, JSON.stringify(serve, null, 2), { mode: 0o600 });
+  const reloadUrl = process.env.ARK_EDGE_RELOAD_URL;
+  let applied = false;
+  if (reloadUrl) {
+    const adapted = await fetch(`${reloadUrl.replace(/\/$/, "")}/adapt`, {
+      method: "POST",
+      headers: { "content-type": "text/caddyfile" },
+      body: caddy,
+    });
+    if (!adapted.ok) throw new Error(`Caddy rejected candidate configuration: ${adapted.status}`);
+    const config = await adapted.text();
+    const loaded = await fetch(`${reloadUrl.replace(/\/$/, "")}/load`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: config,
+    });
+    if (!loaded.ok) throw new Error(`Caddy reload failed: ${loaded.status}`);
+    applied = true;
+  } else if (process.env.NODE_ENV === "production") {
+    throw new Error("ARK_EDGE_RELOAD_URL is required to apply gateway changes in production.");
+  }
+  await rename(nextCaddy, caddyPath);
+  await rename(nextServe, servePath);
+  await chmod(caddyPath, 0o600);
+  return { dir, funnel: false, applied };
 }
 
 export async function resolveImageDigest(image: string) {
@@ -207,8 +524,50 @@ export async function resolveImageDigest(image: string) {
   if (process.env.GHCR_TOKEN && host === "ghcr.io") {
     headers.authorization = `Bearer ${process.env.GHCR_TOKEN}`;
   }
-  const response = await fetch(url, { method: "HEAD", headers });
-  return { image, digest: digestFromHeaders(response.headers), status: response.status };
+  let response = await fetch(url, { headers });
+  if (response.status === 401) {
+    const challenge = parseBearerChallenge(response.headers.get("www-authenticate"));
+    if (!challenge) throw new Error(`Registry ${host} returned an unsupported authentication challenge.`);
+    const tokenUrl = new URL(challenge.realm);
+    if (challenge.service) tokenUrl.searchParams.set("service", challenge.service);
+    if (challenge.scope) tokenUrl.searchParams.set("scope", challenge.scope);
+    const tokenResponse = await fetch(tokenUrl, {
+      headers: process.env.ARK_REGISTRY_USERNAME
+        ? {
+            authorization: `Basic ${Buffer.from(`${process.env.ARK_REGISTRY_USERNAME}:${process.env.ARK_REGISTRY_PASSWORD ?? ""}`).toString("base64")}`,
+          }
+        : {},
+    });
+    if (!tokenResponse.ok) throw new Error(`Registry token request failed: ${tokenResponse.status}`);
+    const tokenBody = (await tokenResponse.json()) as { token?: string; access_token?: string };
+    const token = tokenBody.token ?? tokenBody.access_token;
+    if (!token) throw new Error("Registry token response did not contain a bearer token.");
+    headers.authorization = `Bearer ${token}`;
+    response = await fetch(url, { headers });
+  }
+  if (!response.ok) throw new Error(`Registry manifest request failed: ${response.status}`);
+  let digest = digestFromHeaders(response.headers);
+  const contentType = response.headers.get("content-type") ?? "";
+  const body = (await response.json().catch(() => null)) as {
+    manifests?: Array<{ digest: string; platform?: { architecture?: string; os?: string } }>;
+  } | null;
+  if (contentType.includes("manifest.list") || contentType.includes("image.index")) {
+    const architecture = process.arch === "x64" ? "amd64" : process.arch;
+    const selected = body?.manifests?.find(
+      (item) => item.platform?.os === "linux" && item.platform.architecture === architecture,
+    );
+    if (!selected) throw new Error(`Registry index has no linux/${architecture} manifest.`);
+    const selectedResponse = await fetch(
+      url.replace(/\/manifests\/[^/]+$/, `/manifests/${selected.digest}`),
+      {
+        headers,
+      },
+    );
+    if (!selectedResponse.ok) throw new Error(`Platform manifest request failed: ${selectedResponse.status}`);
+    digest = digestFromHeaders(selectedResponse.headers) ?? selected.digest;
+  }
+  if (!digest?.startsWith("sha256:")) throw new Error("Registry did not return an immutable content digest.");
+  return { image, digest, status: response.status };
 }
 
 export function scanImport(local: ExternalInventory, incoming: ExternalInventory) {

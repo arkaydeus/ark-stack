@@ -31,8 +31,23 @@ export function registryManifestUrl(image: string) {
   return {
     url: `${base}/v2/${repo}/manifests/${tag}`,
     host,
-    accept: "application/vnd.docker.distribution.manifest.v2+json",
+    accept: [
+      "application/vnd.oci.image.index.v1+json",
+      "application/vnd.oci.image.manifest.v1+json",
+      "application/vnd.docker.distribution.manifest.list.v2+json",
+      "application/vnd.docker.distribution.manifest.v2+json",
+    ].join(", "),
   };
+}
+
+export function parseBearerChallenge(value: string | null) {
+  if (!value?.toLowerCase().startsWith("bearer ")) return null;
+  const parameters: Record<string, string> = {};
+  for (const match of value.slice(7).matchAll(/([a-z]+)="([^"]*)"/gi)) {
+    parameters[match[1].toLowerCase()] = match[2];
+  }
+  if (!parameters.realm) return null;
+  return { realm: parameters.realm, service: parameters.service, scope: parameters.scope };
 }
 
 export function digestFromHeaders(headers: Headers) {

@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { buildMailDocuments, mailReadiness, type MailDesiredState } from "@ark-stack/shared";
@@ -7,10 +7,10 @@ import { applyStalwart } from "./providers.ts";
 
 export async function writeMailDesiredState(state: MailDesiredState) {
   const dir = process.env.ARK_MAIL_STATE_DIR ?? join(process.cwd(), "tmp", "mail-state");
-  await mkdir(dir, { recursive: true });
+  await mkdir(dir, { recursive: true, mode: 0o700 });
   const documents = buildMailDocuments(state);
   for (const [name, body] of Object.entries(documents)) {
-    await Bun.write(join(dir, name), JSON.stringify(body, null, 2));
+    await writeFile(join(dir, name), JSON.stringify(body, null, 2), { mode: 0o600 });
   }
   return { dir, documents };
 }
@@ -37,6 +37,7 @@ export async function reconcileMailEngine(input: {
   domains: MailDesiredState["domains"];
   mailboxes: Array<MailDesiredState["mailboxes"][number] & { password?: string; nativeId?: string }>;
   aliases: MailDesiredState["aliases"];
+  removedAliases?: Array<{ address: string; nativeId: string }>;
   sesReady: boolean;
   smtpUsername?: string;
 }) {
@@ -60,6 +61,7 @@ export async function reconcileMailEngine(input: {
       nativeId: item.nativeId,
     })),
     aliases: input.aliases,
+    removedAliases: input.removedAliases,
     smtpUsername: input.smtpUsername,
     outboundPaused: !input.sesReady,
   });

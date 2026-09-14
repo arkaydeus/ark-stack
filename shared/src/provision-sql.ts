@@ -25,9 +25,10 @@ export function buildProvisionPlan(input: {
   }));
   const statements: string[] = [
     `CREATE DATABASE ${quoteIdent(database)}`,
-    ...roles.map(
-      (role) =>
-        `CREATE ROLE ${quoteIdent(role.name)} LOGIN PASSWORD ${literal(role.password)} NOSUPERUSER NOCREATEDB NOCREATEROLE`,
+    ...roles.map((role) =>
+      role.kind === "owner"
+        ? `CREATE ROLE ${quoteIdent(role.name)} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`
+        : `CREATE ROLE ${quoteIdent(role.name)} LOGIN PASSWORD ${literal(role.password)} NOSUPERUSER NOCREATEDB NOCREATEROLE`,
     ),
     `REVOKE ALL ON DATABASE ${quoteIdent(database)} FROM PUBLIC`,
     `GRANT CONNECT, TEMPORARY ON DATABASE ${quoteIdent(database)} TO ${roles.map((role) => quoteIdent(role.name)).join(", ")}`,
@@ -49,10 +50,24 @@ export function buildProvisionPlan(input: {
     `REVOKE ALL ON SCHEMA public FROM PUBLIC`,
     `GRANT USAGE, CREATE ON SCHEMA public TO ${owner}, ${migration}`,
     `GRANT USAGE ON SCHEMA public TO ${runtime}, ${readonly}`,
+    `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${runtime}`,
+    `GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${readonly}`,
+    `GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO ${runtime}`,
+    `GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO ${readonly}`,
+    `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC`,
+    `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO ${runtime}, ${readonly}`,
     `ALTER DEFAULT PRIVILEGES FOR ROLE ${migration} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${runtime}`,
     `ALTER DEFAULT PRIVILEGES FOR ROLE ${migration} IN SCHEMA public GRANT SELECT ON TABLES TO ${readonly}`,
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${migration} IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${runtime}`,
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${migration} IN SCHEMA public GRANT SELECT ON SEQUENCES TO ${readonly}`,
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${migration} IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`,
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${migration} IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO ${runtime}, ${readonly}`,
     `ALTER DEFAULT PRIVILEGES FOR ROLE ${owner} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${runtime}`,
     `ALTER DEFAULT PRIVILEGES FOR ROLE ${owner} IN SCHEMA public GRANT SELECT ON TABLES TO ${readonly}`,
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${owner} IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${runtime}`,
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${owner} IN SCHEMA public GRANT SELECT ON SEQUENCES TO ${readonly}`,
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${owner} IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`,
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${owner} IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO ${runtime}, ${readonly}`,
   ];
   if (input.withPgvector) extensionStatements.unshift(`CREATE EXTENSION IF NOT EXISTS vector`);
   return { database, testDatabase, roles, statements, extensionStatements };

@@ -8,12 +8,12 @@ import (
 )
 
 type journalEntry struct {
-	ID        string    `json:"id"`
-	Action    string    `json:"action"`
-	Target    string    `json:"target"`
-	Status    string    `json:"status"`
-	At        time.Time `json:"at"`
-	Note      string    `json:"note"`
+	ID     string    `json:"id"`
+	Action string    `json:"action"`
+	Target string    `json:"target"`
+	Status string    `json:"status"`
+	At     time.Time `json:"at"`
+	Note   string    `json:"note"`
 }
 
 type journal struct {

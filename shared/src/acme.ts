@@ -28,6 +28,7 @@ export function legoArgs(input: {
   webroot: string;
   path: string;
   staging: boolean;
+  action?: "run" | "renew";
 }) {
   const args = [
     "--accept-tos",
@@ -42,6 +43,6 @@ export function legoArgs(input: {
     input.path,
   ];
   if (input.staging) args.push("--server", "https://acme-staging-v02.api.letsencrypt.org/directory");
-  args.push("run");
+  args.push(input.action ?? "run");
   return args;
 }

@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button";
 import { authClient } from "@/lib/auth-client";
 import type { PlatformState } from "@/lib/types";
 import { api, cn } from "@/lib/utils";
-import { AuthScreen } from "@/pages/Auth";
+import { AuthScreen, MfaSetup } from "@/pages/Auth";
 import {
   ActivityView,
   BackupsView,
@@ -55,6 +55,7 @@ export function App() {
   );
   const [state, setState] = useState<PlatformState | null>(null);
   const [error, setError] = useState("");
+  const [mfaEnrollmentGate, setMfaEnrollmentGate] = useState(false);
 
   useEffect(() => {
     if (!isPending) setSessionResolved(true);
@@ -81,6 +82,10 @@ export function App() {
   }, [session, load]);
 
   useEffect(() => {
+    if (state && !state.setup.mfaAssured) setMfaEnrollmentGate(true);
+  }, [state]);
+
+  useEffect(() => {
     if (!state?.operations.some((item) => item.status === "queued" || item.status === "running")) return;
     const timer = window.setInterval(() => void load(), 2000);
     return () => window.clearInterval(timer);
@@ -94,6 +99,17 @@ export function App() {
     );
   }
   if (!session) return <AuthScreen />;
+  if (state && (!state.setup.mfaAssured || mfaEnrollmentGate)) {
+    return (
+      <MfaSetup
+        enrolled={state.setup.mfaEnrolled}
+        onComplete={async () => {
+          setMfaEnrollmentGate(false);
+          await load();
+        }}
+      />
+    );
+  }
   if (state && !state.setup.wizardCompleted) return <Wizard onDone={load} />;
 
   return (

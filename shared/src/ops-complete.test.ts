@@ -3,7 +3,15 @@ import { describe, expect, test } from "bun:test";
 import { adoptionPreview, classifyDiscovery } from "./adopt.ts";
 import { assertCidrs, clientAllowed } from "./cidr.ts";
 import { canMutateQueue, parseStalwartQueue } from "./mail-queue.ts";
-import { bundleDigest, validateMaintenanceBundle } from "./maintenance.ts";
+import { generateKeyPairSync, sign } from "node:crypto";
+
+import {
+  bundleDigest,
+  composeDigest,
+  maintenanceSignaturePayload,
+  validateMaintenanceBundle,
+  verifyMaintenanceRelease,
+} from "./maintenance.ts";
 import { rotateRoleSql } from "./rotate.ts";
 import { groupSchemaRows, schemaBrowserSql } from "./schema-browser.ts";
 
@@ -72,9 +80,55 @@ describe("remaining control-plane policies", () => {
     expect(() =>
       validateMaintenanceBundle({
         version: "1.0.0",
-        images: ["postgres:17"],
-        digest: bundleDigest(["postgres:17"]),
+        images: [`postgres@sha256:${"b".repeat(64)}`],
+        digest: bundleDigest([`postgres@sha256:${"b".repeat(64)}`]),
       }),
     ).toThrow(/stateful/);
+  });
+
+  test("binds maintenance approval to a publisher and exact compose manifest", () => {
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    const images = [
+      "ghcr.io/ark-stack/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ];
+    const compose = `services:\n  api:\n    image: ${images[0]}\n`;
+    const bundle = {
+      version: "1.0.0",
+      images,
+      digest: bundleDigest(images),
+      composeDigest: composeDigest(compose),
+      signature: "",
+    };
+    bundle.signature = sign(null, Buffer.from(maintenanceSignaturePayload(bundle)), privateKey).toString(
+      "base64",
+    );
+    expect(
+      verifyMaintenanceRelease(bundle, compose, publicKey.export({ type: "spki", format: "pem" })).images,
+    ).toEqual(images);
+    expect(() =>
+      verifyMaintenanceRelease(
+        bundle,
+        `${compose}# changed`,
+        publicKey.export({ type: "spki", format: "pem" }),
+      ),
+    ).toThrow(/exact Compose/);
+    const mismatchedCompose = `services:\n  api:\n    image: ghcr.io/ark-stack/api@sha256:${"b".repeat(64)}\n`;
+    const mismatchedBundle = {
+      ...bundle,
+      composeDigest: composeDigest(mismatchedCompose),
+      signature: "",
+    };
+    mismatchedBundle.signature = sign(
+      null,
+      Buffer.from(maintenanceSignaturePayload(mismatchedBundle)),
+      privateKey,
+    ).toString("base64");
+    expect(() =>
+      verifyMaintenanceRelease(
+        mismatchedBundle,
+        mismatchedCompose,
+        publicKey.export({ type: "spki", format: "pem" }),
+      ),
+    ).toThrow(/image list/);
   });
 });

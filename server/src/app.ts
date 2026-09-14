@@ -4,13 +4,12 @@ import {
   assertAliasGraph,
   assertExternalForwarding,
   canTransition,
+  canonicalizeComposeSource,
   canViewDomain,
   canViewProject,
   classifySql,
   createId,
   createToken,
-  encryptSecret,
-  generatePassword,
   localPart,
   normalizeHostname,
   redactValue,
@@ -35,6 +34,7 @@ import {
   projectInput,
   serviceInput,
   sqlInput,
+  sqlCancelInput,
   settingsInput,
   buildDomainPlan,
   type Access,
@@ -42,7 +42,7 @@ import {
   type Role,
 } from "@ark-stack/shared";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
@@ -60,19 +60,19 @@ import {
   requireProject,
   type SessionValue,
 } from "./access.ts";
-import { claimQueued, enqueue } from "./coordinator.ts";
+import {
+  assertExecutionAuthorized,
+  claimQueued,
+  enqueue,
+  finalizeAgentCompletion,
+  heartbeatClaim,
+} from "./coordinator.ts";
 import { db, sql } from "./db.ts";
 import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
-import { inspectDatabaseSchema, executeWorkspaceQuery } from "./modules/database.ts";
-import {
-  discoverContainers,
-  dockerAvailable,
-  serviceLogs,
-  serviceStats,
-  writeApprovedCompose,
-} from "./modules/docker.ts";
+import { cancelWorkspaceQuery } from "./modules/database.ts";
+import { writeApprovedCompose } from "./modules/docker.ts";
 import { listMailQueue } from "./modules/queue.ts";
 import {
   alerts,
@@ -97,8 +97,10 @@ import {
   projects,
   secrets,
   services,
+  stepUpGrants,
   updateCandidates,
   user,
+  workerHeartbeats,
 } from "./schema.ts";
 
 type AppEnv = {
@@ -167,25 +169,145 @@ app.post("/api/auth/sign-up/email", async (c) => {
   }
 });
 
-app.all("/api/auth/*", (c) => auth.handler(c.req.raw));
+app.all("/api/auth/*", async (c) => {
+  const enrollmentVerification = c.req.path.endsWith("/two-factor/verify-totp");
+  const sessionBefore = enrollmentVerification
+    ? await auth.api.getSession({ headers: c.req.raw.headers })
+    : null;
+  const response = await auth.handler(c.req.raw);
+  if (response.ok && enrollmentVerification && sessionBefore?.user.id) {
+    const [verifiedUser] = await db.select().from(user).where(eq(user.id, sessionBefore.user.id));
+    if (verifiedUser?.twoFactorEnabled && !verifiedUser.mfaEnrolledAt) {
+      await sql`
+        UPDATE "user"
+        SET mfa_enrolled_at = (
+          SELECT max(created_at) FROM session WHERE user_id = ${sessionBefore.user.id}
+        ), updated_at = now()
+        WHERE id = ${sessionBefore.user.id}
+          AND two_factor_enabled = true
+          AND mfa_enrolled_at IS NULL
+      `;
+    }
+  }
+  return response;
+});
+
+const workerPrefixes: Record<string, string[]> = {
+  database: ["database.", "pgbouncer."],
+  domains: ["domain.", "dns.", "certificate.", "edge.", "admin."],
+  mail: ["mail.", "mailbox.", "ses."],
+  backup: ["backup.", "update.", "import."],
+  agent: ["service.", "update.apply"],
+  module: [
+    "database.",
+    "pgbouncer.",
+    "mail.",
+    "mailbox.",
+    "ses.",
+    "domain.",
+    "dns.",
+    "certificate.",
+    "edge.",
+    "admin.",
+    "backup.",
+    "update.",
+    "import.",
+  ],
+};
+
+function workerCanExecute(identity: string, kind: string) {
+  return (workerPrefixes[identity] ?? []).some((prefix) =>
+    prefix.endsWith(".") ? kind.startsWith(prefix) : kind === prefix,
+  );
+}
 
 app.use("/api/internal/*", async (c, next) => {
   const supplied = c.req.header("authorization") ?? "";
-  if (secureEqual(supplied, `Bearer ${env.internalToken}`)) c.set("worker", "module");
-  else if (secureEqual(supplied, `Bearer ${env.agentToken}`)) c.set("worker", "agent");
-  else throw new HTTPException(401, { message: "Invalid worker credential." });
+  let identity = "";
+  if (secureEqual(supplied, `Bearer ${env.agentToken}`)) identity = "agent";
+  else {
+    for (const name of ["database", "domains", "mail", "backup"] as const) {
+      if (
+        process.env[`ARK_${name === "domains" ? "DOMAIN" : name.toUpperCase()}_WORKER_TOKEN`] &&
+        secureEqual(supplied, `Bearer ${env.workerTokens[name]}`)
+      ) {
+        identity = name;
+        break;
+      }
+    }
+  }
+  if (!identity && secureEqual(supplied, `Bearer ${env.internalToken}`)) identity = "module";
+  if (!identity) throw new HTTPException(401, { message: "Invalid worker credential." });
+  c.set("worker", identity);
   await next();
+});
+
+app.post("/api/internal/heartbeat", async (c) => {
+  const body = z.object({ version: z.string().min(1).max(100) }).parse(await c.req.json());
+  await db
+    .insert(workerHeartbeats)
+    .values({ identity: c.get("worker"), version: body.version, lastSeenAt: new Date() })
+    .onConflictDoUpdate({
+      target: workerHeartbeats.identity,
+      set: { version: body.version, lastSeenAt: new Date() },
+    });
+  return c.json({ ok: true });
 });
 
 app.get("/api/internal/jobs", async (c) => {
   if (c.get("worker") === "agent") {
     const claimed = await claimQueued({ limit: 20, agentOwned: true });
+    const authorized = [];
+    for (const row of claimed.rows) {
+      try {
+        await assertExecutionAuthorized(row);
+        authorized.push(row);
+      } catch (error) {
+        await db
+          .update(operations)
+          .set({
+            status: "failed",
+            claimToken: null,
+            error: String(redactValue(error instanceof Error ? error.message : "Authorization was revoked.")),
+            updatedAt: new Date(),
+          })
+          .where(and(eq(operations.id, row.id), eq(operations.claimToken, claimed.token)));
+      }
+    }
     return c.json({
-      jobs: claimed.rows.map((row) => ({ ...row, claimToken: claimed.token })),
+      jobs: authorized.map((row) => ({ ...row, claimToken: claimed.token })),
     });
   }
-  const rows = await db.select().from(operations).where(eq(operations.status, "queued")).limit(20);
-  return c.json({ jobs: rows });
+  const requested = (c.req.header("x-ark-worker-kinds") ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const allowed = new Set(workerPrefixes[c.get("worker")] ?? []);
+  if (!requested.length || requested.some((item) => !allowed.has(item))) {
+    throw new HTTPException(403, { message: "A valid worker job allowlist is required." });
+  }
+  const claimed = await claimQueued({ limit: 8, kindPrefixes: requested });
+  return c.json({ jobs: claimed.rows.map((row) => ({ ...row, claimToken: claimed.token })) });
+});
+
+app.post("/api/internal/jobs/:id/heartbeat", async (c) => {
+  const body = z.object({ claimToken: z.string().min(1) }).parse(await c.req.json());
+  const [operation] = await db
+    .select()
+    .from(operations)
+    .where(eq(operations.id, c.req.param("id")));
+  if (!operation || !workerCanExecute(c.get("worker"), operation.kind)) {
+    throw new HTTPException(403, { message: "This worker may not heartbeat that operation kind." });
+  }
+  if (c.get("worker") === "agent") {
+    await assertExecutionAuthorized(operation).catch(() => {
+      throw new HTTPException(403, { message: "The operation actor is no longer authorized." });
+    });
+  }
+  if (!(await heartbeatClaim(c.req.param("id"), body.claimToken))) {
+    throw new HTTPException(409, { message: "The operation lease is stale or no longer owned." });
+  }
+  return c.json({ ok: true });
 });
 
 app.post("/api/internal/jobs/:id/complete", async (c) => {
@@ -194,7 +316,7 @@ app.post("/api/internal/jobs/:id/complete", async (c) => {
       status: z.enum(["succeeded", "failed"]),
       error: z.string().optional(),
       evidence: z.record(z.string(), z.unknown()).optional(),
-      claimToken: z.string().optional(),
+      claimToken: z.string().min(1).optional(),
     })
     .parse(await c.req.json());
   const [operation] = await db
@@ -202,16 +324,19 @@ app.post("/api/internal/jobs/:id/complete", async (c) => {
     .from(operations)
     .where(eq(operations.id, c.req.param("id")));
   if (!operation) throw new HTTPException(404, { message: "Operation not found." });
-  if (c.get("worker") === "agent") {
-    if (!operation.kind.startsWith("service.") && operation.kind !== "update.apply") {
-      throw new HTTPException(403, { message: "Agent workers may only complete service operations." });
-    }
-    if (operation.status !== "queued" && operation.status !== "running") {
-      throw new HTTPException(409, { message: "Operation is not claimed for completion." });
-    }
-    if (operation.claimToken && body.claimToken && operation.claimToken !== body.claimToken) {
-      throw new HTTPException(403, { message: "Claim token does not match this job." });
-    }
+  if (!workerCanExecute(c.get("worker"), operation.kind)) {
+    throw new HTTPException(403, { message: "This worker may not complete that operation kind." });
+  }
+  if (operation.status !== "running") {
+    throw new HTTPException(409, { message: "Operation is not claimed for completion." });
+  }
+  if (!body.claimToken || !operation.claimToken || operation.claimToken !== body.claimToken) {
+    throw new HTTPException(403, { message: "Claim token does not match this job." });
+  }
+  if (c.get("worker") === "agent" && body.status === "succeeded") {
+    await assertExecutionAuthorized(operation).catch(() => {
+      throw new HTTPException(403, { message: "The operation actor is no longer authorized." });
+    });
   }
   if (!canTransition(operation.status as OperationState, body.status)) {
     throw new HTTPException(409, {
@@ -224,15 +349,62 @@ app.post("/api/internal/jobs/:id/complete", async (c) => {
       operationId: operation.id,
       name: "worker-complete",
       status: body.status,
-      evidence: body.evidence,
-      error: body.error,
+      evidence: redactValue(body.evidence) as Record<string, unknown>,
+      error: body.error ? String(redactValue(body.error)).slice(0, 1000) : undefined,
     });
   }
-  await db
+  if (c.get("worker") === "agent") {
+    await finalizeAgentCompletion(operation, body.status === "succeeded");
+  }
+  const updated = await db
     .update(operations)
-    .set({ status: body.status, error: body.error ?? null, updatedAt: new Date() })
-    .where(and(eq(operations.id, operation.id), eq(operations.status, operation.status)));
+    .set({
+      status: body.status,
+      error: body.error ? String(redactValue(body.error)).slice(0, 1000) : null,
+      claimToken: null,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(operations.id, operation.id),
+        eq(operations.status, "running"),
+        eq(operations.claimToken, body.claimToken!),
+      ),
+    )
+    .returning({ id: operations.id });
+  if (updated.length !== 1) {
+    throw new HTTPException(409, { message: "The operation lease changed before completion." });
+  }
   return c.json({ ok: true });
+});
+
+app.get("/api/metrics/prometheus", async (c) => {
+  if (!secureEqual(c.req.header("authorization") ?? "", `Bearer ${env.metricsToken}`)) {
+    throw new HTTPException(401, { message: "Invalid metrics credential." });
+  }
+  const [opRows, backupRows, certRows, heartbeatRows] = await Promise.all([
+    db.select().from(operations),
+    db.select().from(backups),
+    db.select().from(certificates),
+    db.select().from(workerHeartbeats),
+  ]);
+  const lines = [
+    "# TYPE ark_operations gauge",
+    `ark_operations{status="failed"} ${opRows.filter((item) => item.status === "failed").length}`,
+    `ark_operations{status="running"} ${opRows.filter((item) => item.status === "running").length}`,
+    `ark_operations{status="waiting_external"} ${opRows.filter((item) => item.status === "waiting_external").length}`,
+    `ark_operations{status="needs_recovery"} ${opRows.filter((item) => item.status === "needs_recovery").length}`,
+    "# TYPE ark_backups_unverified gauge",
+    `ark_backups_unverified ${backupRows.filter((item) => !item.restoreVerified).length}`,
+    "# TYPE ark_certificates_expiring gauge",
+    `ark_certificates_expiring ${certRows.filter((item) => item.expiresAt && item.expiresAt.getTime() < Date.now() + 14 * 86_400_000).length}`,
+    "# TYPE ark_worker_heartbeat_stale gauge",
+    ...["agent", "database", "domains", "mail", "backup"].map((identity) => {
+      const item = heartbeatRows.find((row) => row.identity === identity);
+      return `ark_worker_heartbeat_stale{identity="${identity}"} ${!item || Date.now() - item.lastSeenAt.getTime() > 90_000 ? 1 : 0}`;
+    }),
+  ];
+  return c.text(`${lines.join("\n")}\n`, 200, { "content-type": "text/plain; version=0.0.4" });
 });
 
 app.use("/api/*", async (c, next) => {
@@ -246,7 +418,19 @@ app.use("/api/*", async (c, next) => {
   }
   const sessionValue = await auth.api.getSession({ headers: c.req.raw.headers });
   if (!sessionValue) throw new HTTPException(401, { message: "Sign in to continue." });
-  c.set("session", sessionValue as SessionValue);
+  // Better Auth's two-factor plugin owns `twoFactorEnabled`, while Ark owns the
+  // enrollment boundary timestamp. Read both from the authoritative row rather
+  // than relying on the plugin's deliberately narrow session serializer.
+  const [currentUser] = await db.select().from(user).where(eq(user.id, sessionValue.user.id));
+  if (!currentUser) throw new HTTPException(401, { message: "The signed-in account no longer exists." });
+  c.set("session", {
+    ...sessionValue,
+    user: {
+      ...sessionValue.user,
+      twoFactorEnabled: currentUser.twoFactorEnabled,
+      mfaEnrolledAt: currentUser.mfaEnrolledAt,
+    },
+  } as SessionValue);
   const [access] = await db
     .select()
     .from(platformAccess)
@@ -257,6 +441,20 @@ app.use("/api/*", async (c, next) => {
     projectIds: access?.projectIds ?? [],
     domainIds: access?.domainIds ?? [],
   });
+  await next();
+});
+
+const browserOrigins = new Set([env.authUrl, ...env.trustedOrigins].map((item) => new URL(item).origin));
+app.use("/api/*", async (c, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(c.req.method)) return next();
+  const origin = c.req.header("origin");
+  if (!origin || !browserOrigins.has(origin)) {
+    throw new HTTPException(403, { message: "The request origin is not trusted." });
+  }
+  const mediaType = (c.req.header("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase();
+  if (mediaType !== "application/json") {
+    throw new HTTPException(415, { message: "Custom API mutations require application/json." });
+  }
   await next();
 });
 
@@ -279,6 +477,57 @@ async function audit(
     operationId,
     detail: redactValue(detail) as Record<string, unknown>,
   });
+}
+
+async function consumeOneTimeSecret(
+  secretId: string,
+  input: { actorId: string; role: string; resourceType: string; resourceId: string; kind: string },
+) {
+  return db.transaction(async (tx) => {
+    const [consumed] = await tx
+      .update(secrets)
+      .set({ revealedAt: new Date() })
+      .where(and(eq(secrets.id, secretId), isNull(secrets.revealedAt)))
+      .returning();
+    if (!consumed) return null;
+    await tx.insert(auditEvents).values({
+      id: createId("aud"),
+      actorId: input.actorId,
+      action: "secret.reveal",
+      resourceType: input.resourceType,
+      resourceId: input.resourceId,
+      role: input.role,
+      detail: { kind: input.kind },
+    });
+    return consumed;
+  });
+}
+
+async function requireTargetScope(access: Access, targetId: string, mode: "view" | "manage" = "manage") {
+  const [database] = await db.select().from(managedDatabases).where(eq(managedDatabases.id, targetId));
+  if (database) return requireDatabaseAccess(access, targetId, mode);
+  const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, targetId));
+  if (mailbox) return requireDomain(access, mailbox.domainId, mode);
+  const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, targetId));
+  if (domain) return requireDomain(access, domain.id, mode);
+  const [service] = await db.select().from(services).where(eq(services.id, targetId));
+  if (service) return requireProject(access, service.projectId);
+  const [project] = await db.select().from(projects).where(eq(projects.id, targetId));
+  if (project) return requireProject(access, project.id);
+  if (targetId === "platform" && access.role === "owner") return;
+  throw new HTTPException(403, { message: "The target is not granted to your account." });
+}
+
+async function requireSecretScope(access: Access, secret: typeof secrets.$inferSelect) {
+  if (secret.sensitivity === "root" || secret.sensitivity === "provider") {
+    throw new HTTPException(403, {
+      message: "Root and provider credentials cannot be revealed through the generic endpoint.",
+    });
+  }
+  if (!secret.resourceId || !secret.resourceType) {
+    throw new HTTPException(403, { message: "This legacy secret has no verified resource owner." });
+  }
+  await requireTargetScope(access, secret.resourceId, "manage");
 }
 
 app.get("/api/state", async (c) => {
@@ -357,7 +606,16 @@ app.get("/api/state", async (c) => {
   const deviceRows = await db.select().from(mailboxDevices);
   return c.json({
     user: { ...session.user, role: access.role },
-    setup: { completed: Boolean(setup?.completed), wizardCompleted: Boolean(setup?.wizardCompleted) },
+    setup: {
+      completed: Boolean(setup?.completed),
+      wizardCompleted: Boolean(setup?.wizardCompleted),
+      mfaEnrolled: Boolean(session.user.twoFactorEnabled && session.user.mfaEnrolledAt),
+      mfaAssured: Boolean(
+        session.user.twoFactorEnabled &&
+        session.user.mfaEnrolledAt &&
+        new Date(session.session.createdAt).getTime() >= new Date(session.user.mfaEnrolledAt).getTime(),
+      ),
+    },
     settings,
     domains: visibleDomains.map((domain) => ({
       ...redactDomain(domain, access),
@@ -396,23 +654,59 @@ app.get("/api/state", async (c) => {
       })),
     projects: visibleProjects,
     services: visibleServices.map((item) => ({
-      ...item,
-      compose: undefined,
-      composePreview: item.compose.slice(0, 400),
+      id: item.id,
+      projectId: item.projectId,
+      name: item.name,
+      imageDigest: item.imageDigest,
+      desiredRevision: item.desiredRevision,
+      observedRevision: item.observedRevision,
+      status: item.status,
+      updatePolicy: item.updatePolicy,
+      stateful: item.stateful,
+      observedAt: item.observedAt,
+      createdAt: item.createdAt,
     })),
-    operations: opRows.filter(
-      (item) => access.role === "owner" || item.targetIds.some((id) => visibleIds.has(id)),
-    ),
-    steps: stepRows.filter((item) =>
-      opRows.some(
-        (op) =>
-          op.id === item.operationId &&
-          (access.role === "owner" || op.targetIds.some((id) => visibleIds.has(id))),
-      ),
-    ),
+    operations: opRows
+      .filter((item) => access.role === "owner" || item.targetIds.some((id) => visibleIds.has(id)))
+      .map((item) => ({
+        id: item.id,
+        kind: item.kind,
+        status: item.status,
+        targetIds: item.targetIds,
+        error: item.error ? String(redactValue(item.error)).slice(0, 500) : null,
+        createdAt: item.createdAt,
+        updatedAt: item.updatedAt,
+      })),
+    steps: stepRows
+      .filter((item) =>
+        opRows.some(
+          (op) =>
+            op.id === item.operationId &&
+            (access.role === "owner" || op.targetIds.some((id) => visibleIds.has(id))),
+        ),
+      )
+      .map((item) => ({
+        id: item.id,
+        operationId: item.operationId,
+        name: item.name,
+        status: item.status,
+        createdAt: item.createdAt,
+      })),
     backups: backupRows.filter((item) => access.role === "owner" || visibleIds.has(item.targetId)),
     alerts: access.role === "owner" || access.role === "operator" ? alertRows : [],
-    audit: access.role === "owner" ? auditRows : auditRows.filter((item) => item.actorId === access.userId),
+    audit: (access.role === "owner"
+      ? auditRows
+      : auditRows.filter((item) => item.actorId === access.userId)
+    ).map((item) => ({
+      id: item.id,
+      actorId: item.actorId,
+      action: item.action,
+      resourceType: item.resourceType,
+      resourceId: item.resourceId,
+      role: item.role,
+      operationId: item.operationId,
+      createdAt: item.createdAt,
+    })),
     updateCandidates: candidateRows.filter((item) => visibleServiceIds.has(item.serviceId)),
     providers: {
       cloudflare: Boolean(process.env.DNS_API_TOKEN || process.env.CLOUDFLARE_API_TOKEN),
@@ -489,7 +783,6 @@ app.post("/api/wizard", async (c) => {
         exposure: "public",
         status: "queued",
       });
-      await enqueue({ kind: "database.provision", actorId: access.userId, targetIds: [databaseId] });
     }
   }
   if (input.includeMail) {
@@ -508,7 +801,6 @@ app.post("/api/wizard", async (c) => {
         localPart: localPart(input.firstMailboxLocalPart),
         displayName: "First mailbox",
       });
-      await enqueue({ kind: "mail.provision", actorId: access.userId, targetIds: [mailboxId] });
     }
   }
   if (input.adminMode === "public") {
@@ -530,9 +822,6 @@ app.post("/api/wizard", async (c) => {
   await db.update(platformSetup).set({ wizardCompleted: true }).where(eq(platformSetup.id, "default"));
   await grantAccess(access.userId, { domainId });
   const verify = await enqueue({ kind: "domain.verify", actorId: access.userId, targetIds: [domainId] });
-  for (const endpointId of createdEndpoints) {
-    await enqueue({ kind: "certificate.issue", actorId: access.userId, targetIds: [endpointId] });
-  }
   await audit(
     access.userId,
     "wizard.complete",
@@ -545,6 +834,44 @@ app.post("/api/wizard", async (c) => {
   return c.json({ domainId, records: plan.records, operationId: verify.id });
 });
 
+app.post("/api/step-up", async (c) => {
+  const access = c.get("access");
+  const sessionValue = c.get("session");
+  requireOperator(access);
+  requireMfa(sessionValue);
+  const body = z
+    .object({
+      password: z.string().min(1).max(1024),
+      action: z.enum([
+        "role.grant",
+        "secret.reveal",
+        "resource.delete",
+        "restore.overwrite",
+        "exposure.public",
+        "credential.rotate",
+        "platform.update",
+      ]),
+      planHash: z.string().max(200).optional(),
+    })
+    .parse(await c.req.json());
+  await auth.api.verifyPassword({ body: { password: body.password }, headers: c.req.raw.headers });
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+  await db.insert(stepUpGrants).values({
+    id: createId("sup"),
+    userId: access.userId,
+    sessionId: sessionValue.session.id,
+    action: body.action,
+    planHash: body.planHash,
+    expiresAt,
+  });
+  await audit(access.userId, "auth.step_up", "session", sessionValue.session.id, {
+    action: body.action,
+    expiresAt: expiresAt.toISOString(),
+  });
+  c.header("cache-control", "no-store");
+  return c.json({ action: body.action, expiresAt });
+});
+
 app.post("/api/domains", async (c) => {
   const access = c.get("access");
   requireOperator(access);
@@ -552,21 +879,37 @@ app.post("/api/domains", async (c) => {
   const input = domainInput.parse(await c.req.json());
   const name = normalizeHostname(input.name);
   const id = createId("dom");
+  const ownershipToken = `ark-own-${createToken(16)}`;
   await db.insert(domainClaims).values({
     id,
     name,
-    ownershipToken: `ark-own-${createToken(16)}`,
+    ownershipToken,
+    status: "awaiting_dns",
     mailFrom: input.mailFrom ? normalizeHostname(input.mailFrom) : `bounce.${name}`,
     dmarcPolicy: input.dmarcPolicy,
   });
+  await db.insert(dnsRecords).values({
+    id: createId("dns"),
+    domainId: id,
+    type: "TXT",
+    name: `_ark-stack.${name}`,
+    relativeName: "_ark-stack",
+    expectedValue: ownershipToken,
+    purpose: "Installation-bound domain ownership proof",
+    required: true,
+  });
   await grantAccess(access.userId, { domainId: id });
   await audit(access.userId, "domain.create", "domain", id, { name }, undefined, access.role);
-  return c.json({ id });
+  return c.json({
+    id,
+    records: [{ type: "TXT", name: `_ark-stack.${name}`, value: ownershipToken, required: true }],
+  });
 });
 
 app.post("/api/domains/:id/verify", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMfa(c.get("session"));
   requireDomain(access, c.req.param("id"), "manage");
   const operation = await enqueue({
     kind: "domain.verify",
@@ -593,6 +936,7 @@ app.post("/api/domains/:id/publish", async (c) => {
 app.post("/api/projects", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMfa(c.get("session"));
   const input = projectInput.parse(await c.req.json());
   const id = createId("prj");
   await db.insert(projects).values({ id, name: input.name, slug: input.slug });
@@ -638,6 +982,7 @@ app.post("/api/databases", async (c) => {
 app.post("/api/mailboxes", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMfa(c.get("session"));
   const input = mailboxInput.parse(await c.req.json());
   requireDomain(access, input.domainId, "manage");
   const id = createId("mbx");
@@ -655,6 +1000,7 @@ app.post("/api/mailboxes", async (c) => {
 app.post("/api/aliases", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMfa(c.get("session"));
   const input = aliasInput.parse(await c.req.json());
   requireDomain(access, input.domainId, "manage");
   const existing = await db.select().from(aliases);
@@ -666,13 +1012,19 @@ app.post("/api/aliases", async (c) => {
     allowExternalForwarding: Boolean(settings?.allowExternalForwarding),
     allowExternal: input.allowExternal,
   });
-  const graph = existing.map((item) => {
-    const domain = domains.find((row) => row.id === item.domainId);
-    return { address: `${item.localPart}@${domain?.name}`, targets: item.targets };
-  });
+  const graph = existing
+    .filter((item) => item.status === "active")
+    .map((item) => {
+      const domain = domains.find((row) => row.id === item.domainId);
+      return { address: `${item.localPart}@${domain?.name}`, targets: item.targets };
+    });
   const domain = domains.find((row) => row.id === input.domainId);
   graph.push({ address: `${localPart(input.localPart)}@${domain?.name}`, targets: input.targets });
   assertAliasGraph(graph);
+  const [mailbox] = await db.select().from(mailboxes).limit(1);
+  if (!mailbox) {
+    throw new HTTPException(409, { message: "Create a mailbox before adding a native mail alias." });
+  }
   const id = createId("als");
   await db.insert(aliases).values({
     id,
@@ -681,7 +1033,102 @@ app.post("/api/aliases", async (c) => {
     description: input.description,
     targets: input.targets,
   });
-  return c.json({ id });
+  const operation = await enqueue({
+    kind: "mail.reconcile",
+    actorId: access.userId,
+    targetIds: [mailbox.id],
+  });
+  return c.json({ id, operationId: operation.id });
+});
+
+app.patch("/api/aliases/:id", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  requireMfa(c.get("session"));
+  const body = z
+    .object({
+      description: z.string().max(200).optional(),
+      targets: z.array(z.string().email()).min(1).max(20),
+      allowExternal: z.boolean().optional(),
+    })
+    .parse(await c.req.json());
+  const [alias] = await db
+    .select()
+    .from(aliases)
+    .where(eq(aliases.id, c.req.param("id")));
+  if (!alias || alias.status !== "active") throw new HTTPException(404, { message: "Alias not found." });
+  requireDomain(access, alias.domainId, "manage");
+  const domains = await db.select().from(domainClaims);
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  assertExternalForwarding({
+    targets: body.targets,
+    localDomains: domains.map((item) => item.name),
+    allowExternalForwarding: Boolean(settings?.allowExternalForwarding),
+    allowExternal: body.allowExternal,
+  });
+  const graph = (await db.select().from(aliases))
+    .filter((item) => item.id !== alias.id && item.status === "active")
+    .map((item) => ({
+      address: `${item.localPart}@${domains.find((domain) => domain.id === item.domainId)?.name}`,
+      targets: item.targets,
+    }));
+  const domain = domains.find((item) => item.id === alias.domainId);
+  graph.push({ address: `${alias.localPart}@${domain?.name}`, targets: body.targets });
+  assertAliasGraph(graph);
+  const [mailbox] = await db.select().from(mailboxes).limit(1);
+  if (!mailbox) throw new HTTPException(409, { message: "No mailbox is available for reconciliation." });
+  await db
+    .update(aliases)
+    .set({ targets: body.targets, description: body.description })
+    .where(eq(aliases.id, alias.id));
+  const operation = await enqueue({
+    kind: "mail.reconcile",
+    actorId: access.userId,
+    targetIds: [mailbox.id],
+  });
+  await audit(access.userId, "mail.alias.update", "alias", alias.id, {}, operation.id, access.role);
+  return c.json({ operationId: operation.id });
+});
+
+app.delete("/api/aliases/:id", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  await requirePrivileged(access, c.get("session"), "resource.delete");
+  const [alias] = await db
+    .select()
+    .from(aliases)
+    .where(eq(aliases.id, c.req.param("id")));
+  if (!alias || alias.status !== "active") throw new HTTPException(404, { message: "Alias not found." });
+  requireDomain(access, alias.domainId, "manage");
+  if (!alias.nativeId) {
+    await db.delete(aliases).where(eq(aliases.id, alias.id));
+    await audit(
+      access.userId,
+      "mail.alias.delete",
+      "alias",
+      alias.id,
+      { native: false },
+      undefined,
+      access.role,
+    );
+    return c.json({ operationId: null });
+  }
+  const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, alias.domainId));
+  const [mailbox] = await db.select().from(mailboxes).limit(1);
+  if (!domain || !mailbox)
+    throw new HTTPException(409, { message: "No mailbox is available for reconciliation." });
+  await db.update(aliases).set({ status: "pending_delete" }).where(eq(aliases.id, alias.id));
+  const operation = await enqueue({
+    kind: "mail.reconcile",
+    actorId: access.userId,
+    targetIds: [mailbox.id],
+    payload: {
+      removedAliasId: alias.id,
+      removedAlias: { address: `${alias.localPart}@${domain.name}`, nativeId: alias.nativeId },
+    },
+  });
+  await audit(access.userId, "mail.alias.delete", "alias", alias.id, {}, operation.id, access.role);
+  return c.json({ operationId: operation.id });
 });
 
 app.post("/api/services", async (c) => {
@@ -698,11 +1145,12 @@ app.post("/api/services", async (c) => {
     id,
     projectId: input.projectId,
     name: input.name,
-    compose: input.compose,
+    compose: canonicalizeComposeSource(input.compose),
     desiredRevision: createId("rev"),
     imageDigest: policy.images[0] ?? null,
     status: "registered",
     updatePolicy: input.updatePolicy,
+    stateful: input.stateful,
   });
   const written = await writeApprovedCompose(id, input.compose);
   const [project] = await db.select().from(projects).where(eq(projects.id, input.projectId));
@@ -712,20 +1160,73 @@ app.post("/api/services", async (c) => {
     targetIds: [id],
     payload: {
       images: policy.images,
-      compose: input.compose,
+      compose: written.canonical,
+      composeHash: written.hash,
       name: input.name,
-      file: written.file,
       project: `ark-${project?.slug ?? "workload"}`,
     },
   });
   return c.json({ id, operationId: operation.id, preview: policy });
 });
 
-app.get("/api/services/discover", async (c) => {
-  requireOperator(c.get("access"));
-  const discovered = await discoverContainers();
+app.post("/api/services/discover", async (c) => {
+  const access = c.get("access");
+  if (access.role !== "owner")
+    throw new HTTPException(403, { message: "Only owners can discover host resources." });
+  requireMfa(c.get("session"));
+  await c.req.json();
+  const operation = await enqueue({
+    kind: "service.discover",
+    actorId: access.userId,
+    targetIds: ["platform"],
+    payload: { request: "redacted-inventory-v1" },
+  });
+  await audit(access.userId, "service.discover", "platform", "platform", {}, operation.id, access.role);
+  return c.json({ operationId: operation.id, status: operation.status });
+});
+
+app.get("/api/services/discovery/:operationId", async (c) => {
+  const access = c.get("access");
+  if (access.role !== "owner")
+    throw new HTTPException(403, { message: "Only owners can view host discovery." });
+  const [operation] = await db
+    .select()
+    .from(operations)
+    .where(eq(operations.id, c.req.param("operationId")));
+  if (!operation || operation.kind !== "service.discover" || !operation.targetIds.includes("platform")) {
+    throw new HTTPException(404, { message: "Discovery result was not found." });
+  }
+  if (operation.status !== "succeeded") {
+    return c.json({ status: operation.status, available: false, error: operation.error });
+  }
+  const [step] = await db
+    .select()
+    .from(operationSteps)
+    .where(eq(operationSteps.operationId, operation.id))
+    .orderBy(desc(operationSteps.createdAt))
+    .limit(1);
+  const evidence = (step?.evidence ?? {}) as Record<string, unknown>;
+  const inventory = Array.isArray(evidence.inventory)
+    ? evidence.inventory.slice(0, 100).flatMap((raw) => {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+        const item = raw as Record<string, unknown>;
+        const names = Array.isArray(item.Names) ? item.Names : [];
+        const labels = item.Labels && typeof item.Labels === "object" ? item.Labels : {};
+        return [
+          {
+            id: String(item.Id ?? "").slice(0, 64),
+            name: String(names[0] ?? "")
+              .replace(/^\//, "")
+              .slice(0, 128),
+            image: String(item.Image ?? "").slice(0, 512),
+            state: String(item.State ?? "unknown").slice(0, 32),
+            labels: labels as Record<string, string>,
+          },
+        ];
+      })
+    : [];
   const registered = (await db.select().from(services)).map((item) => item.name);
-  return c.json({ docker: dockerAvailable(), ...classifyDiscovery(discovered, registered) });
+  return c.json({ status: operation.status, available: true, ...classifyDiscovery(inventory, registered) });
 });
 
 app.post("/api/services/adopt", async (c) => {
@@ -745,48 +1246,87 @@ app.post("/api/services/adopt", async (c) => {
     desiredRevision: createId("rev"),
     containerId: input.containerId,
     adoptedFrom: input.containerId,
-    status: "adopted",
+    status: "adoption_pending",
     updatePolicy: "notify",
   });
+  const written = await writeApprovedCompose(id, input.compose);
   const operation = await enqueue({
     kind: "service.adopt",
     actorId: access.userId,
     targetIds: [id],
-    payload: input,
+    payload: { ...input, compose: written.canonical, composeHash: written.hash },
   });
   return c.json({ id, operationId: operation.id, preview });
 });
 
-app.get("/api/services/:id/logs", async (c) => {
-  requireOperator(c.get("access"));
+app.post("/api/services/:id/observe", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  requireMfa(c.get("session"));
+  const input = z.object({ kind: z.enum(["logs", "stats"]) }).parse(await c.req.json());
   const [service] = await db
     .select()
     .from(services)
     .where(eq(services.id, c.req.param("id")));
   if (!service) throw new HTTPException(404, { message: "Service not found." });
-  requireProject(c.get("access"), service.projectId);
-  const [project] = await db.select().from(projects).where(eq(projects.id, service.projectId));
-  if (!dockerAvailable()) return c.json({ lines: [], available: false });
-  const lines = await serviceLogs(`ark-${project?.slug ?? "workload"}`, service.name);
-  return c.json({ lines, available: true });
+  requireProject(access, service.projectId);
+  const operation = await enqueue({
+    kind: input.kind === "logs" ? "service.logs" : "service.stats",
+    actorId: access.userId,
+    targetIds: [service.id],
+    payload: { name: service.name },
+  });
+  await audit(access.userId, `service.${input.kind}`, "service", service.id, {}, operation.id, access.role);
+  return c.json({ operationId: operation.id, status: operation.status });
 });
 
-app.get("/api/services/:id/stats", async (c) => {
-  requireOperator(c.get("access"));
+app.get("/api/services/:id/observations/:operationId", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
   const [service] = await db
     .select()
     .from(services)
     .where(eq(services.id, c.req.param("id")));
   if (!service) throw new HTTPException(404, { message: "Service not found." });
-  requireProject(c.get("access"), service.projectId);
-  const [project] = await db.select().from(projects).where(eq(projects.id, service.projectId));
-  if (!dockerAvailable()) return c.json({ available: false });
-  return c.json(await serviceStats(`ark-${project?.slug ?? "workload"}`, service.name));
+  requireProject(access, service.projectId);
+  const [operation] = await db
+    .select()
+    .from(operations)
+    .where(eq(operations.id, c.req.param("operationId")));
+  if (
+    !operation ||
+    !operation.targetIds.includes(service.id) ||
+    (operation.kind !== "service.logs" && operation.kind !== "service.stats")
+  ) {
+    throw new HTTPException(404, { message: "Service observation was not found." });
+  }
+  if (operation.status !== "succeeded") {
+    return c.json({ status: operation.status, available: false, error: operation.error });
+  }
+  const [step] = await db
+    .select()
+    .from(operationSteps)
+    .where(eq(operationSteps.operationId, operation.id))
+    .orderBy(desc(operationSteps.createdAt))
+    .limit(1);
+  const evidence = (step?.evidence ?? {}) as Record<string, unknown>;
+  if (operation.kind === "service.logs") {
+    const lines = Array.isArray(evidence.lines)
+      ? evidence.lines.filter((item): item is string => typeof item === "string").slice(-500)
+      : [];
+    return c.json({ status: operation.status, available: true, lines });
+  }
+  const stats =
+    evidence.stats && typeof evidence.stats === "object" && !Array.isArray(evidence.stats)
+      ? evidence.stats
+      : {};
+  return c.json({ status: operation.status, available: true, stats });
 });
 
 app.post("/api/services/:id/:action", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMfa(c.get("session"));
   const action = c.req.param("action");
   const kind =
     action === "restart"
@@ -803,7 +1343,13 @@ app.post("/api/services/:id/:action", async (c) => {
     .where(eq(services.id, c.req.param("id")));
   if (!service) throw new HTTPException(404, { message: "Service not found." });
   requireProject(access, service.projectId);
-  const operation = await enqueue({ kind, actorId: access.userId, targetIds: [c.req.param("id")] });
+  const [project] = await db.select().from(projects).where(eq(projects.id, service.projectId));
+  const operation = await enqueue({
+    kind,
+    actorId: access.userId,
+    targetIds: [c.req.param("id")],
+    payload: { name: service.name, project: `ark-${project?.slug ?? "workload"}` },
+  });
   await audit(access.userId, kind, "service", c.req.param("id"), {}, operation.id, access.role);
   return c.json({ operationId: operation.id });
 });
@@ -811,7 +1357,7 @@ app.post("/api/services/:id/:action", async (c) => {
 app.post("/api/sql/query", async (c) => {
   const access = c.get("access");
   requireOperator(access);
-  requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(access, c.get("session"), "secret.reveal");
   const input = sqlInput.parse(await c.req.json());
   const classified = classifySql(input.sql, input.readOnly);
   await requireDatabaseAccess(access, input.databaseId, "manage");
@@ -826,14 +1372,18 @@ app.post("/api/sql/query", async (c) => {
     .where(and(eq(databaseRoles.databaseId, database.id), eq(databaseRoles.kind, input.role)));
   if (!role?.secretId)
     throw new HTTPException(404, { message: "That role is not available for this database." });
-  const [secret] = await db.select().from(secrets).where(eq(secrets.id, role.secretId));
-  if (!secret) throw new HTTPException(404, { message: "Role secret is missing." });
-  const rows = await executeWorkspaceQuery({
-    database: database.name,
-    username: role.name,
-    password: revealSecret(secret),
-    sql: input.sql,
-    readOnly: input.readOnly,
+  const operation = await enqueue({
+    kind: "database.query",
+    actorId: access.userId,
+    targetIds: [database.id],
+    payload: {
+      executionId: input.executionId,
+      workspaceId: input.workspaceId,
+      role: input.role,
+      sql: input.sql,
+      readOnly: input.readOnly,
+      fingerprint: classified.fingerprint,
+    },
   });
   await audit(
     access.userId,
@@ -841,22 +1391,94 @@ app.post("/api/sql/query", async (c) => {
     "database",
     input.databaseId,
     { fingerprint: classified.fingerprint, role: input.role, workspaceId: input.workspaceId },
-    undefined,
+    operation.id,
     access.role,
   );
   return c.json({
+    operationId: operation.id,
+    status: operation.status,
     databaseId: input.databaseId,
     workspaceId: input.workspaceId,
     role: input.role,
     fingerprint: classified.fingerprint,
-    rows,
   });
 });
 
-app.get("/api/databases/:id/schema", async (c) => {
-  requireOperator(c.get("access"));
-  requirePrivileged(c.get("access"), c.get("session"), "secret.reveal");
-  await requireDatabaseAccess(c.get("access"), c.req.param("id"));
+app.get("/api/sql/results/:operationId", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  const [operation] = await db
+    .select()
+    .from(operations)
+    .where(eq(operations.id, c.req.param("operationId")));
+  if (
+    !operation ||
+    !["database.query", "database.schema"].includes(operation.kind) ||
+    operation.targetIds.length !== 1
+  ) {
+    throw new HTTPException(404, { message: "Database result was not found." });
+  }
+  await requireDatabaseAccess(access, operation.targetIds[0]!, "manage");
+  if (operation.status !== "succeeded") {
+    return c.json({ status: operation.status, available: false, error: operation.error });
+  }
+  const [step] = await db
+    .select()
+    .from(operationSteps)
+    .where(eq(operationSteps.operationId, operation.id))
+    .orderBy(desc(operationSteps.createdAt))
+    .limit(1);
+  const evidence = (step?.evidence ?? {}) as Record<string, unknown>;
+  const key = operation.kind === "database.query" ? "query" : "schema";
+  const result = evidence[key];
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new HTTPException(409, { message: "Database worker completed without a bounded result." });
+  }
+  return c.json({ status: operation.status, available: true, [key]: result });
+});
+
+app.post("/api/sql/cancel", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  requireMfa(c.get("session"));
+  const input = sqlCancelInput.parse(await c.req.json());
+  const scope = await requireDatabaseAccess(access, input.databaseId, "manage");
+  let cancelled = false;
+  if (env.embeddedWorkers) {
+    cancelled = await cancelWorkspaceQuery({
+      executionId: input.executionId,
+      actorId: access.userId,
+      database: scope.database.name,
+    });
+  } else {
+    const workerUrl = process.env.ARK_DATABASE_WORKER_URL;
+    if (!workerUrl) throw new HTTPException(503, { message: "Database cancellation worker is unavailable." });
+    const response = await fetch(`${workerUrl.replace(/\/$/, "")}/cancel`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.workerTokens.database}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        executionId: input.executionId,
+        actorId: access.userId,
+        database: scope.database.name,
+      }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok)
+      throw new HTTPException(503, { message: "Database cancellation worker rejected the request." });
+    const result = (await response.json()) as { cancelled?: boolean };
+    cancelled = result.cancelled === true;
+  }
+  return c.json({ executionId: input.executionId, cancelled });
+});
+
+app.post("/api/databases/:id/schema", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  await requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requireDatabaseAccess(access, c.req.param("id"));
   const [database] = await db
     .select()
     .from(managedDatabases)
@@ -867,20 +1489,19 @@ app.get("/api/databases/:id/schema", async (c) => {
     .from(databaseRoles)
     .where(and(eq(databaseRoles.databaseId, database.id), eq(databaseRoles.kind, "readonly")));
   if (!role?.secretId) throw new HTTPException(404, { message: "Readonly role is not available." });
-  const [secret] = await db.select().from(secrets).where(eq(secrets.id, role.secretId));
-  if (!secret) throw new HTTPException(404, { message: "Role secret is missing." });
-  return c.json(
-    await inspectDatabaseSchema({
-      database: database.name,
-      username: role.name,
-      password: revealSecret(secret),
-    }),
-  );
+  const operation = await enqueue({
+    kind: "database.schema",
+    actorId: access.userId,
+    targetIds: [database.id],
+    payload: {},
+  });
+  await audit(access.userId, "database.schema", "database", database.id, {}, operation.id, access.role);
+  return c.json({ operationId: operation.id, status: operation.status });
 });
 
 app.post("/api/databases/:id/rotate", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "credential.rotate");
+  await requirePrivileged(access, c.get("session"), "credential.rotate");
   await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const body = z.object({ kind: z.enum(["runtime", "readonly", "migration"]) }).parse(await c.req.json());
   const operation = await enqueue({
@@ -903,7 +1524,7 @@ app.post("/api/databases/:id/rotate", async (c) => {
 
 app.put("/api/databases/:id/cidrs", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "exposure.public");
+  await requirePrivileged(access, c.get("session"), "exposure.public");
   await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const input = cidrInput.parse(await c.req.json());
   const cidrs = assertCidrs(input.sourceCidrs);
@@ -942,14 +1563,21 @@ app.post("/api/mail/queue", async (c) => {
   requireOperator(access);
   requireMfa(c.get("session"));
   const input = queueActionInput.parse(await c.req.json());
-  const domains = (await db.select().from(domainClaims)).map((item) => item.name);
-  const allowed = canMutateQueue({ action: input.action, item: input.item, localDomains: domains });
+  const native = (await listMailQueue()).find((item) => item.id === input.item.id);
+  if (!native) throw new HTTPException(404, { message: "Queue item not found." });
+  const domainRows = await db.select().from(domainClaims);
+  const domains = domainRows.map((item) => item.name);
+  const allowed = canMutateQueue({ action: input.action, item: native, localDomains: domains });
   if (!allowed.ok) throw new HTTPException(422, { message: allowed.reason });
+  const recipientDomain = native.recipient.split("@")[1]?.toLowerCase();
+  const domain = domainRows.find((item) => item.name === recipientDomain);
+  if (!domain) throw new HTTPException(403, { message: "Queue item is outside managed mail domains." });
+  requireDomain(access, domain.id, "manage");
   const operation = await enqueue({
     kind: input.action === "delete" ? "mail.queue_delete" : "mail.queue_retry",
     actorId: access.userId,
     targetIds: [input.item.id],
-    payload: input.item,
+    payload: native,
   });
   return c.json({ operationId: operation.id });
 });
@@ -965,38 +1593,67 @@ app.post("/api/mailboxes/:id/devices", async (c) => {
     .where(eq(mailboxes.id, c.req.param("id")));
   if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
   requireDomain(access, mailbox.domainId, "manage");
-  const password = generatePassword();
-  const sealed = encryptSecret(env.rootKey, password, env.rootKeyId);
-  const secretId = createId("sec");
-  await db
-    .insert(secrets)
-    .values({ id: secretId, kind: `mailbox.device.${mailbox.id}`, once: true, ...sealed });
   const id = createId("dev");
-  await db.insert(mailboxDevices).values({ id, mailboxId: mailbox.id, label: input.label, secretId });
+  await db.insert(mailboxDevices).values({ id, mailboxId: mailbox.id, label: input.label });
   const operation = await enqueue({
     kind: "mailbox.device",
     actorId: access.userId,
     targetIds: [mailbox.id],
-    payload: { deviceId: id, label: input.label },
+    payload: { action: "create", deviceId: id, label: input.label },
   });
+  return c.json({ id, operationId: operation.id });
+});
+
+app.post("/api/devices/:id/credential", async (c) => {
+  const access = c.get("access");
+  await requirePrivileged(access, c.get("session"), "secret.reveal");
+  const [device] = await db
+    .select()
+    .from(mailboxDevices)
+    .where(eq(mailboxDevices.id, c.req.param("id")));
+  if (!device) throw new HTTPException(404, { message: "Device not found." });
+  const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, device.mailboxId));
+  if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
+  requireDomain(access, mailbox.domainId, "manage");
+  if (!device.secretId) throw new HTTPException(409, { message: "The native credential is not ready." });
+  const consumed = await consumeOneTimeSecret(device.secretId, {
+    actorId: access.userId,
+    role: access.role,
+    resourceType: "mailbox-device",
+    resourceId: device.id,
+    kind: `mailbox-device.${device.id}`,
+  });
+  if (!consumed) throw new HTTPException(409, { message: "This device password was already shown." });
   c.header("cache-control", "no-store");
-  return c.json({ id, password, operationId: operation.id });
+  return c.json({ password: revealSecret(consumed) });
 });
 
 app.post("/api/devices/:id/revoke", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
-  await db
-    .update(mailboxDevices)
-    .set({ revokedAt: new Date() })
+  const [device] = await db
+    .select()
+    .from(mailboxDevices)
     .where(eq(mailboxDevices.id, c.req.param("id")));
-  return c.json({ ok: true });
+  if (!device) throw new HTTPException(404, { message: "Device not found." });
+  const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, device.mailboxId));
+  if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
+  requireDomain(access, mailbox.domainId, "manage");
+  const operation = await enqueue({
+    kind: "mailbox.device",
+    actorId: access.userId,
+    targetIds: [mailbox.id],
+    payload: { action: "revoke", deviceId: device.id },
+  });
+  await audit(access.userId, "mailbox.device.revoke", "mailbox", mailbox.id, {}, operation.id, access.role);
+  return c.json({ operationId: operation.id });
 });
 
 app.post("/api/platform/maintain", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "platform.update");
+  if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
+  await requirePrivileged(access, c.get("session"), "platform.update");
   if (!secureEqual(c.req.header("x-maintenance-token") ?? "", env.maintenanceToken || "missing")) {
     throw new HTTPException(403, { message: "Maintenance token is invalid." });
   }
@@ -1012,34 +1669,46 @@ app.post("/api/platform/maintain", async (c) => {
 
 app.post("/api/secrets/:id/reveal", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(access, c.get("session"), "secret.reveal");
   const [secret] = await db
     .select()
     .from(secrets)
     .where(eq(secrets.id, c.req.param("id")));
   if (!secret) throw new HTTPException(404, { message: "Secret not found." });
-  if (secret.once && secret.revealedAt)
-    throw new HTTPException(409, {
-      message: "This credential was already revealed. Rotate it to obtain a new value.",
+  await requireSecretScope(access, secret);
+  let consumed = secret;
+  if (secret.once) {
+    const winner = await consumeOneTimeSecret(secret.id, {
+      actorId: access.userId,
+      role: access.role,
+      resourceType: secret.resourceType!,
+      resourceId: secret.resourceId!,
+      kind: secret.kind,
     });
-  const value = revealSecret(secret);
-  if (secret.once) await db.update(secrets).set({ revealedAt: new Date() }).where(eq(secrets.id, secret.id));
-  await audit(
-    access.userId,
-    "secret.reveal",
-    "secret",
-    secret.id,
-    { kind: secret.kind },
-    undefined,
-    access.role,
-  );
+    if (!winner)
+      throw new HTTPException(409, {
+        message: "This credential was already revealed. Rotate it to obtain a new value.",
+      });
+    consumed = winner;
+  } else {
+    await audit(
+      access.userId,
+      "secret.reveal",
+      secret.resourceType!,
+      secret.resourceId!,
+      { kind: secret.kind },
+      undefined,
+      access.role,
+    );
+  }
+  const value = revealSecret(consumed);
   c.header("cache-control", "no-store");
   return c.json({ value, kind: secret.kind });
 });
 
 app.post("/api/databases/:id/credential", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(access, c.get("session"), "secret.reveal");
   await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const [role] = await db
     .select()
@@ -1048,12 +1717,18 @@ app.post("/api/databases/:id/credential", async (c) => {
   if (!role?.secretId) throw new HTTPException(404, { message: "Runtime credential is not available." });
   const [secret] = await db.select().from(secrets).where(eq(secrets.id, role.secretId));
   if (!secret) throw new HTTPException(404, { message: "Runtime credential is not available." });
-  if (secret.revealedAt)
+  const consumed = await consumeOneTimeSecret(secret.id, {
+    actorId: access.userId,
+    role: access.role,
+    resourceType: "database",
+    resourceId: c.req.param("id"),
+    kind: secret.kind,
+  });
+  if (!consumed)
     throw new HTTPException(409, {
       message: "This password was already shown. Rotate the role to generate a new one.",
     });
-  const password = revealSecret(secret);
-  await db.update(secrets).set({ revealedAt: new Date() }).where(eq(secrets.id, secret.id));
+  const password = revealSecret(consumed);
   const [database] = await db
     .select()
     .from(managedDatabases)
@@ -1076,7 +1751,7 @@ app.post("/api/databases/:id/credential", async (c) => {
 
 app.post("/api/mailboxes/:id/credential", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "secret.reveal");
+  await requirePrivileged(access, c.get("session"), "secret.reveal");
   const [mailbox] = await db
     .select()
     .from(mailboxes)
@@ -1087,11 +1762,19 @@ app.post("/api/mailboxes/:id/credential", async (c) => {
   const [secret] = await db
     .select()
     .from(secrets)
-    .where(eq(secrets.kind, `mailbox.${mailbox.id}`));
-  if (!secret || secret.revealedAt)
-    throw new HTTPException(409, { message: "No one-time mailbox credential remains." });
-  const password = revealSecret(secret);
-  await db.update(secrets).set({ revealedAt: new Date() }).where(eq(secrets.id, secret.id));
+    .where(eq(secrets.kind, `mailbox.${mailbox.id}`))
+    .orderBy(desc(secrets.createdAt))
+    .limit(1);
+  if (!secret) throw new HTTPException(409, { message: "No one-time mailbox credential remains." });
+  const consumed = await consumeOneTimeSecret(secret.id, {
+    actorId: access.userId,
+    role: access.role,
+    resourceType: "mailbox",
+    resourceId: mailbox.id,
+    kind: secret.kind,
+  });
+  if (!consumed) throw new HTTPException(409, { message: "No one-time mailbox credential remains." });
+  const password = revealSecret(consumed);
   await db.update(mailboxes).set({ credentialAvailable: false }).where(eq(mailboxes.id, mailbox.id));
   c.header("cache-control", "no-store");
   return c.json({ password });
@@ -1100,7 +1783,11 @@ app.post("/api/mailboxes/:id/credential", async (c) => {
 app.post("/api/backups", async (c) => {
   const access = c.get("access");
   requireOperator(access);
-  const body = z.object({ kind: z.string(), targetId: z.string() }).parse(await c.req.json());
+  requireMfa(c.get("session"));
+  const body = z
+    .object({ kind: z.enum(["platform-postgres", "app-postgres", "mail", "volume"]), targetId: z.string() })
+    .parse(await c.req.json());
+  await requireTargetScope(access, body.targetId);
   const operation = await enqueue({
     kind: "backup.create",
     actorId: access.userId,
@@ -1112,10 +1799,19 @@ app.post("/api/backups", async (c) => {
 
 app.post("/api/backups/restore-test", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "restore.overwrite");
+  await requirePrivileged(access, c.get("session"), "restore.overwrite");
   const body = z
-    .object({ kind: z.string(), targetId: z.string(), backupId: z.string().optional() })
+    .object({
+      kind: z.enum(["platform-postgres", "app-postgres", "mail", "volume"]),
+      targetId: z.string(),
+      backupId: z.string().min(1),
+    })
     .parse(await c.req.json());
+  await requireTargetScope(access, body.targetId);
+  const [selected] = await db.select().from(backups).where(eq(backups.id, body.backupId));
+  if (!selected || selected.targetId !== body.targetId || selected.kind !== body.kind) {
+    throw new HTTPException(404, { message: "The selected backup does not belong to this target." });
+  }
   const operation = await enqueue({
     kind: "backup.restore_test",
     actorId: access.userId,
@@ -1131,7 +1827,8 @@ app.post("/api/mail/reconcile", async (c) => {
   requireMfa(c.get("session"));
   const body = z.object({ mailboxId: z.string() }).parse(await c.req.json());
   const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, body.mailboxId));
-  if (mailbox) requireDomain(access, mailbox.domainId, "manage");
+  if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
+  requireDomain(access, mailbox.domainId, "manage");
   const operation = await enqueue({
     kind: "mail.reconcile",
     actorId: access.userId,
@@ -1158,7 +1855,9 @@ app.post("/api/mailboxes/:id/lifecycle", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
-  const body = z.object({ lifecycle: z.enum(["active", "suspended", "purged"]) }).parse(await c.req.json());
+  const body = z
+    .object({ lifecycle: z.enum(["active", "suspended", "retained", "purged"]) })
+    .parse(await c.req.json());
   const [mailbox] = await db
     .select()
     .from(mailboxes)
@@ -1167,6 +1866,20 @@ app.post("/api/mailboxes/:id/lifecycle", async (c) => {
   requireDomain(access, mailbox.domainId, "manage");
   if (mailbox.lifecycle === "purged")
     throw new HTTPException(409, { message: "A purged mailbox address stays reserved." });
+  if (body.lifecycle === "purged") {
+    await requirePrivileged(access, c.get("session"), "resource.delete");
+    const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, mailbox.domainId));
+    const address = `${mailbox.localPart}@${domain?.name}`.toLowerCase();
+    const dependencies = (await db.select().from(aliases)).filter(
+      (alias) =>
+        alias.status === "active" && alias.targets.some((target) => target.toLowerCase() === address),
+    );
+    if (dependencies.length) {
+      throw new HTTPException(409, {
+        message: `Remove ${dependencies.length} alias dependency before permanently purging this mailbox.`,
+      });
+    }
+  }
   await db.update(mailboxes).set({ lifecycle: body.lifecycle }).where(eq(mailboxes.id, mailbox.id));
   const operation = await enqueue({
     kind: "mail.reconcile",
@@ -1181,6 +1894,8 @@ app.post("/api/mailboxes/:id/lifecycle", async (c) => {
 app.post("/api/updates/detect", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMfa(c.get("session"));
+  if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
   const operation = await enqueue({
     kind: "update.detect",
     actorId: access.userId,
@@ -1193,6 +1908,7 @@ app.post("/api/import/scan", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
   const body = z
     .object({
       source: z.enum(["orkmail", "pgstack", "compose"]),
@@ -1222,6 +1938,7 @@ app.post("/api/import/scan", async (c) => {
 app.post("/api/alerts/:id/ack", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMfa(c.get("session"));
   await db
     .update(alerts)
     .set({ acknowledged: true })
@@ -1229,12 +1946,37 @@ app.post("/api/alerts/:id/ack", async (c) => {
   return c.json({ ok: true });
 });
 
+app.post("/api/alerts/:id/silence", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  requireMfa(c.get("session"));
+  const body = z.object({ minutes: z.number().int().min(5).max(10_080) }).parse(await c.req.json());
+  const [alert] = await db
+    .select()
+    .from(alerts)
+    .where(eq(alerts.id, c.req.param("id")));
+  if (!alert) throw new HTTPException(404, { message: "Alert not found." });
+  const silencedUntil = new Date(Date.now() + body.minutes * 60_000);
+  await db.update(alerts).set({ silencedUntil }).where(eq(alerts.id, alert.id));
+  await audit(
+    access.userId,
+    "alert.silence",
+    "alert",
+    alert.id,
+    { silencedUntil: silencedUntil.toISOString() },
+    undefined,
+    access.role,
+  );
+  return c.json({ silencedUntil });
+});
+
 app.post("/api/updates/apply", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "platform.update");
+  await requirePrivileged(access, c.get("session"), "platform.update");
   const body = z.object({ serviceId: z.string(), digest: z.string() }).parse(await c.req.json());
   const [service] = await db.select().from(services).where(eq(services.id, body.serviceId));
-  if (service) requireProject(access, service.projectId);
+  if (!service) throw new HTTPException(404, { message: "Service not found." });
+  requireProject(access, service.projectId);
   const operation = await enqueue({
     kind: "update.apply",
     actorId: access.userId,
@@ -1246,7 +1988,8 @@ app.post("/api/updates/apply", async (c) => {
 
 app.post("/api/settings/mode", async (c) => {
   const access = c.get("access");
-  requirePrivileged(access, c.get("session"), "exposure.public");
+  if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
+  await requirePrivileged(access, c.get("session"), "exposure.public");
   const body = z.object({ adminMode: z.enum(["public", "tailnet"]) }).parse(await c.req.json());
   const operation = await enqueue({
     kind: "admin.mode_change",
@@ -1259,7 +2002,8 @@ app.post("/api/settings/mode", async (c) => {
 
 app.put("/api/settings", async (c) => {
   const access = c.get("access");
-  requireOperator(access);
+  if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
+  requireMfa(c.get("session"));
   const input = settingsInput.parse(await c.req.json());
   await db
     .update(platformSettings)

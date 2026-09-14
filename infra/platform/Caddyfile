@@ -1,11 +1,11 @@
 {
-  admin off
+  admin 0.0.0.0:2019
 }
 
 :80 {
   @challenge path /.well-known/acme-challenge/*
   handle @challenge {
-    root * /var/www/acme
+    root * /var/lib/ark/acme
     file_server
   }
   handle {

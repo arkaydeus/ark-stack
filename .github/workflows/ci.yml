@@ -3,33 +3,55 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       postgres:
-        image: postgres:17.6
+        image: postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929
         env:
-          POSTGRES_USER: ark
-          POSTGRES_PASSWORD: ark
-          POSTGRES_DB: ark_platform
+          POSTGRES_PASSWORD: postgres
         ports:
-          - 5433:5432
+          - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U ark -d ark_platform"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 20
     env:
-      DATABASE_URL: postgres://ark:ark@127.0.0.1:5433/ark_platform
-      BETTER_AUTH_SECRET: ci-better-auth-secret-32-chars-min
-      ARK_ROOT_KEY: ci-root-key-must-be-32-characters
-      ARK_SETUP_TOKEN: ci-setup-token
-      ARK_INTERNAL_TOKEN: ci-internal-token
-      ARK_AGENT_TOKEN: ci-agent-token
-      ARK_MAINTENANCE_TOKEN: ci-maintenance-token
-      ARK_SKIP_LISTEN: "1"
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      DATABASE_APP_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      BETTER_AUTH_SECRET: ci-better-auth-secret-0123456789abcdef
+      BETTER_AUTH_URL: http://127.0.0.1:3000
+      BETTER_AUTH_TRUSTED_ORIGINS: http://127.0.0.1:3000
+      ARK_ROOT_KEY: ci-root-key-0123456789abcdef0123456789abcdef
+      ARK_SETUP_TOKEN: ci-setup-token-0123456789
+      ARK_INTERNAL_TOKEN: ci-internal-token-0123456789
+      ARK_DATABASE_WORKER_TOKEN: ci-database-worker-token-0123456789
+      ARK_DOMAIN_WORKER_TOKEN: ci-domain-worker-token-0123456789
+      ARK_MAIL_WORKER_TOKEN: ci-mail-worker-token-0123456789
+      ARK_BACKUP_WORKER_TOKEN: ci-backup-worker-token-0123456789
+      ARK_AGENT_TOKEN: ci-agent-token-0123456789
+      ARK_MAINTENANCE_TOKEN: ci-maintenance-token-0123456789
+      ARK_MFA_RECOVERY_TOKEN: ci-mfa-recovery-token-0123456789
+      ARK_METRICS_TOKEN: ci-metrics-token-0123456789
+      ARK_OFFHOST_HEARTBEAT_TOKEN: ci-offhost-heartbeat-token-0123456789
+      ARK_CONTROL_DB_PASSWORD: ci-control-db-password-0123456789
+      ARK_APP_DB_PASSWORD: ci-app-db-password-0123456789
+      ARK_API_DB_PASSWORD: ci-api-db-password-0123456789
+      STALWART_ADMIN_ADDRESS: admin
+      STALWART_ADMIN_PASSWORD: ci-stalwart-password-0123456789
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -37,16 +59,28 @@ jobs:
           bun-version: 1.4.2
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25.1"
-      - run: bun install
+          go-version: 1.25.1
+      - run: bun install --frozen-lockfile
+      - run: touch .env
+      - run: bun run --cwd server db:migrate
       - run: bunx oxfmt --check .
-      - run: bunx oxlint .
+      - run: bunx oxlint . --deny-warnings
       - run: bunx tsc --noEmit -p shared/tsconfig.json
       - run: bunx tsc --noEmit -p server/tsconfig.json
       - run: bunx tsc --noEmit -p web/tsconfig.json
       - run: bunx tsc --noEmit -p workers/tsconfig.json
-      - run: bun --env-file=/dev/null run --cwd server db:migrate
       - run: bun test shared server workers tests
-      - run: go test ./...
+      - run: ARK_DOCKER_INTEGRATION=1 go test ./...
         working-directory: agent
       - run: bun run --cwd web build
+      - run: bunx playwright install --with-deps chromium
+      - run: bun scripts/test-e2e.ts
+      - run: bun scripts/test-upgrade-migrations.ts
+      - run: env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts
+      - run: bun scripts/test-edge-config.ts
+      - run: docker build --check -f Dockerfile .
+      - run: docker build --check -f agent/Dockerfile agent
+      - run: docker compose -f infra/platform/docker-compose.yml config --quiet
+      - run: docker compose -f infra/platform/docker-compose.yml -f infra/platform/docker-compose.dev.yml config --quiet
+      - run: docker compose -f infra/mail/docker-compose.yml config --quiet
+      - run: docker compose -f infra/monitoring/docker-compose.yml config --quiet

@@ -4,7 +4,6 @@ import { Badge, statusVariant } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field } from "@/components/ui/input";
-import { authClient } from "@/lib/auth-client";
 import type { PlatformState } from "@/lib/types";
 import { api, formatDate } from "@/lib/utils";
 
@@ -60,18 +59,40 @@ export function Overview({ state, reload }: { state: PlatformState; reload: () =
               state.alerts.map((alert) => (
                 <div className="mb-3 flex items-center justify-between gap-3" key={alert.id}>
                   <p>
-                    <Badge variant={statusVariant(alert.severity)}>{alert.severity}</Badge> {alert.title}
+                    <Badge variant={statusVariant(alert.resolvedAt ? "ready" : alert.severity)}>
+                      {alert.resolvedAt ? "resolved" : alert.severity}
+                    </Badge>{" "}
+                    {alert.title}
                   </p>
-                  {!alert.acknowledged && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() =>
-                        void api(`/api/alerts/${alert.id}/ack`, { method: "POST", body: "{}" }).then(reload)
-                      }
-                    >
-                      Ack
-                    </Button>
+                  {!alert.resolvedAt && (
+                    <div className="flex gap-2">
+                      {!alert.acknowledged && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            void api(`/api/alerts/${alert.id}/ack`, {
+                              method: "POST",
+                              body: "{}",
+                            }).then(reload)
+                          }
+                        >
+                          Ack
+                        </Button>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          void api(`/api/alerts/${alert.id}/silence`, {
+                            method: "POST",
+                            body: JSON.stringify({ minutes: 60 }),
+                          }).then(reload)
+                        }
+                      >
+                        Silence 1h
+                      </Button>
+                    </div>
                   )}
                 </div>
               ))
@@ -197,8 +218,37 @@ export function ProjectsView({ state, reload }: { state: PlatformState; reload: 
   );
 }
 
+async function waitForDatabaseResult(operationId: string) {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const result = await api<{
+      status: string;
+      available: boolean;
+      error?: string;
+      query?: {
+        rows: unknown[];
+        fingerprint: string;
+        role: string;
+        databaseId: string;
+        truncated: boolean;
+        bytes: number;
+      };
+      schema?: { schemas: Record<string, Record<string, unknown[]>> };
+    }>(`/api/sql/results/${operationId}`);
+    if (result.available) return result;
+    if (["failed", "cancelled", "needs_recovery"].includes(result.status)) {
+      throw new Error(result.error || "Database worker operation failed.");
+    }
+  }
+  throw new Error("Database operation is still queued; check Operations for progress.");
+}
+
 export function DatabasesView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   const [secret, setSecret] = useState<string>("");
+  const [schemaOutput, setSchemaOutput] = useState<Record<string, string>>({});
+  const [queryOutput, setQueryOutput] = useState<
+    Record<string, { role: string; fingerprint: string; rows: unknown[]; truncated: boolean; bytes: number }>
+  >({});
   return (
     <div className="space-y-5">
       <FormCard
@@ -276,11 +326,26 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() =>
-                    void api<{ schemas: Record<string, Record<string, unknown[]>> }>(
-                      `/api/databases/${item.id}/schema`,
-                    ).then((result) => setSecret(JSON.stringify(result.schemas)))
-                  }
+                  onClick={() => {
+                    setSchemaOutput((current) => ({ ...current, [item.id]: "Schema inspection queued…" }));
+                    void api<{ operationId: string }>(`/api/databases/${item.id}/schema`, {
+                      method: "POST",
+                      body: "{}",
+                    })
+                      .then((queued) => waitForDatabaseResult(queued.operationId))
+                      .then((result) =>
+                        setSchemaOutput((current) => ({
+                          ...current,
+                          [item.id]: JSON.stringify(result.schema?.schemas ?? {}),
+                        })),
+                      )
+                      .catch((error) =>
+                        setSchemaOutput((current) => ({
+                          ...current,
+                          [item.id]: error instanceof Error ? error.message : "Schema inspection failed.",
+                        })),
+                      );
+                  }}
                 >
                   Schema
                 </Button>
@@ -297,28 +362,50 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
           </CardContent>
         </Card>
       )}
+      {Object.entries(schemaOutput).map(([databaseId, output]) => (
+        <Card key={databaseId}>
+          <CardContent>
+            <p className="text-sm font-semibold">
+              Schema · {state.databases.find((item) => item.id === databaseId)?.name ?? databaseId}
+            </p>
+            <code className="mt-2 block max-h-64 overflow-auto whitespace-pre-wrap text-xs">{output}</code>
+          </CardContent>
+        </Card>
+      ))}
       <FormCard
         title="SQL workspace"
         description="Bound to one database and role. Read-only by default. Results stay with this workspace."
         onSubmit={async (form) => {
-          const result = await api<{
-            rows: unknown[];
-            fingerprint: string;
-            role: string;
-            databaseId: string;
+          const databaseId = String(form.get("databaseId"));
+          const role = String(form.get("role"));
+          const sql = String(form.get("sql"));
+          const executionId = crypto.randomUUID();
+          const queued = await api<{
+            operationId: string;
           }>("/api/sql/query", {
             method: "POST",
             body: JSON.stringify({
-              databaseId: form.get("databaseId"),
-              workspaceId: state.databases[0]?.id,
-              role: form.get("role"),
-              sql: form.get("sql"),
+              executionId,
+              databaseId,
+              workspaceId: databaseId,
+              role,
+              sql,
               readOnly: form.has("readOnly"),
             }),
           });
-          setSecret(
-            `${result.role}@${result.databaseId} ${result.fingerprint} → ${JSON.stringify(result.rows)}`,
-          );
+          const completed = await waitForDatabaseResult(queued.operationId);
+          if (!completed.query) throw new Error("Database worker returned no query result.");
+          const result = completed.query;
+          setQueryOutput((current) => ({
+            ...current,
+            [databaseId]: {
+              role: result.role,
+              fingerprint: result.fingerprint,
+              rows: result.rows,
+              truncated: result.truncated,
+              bytes: result.bytes,
+            },
+          }));
         }}
       >
         <div>
@@ -351,6 +438,23 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
           />
         </div>
       </FormCard>
+      {Object.entries(queryOutput).map(([databaseId, output]) => (
+        <Card key={databaseId}>
+          <CardContent>
+            <p className="text-sm font-semibold">
+              Results · {output.role}@
+              {state.databases.find((item) => item.id === databaseId)?.name ?? databaseId}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {output.fingerprint} · {output.bytes} bytes
+              {output.truncated ? " · truncated at server limit" : ""}
+            </p>
+            <code className="mt-2 block max-h-64 overflow-auto whitespace-pre-wrap text-xs">
+              {JSON.stringify(output.rows)}
+            </code>
+          </CardContent>
+        </Card>
+      ))}
     </div>
   );
 }
@@ -488,20 +592,38 @@ export function EmailView({ state, reload }: { state: PlatformState; reload: () 
         <Field label="Targets" name="targets" placeholder="a@example.com, b@example.com" required />
       </FormCard>
       {state.aliases.map((item) => (
-        <p key={item.id} className="text-sm">
-          {item.address} → {item.targets.join(", ")}
-        </p>
+        <div key={item.id} className="flex items-center justify-between gap-3 text-sm">
+          <span>
+            {item.address} → {item.targets.join(", ")}{" "}
+            <Badge variant={statusVariant(item.status)}>{item.status}</Badge>
+          </span>
+          {item.status === "active" && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                if (!window.confirm(`Delete alias ${item.address}? This requires a recent delete step-up.`))
+                  return;
+                void api(`/api/aliases/${item.id}`, {
+                  method: "DELETE",
+                  body: JSON.stringify({}),
+                }).then(reload);
+              }}
+            >
+              Delete
+            </Button>
+          )}
+        </div>
       ))}
       {password && <code className="block rounded-lg border border-border p-3 text-xs">{password}</code>}
       <FormCard
         title="Device credential"
-        description="One-time IMAP/submission password, separate from the portal login."
+        description="Creates a native Stalwart app password. Reveal it once after the operation succeeds."
         onSubmit={async (form) => {
-          const result = await api<{ password: string }>(`/api/mailboxes/${form.get("mailboxId")}/devices`, {
+          await api(`/api/mailboxes/${form.get("mailboxId")}/devices`, {
             method: "POST",
             body: JSON.stringify({ label: form.get("label") }),
           });
-          setPassword(result.password);
           await reload();
         }}
       >
@@ -523,15 +645,31 @@ export function EmailView({ state, reload }: { state: PlatformState; reload: () 
             {item.label} {item.revokedAt ? "(revoked)" : ""}
           </span>
           {!item.revokedAt && (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() =>
-                void api(`/api/devices/${item.id}/revoke`, { method: "POST", body: "{}" }).then(reload)
-              }
-            >
-              Revoke
-            </Button>
+            <div className="flex gap-2">
+              {item.secretId && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    void api<{ password: string }>(`/api/devices/${item.id}/credential`, {
+                      method: "POST",
+                      body: "{}",
+                    }).then((result) => setPassword(result.password))
+                  }
+                >
+                  Reveal once
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  void api(`/api/devices/${item.id}/revoke`, { method: "POST", body: "{}" }).then(reload)
+                }
+              >
+                Revoke
+              </Button>
+            </div>
           )}
         </div>
       ))}
@@ -561,6 +699,49 @@ const SAMPLE_COMPOSE = `services:
       - "8088:80"
 `;
 
+async function observeService(id: string, kind: "logs" | "stats") {
+  const queued = await api<{ operationId: string }>(`/api/services/${id}/observe`, {
+    method: "POST",
+    body: JSON.stringify({ kind }),
+  });
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const result = await api<{
+      status: string;
+      available: boolean;
+      error?: string;
+      lines?: string[];
+      stats?: Record<string, unknown>;
+    }>(`/api/services/${id}/observations/${queued.operationId}`);
+    if (result.available) return result;
+    if (["failed", "cancelled", "needs_recovery"].includes(result.status)) {
+      throw new Error(result.error || `Service ${kind} observation failed.`);
+    }
+  }
+  throw new Error(`Service ${kind} observation is still queued; check Operations for progress.`);
+}
+
+async function discoverServices() {
+  const queued = await api<{ operationId: string }>("/api/services/discover", {
+    method: "POST",
+    body: "{}",
+  });
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const result = await api<{
+      status: string;
+      available: boolean;
+      error?: string;
+      unmanaged?: Array<{ name: string; image: string }>;
+    }>(`/api/services/discovery/${queued.operationId}`);
+    if (result.available) return result.unmanaged ?? [];
+    if (["failed", "cancelled", "needs_recovery"].includes(result.status)) {
+      throw new Error(result.error || "Host discovery failed.");
+    }
+  }
+  throw new Error("Host discovery is still queued; check Operations for progress.");
+}
+
 export function ServicesView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   const projectId = state.projects[0]?.id;
   const [logs, setLogs] = useState("");
@@ -576,12 +757,17 @@ export function ServicesView({ state, reload }: { state: PlatformState; reload: 
               projectId,
               name: form.get("name"),
               compose: form.get("compose"),
+              stateful: form.get("stateful") === "on",
             }),
           });
           await reload();
         }}
       >
         <Field label="Service name" name="name" defaultValue="demo" required />
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" name="stateful" />
+          This workload owns persistent application data
+        </label>
         <div className="md:col-span-2">
           <label className="mb-1.5 block text-xs font-semibold">Approved Compose subset</label>
           <textarea
@@ -594,11 +780,12 @@ export function ServicesView({ state, reload }: { state: PlatformState; reload: 
       <Card>
         <CardContent className="p-0">
           {state.services.map((item) => (
-            <div className="table-row grid-cols-[1fr_auto_auto]" key={item.id}>
+            <div className="table-row grid-cols-[1fr_auto_auto_auto_auto]" key={item.id}>
               <div>
                 <strong>{item.name}</strong>
                 <p className="text-xs text-muted-foreground">
-                  {item.status} · observed {formatDate(item.observedAt)}
+                  {item.status} · {item.stateful ? "stateful" : "stateless"} · observed{" "}
+                  {formatDate(item.observedAt)}
                 </p>
               </div>
               <Button
@@ -621,13 +808,30 @@ export function ServicesView({ state, reload }: { state: PlatformState; reload: 
               <Button
                 size="sm"
                 variant="ghost"
-                onClick={() =>
-                  void api<{ lines: string[] }>(`/api/services/${item.id}/logs`).then((result) =>
-                    setLogs(result.lines.join("\n") || "No logs (Docker unavailable)."),
-                  )
-                }
+                onClick={() => {
+                  setLogs("Log observation queued…");
+                  void observeService(item.id, "logs")
+                    .then((result) => setLogs(result.lines?.join("\n") || "No log lines returned."))
+                    .catch((error) =>
+                      setLogs(error instanceof Error ? error.message : "Log request failed."),
+                    );
+                }}
               >
                 Logs
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setLogs("Stats observation queued…");
+                  void observeService(item.id, "stats")
+                    .then((result) => setLogs(JSON.stringify(result.stats ?? {}, null, 2)))
+                    .catch((error) =>
+                      setLogs(error instanceof Error ? error.message : "Stats request failed."),
+                    );
+                }}
+              >
+                Stats
               </Button>
             </div>
           ))}
@@ -636,15 +840,16 @@ export function ServicesView({ state, reload }: { state: PlatformState; reload: 
       {logs && <pre className="overflow-auto rounded-lg border border-border p-3 text-xs">{logs}</pre>}
       <Button
         variant="outline"
-        onClick={() =>
-          void api<{ unmanaged: Array<{ name: string; image: string }> }>("/api/services/discover").then(
-            (result) =>
+        onClick={() => {
+          setLogs("Host discovery queued…");
+          void discoverServices()
+            .then((items) =>
               setLogs(
-                result.unmanaged.map((item) => `${item.name} ${item.image}`).join("\n") ||
-                  "No unmanaged containers.",
+                items.map((item) => `${item.name} ${item.image}`).join("\n") || "No unmanaged containers.",
               ),
-          )
-        }
+            )
+            .catch((error) => setLogs(error instanceof Error ? error.message : "Host discovery failed."));
+        }}
       >
         Discover unmanaged containers
       </Button>
@@ -785,6 +990,40 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
   return (
     <div className="space-y-5">
       <FormCard
+        title="Sensitive-action verification"
+        description="Creates a ten-minute grant bound to this session and the selected action. Session refreshes do not extend it."
+        onSubmit={async (form) => {
+          const result = await api<{ action: string; expiresAt: string }>("/api/step-up", {
+            method: "POST",
+            body: JSON.stringify({
+              password: form.get("password"),
+              action: form.get("action"),
+            }),
+          });
+          setMessage(`Verified ${result.action} until ${formatDate(result.expiresAt)}.`);
+        }}
+      >
+        <div>
+          <label className="mb-1.5 block text-xs font-semibold">Action</label>
+          <select name="action" className="select">
+            <option value="secret.reveal">Reveal credentials / query data</option>
+            <option value="credential.rotate">Rotate credentials</option>
+            <option value="exposure.public">Change public exposure</option>
+            <option value="restore.overwrite">Test a restore</option>
+            <option value="platform.update">Apply updates</option>
+            <option value="resource.delete">Delete resources</option>
+            <option value="role.grant">Change access roles</option>
+          </select>
+        </div>
+        <Field
+          label="Current password"
+          name="password"
+          type="password"
+          autoComplete="current-password"
+          required
+        />
+      </FormCard>
+      <FormCard
         title="Platform settings"
         description="Auth origin is the exact configured HTTPS origin, never a Host header."
         onSubmit={async (form) => {
@@ -824,22 +1063,10 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm">Two-factor enabled: {state.user.twoFactorEnabled ? "yes" : "no"}</p>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() =>
-              void authClient.twoFactor
-                .enable({ password: window.prompt("Confirm your password to enroll MFA") ?? "" })
-                .then((result) => {
-                  setMessage(
-                    result.error?.message ??
-                      "Scan the TOTP secret from your authenticator, then verify a code on the next sign-in.",
-                  );
-                })
-            }
-          >
-            Enroll TOTP
-          </Button>
+          <p className="text-sm text-muted-foreground">
+            Re-enrollment is available only through the local recovery workflow; MFA cannot be disabled from
+            an ordinary authenticated session.
+          </p>
           {message && <p className="text-sm text-muted-foreground">{message}</p>}
         </CardContent>
       </Card>
@@ -922,10 +1149,12 @@ function FormCard({
   const [error, setError] = useState("");
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     setError("");
     try {
-      await onSubmit(new FormData(event.currentTarget));
-      event.currentTarget.reset();
+      await onSubmit(form);
+      formElement.reset();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not save.");
     }

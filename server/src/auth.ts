@@ -26,7 +26,6 @@ export const auth = betterAuth({
         type: "date",
         required: false,
         input: false,
-        fieldName: "mfa_enrolled_at",
       },
     },
   },
@@ -48,6 +47,9 @@ export const auth = betterAuth({
     defaultCookieAttributes: {
       sameSite: "lax",
       httpOnly: true,
+    },
+    ipAddress: {
+      trustedProxies: env.trustedProxies,
     },
   },
   rateLimit: {

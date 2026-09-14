@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 export type StalwartUpsert = {
-  "@type": "upsert";
+  "@type": "upsert" | "delete";
   object: string;
   matchOn: string;
   value: Record<string, Record<string, unknown>>;
@@ -23,6 +23,7 @@ export function buildStalwartPlan(input: {
     nativeId?: string;
   }>;
   aliases: Array<{ address: string; targets: string[] }>;
+  removedAliases?: Array<{ address: string; nativeId: string }>;
   smtpUsername?: string;
   outboundPaused: boolean;
 }) {
@@ -46,9 +47,42 @@ export function buildStalwartPlan(input: {
       quota: mailbox.quotaGb * 1024 * 1024 * 1024,
       email: [mailbox.address],
       ...(mailbox.nativeId ? { $nativeId: mailbox.nativeId } : {}),
+      isEnabled: mailbox.lifecycle === "active",
     };
   }
   plan.push({ "@type": "upsert", object: "Account", matchOn: "name", value: accounts });
+  const removedAccounts: Record<string, Record<string, unknown>> = {};
+  for (const mailbox of input.mailboxes.filter((item) => item.lifecycle === "purged")) {
+    removedAccounts[stalwartRef("account", mailbox.address)] = {
+      name: mailbox.address,
+      ...(mailbox.nativeId ? { $nativeId: mailbox.nativeId } : {}),
+    };
+  }
+  if (Object.keys(removedAccounts).length) {
+    plan.push({ "@type": "delete", object: "Account", matchOn: "name", value: removedAccounts });
+  }
+  const aliasValues: Record<string, Record<string, unknown>> = {};
+  for (const alias of input.aliases) {
+    aliasValues[stalwartRef("alias", alias.address)] = {
+      name: alias.address,
+      emails: alias.targets,
+      isEnabled: true,
+    };
+  }
+  plan.push({ "@type": "upsert", object: "Alias", matchOn: "name", value: aliasValues });
+  if (input.removedAliases?.length) {
+    plan.push({
+      "@type": "delete",
+      object: "Alias",
+      matchOn: "nativeId",
+      value: Object.fromEntries(
+        input.removedAliases.map((alias) => [
+          stalwartRef("alias", alias.address),
+          { $nativeId: alias.nativeId },
+        ]),
+      ),
+    });
+  }
   return {
     plan,
     outbound: {

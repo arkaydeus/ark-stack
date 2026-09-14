@@ -1,10 +1,16 @@
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import { omitSensitiveLabels, redactLogLine, validateComposeSource } from "@ark-stack/shared";
+import {
+  canonicalizeComposeSource,
+  omitSensitiveLabels,
+  redactLogLine,
+  sha256Hex,
+  validateComposeSource,
+} from "@ark-stack/shared";
 
 const exec = promisify(execFile);
 
@@ -18,10 +24,14 @@ export async function writeApprovedCompose(serviceId: string, source: string) {
   const policy = validateComposeSource(source);
   if (!policy.ok) throw new Error(policy.violations.map((item) => item.message).join(" "));
   const dir = composeDir(serviceId);
-  await mkdir(dir, { recursive: true });
+  await mkdir(dir, { recursive: true, mode: 0o700 });
   const file = join(dir, "compose.yml");
-  await Bun.write(file, source);
-  return { file, policy };
+  const canonical = canonicalizeComposeSource(source);
+  const temporary = join(dir, `.compose-${crypto.randomUUID()}.tmp`);
+  await Bun.write(temporary, canonical);
+  await chmod(temporary, 0o600);
+  await rename(temporary, file);
+  return { file, policy, hash: sha256Hex(canonical), canonical };
 }
 
 export function childProcessEnv(): NodeJS.ProcessEnv {
@@ -36,6 +46,7 @@ async function docker(args: string[]) {
 }
 
 export async function deployCompose(project: string, file: string) {
+  await docker(["compose", "-f", file, "-p", project, "pull", "--policy", "missing"]);
   const { stdout, stderr } = await docker([
     "compose",
     "-f",
@@ -49,7 +60,6 @@ export async function deployCompose(project: string, file: string) {
     "--no-build",
     "--pull",
     "never",
-    "--no-interpolate",
   ]);
   return redactLogLine(`${stdout}\n${stderr}`);
 }

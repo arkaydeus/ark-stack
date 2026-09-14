@@ -1,23 +1,32 @@
 # Security review checklist
 
-This is the in-repo review surface for a first deploy. It does not replace an external review.
+This checklist records code-backed boundaries, not deployment acceptance. A box means a repository test exercises the rule; it does not certify the Linux daemon, public network, DNS/provider account, certificate authority, or restore repository.
 
 ## Privilege boundaries
 
 - [x] Docker socket is not mounted in the API/web containers.
-- [x] Compose policy rejects privileged mode, sockets, host namespaces, includes, and floating `latest`.
+- [x] TypeScript and Go Compose policies default-deny fields and reject external/named platform resources, local-driver bind options, privileged mode, sockets, host namespaces, includes, interpolation, aliases and floating tags.
 - [x] Public PgBouncer omits `_owner`, `_migration`, `_backup`, and `_monitor` roles.
 - [x] Tailscale Funnel stays disabled; mode change rewrites edge config and revokes sessions.
-- [x] Internal worker routes use independent bearer tokens.
+- [x] Internal worker routes authenticate bearer identities and reject job kinds outside each typed allowlist.
+- [x] Public and tailnet Caddy routes preserve deny-before-fallback ordering for internal and unknown API paths.
 - [x] Setup signup is single-use and token-gated.
 
 ## Secrets and audit
 
 - [x] Inventory APIs return metadata, not plaintext.
-- [x] One-time reveal for runtime DB and mailbox credentials.
+- [x] One-time reveal uses a conditional atomic consume and is scoped to the underlying database or mailbox.
 - [x] Audit events are redacted and not deletable through the API.
 - [x] Root key stays out of PostgreSQL.
 
-## Remaining host checks
+## Deployment acceptance still required
 
-Run after deploy: forged Host/forwarded-header bypass, public-only browser routes, verified-TLS database login, inbound SMTP without open relay, isolated restore, and an off-box `ARK_ALERT_WEBHOOK`.
+- [ ] Inspect a permitted workload on an isolated Linux Docker daemon and verify the agent ledger survives restart.
+- [ ] Test forged forwarding headers and the final public/tailnet origins through the deployed Caddy/Tailscale paths.
+- [ ] Perform an external PgBouncer login over verified TLS and prove real IPv4/IPv6 CIDR denial.
+- [ ] Deliver and read mail on disposable Stalwart, then prove alias, suspension, device revocation and relay denial.
+- [ ] Complete HTTP-01 issuance/renewal against a disposable public domain.
+- [ ] Restore exact database and mail snapshots in fresh isolated volumes and attach assertion results and recovery time.
+- [ ] Exercise signed update failure/recovery and an independent off-host heartbeat alert.
+
+Production-facing status must remain waiting, untrusted, paused or unverified until the corresponding observation above exists.
