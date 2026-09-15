@@ -1,16 +1,22 @@
+import { ValidationError } from "./errors.ts";
+
 const V4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\/(?:3[0-2]|[12]?\d)$/;
-const V6 = /^[0-9a-f:]+\/(?:12[0-8]|1[01]\d|\d?\d)$/i;
+const V6 = /^[0-9a-f:.]+\/(?:12[0-8]|1[01]\d|\d?\d)$/i;
 
 export function parseCidr(value: string) {
   const cidr = value.trim();
   if (V4.test(cidr)) return { ok: true as const, version: 4 as const, cidr };
-  if (V6.test(cidr)) return { ok: true as const, version: 6 as const, cidr };
+  // The shape regex alone accepts malformed addresses such as `::::/64`, which nft rejects at
+  // load time and would take the whole allowlist down with it. Require a parsable address.
+  if (V6.test(cidr) && parseIpv6(cidr.slice(0, cidr.lastIndexOf("/"))) !== null) {
+    return { ok: true as const, version: 6 as const, cidr };
+  }
   return { ok: false as const, cidr };
 }
 
 export function assertCidrs(values: string[]) {
   const invalid = values.filter((item) => !parseCidr(item).ok);
-  if (invalid.length) throw new Error(`Invalid CIDR allowlist: ${invalid.join(", ")}`);
+  if (invalid.length) throw new ValidationError(`Invalid CIDR allowlist: ${invalid.join(", ")}`);
   return values.map((item) => item.trim());
 }
 
@@ -27,8 +33,9 @@ export function parseIpv6(ip: string) {
   if (trimmed.includes(".")) {
     const lastColon = trimmed.lastIndexOf(":");
     const v4 = trimmed.slice(lastColon + 1);
-    const v6 = `${trimmed.slice(0, lastColon)}:0:0`;
-    const mapped = parseIpv6(v6.replace(/:0:0$/, ""));
+    // Parse the prefix with the trailing quad replaced by two zero groups so the preceding
+    // groups land in their real positions; stripping them again would shift them to the tail.
+    const mapped = parseIpv6(`${trimmed.slice(0, lastColon)}:0:0`);
     if (!mapped) return null;
     const bytes = new Uint8Array(16);
     bytes.set(mapped.slice(0, 12), 0);
@@ -78,7 +85,7 @@ function prefixMatch(value: Uint8Array, network: Uint8Array, bits: number) {
 
 export function clientAllowed(cidrs: string[], ip: string) {
   if (!cidrs.length) return { allowed: true, reason: "any-authenticated" as const };
-  const trimmed = ip.replace(/^\[|\]$/g, "").replace(/^::ffff:/, "");
+  const trimmed = ip.replace(/^\[|\]$/g, "").replace(/^::ffff:/i, "");
   for (const item of cidrs) {
     const parsed = parseCidr(item);
     if (!parsed.ok) continue;
@@ -103,13 +110,18 @@ export function clientAllowed(cidrs: string[], ip: string) {
 
 export function nftAllowlist(cidrs: string[], port = 5432) {
   const valid = cidrs.map((item) => parseCidr(item)).filter((item) => item.ok);
-  if (!valid.length) {
-    return `# Generated public database source policy. Empty means any authenticated client.\ntable inet ark_db_ingress\ndelete table inet ark_db_ingress\n`;
-  }
   const v4 = valid.filter((item) => item.version === 4).map((item) => `    ip saddr ${item.cidr} accept`);
   const v6 = valid.filter((item) => item.version === 6).map((item) => `    ip6 saddr ${item.cidr} accept`);
+  // An empty allowlist still emits a real table with an accept-only chain. Emitting a bare
+  // `delete table` instead would leave hosts with nothing to read back, and the reconcilers
+  // treat a missing table as a failed apply and close the listener.
+  const policy = valid.length
+    ? `# Default deny applies only to tcp/${port}.\n${[...v4, ...v6].join("\n")}\n    drop`
+    : `# Empty allowlist: any authenticated client may reach tcp/${port}.\n    accept`;
+  const [comment, ...rules] = policy.split("\n");
   return `#!/usr/sbin/nft -f
-# Generated public database source policy. Default deny applies only to tcp/${port}.
+# Generated public database source policy.
+${comment}
 # input covers a host-namespace listener; forward covers Docker DNAT to a published port.
 table inet ark_db_ingress
 delete table inet ark_db_ingress
@@ -123,8 +135,7 @@ table inet ark_db_ingress {
     ct status dnat tcp dport ${port} jump ark_db_allow
   }
   chain ark_db_allow {
-${[...v4, ...v6].join("\n")}
-    drop
+${rules.join("\n")}
   }
 }
 `;

@@ -88,7 +88,14 @@ export type PlatformState = {
   }>;
   operations: Array<{ id: string; kind: string; status: string; error: string | null; createdAt: string }>;
   steps: Array<{ id: string; operationId: string; name: string; status: string }>;
-  backups: Array<{ id: string; kind: string; status: string; restoreVerified: boolean; createdAt: string }>;
+  backups: Array<{
+    id: string;
+    kind: string;
+    targetId: string;
+    status: string;
+    restoreVerified: boolean;
+    createdAt: string;
+  }>;
   alerts: Array<{
     id: string;
     severity: string;

@@ -1,5 +1,7 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
+import { ValidationError } from "./errors.ts";
+
 const MAX_BYTES = 64 * 1024;
 const MAX_SERVICES = 20;
 const RESERVED_PORTS = new Set([25, 80, 443, 465, 587, 993, 5432, 5433]);
@@ -158,7 +160,7 @@ export function validateComposeSource(
         violations.push({
           path: `services.${name}.image`,
           message:
-            "Image must come from an allowed registry and must not use a floating latest tag without a digest.",
+            "Image must come from an allowed registry and must be pinned by an immutable sha256 digest.",
         });
       }
     }
@@ -211,7 +213,7 @@ export function validateComposeSource(
 export function canonicalizeComposeSource(source: string, options: { allowedRegistries?: string[] } = {}) {
   const policy = validateComposeSource(source, options);
   if (!policy.ok)
-    throw new Error(policy.violations.map((item) => `${item.path}: ${item.message}`).join("\n"));
+    throw new ValidationError(policy.violations.map((item) => `${item.path}: ${item.message}`).join("\n"));
   const doc = parseYaml(source, { merge: false, uniqueKeys: true }) as Record<string, unknown>;
   const services = doc.services as Record<string, Record<string, unknown>>;
   for (const service of Object.values(services)) {
@@ -337,8 +339,9 @@ export function imageRegistry(image: string) {
 function isAllowedImage(image: string, registries: string[]) {
   if (image.includes("..") || image.startsWith("/")) return false;
   const [name, digest] = image.split("@");
-  const tag = name.includes(":") ? name.slice(name.lastIndexOf(":") + 1) : "latest";
-  if (tag === "latest" && !digest) return false;
+  // The agent only pulls immutable digests, so accepting a tag-only reference here would
+  // enqueue a deploy it can never execute.
+  if (!/^sha256:[a-f0-9]{64}$/i.test(digest ?? "")) return false;
   const registry = imageRegistry(name);
   return registries.includes(registry);
 }
@@ -365,10 +368,16 @@ function hasForbiddenMount(volumes: unknown) {
     }
     if (item && typeof item === "object") {
       const mount = item as { type?: string; source?: string; target?: string };
-      if (mount.type === "bind") return true;
+      // Allowlist the mount type. `bind` reaches the host filesystem and `image` (Compose 2.35+)
+      // mounts an arbitrary image's contents, bypassing the registry and digest allowlists.
+      if (mount.type !== undefined && mount.type !== "volume" && mount.type !== "tmpfs") return true;
       if (
         typeof mount.source === "string" &&
-        (mount.source.includes("$") || mount.source.startsWith("/") || mount.source.includes("docker.sock"))
+        (mount.source.includes("$") ||
+          mount.source.startsWith("/") ||
+          mount.source.startsWith("~") ||
+          mount.source.startsWith(".") ||
+          mount.source.includes("docker.sock"))
       ) {
         return true;
       }
@@ -410,8 +419,12 @@ function extractPorts(ports: unknown): number[] {
       return published !== undefined ? [published] : [];
     }
     if (item && typeof item === "object" && "published" in item) {
-      const published = Number((item as { published: string | number }).published);
-      return Number.isFinite(published) ? [published] : [];
+      const raw = (item as { published: string | number }).published;
+      // `Number("80-81")` is NaN. Returning [] there would drop a range on the floor; NaN is
+      // what the caller treats as "ambiguous publish syntax", matching the string form.
+      if (typeof raw === "string" && /\d+-\d+/.test(raw)) return [Number.NaN];
+      const published = Number(raw);
+      return Number.isInteger(published) ? [published] : [Number.NaN];
     }
     return [];
   });

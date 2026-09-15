@@ -15,3 +15,6 @@ agent/ark-agent
 agent/journal.db
 tmp/
 infra/database/userlist.txt
+# Edge config swap files written by edge.apply
+infra/platform/*.next
+tmp/edge/*.next

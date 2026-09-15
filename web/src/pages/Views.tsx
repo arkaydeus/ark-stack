@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field } from "@/components/ui/input";
 import type { PlatformState } from "@/lib/types";
-import { api, formatDate } from "@/lib/utils";
+import { act, api, formatDate } from "@/lib/utils";
 
 import { InlineError } from "./Auth";
 
@@ -71,10 +71,13 @@ export function Overview({ state, reload }: { state: PlatformState; reload: () =
                           size="sm"
                           variant="outline"
                           onClick={() =>
-                            void api(`/api/alerts/${alert.id}/ack`, {
-                              method: "POST",
-                              body: "{}",
-                            }).then(reload)
+                            act(
+                              api(`/api/alerts/${alert.id}/ack`, {
+                                method: "POST",
+                                body: "{}",
+                              }),
+                              reload,
+                            )
                           }
                         >
                           Ack
@@ -84,10 +87,13 @@ export function Overview({ state, reload }: { state: PlatformState; reload: () =
                         size="sm"
                         variant="ghost"
                         onClick={() =>
-                          void api(`/api/alerts/${alert.id}/silence`, {
-                            method: "POST",
-                            body: JSON.stringify({ minutes: 60 }),
-                          }).then(reload)
+                          act(
+                            api(`/api/alerts/${alert.id}/silence`, {
+                              method: "POST",
+                              body: JSON.stringify({ minutes: 60 }),
+                            }),
+                            reload,
+                          )
                         }
                       >
                         Silence 1h
@@ -135,7 +141,7 @@ export function DomainsView({ state, reload }: { state: PlatformState; reload: (
               <Button
                 size="sm"
                 onClick={() =>
-                  void api(`/api/domains/${domain.id}/verify`, { method: "POST", body: "{}" }).then(reload)
+                  act(api(`/api/domains/${domain.id}/verify`, { method: "POST", body: "{}" }), reload)
                 }
               >
                 Recheck DNS
@@ -145,7 +151,7 @@ export function DomainsView({ state, reload }: { state: PlatformState; reload: (
                   size="sm"
                   variant="outline"
                   onClick={() =>
-                    void api(`/api/domains/${domain.id}/publish`, { method: "POST", body: "{}" }).then(reload)
+                    act(api(`/api/domains/${domain.id}/publish`, { method: "POST", body: "{}" }), reload)
                   }
                 >
                   Publish reviewed DNS
@@ -315,10 +321,13 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
                   size="sm"
                   variant="ghost"
                   onClick={() =>
-                    void api(`/api/databases/${item.id}/rotate`, {
-                      method: "POST",
-                      body: JSON.stringify({ kind: "runtime" }),
-                    }).then(reload)
+                    act(
+                      api(`/api/databases/${item.id}/rotate`, {
+                        method: "POST",
+                        body: JSON.stringify({ kind: "runtime" }),
+                      }),
+                      reload,
+                    )
                   }
                 >
                   Rotate runtime
@@ -484,10 +493,13 @@ export function EmailView({ state, reload }: { state: PlatformState; reload: () 
           <Button
             variant="outline"
             onClick={() =>
-              void api("/api/mail/reconcile", {
-                method: "POST",
-                body: JSON.stringify({ mailboxId: state.mailboxes[0].id }),
-              }).then(reload)
+              act(
+                api("/api/mail/reconcile", {
+                  method: "POST",
+                  body: JSON.stringify({ mailboxId: state.mailboxes[0].id }),
+                }),
+                reload,
+              )
             }
           >
             Reconcile Stalwart
@@ -497,10 +509,13 @@ export function EmailView({ state, reload }: { state: PlatformState; reload: () 
           <Button
             variant="outline"
             onClick={() =>
-              void api("/api/ses/reconcile", {
-                method: "POST",
-                body: JSON.stringify({ domainId: state.domains[0].id }),
-              }).then(reload)
+              act(
+                api("/api/ses/reconcile", {
+                  method: "POST",
+                  body: JSON.stringify({ domainId: state.domains[0].id }),
+                }),
+                reload,
+              )
             }
           >
             Reconcile SES
@@ -555,12 +570,15 @@ export function EmailView({ state, reload }: { state: PlatformState; reload: () 
                   size="sm"
                   variant="ghost"
                   onClick={() =>
-                    void api(`/api/mailboxes/${item.id}/lifecycle`, {
-                      method: "POST",
-                      body: JSON.stringify({
-                        lifecycle: item.lifecycle === "suspended" ? "active" : "suspended",
+                    act(
+                      api(`/api/mailboxes/${item.id}/lifecycle`, {
+                        method: "POST",
+                        body: JSON.stringify({
+                          lifecycle: item.lifecycle === "suspended" ? "active" : "suspended",
+                        }),
                       }),
-                    }).then(reload)
+                      reload,
+                    )
                   }
                 >
                   {item.lifecycle === "suspended" ? "Resume" : "Suspend"}
@@ -604,10 +622,13 @@ export function EmailView({ state, reload }: { state: PlatformState; reload: () 
               onClick={() => {
                 if (!window.confirm(`Delete alias ${item.address}? This requires a recent delete step-up.`))
                   return;
-                void api(`/api/aliases/${item.id}`, {
-                  method: "DELETE",
-                  body: JSON.stringify({}),
-                }).then(reload);
+                act(
+                  api(`/api/aliases/${item.id}`, {
+                    method: "DELETE",
+                    body: JSON.stringify({}),
+                  }),
+                  reload,
+                );
               }}
             >
               Delete
@@ -664,7 +685,7 @@ export function EmailView({ state, reload }: { state: PlatformState; reload: () 
                 size="sm"
                 variant="ghost"
                 onClick={() =>
-                  void api(`/api/devices/${item.id}/revoke`, { method: "POST", body: "{}" }).then(reload)
+                  act(api(`/api/devices/${item.id}/revoke`, { method: "POST", body: "{}" }), reload)
                 }
               >
                 Revoke
@@ -791,7 +812,7 @@ export function ServicesView({ state, reload }: { state: PlatformState; reload: 
               <Button
                 size="sm"
                 onClick={() =>
-                  void api(`/api/services/${item.id}/restart`, { method: "POST", body: "{}" }).then(reload)
+                  act(api(`/api/services/${item.id}/restart`, { method: "POST", body: "{}" }), reload)
                 }
               >
                 Restart
@@ -800,7 +821,7 @@ export function ServicesView({ state, reload }: { state: PlatformState; reload: 
                 size="sm"
                 variant="outline"
                 onClick={() =>
-                  void api(`/api/services/${item.id}/stop`, { method: "POST", body: "{}" }).then(reload)
+                  act(api(`/api/services/${item.id}/stop`, { method: "POST", body: "{}" }), reload)
                 }
               >
                 Stop
@@ -903,33 +924,75 @@ export function BackupsView({ state, reload }: { state: PlatformState; reload: (
       <div className="flex flex-wrap gap-2">
         <Button
           onClick={() =>
-            void api("/api/backups", {
-              method: "POST",
-              body: JSON.stringify({ kind: "platform-postgres", targetId: "platform" }),
-            }).then(reload)
+            act(
+              api("/api/backups", {
+                method: "POST",
+                body: JSON.stringify({ kind: "platform-postgres", targetId: "platform" }),
+              }),
+              reload,
+            )
           }
         >
           Capture platform backup
         </Button>
-        <Button
-          variant="outline"
-          onClick={() =>
-            void api("/api/backups/restore-test", {
-              method: "POST",
-              body: JSON.stringify({ kind: "platform-postgres", targetId: "platform" }),
-            }).then(reload)
-          }
-        >
-          Isolated restore test
-        </Button>
       </div>
       {state.backups.map((item) => (
         <Card key={item.id}>
-          <CardContent>
-            <strong>{item.kind}</strong>
-            <p className="text-sm text-muted-foreground">
-              Upload {item.status}. Restore proof {item.restoreVerified ? "verified" : "not yet run"}.
-            </p>
+          <CardContent className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <strong>{item.kind}</strong>
+              <p className="text-sm text-muted-foreground">
+                Upload {item.status}. Restore proof {item.restoreVerified ? "verified" : "not yet run"}.
+              </p>
+            </div>
+            {/* The restore test runs against one exact backup, so the action belongs on the row
+                that identifies it rather than on a target-wide button. */}
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  act(
+                    api("/api/backups/restore-test", {
+                      method: "POST",
+                      body: JSON.stringify({
+                        kind: item.kind,
+                        targetId: item.targetId,
+                        backupId: item.id,
+                      }),
+                    }),
+                    reload,
+                  )
+                }
+              >
+                Isolated restore test
+              </Button>
+              {item.status === "integrity_ok" && !item.restoreVerified && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    if (
+                      !window.confirm(
+                        "Confirm the restored copy booted and served its data? This marks the backup as restore proof for stateful updates.",
+                      )
+                    )
+                      return;
+                    act(
+                      api(`/api/backups/${item.id}/verify-restore`, {
+                        method: "POST",
+                        body: JSON.stringify({
+                          confirmation: "restored copy booted and served its data",
+                        }),
+                      }),
+                      reload,
+                    );
+                  }}
+                >
+                  Mark restore verified
+                </Button>
+              )}
+            </div>
           </CardContent>
         </Card>
       ))}
@@ -940,7 +1003,7 @@ export function BackupsView({ state, reload }: { state: PlatformState; reload: (
 export function UpdatesView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   return (
     <div className="space-y-5">
-      <Button onClick={() => void api("/api/updates/detect", { method: "POST", body: "{}" }).then(reload)}>
+      <Button onClick={() => act(api("/api/updates/detect", { method: "POST", body: "{}" }), reload)}>
         Resolve registry digests
       </Button>
       <Card>
@@ -967,10 +1030,13 @@ export function UpdatesView({ state, reload }: { state: PlatformState; reload: (
                   <Button
                     size="sm"
                     onClick={() =>
-                      void api("/api/updates/apply", {
-                        method: "POST",
-                        body: JSON.stringify({ serviceId: item.id, digest: candidate.candidateDigest }),
-                      }).then(reload)
+                      act(
+                        api("/api/updates/apply", {
+                          method: "POST",
+                          body: JSON.stringify({ serviceId: item.id, digest: candidate.candidateDigest }),
+                        }),
+                        reload,
+                      )
                     }
                   >
                     Apply digest
@@ -1086,10 +1152,13 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
             type="button"
             variant="outline"
             onClick={() =>
-              void api("/api/settings/mode", {
-                method: "POST",
-                body: JSON.stringify({ adminMode: "public" }),
-              }).then(reload)
+              act(
+                api("/api/settings/mode", {
+                  method: "POST",
+                  body: JSON.stringify({ adminMode: "public" }),
+                }),
+                reload,
+              )
             }
           >
             Public HTTPS
@@ -1098,10 +1167,13 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
             type="button"
             variant="outline"
             onClick={() =>
-              void api("/api/settings/mode", {
-                method: "POST",
-                body: JSON.stringify({ adminMode: "tailnet" }),
-              }).then(reload)
+              act(
+                api("/api/settings/mode", {
+                  method: "POST",
+                  body: JSON.stringify({ adminMode: "tailnet" }),
+                }),
+                reload,
+              )
             }
           >
             Tailnet only

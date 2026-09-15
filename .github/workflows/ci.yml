@@ -82,5 +82,8 @@ jobs:
       - run: docker build --check -f agent/Dockerfile agent
       - run: docker compose -f infra/platform/docker-compose.yml config --quiet
       - run: docker compose -f infra/platform/docker-compose.yml -f infra/platform/docker-compose.dev.yml config --quiet
+      - run: docker compose -f infra/platform/docker-compose.yml up --wait --wait-timeout 120 postgres app-postgres
+      - run: docker compose -f infra/platform/docker-compose.yml down -v
+        if: always()
       - run: docker compose -f infra/mail/docker-compose.yml config --quiet
       - run: docker compose -f infra/monitoring/docker-compose.yml config --quiet

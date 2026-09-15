@@ -41,7 +41,12 @@ try {
   if (expose && process.env.ARK_PUBLIC_DB_CONTROL === "1") {
     await run("docker", ["compose", "-f", composeFile, "up", "-d", "database-ingress", "pgbouncer-public"]);
   }
-  await writeFile(statusFile, `applied=true\nenforced=true\nexposed=${expose}\nerror=\n`, { mode: 0o600 });
+  // An empty allowlist installs an accept-only chain, so the table exists but nothing is
+  // enforced. Report that honestly rather than claiming enforcement.
+  const enforced = (await Bun.file(file).text()).includes("drop");
+  await writeFile(statusFile, `applied=true\nenforced=${enforced}\nexposed=${expose}\nerror=\n`, {
+    mode: 0o600,
+  });
 } catch (error) {
   if (process.env.ARK_PUBLIC_DB_CONTROL === "1") {
     await run("docker", ["compose", "-f", composeFile, "restart", "database-ingress"]).catch(() => undefined);

@@ -8,6 +8,7 @@ export * from "./compose-policy.ts";
 export * from "./crypto.ts";
 export * from "./dns-plan.ts";
 export * from "./edge.ts";
+export * from "./errors.ts";
 export * from "./hash.ts";
 export * from "./hostnames.ts";
 export * from "./install.ts";

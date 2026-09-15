@@ -436,15 +436,9 @@ export async function applyDatabaseAllowlist(
       await exec(helper, [file], { timeout: 20_000 });
       return { file, applied: true, enforced: cidrs.length > 0, exposed: expose };
     }
-    if (!cidrs.length) {
-      if (process.env.ARK_APPLY_NFT === "1") {
-        await exec("nft", ["delete", "table", "inet", "ark_db_ingress"], { timeout: 10_000 }).catch(
-          () => undefined,
-        );
-      }
-      await controlPublicDatabaseListener({ expose });
-      return { file, applied: true, enforced: false, exposed: expose };
-    }
+    // An empty allowlist is applied like any other policy: the generated file installs an
+    // accept-only chain. Deleting the table instead would leave the host reconcilers with
+    // nothing to read back, and they treat a missing table as a failed apply.
     if (process.env.ARK_APPLY_NFT === "0") {
       await controlPublicDatabaseListener({ expose: false });
       if (requireApply) throw new Error("Database CIDR allowlist cannot be applied because ARK_APPLY_NFT=0.");
@@ -453,7 +447,7 @@ export async function applyDatabaseAllowlist(
     await exec("nft", ["-f", file], { timeout: 10_000 });
     await exec("nft", ["list", "table", "inet", "ark_db_ingress"], { timeout: 10_000 });
     await controlPublicDatabaseListener({ expose });
-    return { file, applied: true, enforced: true, exposed: expose };
+    return { file, applied: true, enforced: cidrs.length > 0, exposed: expose };
   } catch (error) {
     await writeFile(join(dir, "expose"), "0\n", { mode: 0o600 }).catch(() => undefined);
     await controlPublicDatabaseListener({ expose: false }).catch(() => undefined);

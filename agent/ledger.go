@@ -34,11 +34,24 @@ func loadLedger() (resourceLedger, error) {
 	if err != nil {
 		return ledger, err
 	}
-	if err := json.Unmarshal(raw, &ledger); err != nil {
-		return ledger, err
-	}
-	if ledger.Version != 1 || ledger.Workloads == nil {
-		return ledger, fmt.Errorf("unsupported resource ledger")
+	if err := json.Unmarshal(raw, &ledger); err != nil || ledger.Version != 1 || ledger.Workloads == nil {
+		// A torn write leaves a truncated or empty file. Fall back to the previous copy rather
+		// than failing every owned-container operation until someone intervenes by hand.
+		backup, backupErr := os.ReadFile(ledgerPath() + ".bak")
+		if backupErr != nil {
+			if err != nil {
+				return ledger, err
+			}
+			return ledger, fmt.Errorf("unsupported resource ledger")
+		}
+		recovered := resourceLedger{Version: 1, Workloads: map[string]workloadBinding{}}
+		if err := json.Unmarshal(backup, &recovered); err != nil {
+			return ledger, fmt.Errorf("resource ledger and its backup are both unreadable: %w", err)
+		}
+		if recovered.Version != 1 || recovered.Workloads == nil {
+			return ledger, fmt.Errorf("unsupported resource ledger")
+		}
+		return recovered, nil
 	}
 	return ledger, nil
 }
@@ -52,11 +65,48 @@ func saveLedger(ledger resourceLedger) error {
 	if err != nil {
 		return err
 	}
+	// Keep the previous ledger so a torn write is recoverable; without it a truncated file
+	// makes every owned-container operation fail permanently.
+	if previous, err := os.ReadFile(path); err == nil {
+		if err := writeFileSynced(path+".bak", previous); err != nil {
+			return err
+		}
+	}
 	next := path + ".next"
-	if err := os.WriteFile(next, raw, 0o600); err != nil {
+	if err := writeFileSynced(next, raw); err != nil {
 		return err
 	}
-	return os.Rename(next, path)
+	if err := os.Rename(next, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// Durability for a rename-based atomic replace needs the file contents on disk before the
+// rename and the directory entry on disk after it.
+func writeFileSynced(path string, data []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func syncDir(dir string) error {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	return handle.Sync()
 }
 
 func recordWorkload(id, project, composeHash, compose string) error {
@@ -64,19 +114,35 @@ func recordWorkload(id, project, composeHash, compose string) error {
 	if err != nil {
 		return err
 	}
+	// The control plane shares one Compose project across every service in a platform project,
+	// and `COMPOSE_IGNORE_ORPHANS` keeps containers from removed services running. So the scan
+	// is scoped to the services this manifest actually declares: anything else under the same
+	// project belongs to a sibling workload and is none of this deploy's business.
+	declared, err := composeServiceNames(compose)
+	if err != nil {
+		return err
+	}
 	containers := []string{}
 	for _, item := range items {
-		if item.Labels["com.docker.compose.project"] == project {
-			serviceName := item.Labels["com.docker.compose.service"]
-			expectedImage, err := composeServiceImage(compose, serviceName)
-			if err != nil {
-				return err
-			}
-			if _, err := inspectAdoptableContainer(item.ID, serviceName, expectedImage); err != nil {
-				return fmt.Errorf("deployed container failed effective-policy inspection: %w", err)
-			}
-			containers = append(containers, item.ID)
+		if item.Labels["com.docker.compose.project"] != project {
+			continue
 		}
+		serviceName := item.Labels["com.docker.compose.service"]
+		if !declared[serviceName] {
+			continue
+		}
+		expectedImage, err := composeServiceImage(compose, serviceName)
+		if err != nil {
+			return err
+		}
+		if _, err := inspectAdoptableContainer(item.ID, serviceName, expectedImage); err != nil {
+			// `compose up` has already run, so a container that fails inspection is live and
+			// about to be left out of the ledger. Stop what this deploy created rather than
+			// leaving unmanaged containers behind.
+			stopUnledgered(append(containers, item.ID))
+			return fmt.Errorf("deployed container failed effective-policy inspection: %w", err)
+		}
+		containers = append(containers, item.ID)
 	}
 	if len(containers) == 0 {
 		return fmt.Errorf("compose completed without observable owned containers")
@@ -166,4 +232,12 @@ func ownedContainer(workloadID, serviceName string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no currently owned container matches this workload")
+}
+
+// Best effort: the caller is already returning an error, and a container that cannot be stopped
+// is reported through that error rather than masking it.
+func stopUnledgered(containers []string) {
+	for _, id := range containers {
+		_ = mutateContainer(id, "stop")
+	}
 }

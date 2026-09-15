@@ -1,9 +1,7 @@
+# Replace the digest with the one you actually intend to deploy; the policy requires an
+# immutable sha256 reference. CPU, memory, pids, capabilities and the read-only root are
+# applied by canonicalisation, so this file must not set them.
 services:
   worker:
     image: docker.io/library/python:3.13.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     command: ["python", "-m", "http.server", "8080"]
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M

@@ -38,7 +38,11 @@ import {
   sqlCancelInput,
   settingsInput,
   buildDomainPlan,
+  nextBackupStatus,
+  redactLogLine,
+  ValidationError,
   type Access,
+  type BackupStatus,
   type OperationState,
   type Role,
 } from "@ark-stack/shared";
@@ -120,9 +124,67 @@ app.use("/api/*", bodyLimit({ maxSize: 256 * 1024 }));
 app.onError((error, c) => {
   if (error instanceof HTTPException) return c.json({ error: error.message }, error.status);
   if (error instanceof z.ZodError) return c.json({ error: z.prettifyError(error) }, 422);
+  // Better Auth surfaces its own failures (a wrong step-up password, for example) as APIError.
+  // Reporting those as 500 hides an actionable message behind a generic one.
+  if (isApiError(error)) {
+    const status =
+      error.status === 401
+        ? 401
+        : error.status === 403
+          ? 403
+          : error.status === 404
+            ? 404
+            : error.status === 409
+              ? 409
+              : error.status === 429
+                ? 429
+                : 422;
+    return c.json({ error: redactLogLine(error.message) }, status);
+  }
+  // Input validators in shared/ reject with plain Errors. They describe a caller mistake, not a
+  // server fault, so they belong in the response rather than only in the log.
+  if (error instanceof ValidationError) return c.json({ error: error.message }, 422);
   console.error(error instanceof Error ? error.message : error);
   return c.json({ error: "The request could not be completed." }, 500);
 });
+
+const STEP_UP_MAX_FAILURES = 5;
+const STEP_UP_LOCKOUT_MS = 15 * 60 * 1000;
+const stepUpFailures = new Map<string, { count: number; firstAt: number }>();
+
+function assertStepUpAttemptAllowed(userId: string) {
+  const record = stepUpFailures.get(userId);
+  if (!record) return;
+  if (Date.now() - record.firstAt > STEP_UP_LOCKOUT_MS) {
+    stepUpFailures.delete(userId);
+    return;
+  }
+  if (record.count >= STEP_UP_MAX_FAILURES) {
+    throw new HTTPException(429, {
+      message: "Too many failed verification attempts. Wait before requesting another step-up grant.",
+    });
+  }
+}
+
+function recordStepUpFailure(userId: string) {
+  const now = Date.now();
+  const record = stepUpFailures.get(userId);
+  if (!record || now - record.firstAt > STEP_UP_LOCKOUT_MS) {
+    stepUpFailures.set(userId, { count: 1, firstAt: now });
+    return;
+  }
+  record.count += 1;
+}
+
+function clearStepUpFailures(userId: string) {
+  stepUpFailures.delete(userId);
+}
+
+function isApiError(error: unknown): error is Error & { status: number } {
+  if (!(error instanceof Error) || !("status" in error)) return false;
+  const status = (error as { status: unknown }).status;
+  return typeof status === "number" && status >= 400 && status < 500;
+}
 
 app.get("/api/health", async (c) => {
   await sql`SELECT 1`;
@@ -194,11 +256,14 @@ app.all("/api/auth/*", async (c) => {
   return response;
 });
 
+// `update.apply` belongs to the agent alone: its planning half delegates a compose payload and
+// requeues, so a module worker holding the `update.` prefix would re-plan the same operation on
+// every poll, minting a deployment revision each time. Module workers get `update.detect` only.
 const workerPrefixes: Record<string, string[]> = {
   database: ["database.", "pgbouncer."],
   domains: ["domain.", "dns.", "certificate.", "edge.", "admin."],
   mail: ["mail.", "mailbox.", "ses."],
-  backup: ["backup.", "update.", "import."],
+  backup: ["backup.", "update.detect", "import."],
   agent: ["service.", "update.apply"],
   module: [
     "database.",
@@ -212,7 +277,7 @@ const workerPrefixes: Record<string, string[]> = {
     "edge.",
     "admin.",
     "backup.",
-    "update.",
+    "update.detect",
     "import.",
   ],
 };
@@ -729,8 +794,17 @@ app.get("/api/state", async (c) => {
 app.post("/api/wizard", async (c) => {
   const access = c.get("access");
   const session = c.get("session");
-  requireOperator(access);
+  // The wizard writes the same admin exposure settings that `/api/settings` and
+  // `/api/settings/mode` guard with owner plus an `exposure.public` step-up. Without these
+  // checks an operator could re-run it to reach those settings by the back door.
+  if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
   requireMfa(session);
+  const [wizardSetup] = await db.select().from(platformSetup).where(eq(platformSetup.id, "default"));
+  if (wizardSetup?.wizardCompleted) {
+    throw new HTTPException(409, {
+      message: "First-run setup is already complete. Change these settings from Settings instead.",
+    });
+  }
   const input = wizardInput.parse(await c.req.json());
   const ownershipToken = `ark-own-${createToken(16)}`;
   const plan = buildDomainPlan({
@@ -870,7 +944,20 @@ app.post("/api/step-up", async (c) => {
       message: "A request binding or plan hash is required for a single-use step-up grant.",
     });
   }
-  await auth.api.verifyPassword({ body: { password: body.password }, headers: c.req.raw.headers });
+  // `auth.api.verifyPassword` bypasses Better Auth's rate limiter, which only wraps
+  // `auth.handler`. Without a throttle here a stolen post-MFA session cookie could brute-force
+  // the account password to mint grants for secret reveal and credential rotation.
+  assertStepUpAttemptAllowed(access.userId);
+  try {
+    await auth.api.verifyPassword({ body: { password: body.password }, headers: c.req.raw.headers });
+  } catch (error) {
+    recordStepUpFailure(access.userId);
+    await audit(access.userId, "auth.step_up_failed", "session", sessionValue.session.id, {
+      action: body.action,
+    });
+    throw error;
+  }
+  clearStepUpFailures(access.userId);
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
   await db.insert(stepUpGrants).values({
     id: createId("sup"),
@@ -1010,6 +1097,7 @@ app.post("/api/mailboxes", async (c) => {
     quotaGb: input.quotaGb,
   });
   const operation = await enqueue({ kind: "mail.provision", actorId: access.userId, targetIds: [id] });
+  await audit(access.userId, "mail.mailbox.create", "mailbox", id, input, operation.id, access.role);
   return c.json({ id, operationId: operation.id });
 });
 
@@ -1051,6 +1139,7 @@ app.post("/api/aliases", async (c) => {
     actorId: access.userId,
     targetIds: [mailbox.id],
   });
+  await audit(access.userId, "mail.alias.create", "alias", id, input, operation.id, access.role);
   return c.json({ id, operationId: operation.id });
 });
 
@@ -1105,18 +1194,20 @@ app.patch("/api/aliases/:id", async (c) => {
 app.delete("/api/aliases/:id", async (c) => {
   const access = c.get("access");
   requireOperator(access);
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "resource.delete",
-    privilegedRequestHash("resource.delete", { aliasId: c.req.param("id") }),
-  );
   const [alias] = await db
     .select()
     .from(aliases)
     .where(eq(aliases.id, c.req.param("id")));
   if (!alias || alias.status !== "active") throw new HTTPException(404, { message: "Alias not found." });
   requireDomain(access, alias.domainId, "manage");
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "resource.delete",
+    privilegedRequestHash("resource.delete", { aliasId: c.req.param("id") }),
+  );
   if (!alias.nativeId) {
     await db.delete(aliases).where(eq(aliases.id, alias.id));
     await audit(
@@ -1157,6 +1248,9 @@ app.post("/api/services", async (c) => {
   if (!policy.ok)
     throw new HTTPException(422, { message: policy.violations.map((item) => item.message).join(" ") });
   const id = createId("svc");
+  // Write the approved compose artefact first: if the filesystem write fails the request must
+  // not leave behind a registered service row with no deploy operation behind it.
+  const written = await writeApprovedCompose(id, input.compose);
   await db.insert(services).values({
     id,
     projectId: input.projectId,
@@ -1168,7 +1262,6 @@ app.post("/api/services", async (c) => {
     updatePolicy: input.updatePolicy,
     stateful: input.stateful,
   });
-  const written = await writeApprovedCompose(id, input.compose);
   const [project] = await db.select().from(projects).where(eq(projects.id, input.projectId));
   const operation = await enqueue({
     kind: "service.deploy",
@@ -1182,6 +1275,15 @@ app.post("/api/services", async (c) => {
       project: `ark-${project?.slug ?? "workload"}`,
     },
   });
+  await audit(
+    access.userId,
+    "service.create",
+    "service",
+    id,
+    { name: input.name, projectId: input.projectId },
+    operation.id,
+    access.role,
+  );
   return c.json({ id, operationId: operation.id, preview: policy });
 });
 
@@ -1254,6 +1356,8 @@ app.post("/api/services/adopt", async (c) => {
   const preview = adoptionPreview(input.compose);
   if (!preview.ok) throw new HTTPException(422, { message: "Unsupported compose cannot be adopted." });
   const id = createId("svc");
+  // Same ordering as registration: a failed artefact write must not leave an orphan row.
+  const written = await writeApprovedCompose(id, input.compose);
   await db.insert(services).values({
     id,
     projectId: input.projectId,
@@ -1265,13 +1369,21 @@ app.post("/api/services/adopt", async (c) => {
     status: "adoption_pending",
     updatePolicy: "notify",
   });
-  const written = await writeApprovedCompose(id, input.compose);
   const operation = await enqueue({
     kind: "service.adopt",
     actorId: access.userId,
     targetIds: [id],
     payload: { ...input, compose: written.canonical, composeHash: written.hash },
   });
+  await audit(
+    access.userId,
+    "service.adopt",
+    "service",
+    id,
+    { name: input.name, projectId: input.projectId },
+    operation.id,
+    access.role,
+  );
   return c.json({ id, operationId: operation.id, preview });
 });
 
@@ -1374,14 +1486,16 @@ app.post("/api/sql/query", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   const input = sqlInput.parse(await c.req.json());
+  const classified = classifySql(input.sql, input.readOnly);
+  await requireDatabaseAccess(access, input.databaseId, "manage");
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
   await requirePrivileged(
     access,
     c.get("session"),
     "secret.reveal",
     privilegedRequestHash("secret.reveal", { databaseId: input.databaseId, kind: "sql.query" }),
   );
-  const classified = classifySql(input.sql, input.readOnly);
-  await requireDatabaseAccess(access, input.databaseId, "manage");
   const [database] = await db
     .select()
     .from(managedDatabases)
@@ -1498,13 +1612,15 @@ app.post("/api/sql/cancel", async (c) => {
 app.post("/api/databases/:id/schema", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  await requireDatabaseAccess(access, c.req.param("id"));
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
   await requirePrivileged(
     access,
     c.get("session"),
     "secret.reveal",
     privilegedRequestHash("secret.reveal", { databaseId: c.req.param("id"), kind: "schema" }),
   );
-  await requireDatabaseAccess(access, c.req.param("id"));
   const [database] = await db
     .select()
     .from(managedDatabases)
@@ -1528,13 +1644,15 @@ app.post("/api/databases/:id/schema", async (c) => {
 app.post("/api/databases/:id/rotate", async (c) => {
   const access = c.get("access");
   const body = z.object({ kind: z.enum(["runtime", "readonly", "migration"]) }).parse(await c.req.json());
+  await requireDatabaseAccess(access, c.req.param("id"), "manage");
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
   await requirePrivileged(
     access,
     c.get("session"),
     "credential.rotate",
     privilegedRequestHash("credential.rotate", { databaseId: c.req.param("id"), kind: body.kind }),
   );
-  await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const operation = await enqueue({
     kind: "database.rotate",
     actorId: access.userId,
@@ -1556,14 +1674,16 @@ app.post("/api/databases/:id/rotate", async (c) => {
 app.put("/api/databases/:id/cidrs", async (c) => {
   const access = c.get("access");
   const input = cidrInput.parse(await c.req.json());
+  await requireDatabaseAccess(access, c.req.param("id"), "manage");
+  const cidrs = assertCidrs(input.sourceCidrs);
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
   await requirePrivileged(
     access,
     c.get("session"),
     "exposure.public",
     privilegedRequestHash("exposure.public", { databaseId: c.req.param("id"), cidrs: input.sourceCidrs }),
   );
-  await requireDatabaseAccess(access, c.req.param("id"), "manage");
-  const cidrs = assertCidrs(input.sourceCidrs);
   await db
     .update(managedDatabases)
     .set({ sourceCidrs: cidrs })
@@ -1574,6 +1694,15 @@ app.put("/api/databases/:id/cidrs", async (c) => {
     targetIds: [c.req.param("id")],
     payload: { cidrs },
   });
+  await audit(
+    access.userId,
+    "database.cidrs",
+    "database",
+    c.req.param("id"),
+    { cidrs },
+    operation.id,
+    access.role,
+  );
   return c.json({ operationId: operation.id, cidrs });
 });
 
@@ -1589,8 +1718,21 @@ app.get("/api/databases/:id/admission", async (c) => {
 });
 
 app.get("/api/mail/queue", async (c) => {
-  requireOperator(c.get("access"));
-  const items = (await listMailQueue()).map(redactQueueItem);
+  const access = c.get("access");
+  requireOperator(access);
+  // Queue entries carry sender and recipient addresses for every tenant. Scope reads to the
+  // domains the caller may view, matching the domain scoping the mutation route already does.
+  const domainRows = await db.select().from(domainClaims);
+  const visible = new Set(
+    domainRows.filter((item) => canViewDomain(access, item.id)).map((item) => item.name.toLowerCase()),
+  );
+  const items = (await listMailQueue())
+    .filter((item) => {
+      const recipient = item.recipient.split("@")[1]?.toLowerCase() ?? "";
+      const sender = item.sender.split("@")[1]?.toLowerCase() ?? "";
+      return visible.has(recipient) || visible.has(sender);
+    })
+    .map(redactQueueItem);
   return c.json({ items });
 });
 
@@ -1615,6 +1757,15 @@ app.post("/api/mail/queue", async (c) => {
     targetIds: [input.item.id],
     payload: native,
   });
+  await audit(
+    access.userId,
+    `mail.queue.${input.action}`,
+    "mail-queue",
+    input.item.id,
+    { action: input.action, recipient: native.recipient },
+    operation.id,
+    access.role,
+  );
   return c.json({ operationId: operation.id });
 });
 
@@ -1637,17 +1788,20 @@ app.post("/api/mailboxes/:id/devices", async (c) => {
     targetIds: [mailbox.id],
     payload: { action: "create", deviceId: id, label: input.label },
   });
+  await audit(
+    access.userId,
+    "mailbox.device.create",
+    "mailbox",
+    mailbox.id,
+    { deviceId: id, label: input.label },
+    operation.id,
+    access.role,
+  );
   return c.json({ id, operationId: operation.id });
 });
 
 app.post("/api/devices/:id/credential", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "secret.reveal",
-    privilegedRequestHash("secret.reveal", { deviceId: c.req.param("id") }),
-  );
   const [device] = await db
     .select()
     .from(mailboxDevices)
@@ -1657,6 +1811,14 @@ app.post("/api/devices/:id/credential", async (c) => {
   if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
   requireDomain(access, mailbox.domainId, "manage");
   if (!device.secretId) throw new HTTPException(409, { message: "The native credential is not ready." });
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { deviceId: c.req.param("id") }),
+  );
   const consumed = await consumeOneTimeSecret(device.secretId, {
     actorId: access.userId,
     role: access.role,
@@ -1695,38 +1857,58 @@ app.post("/api/platform/maintain", async (c) => {
   const access = c.get("access");
   if (access.role !== "owner") throw new HTTPException(403, { message: "Owner access is required." });
   const input = maintainInput.parse(await c.req.json());
+  // Falling back to a placeholder would turn the second factor into a public constant, so an
+  // unconfigured maintenance token has to fail closed.
+  if (!env.maintenanceToken) {
+    throw new HTTPException(503, {
+      message: "ARK_MAINTENANCE_TOKEN is not configured; platform maintenance is unavailable.",
+    });
+  }
+  if (!secureEqual(c.req.header("x-maintenance-token") ?? "", env.maintenanceToken)) {
+    throw new HTTPException(403, { message: "Maintenance token is invalid." });
+  }
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
   await requirePrivileged(
     access,
     c.get("session"),
     "platform.update",
     privilegedRequestHash("platform.update", { maintain: input }),
   );
-  if (!secureEqual(c.req.header("x-maintenance-token") ?? "", env.maintenanceToken || "missing")) {
-    throw new HTTPException(403, { message: "Maintenance token is invalid." });
-  }
   const operation = await enqueue({
     kind: "platform.maintain",
     actorId: access.userId,
     targetIds: ["platform"],
     payload: input,
   });
+  await audit(
+    access.userId,
+    "platform.maintain",
+    "platform",
+    "platform",
+    input as Record<string, unknown>,
+    operation.id,
+    access.role,
+  );
   return c.json({ operationId: operation.id });
 });
 
 app.post("/api/secrets/:id/reveal", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "secret.reveal",
-    privilegedRequestHash("secret.reveal", { secretId: c.req.param("id") }),
-  );
   const [secret] = await db
     .select()
     .from(secrets)
     .where(eq(secrets.id, c.req.param("id")));
   if (!secret) throw new HTTPException(404, { message: "Secret not found." });
   await requireSecretScope(access, secret);
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { secretId: c.req.param("id") }),
+  );
   let consumed = secret;
   if (secret.once) {
     const winner = await consumeOneTimeSecret(secret.id, {
@@ -1759,12 +1941,6 @@ app.post("/api/secrets/:id/reveal", async (c) => {
 
 app.post("/api/databases/:id/credential", async (c) => {
   const access = c.get("access");
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "secret.reveal",
-    privilegedRequestHash("secret.reveal", { databaseId: c.req.param("id"), kind: "runtime" }),
-  );
   await requireDatabaseAccess(access, c.req.param("id"), "manage");
   const [role] = await db
     .select()
@@ -1773,6 +1949,14 @@ app.post("/api/databases/:id/credential", async (c) => {
   if (!role?.secretId) throw new HTTPException(404, { message: "Runtime credential is not available." });
   const [secret] = await db.select().from(secrets).where(eq(secrets.id, role.secretId));
   if (!secret) throw new HTTPException(404, { message: "Runtime credential is not available." });
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { databaseId: c.req.param("id"), kind: "runtime" }),
+  );
   const consumed = await consumeOneTimeSecret(secret.id, {
     actorId: access.userId,
     role: access.role,
@@ -1807,19 +1991,24 @@ app.post("/api/databases/:id/credential", async (c) => {
 
 app.post("/api/mailboxes/:id/credential", async (c) => {
   const access = c.get("access");
+  const [mailbox] = await db
+    .select()
+    .from(mailboxes)
+    .where(eq(mailboxes.id, c.req.param("id")));
+  if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
+  // Scope first: answering 409-vs-403 before the grant check would tell a caller without access
+  // whether a foreign mailbox still holds an unrevealed credential.
+  requireDomain(access, mailbox.domainId, "manage");
+  if (!mailbox.credentialAvailable)
+    throw new HTTPException(409, { message: "No one-time mailbox credential remains." });
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
   await requirePrivileged(
     access,
     c.get("session"),
     "secret.reveal",
     privilegedRequestHash("secret.reveal", { mailboxId: c.req.param("id") }),
   );
-  const [mailbox] = await db
-    .select()
-    .from(mailboxes)
-    .where(eq(mailboxes.id, c.req.param("id")));
-  if (!mailbox?.credentialAvailable)
-    throw new HTTPException(409, { message: "No one-time mailbox credential remains." });
-  requireDomain(access, mailbox.domainId, "manage");
   const [secret] = await db
     .select()
     .from(secrets)
@@ -1867,6 +2056,13 @@ app.post("/api/backups/restore-test", async (c) => {
       backupId: z.string().min(1),
     })
     .parse(await c.req.json());
+  await requireTargetScope(access, body.targetId);
+  const [selected] = await db.select().from(backups).where(eq(backups.id, body.backupId));
+  if (!selected || selected.targetId !== body.targetId || selected.kind !== body.kind) {
+    throw new HTTPException(404, { message: "The selected backup does not belong to this target." });
+  }
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
   await requirePrivileged(
     access,
     c.get("session"),
@@ -1877,18 +2073,65 @@ app.post("/api/backups/restore-test", async (c) => {
       backupId: body.backupId,
     }),
   );
-  await requireTargetScope(access, body.targetId);
-  const [selected] = await db.select().from(backups).where(eq(backups.id, body.backupId));
-  if (!selected || selected.targetId !== body.targetId || selected.kind !== body.kind) {
-    throw new HTTPException(404, { message: "The selected backup does not belong to this target." });
-  }
   const operation = await enqueue({
     kind: "backup.restore_test",
     actorId: access.userId,
     targetIds: [body.targetId],
     payload: body,
   });
+  await audit(
+    access.userId,
+    "backup.restore_test",
+    "backup",
+    body.backupId,
+    { kind: body.kind, targetId: body.targetId },
+    operation.id,
+    access.role,
+  );
   return c.json({ operationId: operation.id });
+});
+
+/**
+ * A completed restore test only proves the bytes came back. Restore proof — the state stateful
+ * updates gate on — requires a human to confirm the restored copy actually booted and served
+ * its data, which is what this route records.
+ */
+app.post("/api/backups/:id/verify-restore", async (c) => {
+  const access = c.get("access");
+  const [selected] = await db
+    .select()
+    .from(backups)
+    .where(eq(backups.id, c.req.param("id")));
+  if (!selected) throw new HTTPException(404, { message: "Backup not found." });
+  await requireTargetScope(access, selected.targetId);
+  const body = z
+    .object({ confirmation: z.literal("restored copy booted and served its data") })
+    .parse(await c.req.json());
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "restore.overwrite",
+    privilegedRequestHash("restore.overwrite", { backupId: selected.id, verify: true }),
+  );
+  let status: string;
+  try {
+    status = nextBackupStatus(selected.status as BackupStatus, "restore");
+  } catch (error) {
+    throw new HTTPException(409, {
+      message: error instanceof Error ? error.message : "Backup cannot be marked restore verified.",
+    });
+  }
+  await db.update(backups).set({ status, restoreVerified: true }).where(eq(backups.id, selected.id));
+  await audit(
+    access.userId,
+    "backup.restore_verified",
+    "backup",
+    selected.id,
+    { confirmation: body.confirmation },
+    undefined,
+    access.role,
+  );
+  return c.json({ id: selected.id, status, restoreVerified: true });
 });
 
 app.post("/api/mail/reconcile", async (c) => {
@@ -2048,21 +2291,24 @@ app.post("/api/alerts/:id/silence", async (c) => {
 app.post("/api/updates/apply", async (c) => {
   const access = c.get("access");
   const body = z.object({ serviceId: z.string(), digest: z.string() }).parse(await c.req.json());
+  const [service] = await db.select().from(services).where(eq(services.id, body.serviceId));
+  if (!service) throw new HTTPException(404, { message: "Service not found." });
+  requireProject(access, service.projectId);
+  // Consume the single-use grant only after the target and inputs are known good, so a 404,
+  // scope rejection, or validation error does not burn it and force a fresh password+MFA round.
   await requirePrivileged(
     access,
     c.get("session"),
     "platform.update",
     privilegedRequestHash("platform.update", { serviceId: body.serviceId, digest: body.digest }),
   );
-  const [service] = await db.select().from(services).where(eq(services.id, body.serviceId));
-  if (!service) throw new HTTPException(404, { message: "Service not found." });
-  requireProject(access, service.projectId);
   const operation = await enqueue({
     kind: "update.apply",
     actorId: access.userId,
     targetIds: [body.serviceId],
     payload: body,
   });
+  await audit(access.userId, "update.apply", "service", body.serviceId, body, operation.id, access.role);
   return c.json({ operationId: operation.id });
 });
 
@@ -2082,6 +2328,7 @@ app.post("/api/settings/mode", async (c) => {
     targetIds: ["platform"],
     payload: body,
   });
+  await audit(access.userId, "settings.mode", "platform", "platform", body, operation.id, access.role);
   return c.json({ operationId: operation.id });
 });
 
@@ -2099,6 +2346,7 @@ app.put("/api/settings", async (c) => {
       updatedAt: new Date(),
     })
     .where(eq(platformSettings.id, "default"));
+  await audit(access.userId, "settings.update", "platform", "platform", input, undefined, access.role);
   return c.json({ ok: true });
 });
 

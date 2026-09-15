@@ -180,6 +180,12 @@ func execute(ctx context.Context, item job) (map[string]any, error) {
 		if len(item.TargetIDs) != 1 || project == "" || expectedHash == "" {
 			return nil, fmt.Errorf("one workload target, project, and composeHash are required for deploy")
 		}
+		// Before any Docker call: `compose -p <project> up` recreates whatever already exists
+		// under that project name, so an unvalidated project would let a deploy replace the
+		// control plane's own containers.
+		if err := validateWorkloadProject(project); err != nil {
+			return nil, err
+		}
 		file, err := materializeCompose(item.TargetIDs[0], compose, expectedHash)
 		if err != nil {
 			return nil, err

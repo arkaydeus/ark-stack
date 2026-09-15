@@ -85,12 +85,23 @@ export const databaseInput = z.object({
   sourceCidrs: z.array(z.string()).default([]),
 });
 
+/**
+ * Workload Compose projects are named `ark-<slug>`, which is the same namespace the platform's
+ * own stacks live in (`ark-platform`, `ark-mail`, `ark-monitoring`, `ark-restore`). A project
+ * using one of those slugs would make the agent run `docker compose up` against the control
+ * plane itself, so the names are reserved.
+ */
+export const reservedProjectSlugs = ["platform", "mail", "monitoring", "restore", "control"] as const;
+
 export const projectInput = z.object({
   name: z.string().trim().min(1).max(80),
   slug: z
     .string()
     .trim()
-    .regex(/^[a-z][a-z0-9-]{0,40}$/),
+    .regex(/^[a-z][a-z0-9-]{0,40}$/)
+    .refine((value) => !(reservedProjectSlugs as readonly string[]).includes(value), {
+      message: "This project slug is reserved for platform stacks.",
+    }),
 });
 
 export const serviceInput = z

@@ -1,13 +1,13 @@
+# Replace the digest with the one you actually intend to deploy; the policy requires an
+# immutable sha256 reference. CPU, memory, pids, capabilities and the read-only root are
+# applied by canonicalisation, so this file must not set them. A read-only root means the
+# service may only write inside its declared volume (and /tmp).
 services:
   store:
-    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    image: docker.io/library/redis:7.4.1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    command: ["redis-server", "--dir", "/var/lib/store", "--save", "60", "1"]
     volumes:
       - store_data:/var/lib/store
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M
 
 volumes:
   store_data:

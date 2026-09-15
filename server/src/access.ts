@@ -11,7 +11,7 @@ import { eq } from "drizzle-orm";
 import { HTTPException } from "hono/http-exception";
 
 import { db, sql } from "./db.ts";
-import { databaseClusters, endpoints, mailboxes, managedDatabases, platformAccess } from "./schema.ts";
+import { databaseClusters, endpoints, mailboxes, managedDatabases } from "./schema.ts";
 
 export type SessionValue = {
   user: { id: string; name: string; email: string; twoFactorEnabled?: boolean; mfaEnrolledAt?: Date | null };
@@ -120,18 +120,26 @@ export function requireDomain(access: Access, domainId: string, mode: "view" | "
   if (!allowed) throw new HTTPException(403, { message: "You do not have access to this domain." });
 }
 
+/**
+ * Appends in SQL rather than read-modify-write: two concurrent creates by the same user (two
+ * `POST /api/projects` in flight) would otherwise each write back the array they read and drop
+ * one of the grants.
+ */
 export async function grantAccess(userId: string, grant: { projectId?: string; domainId?: string }) {
-  const [row] = await db.select().from(platformAccess).where(eq(platformAccess.userId, userId));
-  if (!row) return;
-  const projectIds =
-    grant.projectId && !row.projectIds.includes(grant.projectId)
-      ? [...row.projectIds, grant.projectId]
-      : row.projectIds;
-  const domainIds =
-    grant.domainId && !row.domainIds.includes(grant.domainId)
-      ? [...row.domainIds, grant.domainId]
-      : row.domainIds;
-  await db.update(platformAccess).set({ projectIds, domainIds }).where(eq(platformAccess.userId, userId));
+  if (grant.projectId) {
+    await sql`
+      UPDATE platform_access
+      SET project_ids = project_ids || to_jsonb(${grant.projectId}::text)
+      WHERE user_id = ${userId} AND NOT (project_ids ? ${grant.projectId})
+    `;
+  }
+  if (grant.domainId) {
+    await sql`
+      UPDATE platform_access
+      SET domain_ids = domain_ids || to_jsonb(${grant.domainId}::text)
+      WHERE user_id = ${userId} AND NOT (domain_ids ? ${grant.domainId})
+    `;
+  }
 }
 
 export async function databaseScope(databaseId: string) {

@@ -16,6 +16,7 @@ const maxComposeServices = 20
 
 var reservedPorts = map[int]bool{25: true, 80: true, 443: true, 465: true, 587: true, 993: true, 5432: true, 5433: true}
 var resourceName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+var imageDigest = regexp.MustCompile(`@sha256:[a-fA-F0-9]{64}$`)
 var allowedTop = set("services", "volumes", "networks")
 var allowedService = set("image", "command", "entrypoint", "environment", "ports", "expose", "volumes", "networks", "depends_on", "restart", "healthcheck", "labels", "user", "working_dir", "read_only", "tmpfs", "stop_grace_period", "init", "pids_limit", "mem_limit", "cpus", "cap_drop", "security_opt")
 
@@ -90,8 +91,10 @@ func validateCompose(source string) error {
 		if !ok || image == "" {
 			return fmt.Errorf("service %q requires a prebuilt image", name)
 		}
-		if strings.HasSuffix(strings.Split(image, "@")[0], ":latest") && !strings.Contains(image, "@sha256:") {
-			return fmt.Errorf("floating latest tags without a digest are not allowed")
+		// The agent only ever pulls immutable digests, so accepting a tag-only reference here
+		// would let a deploy through that can never be executed on a host without the image.
+		if !imageDigest.MatchString(image) {
+			return fmt.Errorf("image %q must be pinned by an immutable sha256 digest", image)
 		}
 		if err := validateSandbox(service); err != nil {
 			return fmt.Errorf("service %s: %w", name, err)
@@ -403,4 +406,44 @@ func publishedPort(item string) (int, bool) {
 		return port, err == nil
 	}
 	return 0, false
+}
+
+var workloadProjectName = regexp.MustCompile(`^ark-[a-z][a-z0-9-]{0,40}$`)
+
+// A workload Compose project must be `ark-<slug>` and must never name one of the platform's own
+// stacks. `docker compose -p <project> up` adopts and recreates every existing container under
+// that project, so a project of `ark-platform` would let a workload deploy overwrite the API,
+// database, or edge containers with caller-supplied images.
+func validateWorkloadProject(project string) error {
+	normalized := strings.ToLower(strings.TrimSpace(project))
+	if normalized != project || !workloadProjectName.MatchString(normalized) {
+		return fmt.Errorf("workload Compose project %q is not a valid ark-<slug> project name", project)
+	}
+	for _, reserved := range platformProjects {
+		if normalized == reserved || strings.HasPrefix(normalized, reserved+"-") {
+			return fmt.Errorf("workload Compose project %q is reserved for platform stacks", project)
+		}
+	}
+	return nil
+}
+
+// The service names this canonical manifest declares. Containers running under the same Compose
+// project that are not in this set belong to a sibling workload.
+func composeServiceNames(source string) (map[string]bool, error) {
+	if err := validateCompose(source); err != nil {
+		return nil, err
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(source), &doc); err != nil {
+		return nil, fmt.Errorf("invalid canonical compose model: %w", err)
+	}
+	services, ok := stringMap(doc["services"])
+	if !ok {
+		return nil, fmt.Errorf("canonical compose services are invalid")
+	}
+	names := make(map[string]bool, len(services))
+	for name := range services {
+		names[name] = true
+	}
+	return names, nil
 }
