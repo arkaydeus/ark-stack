@@ -1,6 +1,9 @@
+# Replace the digest with the one you actually intend to deploy; the policy requires an
+# immutable sha256 reference. CPU, memory, pids, capabilities and the read-only root are
+# applied by canonicalisation, so this file must not set them.
 services:
   app:
-    image: docker.io/library/nginx:1.27.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    image: docker.io/traefik/whoami:v1.11.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     ports:
       - "8088:80"
     healthcheck:
@@ -8,8 +11,3 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M

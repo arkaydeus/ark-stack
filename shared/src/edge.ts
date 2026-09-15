@@ -22,7 +22,7 @@ export function renderCaddyfile(input: {
   route {
     @internal path /api/internal/* /api/metrics/prometheus /api/platform/maintain
     respond @internal 404
-    @browserApi path /api/auth/* /api/setup/status /api/state /api/me /api/wizard /api/step-up /api/domains* /api/projects* /api/databases* /api/mailboxes* /api/aliases* /api/services* /api/sql/* /api/mail/* /api/devices/* /api/backups* /api/ses/* /api/updates/* /api/import/* /api/alerts/* /api/settings* /api/metrics
+    @browserApi path /api/auth/* /api/setup/status /api/state /api/me /api/wizard /api/step-up /api/domains* /api/projects* /api/databases* /api/mailboxes* /api/aliases* /api/services* /api/sql/* /api/mail/* /api/devices/* /api/secrets/* /api/backups* /api/ses/* /api/updates/* /api/import/* /api/alerts/* /api/settings* /api/metrics
     reverse_proxy @browserApi ${input.apiUpstream} {
       header_up -X-Forwarded-Host
       header_up X-Forwarded-Proto https
@@ -36,7 +36,7 @@ export function renderCaddyfile(input: {
 `
       : "";
   return `{
-  admin 0.0.0.0:2019
+  admin edge-admin:2019
 }
 
 :80 {

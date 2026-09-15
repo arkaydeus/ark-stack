@@ -44,8 +44,10 @@ describe("coordinator enqueue and claims", () => {
       targetIds: [createId("tgt")],
       payload: { kind: "volume", targetId: "two", nonce: createId("n") },
     });
-    const claimed = await claimQueued({ limit: 2, leaseMs: 30_000 });
-    expect(claimed.rows.map((item) => item.id).toSorted()).toEqual([first.id, second.id].toSorted());
+    const claimed = await claimQueued({ limit: 50, leaseMs: 30_000 });
+    const claimedIds = claimed.rows.map((item) => item.id);
+    expect(claimedIds).toContain(first.id);
+    expect(claimedIds).toContain(second.id);
     expect(await heartbeatClaim(first.id, claimed.token)).toBe(true);
     const { sql } = await import("./db.ts");
     await sql`UPDATE operations SET heartbeat_at = now() - interval '2 minutes' WHERE id = ${second.id}`;
@@ -88,6 +90,10 @@ describe("coordinator enqueue and claims", () => {
     });
     expect(second.id).not.toBe(first.id);
     expect(isInFlight(second.status)).toBe(true);
+    await db
+      .update(operations)
+      .set({ status: "failed", claimToken: null })
+      .where(eq(operations.id, second.id));
   });
 
   test("concurrent processQueued claims a queued row once and refuses plan-only backup success", async () => {

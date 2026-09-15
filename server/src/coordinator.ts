@@ -16,11 +16,13 @@ import {
   firstComposeImage,
   generatePassword,
   isInFlight,
+  nextBackupStatus,
   observedDnsValue,
   parseImageRef,
   pinComposeImage,
   planHash,
   validateMaintenanceBundle,
+  type BackupStatus,
   type DnsWrite,
   type ExternalInventory,
   type MaintenanceBundle,
@@ -212,6 +214,32 @@ export async function enqueue(input: {
   idempotencyKey?: string;
 }) {
   const base = input.idempotencyKey ?? operationIdempotencyKey(input.kind, input.targetIds, input.payload);
+  // Serialise enqueues for one idempotency base. The unique index only protects the very first
+  // enqueue: once a prior terminal operation exists every caller mints a distinct suffixed key,
+  // so concurrent callers would both insert and leave two queued duplicates.
+  const connection = await sql.reserve();
+  try {
+    await connection`SELECT pg_advisory_lock(hashtext(${`ark:enqueue:${base}`}))`;
+    try {
+      return await insertEnqueued(input, base);
+    } finally {
+      await connection`SELECT pg_advisory_unlock(hashtext(${`ark:enqueue:${base}`}))`;
+    }
+  } finally {
+    connection.release();
+  }
+}
+
+async function insertEnqueued(
+  input: {
+    kind: OperationKind;
+    actorId?: string;
+    targetIds: string[];
+    payload?: Record<string, unknown>;
+    idempotencyKey?: string;
+  },
+  base: string,
+) {
   const related = await sql`
     SELECT * FROM operations
     WHERE idempotency_key = ${base} OR idempotency_key LIKE ${`${base}:%`}
@@ -272,37 +300,51 @@ export async function claimQueued(
     WHERE status = 'running'
       AND heartbeat_at < now() - (${leaseSeconds}::int * interval '1 second')
   `;
-  const rows = await sql`
-    UPDATE operations
-    SET status = 'running',
-        claim_token = ${token},
-        heartbeat_at = now(),
-        updated_at = now()
-    WHERE id IN (
-      SELECT id FROM operations
-      WHERE status = 'queued'
-        AND (${patterns.length === 0}::boolean OR kind LIKE ANY(${patterns}::text[]))
-        AND (${unlike}::text IS NULL OR kind NOT LIKE ${unlike})
-        AND (
-          ${agentOwned}::boolean IS NOT TRUE
-          OR (kind = 'service.deploy' AND payload ?& ARRAY['compose', 'composeHash', 'project'])
-          OR (kind = 'service.adopt' AND payload ?& ARRAY['compose', 'composeHash', 'containerId', 'name'])
-          OR (kind IN ('service.start', 'service.stop', 'service.restart', 'service.logs', 'service.stats') AND payload ? 'name')
-          OR (kind = 'service.discover' AND payload ->> 'request' = 'redacted-inventory-v1')
-          OR (kind = 'update.apply' AND payload ?& ARRAY['compose', 'composeHash', 'project'])
+  // Two separate races have to be closed here. Across transactions, the overlap exclusion reads
+  // rows another claimer has not committed as `running` yet, so the claim is serialised on an
+  // advisory lock. Within one claim, a single multi-row UPDATE evaluates its exclusion against
+  // the pre-statement snapshot, so rows that overlap *each other* would all be taken; claiming
+  // one row per statement makes each subsequent statement see the preceding one.
+  const rows = await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtext('ark:operations:claim'))`;
+    const claimed: Record<string, unknown>[] = [];
+    for (let taken = 0; taken < limit; taken++) {
+      const batch = await tx`
+        UPDATE operations
+        SET status = 'running',
+            claim_token = ${token},
+            heartbeat_at = now(),
+            updated_at = now()
+        WHERE id IN (
+          SELECT id FROM operations
+          WHERE status = 'queued'
+            AND (${patterns.length === 0}::boolean OR kind LIKE ANY(${patterns}::text[]))
+            AND (${unlike}::text IS NULL OR kind NOT LIKE ${unlike})
+            AND (
+              ${agentOwned}::boolean IS NOT TRUE
+              OR (kind = 'service.deploy' AND payload ?& ARRAY['compose', 'composeHash', 'project'])
+              OR (kind = 'service.adopt' AND payload ?& ARRAY['compose', 'composeHash', 'containerId', 'name'])
+              OR (kind IN ('service.start', 'service.stop', 'service.restart', 'service.logs', 'service.stats') AND payload ? 'name')
+              OR (kind = 'service.discover' AND payload ->> 'request' = 'redacted-inventory-v1')
+              OR (kind = 'update.apply' AND payload ?& ARRAY['compose', 'composeHash', 'project'])
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM operations active
+              WHERE active.status = 'running'
+                AND active.id <> operations.id
+                AND active.target_ids ?| ARRAY(SELECT jsonb_array_elements_text(operations.target_ids))
+            )
+          ORDER BY created_at
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
         )
-        AND NOT EXISTS (
-          SELECT 1 FROM operations active
-          WHERE active.status = 'running'
-            AND active.id <> operations.id
-            AND active.target_ids ?| ARRAY(SELECT jsonb_array_elements_text(operations.target_ids))
-        )
-      ORDER BY created_at
-      LIMIT ${limit}
-      FOR UPDATE SKIP LOCKED
-    )
-    RETURNING *
-  `;
+        RETURNING *
+      `;
+      if (!batch.length) break;
+      claimed.push(...batch);
+    }
+    return claimed;
+  });
   return { token, rows: rows.map(mapOperation) };
 }
 
@@ -345,6 +387,17 @@ async function finishOperation(
   if (updated.length !== 1) throw new Error("Operation claim is stale or no longer owned by this worker.");
 }
 
+/**
+ * True once an operation's payload carries the canonical compose the Docker agent executes.
+ * Such a row has already been planned and requeued for the agent; anyone else re-running it
+ * would repeat the planning side effects.
+ */
+export function isDelegatedPayload(operation: Pick<OperationRow, "kind" | "payload">) {
+  if (operation.kind !== "update.apply") return false;
+  const payload = operation.payload as Record<string, unknown>;
+  return typeof payload.composeHash === "string" && payload.composeHash.length > 0;
+}
+
 export async function processQueued(limit = 8, kindPrefix?: string) {
   const excludePrefix = !env.embeddedWorkers && !kindPrefix ? "service." : undefined;
   for (let index = 0; index < limit; index++) {
@@ -352,14 +405,15 @@ export async function processQueued(limit = 8, kindPrefix?: string) {
     if (!rows.length) break;
     const operation = rows[0]!;
     if (kindPrefix && !operation.kind.startsWith(kindPrefix)) continue;
-    if (
-      !env.embeddedWorkers &&
-      (operation.kind.startsWith("service.") ||
-        (operation.kind === "update.apply" && operation.payload.file && operation.payload.project))
-    ) {
+    if (!env.embeddedWorkers && (operation.kind.startsWith("service.") || isDelegatedPayload(operation))) {
       await finishOperation(operation, token, "queued");
       continue;
     }
+    // Operations that outlive the claim lease (lego, restore, compose pull+up) would otherwise
+    // be reclaimed and re-executed by a concurrent claimer while still running here.
+    const heartbeat = setInterval(() => {
+      void heartbeatClaim(operation.id, token).catch(() => undefined);
+    }, 15_000);
     try {
       await runOperation(operation.kind as OperationKind, operation);
       await finishOperation(operation, token, "succeeded");
@@ -371,6 +425,7 @@ export async function processQueued(limit = 8, kindPrefix?: string) {
             status: "queued",
             payload: error.payload,
             claimToken: null,
+            heartbeatAt: null,
             updatedAt: new Date(),
           })
           .where(eq(operations.id, operation.id));
@@ -378,6 +433,8 @@ export async function processQueued(limit = 8, kindPrefix?: string) {
       }
       const message = error instanceof Error ? error.message : "Operation failed.";
       await finishOperation(operation, token, "failed", message);
+    } finally {
+      clearInterval(heartbeat);
     }
   }
   await evaluateAlerts().catch(() => undefined);
@@ -495,11 +552,19 @@ export async function finalizeAgentCompletion(
       .where(eq(deploymentRevisions.desiredRevision, service.desiredRevision));
     return;
   }
+  // Only a confirmed deploy promotes the planned compose and digest onto the service.
+  const promotion: { compose?: string; imageDigest?: string } = {};
   if (operation.kind === "update.apply") {
     const digest = String(operation.payload.digest ?? "");
-    if (!digest || service.imageDigest !== digest) {
-      throw new Error("Agent update completion does not match the stored desired digest.");
+    const [planned] = await executor
+      .select()
+      .from(deploymentRevisions)
+      .where(eq(deploymentRevisions.desiredRevision, service.desiredRevision));
+    if (!digest || !planned || planned.imageDigest !== digest) {
+      throw new Error("Agent update completion does not match the planned desired digest.");
     }
+    promotion.compose = planned.compose;
+    promotion.imageDigest = digest;
   }
   const status =
     operation.kind === "service.stop"
@@ -511,7 +576,7 @@ export async function finalizeAgentCompletion(
           : "running";
   await executor
     .update(services)
-    .set({ status, observedRevision: service.desiredRevision, observedAt: new Date() })
+    .set({ ...promotion, status, observedRevision: service.desiredRevision, observedAt: new Date() })
     .where(eq(services.id, serviceId));
   await executor
     .update(deploymentRevisions)
@@ -657,7 +722,10 @@ async function issueCertificate(operation: OperationRow) {
     .set({ status: publiclyTrusted ? "testing" : "certificate_untrusted" })
     .where(eq(endpoints.id, endpointId));
   await addStep(operation.id, "certificate-issued", { issuer: issued.issuer, path: issued.certPath });
-  await enqueue({ kind: "edge.apply", actorId: operation.actorId ?? undefined, targetIds: ["platform"] });
+  // Applying the edge config is a platform-wide consequence of issuing a certificate, not an
+  // action the actor requested. Carrying their id over would fail the owner-only platform check
+  // for an operator who is allowed to verify their own domain.
+  await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
 }
 
 async function provisionDatabase(operation: OperationRow) {
@@ -1054,6 +1122,11 @@ async function applyUpdate(operation: OperationRow) {
   const serviceId = operation.targetIds[0];
   const digest = String(operation.payload.digest ?? "");
   if (!digest) throw new Error("Update apply requires a candidate digest.");
+  // Planning already ran and handed this payload to the agent. Re-planning would mint a second
+  // deployment revision and rotate the desired revision out from under the in-flight deploy.
+  if (isDelegatedPayload(operation)) {
+    throw new DelegateToAgent(operation.payload as Record<string, unknown>);
+  }
   const [candidate] = await db
     .select()
     .from(updateCandidates)
@@ -1081,15 +1154,11 @@ async function applyUpdate(operation: OperationRow) {
     imageDigest: digest,
     status: "planned",
   });
-  await db
-    .update(services)
-    .set({
-      compose: nextCompose,
-      imageDigest: digest,
-      desiredRevision,
-      status: "updating",
-    })
-    .where(eq(services.id, serviceId));
+  // The candidate compose and digest stay on the revision row until the deploy is confirmed.
+  // Writing them onto the service here would make a failed rollout look like the running
+  // state, so update detection would report the unapproved digest as current and a later
+  // `service.deploy` would ship it.
+  await db.update(services).set({ desiredRevision, status: "updating" }).where(eq(services.id, serviceId));
   if (!dockerAvailable() || !env.embeddedWorkers) {
     throw new DelegateToAgent({
       ...operation.payload,
@@ -1110,6 +1179,7 @@ async function applyUpdate(operation: OperationRow) {
     .update(services)
     .set({
       status: "deployed",
+      compose: nextCompose,
       imageDigest: digest,
       observedRevision: desiredRevision,
       observedAt: new Date(),
@@ -1166,9 +1236,18 @@ async function restoreBackup(operation: OperationRow) {
   }
   const [latest] = await db.select().from(backups).where(eq(backups.id, backupId));
   if (latest) {
-    await db.update(backups).set({ status: result.status }).where(eq(backups.id, latest.id));
+    // Drive the documented state machine rather than writing a status directly, so an
+    // out-of-order transition is rejected instead of silently recorded.
+    const status = nextBackupStatus(latest.status as BackupStatus, "integrity");
+    await db.update(backups).set({ status }).where(eq(backups.id, latest.id));
   }
-  await addStep(operation.id, "restore-test", { ...result, backupId: latest?.id });
+  await addStep(operation.id, "restore-test", {
+    ...result,
+    backupId: latest?.id,
+    // A restored byte stream is not restore proof. `restore_verified` is only reached once an
+    // operator confirms the restored copy actually booted and served its data.
+    verification: "Confirm the restored copy boots and serves data to mark this restore verified.",
+  });
 }
 
 async function changeMode(operation: OperationRow) {

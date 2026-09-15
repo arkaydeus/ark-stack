@@ -15,22 +15,46 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-func dockerHTTP() *http.Client {
-	sock := getenv("DOCKER_SOCKET", "/var/run/docker.sock")
+func dockerSocket() string {
+	return getenv("DOCKER_SOCKET", "/var/run/docker.sock")
+}
+
+// Built once. A per-call client would park a keep-alive connection in a transport that is then
+// discarded, leaking one socket and its reader/writer goroutines on every Docker API call.
+var dockerClientOnce = sync.OnceValue(func() *http.Client {
+	sock := dockerSocket()
 	return &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 			},
+			MaxIdleConns:    8,
+			IdleConnTimeout: 60 * time.Second,
 		},
 	}
+})
+
+func dockerHTTP() *http.Client {
+	return dockerClientOnce()
+}
+
+// Stop and restart block for the container's configured grace period, which `stop_grace_period`
+// lets a workload set well above the client's default timeout.
+func dockerHTTPWithTimeout(timeout time.Duration) *http.Client {
+	shared := dockerHTTP()
+	return &http.Client{Timeout: timeout, Transport: shared.Transport}
 }
 
 func dockerJSON(method, path string, body any) ([]byte, error) {
+	return dockerJSONWithClient(dockerHTTP(), method, path, body)
+}
+
+func dockerJSONWithClient(client *http.Client, method, path string, body any) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -46,7 +70,7 @@ func dockerJSON(method, path string, body any) ([]byte, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	res, err := dockerHTTP().Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -271,8 +295,20 @@ func validateAdoptableInspection(inspected containerInspection, expectedService,
 	if expectedImage == "" || inspected.Config.Image != expectedImage {
 		return fmt.Errorf("inspected image does not match the canonical adoption manifest")
 	}
-	if inspected.HostConfig.Privileged || inspected.HostConfig.NetworkMode == "host" || inspected.HostConfig.PidMode == "host" || inspected.HostConfig.IpcMode == "host" {
+	if inspected.HostConfig.Privileged {
 		return fmt.Errorf("container uses a forbidden host privilege boundary")
+	}
+	for label, mode := range map[string]string{
+		"network": inspected.HostConfig.NetworkMode,
+		"pid":     inspected.HostConfig.PidMode,
+		"ipc":     inspected.HostConfig.IpcMode,
+	} {
+		if mode == "host" || !allowedNamespaceMode(mode) {
+			return fmt.Errorf("container uses a forbidden %s namespace mode %q", label, mode)
+		}
+	}
+	if len(inspected.NetworkSettings.Networks) == 0 {
+		return fmt.Errorf("container has no inspectable network attachments to verify ownership against")
 	}
 	if len(inspected.HostConfig.Binds) > 0 {
 		return fmt.Errorf("containers with host bind mounts cannot be adopted")
@@ -322,14 +358,41 @@ func hasNoNewPrivileges(values []string) bool {
 	return false
 }
 
+// Platform networks are exactly the ones Compose creates for the platform's own projects. A
+// substring match here would also reject an ordinary workload whose project slug merely
+// contains "control" or "monitoring" — and it would reject it only after `compose up` had
+// already run, leaving the containers unledgered.
+var platformProjects = []string{"ark-platform", "ark-mail", "ark-monitoring", "ark-restore"}
+
 func protectedNetwork(name string) bool {
 	normalized := strings.ToLower(strings.ReplaceAll(name, "_", "-"))
-	for _, fragment := range []string{"ark-platform", "control", "database-management", "mail-management", "monitoring"} {
-		if strings.Contains(normalized, fragment) {
+	for _, project := range platformProjects {
+		if normalized == project || strings.HasPrefix(normalized, project+"-") {
+			return true
+		}
+	}
+	// Platform-internal networks are declared with these exact names in the platform Compose file.
+	for _, exact := range []string{"control", "admin", "database-management", "mail-management", "monitoring"} {
+		if normalized == exact {
 			return true
 		}
 	}
 	return false
+}
+
+// Only the namespace modes Compose produces for an ordinary bridge-networked service. `container:`
+// and `service:` join another container's namespace, which empties NetworkSettings.Networks and
+// would slip past the protected-network check entirely.
+func allowedNamespaceMode(mode string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(mode))
+	switch normalized {
+	case "", "default", "bridge", "none", "private", "shareable":
+		return true
+	}
+	if strings.Contains(normalized, ":") {
+		return false
+	}
+	return resourceName.MatchString(normalized)
 }
 
 func inventory() ([]containerSummary, error) {
@@ -352,8 +415,36 @@ func inventory() ([]containerSummary, error) {
 }
 
 func mutateContainer(id, action string) error {
-	_, err := dockerJSON(http.MethodPost, "/containers/"+id+"/"+action, nil)
+	if action != "stop" && action != "restart" {
+		_, err := dockerJSON(http.MethodPost, "/containers/"+id+"/"+action, nil)
+		return err
+	}
+	// Ask Docker for this container's stop timeout and give the call room to outlast it, so a
+	// workload with a long `stop_grace_period` is not reported as failed while it shuts down.
+	grace := containerStopTimeout(id)
+	path := fmt.Sprintf("/containers/%s/%s?t=%d", id, action, grace)
+	_, err := dockerJSONWithClient(dockerHTTPWithTimeout(time.Duration(grace)*time.Second+30*time.Second), http.MethodPost, path, nil)
 	return err
+}
+
+// Defaults to Docker's own 10s when the container does not declare one.
+func containerStopTimeout(id string) int {
+	raw, err := dockerJSON(http.MethodGet, "/containers/"+id+"/json", nil)
+	if err != nil {
+		return 10
+	}
+	var inspected struct {
+		Config struct {
+			StopTimeout *int `json:"StopTimeout"`
+		} `json:"Config"`
+	}
+	if err := json.Unmarshal(raw, &inspected); err != nil || inspected.Config.StopTimeout == nil {
+		return 10
+	}
+	if *inspected.Config.StopTimeout < 0 || *inspected.Config.StopTimeout > 600 {
+		return 10
+	}
+	return *inspected.Config.StopTimeout
 }
 
 func containerLogs(id string, tail int) (string, error) {
@@ -508,6 +599,9 @@ func dockerCommandEnv(extra ...string) []string {
 		values = append(values, "DOCKER_CONFIG="+config)
 	}
 	values = append(values, "HOME="+home)
+	// The HTTP client honours DOCKER_SOCKET; without this the `docker` CLI children would talk
+	// to the default daemon while the API calls talk to another one.
+	values = append(values, "DOCKER_HOST=unix://"+dockerSocket())
 	return append(values, extra...)
 }
 

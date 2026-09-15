@@ -1,3 +1,5 @@
+import { ValidationError } from "./errors.ts";
+
 export type MailDesiredState = {
   version: 1;
   domains: Array<{
@@ -29,10 +31,10 @@ export function assertExternalForwarding(input: {
   });
   if (!external.length) return;
   if (!input.allowExternalForwarding) {
-    throw new Error("External alias forwarding is disabled.");
+    throw new ValidationError("External alias forwarding is disabled.");
   }
   if (!input.allowExternal) {
-    throw new Error("This alias does not allow external targets.");
+    throw new ValidationError("This alias does not allow external targets.");
   }
 }
 

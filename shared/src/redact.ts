@@ -1,29 +1,30 @@
-const SECRET_KEYS = new Set([
-  "password",
-  "secret",
-  "token",
-  "authorization",
-  "credential",
-  "privatekey",
-  "private_key",
-  "accesstoken",
-  "access_token",
-  "refreshtoken",
-  "refresh_token",
-  "smtppassword",
-  "databaseurl",
-]);
+/**
+ * Matched against the key with separators removed, so `AWS_SECRET_ACCESS_KEY`, `smtp-password`
+ * and `clientSecret` all normalise to something these substrings catch.
+ */
+const SECRET_KEY_PATTERN =
+  /(password|secret|token|authorization|credential|privatekey|apikey|database[a-z]*url|connectionstring|dsn)/;
 
 const CANARY = /(password|secret|token|authorization)=([^\s&]+)/gi;
+/** Credentials embedded in a connection string, e.g. `postgres://user:pw@host/db`. */
+const URL_CREDENTIAL = /(\/\/[^/\s:@]+:)([^@\s/]+)(@)/g;
+
+function redactString(value: string) {
+  return value.replace(CANARY, "$1=<redacted>").replace(URL_CREDENTIAL, "$1<redacted>$3");
+}
+
+export function isSecretKey(key: string) {
+  return SECRET_KEY_PATTERN.test(key.toLowerCase().replaceAll("-", "").replaceAll("_", ""));
+}
 
 export function redactValue(value: unknown): unknown {
-  if (typeof value === "string") return value.replace(CANARY, "$1=<redacted>");
+  if (typeof value === "string") return redactString(value);
   if (Array.isArray(value)) return value.map(redactValue);
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, item]) => [
         key,
-        SECRET_KEYS.has(key.toLowerCase().replaceAll("-", "")) ? "<redacted>" : redactValue(item),
+        isSecretKey(key) ? "<redacted>" : redactValue(item),
       ]),
     );
   }
@@ -31,7 +32,7 @@ export function redactValue(value: unknown): unknown {
 }
 
 export function redactLogLine(line: string, canaries: string[] = []) {
-  let next = line.replace(CANARY, "$1=<redacted>");
+  let next = redactString(line);
   for (const canary of canaries) {
     if (canary) next = next.split(canary).join("<redacted>");
   }

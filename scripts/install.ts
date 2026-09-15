@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, chown, mkdir, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
@@ -24,11 +24,11 @@ const existing = hasEnv ? await Bun.file(envPath).text() : "";
 const template = !hasEnv && existsSync(examplePath) ? await Bun.file(examplePath).text() : "";
 const generated = generateInstallSecrets();
 await Bun.write(envPath, mergeInstallEnv(hasEnv ? existing : template, generated, { template: !hasEnv }));
-await mkdir(join(root, "tmp", "certs"), { recursive: true });
-await mkdir(join(root, "tmp", "acme"), { recursive: true });
-await mkdir(join(root, "tmp", "backups"), { recursive: true });
-await mkdir(join(root, "tmp", "restore-runs"), { recursive: true });
-await mkdir(join(root, "tmp", "pgbouncer"), { recursive: true });
+// `.env` holds every platform secret and `Bun.write` creates it 0644.
+await chmod(envPath, 0o600);
+for (const path of ["certs", "acme", "backups", "restore-runs", "pgbouncer", "edge", "mail-state"]) {
+  await mkdir(join(root, "tmp", path), { recursive: true });
+}
 await mkdir(join(root, "tmp", "certs", "database"), { recursive: true });
 const databaseCert = join(root, "tmp", "certs", "database");
 if (!existsSync(join(databaseCert, "fullchain.pem")) || !existsSync(join(databaseCert, "privkey.pem"))) {
@@ -68,7 +68,6 @@ if (!existsSync(join(root, "tmp", "pgbouncer", "userlist.txt"))) {
   await Bun.write(join(root, "tmp", "pgbouncer", "userlist.txt"), "");
 }
 await Bun.write(join(root, "tmp", "pgbouncer", "expose"), "0\n");
-await mkdir(join(root, "tmp", "edge"), { recursive: true });
 if (!existsSync(join(root, "tmp", "edge", "Caddyfile"))) {
   await Bun.write(
     join(root, "tmp", "edge", "Caddyfile"),
@@ -81,8 +80,6 @@ if (!existsSync(join(root, "tmp", "edge", "serve.json"))) {
     await Bun.file(join(root, "infra", "platform", "serve.json")).text(),
   );
 }
-await mkdir(join(root, "tmp", "mail-state"), { recursive: true });
-
 const parsed = Object.fromEntries(
   (await Bun.file(envPath).text())
     .split("\n")
@@ -94,6 +91,16 @@ const parsed = Object.fromEntries(
 );
 await Bun.write(join(root, "tmp", "metrics.token"), `${parsed.ARK_METRICS_TOKEN}\n`);
 await chmod(join(root, "tmp", "metrics.token"), 0o600);
+
+// Containers run as uid 1000 with CAP_DAC_OVERRIDE dropped, so a host directory created by
+// root (or by any other uid) leaves the workers unable to write to their bind mounts.
+const containerUid = Number(process.env.ARK_CONTAINER_UID ?? "1000");
+const containerGid = Number(process.env.ARK_CONTAINER_GID ?? "1000");
+if (process.platform === "linux" && process.getuid?.() === 0) {
+  for (const path of ["certs", "acme", "backups", "restore-runs", "pgbouncer", "edge", "mail-state"]) {
+    await chownRecursive(join(root, "tmp", path), containerUid, containerGid);
+  }
+}
 
 if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
   for (const network of ["ark_mail_management", "ark_monitoring"]) {
@@ -169,3 +176,12 @@ Setup token: ${parsed.ARK_SETUP_TOKEN}
 Use an SSH tunnel if this host is remote. Create the owner, enroll MFA, then run the domain wizard.
 Do not reuse this token after bootstrap closes.
 `);
+
+async function chownRecursive(path: string, uid: number, gid: number) {
+  await chown(path, uid, gid).catch(() => undefined);
+  const info = await stat(path).catch(() => null);
+  if (!info?.isDirectory()) return;
+  for (const entry of await readdir(path)) {
+    await chownRecursive(join(path, entry), uid, gid);
+  }
+}

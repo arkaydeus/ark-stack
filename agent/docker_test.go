@@ -22,7 +22,7 @@ func safeAdoptionInspection() containerInspection {
 	inspected.HostConfig.PidsLimit = 256
 	inspected.HostConfig.Memory = 512 * 1024 * 1024
 	inspected.HostConfig.NanoCPUs = 1_000_000_000
-	inspected.NetworkSettings.Networks = map[string]json.RawMessage{}
+	inspected.NetworkSettings.Networks = map[string]json.RawMessage{"example_default": {}}
 	return inspected
 }
 
@@ -53,6 +53,22 @@ func TestAdoptionChecksEffectiveContainerIsolation(t *testing.T) {
 		"no-new-privileges false equals": func(item *containerInspection) {
 			item.HostConfig.SecurityOpt = []string{"no-new-privileges=false"}
 		},
+		"shared network namespace": func(item *containerInspection) {
+			item.HostConfig.NetworkMode = "container:0123456789ab"
+		},
+		"shared pid namespace": func(item *containerInspection) {
+			item.HostConfig.PidMode = "container:0123456789ab"
+		},
+		"shared ipc namespace": func(item *containerInspection) {
+			item.HostConfig.IpcMode = "service:other"
+		},
+		"host network": func(item *containerInspection) { item.HostConfig.NetworkMode = "host" },
+		"no network attachments": func(item *containerInspection) {
+			item.NetworkSettings.Networks = map[string]json.RawMessage{}
+		},
+		"platform project network": func(item *containerInspection) {
+			item.NetworkSettings.Networks = map[string]json.RawMessage{"ark-monitoring_default": {}}
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -68,7 +84,7 @@ func TestAdoptionChecksEffectiveContainerIsolation(t *testing.T) {
 func TestAdoptionServiceMustExistInCanonicalManifest(t *testing.T) {
 	compose := `services:
   web:
-    image: docker.io/library/nginx:1.29
+    image: docker.io/library/nginx:1.29@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     read_only: true
     init: true
     pids_limit: 256
@@ -79,7 +95,7 @@ func TestAdoptionServiceMustExistInCanonicalManifest(t *testing.T) {
     security_opt: ["no-new-privileges:true"]
 `
 	image, err := composeServiceImage(compose, "web")
-	if err != nil || image != "docker.io/library/nginx:1.29" {
+	if err != nil || image != "docker.io/library/nginx:1.29@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("expected image extraction, got %q, %v", image, err)
 	}
 	if _, err := composeServiceImage(compose, "other"); err == nil {

@@ -1,7 +1,7 @@
 import { createHash, verify } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 
-import { rollbackSafe, statefulComponents } from "./update-policy.ts";
+import { statefulComponents } from "./update-policy.ts";
 
 export type MaintenanceBundle = {
   version: string;
@@ -34,7 +34,9 @@ export function validateMaintenanceBundle(bundle: MaintenanceBundle) {
       `Refusing unattended stateful images: ${stateful.join(", ")}. Set allowStateful after a reviewed plan.`,
     );
   }
-  return { images: bundle.images, rollbackSafe: bundle.images.every((image) => rollbackSafe(image)) };
+  // `rollbackSafe` takes a bare component name, so calling it with a full image reference
+  // never matches. Reuse the stateful set already computed from the same references.
+  return { images: bundle.images, rollbackSafe: stateful.length === 0 };
 }
 
 export function composeDigest(source: string) {

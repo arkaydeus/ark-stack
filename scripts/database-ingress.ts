@@ -14,6 +14,7 @@ const listenPort = Number(process.env.ARK_PUBLIC_DB_PORT ?? "5432");
 
 let server: ReturnType<typeof createServer> | null = null;
 let reconciling = false;
+let dirty = false;
 
 function run(command: string, args: string[]) {
   return new Promise<string>((resolve, reject) => {
@@ -59,6 +60,18 @@ function startListener() {
     client.on("error", () => upstream.destroy());
     upstream.on("error", () => client.destroy());
   });
+  // Without a handler an EADDRINUSE would surface as an uncaught exception and take the
+  // reconciler down instead of being reported as a failed apply.
+  server.on("error", (error) => {
+    console.error(`public database listener failed: ${error.message}`);
+    stopListener();
+    void writeStatus({
+      applied: true,
+      enforced: true,
+      exposed: false,
+      error: `listener failed: ${error.message}`,
+    });
+  });
   server.listen(listenPort, "0.0.0.0");
 }
 
@@ -71,7 +84,13 @@ async function writeStatus(input: { applied: boolean; enforced: boolean; exposed
 }
 
 async function reconcile() {
-  if (reconciling) return;
+  // The control plane writes `allowlist.nft` and `expose` back to back. Dropping an event that
+  // lands mid-pass would leave the listener out of step with the newest files until some
+  // unrelated change happened to trigger another pass, so re-run once instead.
+  if (reconciling) {
+    dirty = true;
+    return;
+  }
   reconciling = true;
   const expose = await shouldExpose();
   try {
@@ -83,7 +102,10 @@ async function reconcile() {
     await applyNft();
     if (expose) startListener();
     else stopListener();
-    await writeStatus({ applied: true, enforced: true, exposed: expose && Boolean(server) });
+    // An empty allowlist installs an accept-only chain, so the table exists but nothing is
+    // enforced. Report that honestly rather than claiming enforcement.
+    const enforced = (await Bun.file(nftFile).text()).includes("drop");
+    await writeStatus({ applied: true, enforced, exposed: expose && Boolean(server) });
   } catch (error) {
     stopListener();
     await writeStatus({
@@ -95,10 +117,17 @@ async function reconcile() {
   } finally {
     reconciling = false;
   }
+  if (dirty) {
+    dirty = false;
+    await reconcile();
+  }
 }
 
 await mkdir(dir, { recursive: true, mode: 0o700 });
 await reconcile();
-watch(dir, () => {
+watch(dir, (_event, filename) => {
+  // `writeStatus` writes into the directory being watched; reacting to it would make every
+  // reconcile trigger another one.
+  if (filename && filename.toString() === "allowlist.status") return;
   void reconcile();
 });

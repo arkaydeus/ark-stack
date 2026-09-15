@@ -1,3 +1,5 @@
+import { ValidationError } from "./errors.ts";
+
 const HOSTNAME =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
@@ -12,7 +14,7 @@ export function normalizeHostname(value: string) {
       return code < 32 || code === 127;
     })
   ) {
-    throw new Error("Hostname contains control characters or is empty.");
+    throw new ValidationError("Hostname contains control characters or is empty.");
   }
   let ascii = trimmed;
   try {
@@ -21,16 +23,18 @@ export function normalizeHostname(value: string) {
       .map((label) => (label.startsWith("xn--") ? label : punycodeLabel(label)))
       .join(".");
   } catch {
-    throw new Error("Hostname is not a valid domain name.");
+    throw new ValidationError("Hostname is not a valid domain name.");
   }
   if (ascii.includes("..") || ascii.startsWith(".") || ascii.endsWith(".")) {
-    throw new Error("Hostname is malformed.");
+    throw new ValidationError("Hostname is malformed.");
   }
-  if (!HOSTNAME.test(ascii)) throw new Error("Enter a fully-qualified hostname, such as db.example.com.");
+  if (!HOSTNAME.test(ascii))
+    throw new ValidationError("Enter a fully-qualified hostname, such as db.example.com.");
   if (ascii === "localhost" || BLOCKED_SUFFIXES.some((suffix) => ascii.endsWith(suffix))) {
-    throw new Error("Reserved or special-use names cannot be claimed as public service hostnames.");
+    throw new ValidationError("Reserved or special-use names cannot be claimed as public service hostnames.");
   }
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ascii)) throw new Error("Use a hostname, not an IP address.");
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ascii))
+    throw new ValidationError("Use a hostname, not an IP address.");
   return ascii;
 }
 
@@ -42,10 +46,10 @@ function punycodeLabel(label: string) {
 export function localPart(value: string) {
   const trimmed = value.trim();
   if (!/^[A-Za-z0-9.!#$%&'*+=?^_`{|}~-]+$/.test(trimmed)) {
-    throw new Error("Mailbox local part contains unsupported characters.");
+    throw new ValidationError("Mailbox local part contains unsupported characters.");
   }
   if (trimmed.includes("/") || trimmed.startsWith(".") || trimmed.endsWith(".") || trimmed.includes("..")) {
-    throw new Error("Mailbox local part cannot include path separators or adjacent dots.");
+    throw new ValidationError("Mailbox local part cannot include path separators or adjacent dots.");
   }
   return trimmed.toLowerCase();
 }
@@ -53,7 +57,9 @@ export function localPart(value: string) {
 export function postgresIdent(value: string, suffix = "") {
   const ident = `${value}${suffix}`.toLowerCase();
   if (!/^[a-z][a-z0-9_]{0,62}$/.test(ident)) {
-    throw new Error(`PostgreSQL identifier ${ident} exceeds limits or uses unsupported characters.`);
+    throw new ValidationError(
+      `PostgreSQL identifier ${ident} exceeds limits or uses unsupported characters.`,
+    );
   }
   return ident;
 }

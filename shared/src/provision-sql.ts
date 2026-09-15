@@ -80,7 +80,9 @@ function roleName(roles: ProvisionPlan["roles"], kind: DatabaseRoleKind) {
 }
 
 export function literal(value: string) {
-  if (value.includes("$ark$")) throw new Error("Generated secret collided with the SQL dollar-quote tag.");
+  // `$ark` alone is enough to break out: a value ending in `$ark` closes the literal early
+  // when the closing tag is appended.
+  if (value.includes("$ark")) throw new Error("Generated secret collided with the SQL dollar-quote tag.");
   return `$ark$${value}$ark$`;
 }
 

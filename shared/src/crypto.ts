@@ -30,8 +30,13 @@ export function secureEqual(left: string, right: string) {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
+/**
+ * The alphabet is exactly 64 symbols so `byte & 63` is unbiased, and it excludes `$` so a
+ * generated secret can never collide with the `$ark$` SQL dollar-quote tag.
+ */
+const PASSWORD_ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#%^&*";
+
 export function generatePassword(length = 28) {
-  const alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*";
   const bytes = randomBytes(length);
-  return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
+  return Array.from(bytes, (byte) => PASSWORD_ALPHABET[byte & 63]).join("");
 }

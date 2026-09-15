@@ -16,7 +16,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { authClient } from "@/lib/auth-client";
 import type { PlatformState } from "@/lib/types";
-import { api, cn } from "@/lib/utils";
+import { api, cn, onActionError } from "@/lib/utils";
 import { AuthScreen, MfaSetup } from "@/pages/Auth";
 import {
   ActivityView,
@@ -55,7 +55,15 @@ export function App() {
   );
   const [state, setState] = useState<PlatformState | null>(null);
   const [error, setError] = useState("");
+  // Mutations dispatched by `act` report their failures here; without this a 403 from a
+  // step-up-gated route would leave the button looking like it did nothing.
+  const [actionError, setActionError] = useState<string | null>(null);
   const [mfaEnrollmentGate, setMfaEnrollmentGate] = useState(false);
+
+  useEffect(() => {
+    onActionError(setActionError);
+    return () => onActionError(null);
+  }, []);
 
   useEffect(() => {
     if (!isPending) setSessionResolved(true);
@@ -164,6 +172,22 @@ export function App() {
         </header>
         <div className="workspace-body">
           {error && <p className="mb-4 text-sm text-red-200">{error}</p>}
+          {actionError && (
+            <div
+              className="mb-4 flex items-start justify-between gap-3 rounded-lg border border-red-300/30 bg-red-500/10 p-3 text-sm text-red-100"
+              role="alert"
+            >
+              <span>{actionError}</span>
+              <button
+                type="button"
+                className="shrink-0 underline"
+                onClick={() => setActionError(null)}
+                aria-label="Dismiss error"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           {!state ? (
             <RefreshCw className="size-5 animate-spin" />
           ) : (

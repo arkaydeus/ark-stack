@@ -77,9 +77,19 @@ export async function evaluateAlerts() {
       dedupKey: `op-failed:${operation.id}`,
     });
   }
+  // Renewal inserts a new row per endpoint and keeps the old ones, so only the newest
+  // certificate for each endpoint describes what is actually served. Alerting on superseded
+  // rows would make the alert permanent from the first renewal onwards.
   const certs = await db.select().from(certificates);
-  const soon = Date.now() + 14 * 24 * 60 * 60 * 1000;
+  const current = new Map<string, (typeof certs)[number]>();
   for (const cert of certs) {
+    const held = current.get(cert.endpointId);
+    if (!held || (cert.expiresAt?.getTime() ?? 0) > (held.expiresAt?.getTime() ?? 0)) {
+      current.set(cert.endpointId, cert);
+    }
+  }
+  const soon = Date.now() + 14 * 24 * 60 * 60 * 1000;
+  for (const cert of current.values()) {
     if (cert.expiresAt && cert.expiresAt.getTime() < soon) {
       activeKeys.add(`cert:${cert.id}`);
       await raiseAlert({
@@ -89,12 +99,18 @@ export async function evaluateAlerts() {
       });
     }
   }
+  // Freshness is a property of a backup target, not of every row ever written for it: an old
+  // backup is expected once a newer one exists.
   const recentBackups = await db.select().from(backups);
-  const stale = recentBackups.filter(
-    (item) =>
-      Date.now() - item.createdAt.getTime() > 36 * 60 * 60 * 1000 &&
-      item.status !== "restore_verified" &&
-      !item.restoreVerified,
+  const newestPerTarget = new Map<string, (typeof recentBackups)[number]>();
+  for (const item of recentBackups) {
+    if (item.status === "failed" || item.status === "planned") continue;
+    const key = `${item.kind}:${item.targetId}`;
+    const held = newestPerTarget.get(key);
+    if (!held || item.createdAt.getTime() > held.createdAt.getTime()) newestPerTarget.set(key, item);
+  }
+  const stale = [...newestPerTarget.values()].filter(
+    (item) => Date.now() - item.createdAt.getTime() > 36 * 60 * 60 * 1000,
   );
   if (stale.length) {
     activeKeys.add("backup-stale");
