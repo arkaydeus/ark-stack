@@ -17,7 +17,8 @@ authorization, not from text in the role field.
 
 Keys begin with `ahq_`. Store the key in a secret manager or a protected runtime
 environment variable. Do not put it in source control, shell history, issue or
-ticket text, comments, diary entries, screenshots, logs, or command traces.
+ticket text, comments, diary entries, screenshots, logs, command traces, or
+process arguments that other local users can read with `ps`.
 
 Use these runtime values:
 
@@ -43,11 +44,26 @@ Do not use `Authorization: Bearer`. AgentHQ normalizes API-key sessions onto the
 same authorization path as browser and native sessions, then authorizes the
 agent according to its own user record and explicit workspace membership.
 
+Do not build that header as a command-line argument. Passing the key with `-H`
+puts the secret in the process argument list, where any local user can read it
+from `ps` or `/proc/<pid>/cmdline` for the lifetime of the request. Write the
+header once into a private curl config file instead:
+
+```bash
+umask 077
+export AGENTHQ_CURL_CONFIG="$(mktemp)"
+cat > "${AGENTHQ_CURL_CONFIG}" <<EOF
+header = "x-api-key: ${AGENTHQ_API_KEY}"
+EOF
+```
+
+`mktemp` creates the file `0600`, and `cat` takes the key on stdin rather than
+argv. Remove the file when the session ends: `rm -f "${AGENTHQ_CURL_CONFIG}"`.
+
 Verify credentials before beginning work:
 
 ```bash
-curl -sS --fail-with-body \
-  -H "x-api-key: ${AGENTHQ_API_KEY}" \
+curl -sS --fail-with-body -K "${AGENTHQ_CURL_CONFIG}" \
   "${AGENTHQ_BASE}/me"
 ```
 
@@ -91,6 +107,12 @@ signing secret. Use the exact raw bytes received; parsing and re-serializing JSO
 changes the signature input. Compare signatures in constant time and reject
 timestamps outside a short replay window, such as five minutes.
 
+Every field below is attacker-controlled, so the verifier must return `False`
+for malformed input rather than raise. In particular, `hmac.compare_digest`
+raises `TypeError` when a `str` operand contains non-ASCII characters, so encode
+`v1` to ASCII and reject it if that fails; otherwise a single non-ASCII byte in
+the header turns an authentication rejection into a `500`.
+
 Python example:
 
 ```python
@@ -101,10 +123,13 @@ import time
 
 def verify_agenthq_webhook(
     secret: str,
-    signature_header: str,
+    signature_header: str | None,
     raw_body: bytes,
     tolerance_seconds: int = 300,
 ) -> bool:
+    if not signature_header:
+        return False
+
     parts = dict(
         part.split("=", 1)
         for part in signature_header.split(",")
@@ -122,10 +147,29 @@ def verify_agenthq_webhook(
     if abs(time.time() - issued_at) > tolerance_seconds:
         return False
 
+    try:
+        provided_digest = provided.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+
     message = timestamp.encode() + b"." + raw_body
     expected = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, provided)
+    return hmac.compare_digest(expected.encode("ascii"), provided_digest)
 ```
+
+Exercise these cases against your receiver before trusting it. Each must reject
+without raising:
+
+- A valid signature for the exact raw body: accepted.
+- The same signature against a body altered by one byte: rejected.
+- A valid signature older than `tolerance_seconds`, and one dated in the future:
+  both rejected.
+- A missing header, an empty header, `t` alone, `v1` alone, and a non-numeric
+  `t`: all rejected.
+- `v1` containing a non-ASCII character, such as `v1=ü`: rejected, not a
+  `TypeError`.
+- A body re-serialized from parsed JSON rather than the raw bytes: rejected,
+  which confirms the receiver is signing over the bytes it actually received.
 
 Webhook delivery is a notification mechanism, not the source of truth. Continue
 to use the authenticated intray API to recover events missed while a receiver
