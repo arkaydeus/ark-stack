@@ -129,6 +129,11 @@ description = "Run Go agent tests"
 run = "go test ./..."
 dir = "agent"
 
+[tasks."images:publish"]
+description = "Build every platform image and push it to GHCR"
+raw_args = true
+run = "bun scripts/publish-images.ts"
+
 [tasks."agent:build"]
 description = "Build the Docker agent"
 run = "go build -o ark-agent ."
