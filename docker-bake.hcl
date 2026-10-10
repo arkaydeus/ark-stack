@@ -32,10 +32,14 @@ group "default" {
 target "_common" {
   platforms = split(",", PLATFORMS)
   labels = {
-    # Links the GHCR packages to the repository so they inherit its access settings.
     "org.opencontainers.image.source"   = "https://github.com/arkaydeus/ark-stack"
     "org.opencontainers.image.revision" = REVISION
   }
+  # GHCR links a package to its repository (and its access settings) from the pushed image
+  # index, not from the image config labels above. The provenance attestation guarantees an
+  # index exists even for a single-platform push.
+  attest      = ["type=provenance,mode=min"]
+  annotations = ["index:org.opencontainers.image.source=https://github.com/arkaydeus/ark-stack"]
 }
 
 target "_app" {
