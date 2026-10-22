@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "types": ["bun"] },
+  "include": ["publish-images.ts", "publish-images.test.ts", "check-image-plan.ts", "test-ghcr-publish.ts"]
+}

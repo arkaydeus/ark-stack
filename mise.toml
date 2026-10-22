@@ -33,7 +33,7 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts"
 
 [tasks."test:e2e"]
 description = "Run fresh-volume browser onboarding against a disposable local database"
@@ -62,12 +62,13 @@ run = "ARK_DOCKER_INTEGRATION=1 go test -run TestDisposableDockerDeploymentAndDu
 dir = "agent"
 
 [tasks.typecheck]
-description = "Typecheck every TypeScript workspace"
+description = "Typecheck every TypeScript workspace and the image publisher"
 run = [
   "bunx tsc --noEmit -p shared/tsconfig.json",
   "bunx tsc --noEmit -p server/tsconfig.json",
   "bunx tsc --noEmit -p web/tsconfig.json",
   "bunx tsc --noEmit -p workers/tsconfig.json",
+  "bunx tsc --noEmit -p scripts/tsconfig.publish.json",
 ]
 
 [tasks.lint]
@@ -128,6 +129,11 @@ run = "bun --env-file=.env scripts/recover-mfa.ts"
 description = "Run Go agent tests"
 run = "go test ./..."
 dir = "agent"
+
+[tasks."images:publish"]
+description = "Build every platform image and push it to GHCR"
+raw_args = true
+run = "bun scripts/publish-images.ts"
 
 [tasks."agent:build"]
 description = "Build the Docker agent"
