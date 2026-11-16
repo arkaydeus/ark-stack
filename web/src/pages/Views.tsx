@@ -1124,6 +1124,7 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
           Allow external alias forwarding
         </label>
       </FormCard>
+      <RegionSettings state={state} reload={reload} />
       <Card>
         <CardHeader>
           <CardTitle>Administrator MFA</CardTitle>
@@ -1208,6 +1209,104 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
         <Field label="Incoming domains" name="domains" placeholder="mail.example.com" />
       </FormCard>
     </div>
+  );
+}
+
+/**
+ * Region preset (front door §3.15). It only drives suggestions: the Vercel function region,
+ * the backup bucket region hint and the docs wording. SES keeps its own AWS_REGION.
+ */
+function RegionSettings({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  const region = state.region;
+  const [message, setMessage] = useState("");
+  if (!region) return null;
+  const isOwner = state.user.role === "owner";
+  const summary = (
+    <dl className="grid gap-2 text-sm md:col-span-2 md:grid-cols-[max-content_1fr] md:gap-x-6">
+      <dt className="text-muted-foreground">Region</dt>
+      <dd>
+        {region.label} <span className="mono text-xs text-muted-foreground">{region.region}</span>
+      </dd>
+      <dt className="text-muted-foreground">VPS region (recorded)</dt>
+      <dd>{region.vpsRegionLabel ?? "Not recorded"}</dd>
+      <dt className="text-muted-foreground">Suggested Vercel function region</dt>
+      <dd>
+        <span className="mono">{region.vercelRegion}</span> ({region.vercelLocation})
+      </dd>
+      <dt className="text-muted-foreground">vercel.json</dt>
+      <dd>
+        <code className="mono text-xs">{region.vercelSnippet}</code>
+      </dd>
+      <dt className="text-muted-foreground">Suggested backup bucket region</dt>
+      <dd>
+        <span className="mono">{region.backupRegionHint}</span>, or your provider&apos;s nearest location
+      </dd>
+      <dt className="text-muted-foreground">Pick a VPS in</dt>
+      <dd>{region.docsLabel}</dd>
+      <dd className="text-xs text-muted-foreground md:col-span-2">{region.latencyHint}</dd>
+    </dl>
+  );
+  if (!isOwner) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Region</CardTitle>
+          <CardDescription>Only an owner can change the region.</CardDescription>
+        </CardHeader>
+        <CardContent>{summary}</CardContent>
+      </Card>
+    );
+  }
+  return (
+    <FormCard
+      title="Region"
+      description="Drives the suggested Vercel function region, the backup bucket region and the docs wording. Ark does not choose the VPS, and this never changes the SES region (AWS_REGION). Saving needs your password."
+      onSubmit={async (form) => {
+        setMessage("");
+        const label = String(form.get("vpsRegionLabel") ?? "").trim();
+        const request = { region: String(form.get("region") ?? ""), vpsRegionLabel: label || null };
+        await api("/api/step-up", {
+          method: "POST",
+          body: JSON.stringify({ password: form.get("password"), action: "platform.update", request }),
+        });
+        const saved = await api<{ label: string; vercelRegion: string }>("/api/settings/region", {
+          method: "PUT",
+          body: JSON.stringify(request),
+        });
+        await reload();
+        setMessage(`Region saved: ${saved.label}, Vercel ${saved.vercelRegion}.`);
+      }}
+    >
+      {summary}
+      <div>
+        <label htmlFor="region" className="mb-1.5 block text-xs font-semibold">
+          Region
+        </label>
+        <select id="region" name="region" className="select" defaultValue={region.region} key={region.region}>
+          {region.options.map((option) => (
+            <option key={option.region} value={option.region}>
+              {option.label} (Vercel {option.vercelRegion})
+            </option>
+          ))}
+        </select>
+      </div>
+      <Field
+        key={region.vpsRegionLabel ?? ""}
+        label="VPS region label (optional)"
+        name="vpsRegionLabel"
+        placeholder="Hetzner ash"
+        maxLength={64}
+        defaultValue={region.vpsRegionLabel ?? ""}
+      />
+      <Field
+        label="Current password"
+        name="password"
+        type="password"
+        autoComplete="current-password"
+        required
+      />
+      {message && <p className="text-sm text-muted-foreground md:col-span-2">{message}</p>}
+    </FormCard>
   );
 }
 

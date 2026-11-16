@@ -178,6 +178,25 @@ try {
       { pooler_source_cidrs: [], pooler_allow_internet: false, gate_login_mode: "disabled" },
       "Front-door exposure must default closed on upgrade.",
     );
+    // 0014_region.sql (FD-03) must follow 0013 and default the existing install to us-east.
+    assert.equal(
+      order.indexOf("0014_region.sql"),
+      order.indexOf("0013_front_door.sql") + 1,
+      "0014 must follow 0013 directly.",
+    );
+    const [regionSettings] = await verified`
+      SELECT region, vps_region_label FROM platform_settings WHERE id = 'default'
+    `;
+    assert.deepEqual(
+      regionSettings,
+      { region: "us-east", vps_region_label: null },
+      "An upgraded install must report region = us-east with no VPS region label.",
+    );
+    await assert.rejects(
+      verified`UPDATE platform_settings SET region = 'mars-1' WHERE id = 'default'`,
+      /platform_settings_region_check/,
+      "Only the shared/src/region.ts presets may be stored.",
+    );
     const frontDoorTables = await verified`
       SELECT table_name FROM information_schema.tables
       WHERE table_schema = 'public' AND table_name IN ('tailnet_snapshots', 'tailnet_nodes',
@@ -230,7 +249,8 @@ try {
     console.log(
       "Legacy credential data preserved; incorrect password rejected and correct password signed in.\n" +
         "0013_front_door.sql applied after 0012; legacy session backfilled to origin = admin; " +
-        "an insert omitting origin was refused; new sign-in recorded origin = admin.",
+        "an insert omitting origin was refused; new sign-in recorded origin = admin.\n" +
+        "0014_region.sql applied after 0013; the upgraded install reports region = us-east.",
     );
   } finally {
     await verified.end();

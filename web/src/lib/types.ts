@@ -1,5 +1,22 @@
 export type Role = "owner" | "operator" | "viewer";
 
+export type PlatformRegion = "us-east" | "us-west" | "eu-west" | "eu-central";
+
+/** Mirrors `regionSummary` in shared/src/region.ts. */
+export type RegionSummary = {
+  region: PlatformRegion;
+  label: string;
+  vercelRegion: string;
+  vercelLocation: string;
+  backupRegionHint: string;
+  docsLabel: string;
+  vpsRegionLabel: string | null;
+  vercelConfig: { regions: string[] };
+  vercelSnippet: string;
+  latencyHint: string;
+  options: Array<{ region: PlatformRegion; label: string; vercelRegion: string }>;
+};
+
 export type PlatformState = {
   user: { id: string; name: string; email: string; role: Role; twoFactorEnabled?: boolean };
   setup: {
@@ -17,7 +34,11 @@ export type PlatformState = {
     dnsProvider: string;
     defaultQuotaGb: number;
     allowExternalForwarding: boolean;
+    region?: PlatformRegion;
+    vpsRegionLabel?: string | null;
   } | null;
+  /** Region preset and its derived suggestions (front door §3.15). Absent on an older API. */
+  region?: RegionSummary;
   domains: Array<{
     id: string;
     name: string;

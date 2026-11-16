@@ -21,6 +21,7 @@ export * from "./operations.ts";
 export * from "./pgbouncer.ts";
 export * from "./provision-sql.ts";
 export * from "./redact.ts";
+export * from "./region.ts";
 export * from "./registry.ts";
 export * from "./rotate.ts";
 export * from "./schema-browser.ts";
