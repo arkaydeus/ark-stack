@@ -416,7 +416,9 @@ describe("Drizzle schema mirrors the migration", () => {
   test("columns, nullability, defaults, checks, indexes and keys match a fresh migrate", async () => {
     const db = await scratch("drizzle");
     try {
-      await apply(db, through("0013"));
+      // Every migration, not just 0013: later tickets extend these tables (0015 adds
+      // client_certificates.cert_pem for FD-13), and schema.ts mirrors the latest state.
+      await apply(db, migrationFiles);
       for (const table of tables) {
         const config = getTableConfig(table);
         const columns = await db`
