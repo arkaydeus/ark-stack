@@ -3,6 +3,8 @@ import { rm } from "node:fs/promises";
 // Owns the resources of one harness run, including commands still creating resources at shutdown.
 export class EdgeTestRuntime {
   readonly containers: string[] = [];
+  /** Compose projects started by the run; their containers, networks and volumes are removed by label. */
+  readonly composeProjects: string[] = [];
   networkCreated = false;
   private stopping = false;
   private pending = new Set<Promise<{ stdout: string; stderr: string }>>();
@@ -63,12 +65,28 @@ export class EdgeTestRuntime {
       if (this.containers.length) {
         await this.execute(["rm", "--force", "--volumes", ...this.containers]).catch(() => undefined);
       }
+      for (const project of this.composeProjects) await this.removeComposeProject(project);
       if (this.networkCreated) {
         await this.execute(["network", "rm", this.network]).catch(() => undefined);
       }
       await rm(this.directory, { recursive: true, force: true });
     })();
     return this.cleanupPromise;
+  }
+
+  private async removeComposeProject(project: string) {
+    const label = `label=com.docker.compose.project=${project}`;
+    const list = async (...args: string[]) =>
+      (await this.execute(args).catch(() => ({ stdout: "" }))).stdout.split("\n").filter(Boolean);
+    // Containers first: networks and volumes in use cannot be removed.
+    const containers = await list("ps", "--all", "--quiet", "--filter", label);
+    if (containers.length) {
+      await this.execute(["rm", "--force", "--volumes", ...containers]).catch(() => undefined);
+    }
+    const networks = await list("network", "ls", "--quiet", "--filter", label);
+    if (networks.length) await this.execute(["network", "rm", ...networks]).catch(() => undefined);
+    const volumes = await list("volume", "ls", "--quiet", "--filter", label);
+    if (volumes.length) await this.execute(["volume", "rm", "--force", ...volumes]).catch(() => undefined);
   }
 
   installSignalHandlers() {

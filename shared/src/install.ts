@@ -33,6 +33,7 @@ export const placeholderSecretValues = new Set([
   "dev-mfa-recovery-token",
   "dev-metrics-token",
   "dev-offhost-heartbeat-token",
+  "dev-edge-gate-token",
 ]);
 
 const insecureDefaultPaths: Record<string, string[]> = {
@@ -58,6 +59,8 @@ export function generateInstallSecrets() {
     ARK_MFA_RECOVERY_TOKEN: randomBytes(24).toString("base64url"),
     ARK_METRICS_TOKEN: randomBytes(24).toString("base64url"),
     ARK_OFFHOST_HEARTBEAT_TOKEN: randomBytes(24).toString("base64url"),
+    // Shared by `edge` and `api` to authenticate gate calls (docs/design/front-door.md §3.9, FD-11).
+    ARK_EDGE_GATE_TOKEN: randomBytes(32).toString("base64url"),
     ARK_CONTROL_DB_PASSWORD: controlPassword,
     ARK_APP_DB_PASSWORD: appPassword,
     ARK_API_DB_PASSWORD: apiPassword,
@@ -120,6 +123,38 @@ export function mergeInstallEnv(
     .map(([key, value]) => `${key}=${value}`)
     .join("\n")
     .concat("\n");
+}
+
+// Tailscale auth keys are `tskey-<kind>-<id>-<secret>`; anything else, or anything that could
+// break out of its `.env` line, is refused rather than written.
+const tailscaleAuthKey = /^tskey-[A-Za-z0-9-]+$/;
+
+export type EdgeAuthKeyResult = {
+  env: string;
+  /** `kept`: `.env` already had a key. `set`: the supplied key was written. `missing`: neither. */
+  status: "kept" | "set" | "missing";
+};
+
+/**
+ * Adds the edge node's one-off auth key (`TS_EDGE_AUTHKEY`) to an installed `.env`. An existing
+ * non-empty value always wins; the supplied key is only used to fill an absent or empty entry.
+ */
+export function applyEdgeAuthKey(env: string, supplied?: string): EdgeAuthKeyResult {
+  const current = parseEnvFile(env).TS_EDGE_AUTHKEY?.trim() ?? "";
+  if (current) return { env, status: "kept" };
+  const key = supplied?.trim() ?? "";
+  if (!key) return { env, status: "missing" };
+  if (!tailscaleAuthKey.test(key)) {
+    throw new Error("TS_EDGE_AUTHKEY must be a Tailscale auth key (tskey-…); it was not written.");
+  }
+  const lines = env.split("\n");
+  const index = lines.findIndex((line) => /^\s*TS_EDGE_AUTHKEY=/.test(line));
+  if (index >= 0) {
+    lines[index] = `TS_EDGE_AUTHKEY=${key}`;
+    return { env: lines.join("\n"), status: "set" };
+  }
+  const base = env === "" || env.endsWith("\n") ? env : `${env}\n`;
+  return { env: `${base}TS_EDGE_AUTHKEY=${key}\n`, status: "set" };
 }
 
 export function assertNoPlaceholderSecrets(env: Record<string, string | undefined> = process.env) {

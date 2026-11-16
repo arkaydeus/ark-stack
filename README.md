@@ -32,6 +32,8 @@ Useful commands:
 | `mise run test:upgrade`           | representative additive schema upgrade      |
 | `mise run test:stalwart`          | disposable native Stalwart lifecycle test   |
 | `mise run test:edge`              | Caddy validation, edge and harness tests    |
+| `mise run test:edge-tailnet`      | opt-in edge node checks on a real tailnet   |
+| `mise run edge:rejoin`            | put `edge` back in a restarted `edge-ts`    |
 | `mise run test:pgbouncer`         | disposable public PgBouncer TLS/SCRAM test  |
 | `mise run recover -- status`      | local lockout / bootstrap inspection        |
 | `mise run recover:mfa -- …`       | token- and confirmation-gated MFA reset     |
