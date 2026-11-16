@@ -1,0 +1,28 @@
+# Dependabot version updates.
+# Docs: https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+#
+# The repo is a single bun workspace (shared, server, web, workers) with one
+# root bun.lock. A single `bun` entry rooted at "/" lets Dependabot update the
+# workspace package.json files and regenerate the root lockfile together, so
+# `bun install --frozen-lockfile` in CI keeps passing. Do not add per-workspace
+# entries.
+version: 2
+updates:
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      bun-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
