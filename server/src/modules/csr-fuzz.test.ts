@@ -17,6 +17,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { testOpenSsl } from "./test-openssl.ts";
+
 import { headerOffsets, loadCorpus, prng, sha256, toCsrPem } from "./csr-test-kit.ts";
 
 process.env.DATABASE_URL ??= "postgres://unused:unused@127.0.0.1:9/unused";
@@ -38,15 +40,6 @@ const corpus = loadCorpus().map((item) => ({
 }));
 
 const corpusSpkis = corpus.map((item) => item.spki);
-
-function openssl() {
-  for (const candidate of [process.env.ARK_OPENSSL_BIN, Bun.which("openssl")]) {
-    if (!candidate) continue;
-    const version = Bun.spawnSync([candidate, "version"]);
-    if (version.exitCode === 0 && version.stdout.toString().startsWith("OpenSSL ")) return candidate;
-  }
-  return null;
-}
 
 type Random = ReturnType<typeof prng>;
 
@@ -144,7 +137,7 @@ describe("CSR parser seeded mutation fuzz (FD-17 hardening)", () => {
     `${ITERATIONS} mutations from seed ${SEED}: clean rejection or a verified signature`,
     () => {
       const random = prng(SEED);
-      const opensslBin = openssl();
+      const opensslBin = testOpenSsl();
       const work = mkdtempSync(join(tmpdir(), "ark-csr-fuzz-"));
       const outcomes = new Map<string, number>();
       const verifiedByOpenssl = new Set<string>();
@@ -196,7 +189,7 @@ describe("CSR parser seeded mutation fuzz (FD-17 hardening)", () => {
           ).toBe(true);
           const parsedDer = x509.fromPem(pem, ["CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST"]);
           const digest = sha256(parsedDer);
-          if (opensslBin && !verifiedByOpenssl.has(digest)) {
+          if (!verifiedByOpenssl.has(digest)) {
             const path = join(work, `${digest}.der`);
             writeFileSync(path, parsedDer);
             const check = Bun.spawnSync([
@@ -216,11 +209,12 @@ describe("CSR parser seeded mutation fuzz (FD-17 hardening)", () => {
       } finally {
         rmSync(work, { recursive: true, force: true });
       }
+      expect(verifiedByOpenssl.size, "The independent signature oracle must execute").toBeGreaterThan(0);
       const top = [...outcomes].toSorted((a, b) => b[1] - a[1]).slice(0, 6);
       console.log(
         `CSR fuzz: seed ${SEED}, ${ITERATIONS} iterations, ${ITERATIONS - accepted} rejected with CsrError, ` +
           `${accepted} accepted (all with a corpus key; ${verifiedByOpenssl.size} distinct DER verified by ` +
-          `${opensslBin ? "openssl req -verify" : "no OpenSSL available"}); max ${slowest.toFixed(2)} ms, ` +
+          `openssl req -verify); max ${slowest.toFixed(2)} ms, ` +
           `mean ${(totalMs / ITERATIONS).toFixed(3)} ms, bound ${ITERATION_BOUND_MS} ms; top rejections: ` +
           top.map(([reason, count]) => `${reason} ×${count}`).join("; "),
       );

@@ -91,8 +91,9 @@ import {
   databaseClientVercelGuide,
   getDatabaseClient,
   listDatabaseClients,
-  planDatabaseClient,
-  requestRevocation,
+  queueClientIssue,
+  queueClientRevocation,
+  consumeClientIssueAttempt,
   revealDatabaseClient,
 } from "./modules/db-clients.ts";
 import { CLIENT_KEY_SECRET_KIND, PkiPolicyError, validateCsr } from "./modules/pki.ts";
@@ -1763,24 +1764,6 @@ app.get("/api/databases/:id/admission", async (c) => {
 // Owner-only (R12-style exposure decision). Issue and revoke need MFA plus a single-use
 // `credential.rotate` grant bound to the request; the one-time reveal needs `secret.reveal`.
 
-const CLIENT_ISSUE_WINDOW_MS = 10 * 60 * 1000;
-const CLIENT_ISSUE_MAX = 10;
-const clientIssueAttempts = new Map<string, number[]>();
-
-/** CSR submission rate limit: 10 issue requests per owner per 10 minutes, counted before parsing. */
-function assertClientIssueRate(userId: string) {
-  const now = Date.now();
-  const recent = (clientIssueAttempts.get(userId) ?? []).filter((at) => now - at < CLIENT_ISSUE_WINDOW_MS);
-  if (recent.length >= CLIENT_ISSUE_MAX) {
-    clientIssueAttempts.set(userId, recent);
-    throw new HTTPException(429, {
-      message: "Too many database client requests. Wait a few minutes before submitting another.",
-    });
-  }
-  recent.push(now);
-  clientIssueAttempts.set(userId, recent);
-}
-
 app.get("/api/databases/:id/clients", async (c) => {
   requireOwner(c.get("access"));
   await databaseClientContext(c.req.param("id"));
@@ -1791,11 +1774,13 @@ app.post("/api/databases/:id/clients", async (c) => {
   const access = c.get("access");
   requireOwner(access);
   requireMfa(c.get("session"));
-  assertClientIssueRate(access.userId);
+  if (!(await consumeClientIssueAttempt(access.userId)))
+    throw new HTTPException(429, {
+      message: "Too many database client requests. Wait a few minutes before submitting another.",
+    });
   const databaseId = c.req.param("id");
   const request = (await c.req.json()) as Record<string, unknown>;
   const input = databaseClientInput.parse(request);
-  const { role } = await planDatabaseClient({ databaseId, ...input });
   // Parse the CSR here as well as in the worker, so a refused request never reaches the queue.
   if (input.csrPem !== undefined) validateCsr(input.csrPem);
   const roleKind = input.roleKind ?? defaultClientRoleKind(input.environment);
@@ -1806,18 +1791,11 @@ app.post("/api/databases/:id/clients", async (c) => {
     "credential.rotate",
     privilegedRequestHash("credential.rotate", { databaseId, ...request }),
   );
-  const clientId = createId("dbc");
-  const operation = await enqueue({
-    kind: "database.client_issue",
+  const { clientId, role, operation } = await queueClientIssue({
+    databaseId,
+    ...input,
+    roleKind,
     actorId: access.userId,
-    targetIds: [databaseId],
-    payload: {
-      clientId,
-      name: input.name,
-      environment: input.environment,
-      roleKind,
-      ...(input.csrPem === undefined ? {} : { csrPem: input.csrPem }),
-    },
   });
   await audit(
     access.userId,
@@ -1852,6 +1830,8 @@ app.post("/api/databases/:id/clients/:clientId/reveal", async (c) => {
     throw new HTTPException(404, {
       message: "Database client not found. If it was just requested, wait for issuance to finish.",
     });
+  if (!client.issuedAt)
+    throw new HTTPException(409, { message: "Client issuance has not completed; retry issuance first." });
   if (client.status !== "active" || client.revokedAt)
     throw new HTTPException(409, { message: "This client was revoked; its credentials cannot be revealed." });
   if (client.revealedAt)
@@ -1883,7 +1863,7 @@ app.post("/api/databases/:id/clients/:clientId/revoke", async (c) => {
   const clientId = c.req.param("clientId");
   const client = await getDatabaseClient(databaseId, clientId);
   if (!client) throw new HTTPException(404, { message: "Database client not found." });
-  if (client.status !== "active")
+  if (client.revocationCompletedAt)
     throw new HTTPException(409, { message: "This client is already revoked." });
   await requirePrivileged(
     access,
@@ -1891,13 +1871,7 @@ app.post("/api/databases/:id/clients/:clientId/revoke", async (c) => {
     "credential.rotate",
     privilegedRequestHash("credential.rotate", { databaseId, clientId }),
   );
-  await requestRevocation({ databaseId, clientId, actorId: access.userId });
-  const operation = await enqueue({
-    kind: "database.client_revoke",
-    actorId: access.userId,
-    targetIds: [databaseId, clientId],
-    payload: { clientId },
-  });
+  const operation = await queueClientRevocation({ databaseId, clientId, actorId: access.userId });
   await audit(
     access.userId,
     "database.client_revoke",

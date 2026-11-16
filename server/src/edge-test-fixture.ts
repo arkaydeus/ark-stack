@@ -1,3 +1,6 @@
+import { testOpenSsl } from "./modules/test-openssl.ts";
+import { dirname } from "node:path";
+process.env.PATH = `${dirname(testOpenSsl())}:${process.env.PATH}`;
 // Isolated database/process: mode changes revoke all sessions and must not affect other suites.
 // The fake lego writes real certificate files; no public CA or DNS request is made.
 import assert from "node:assert/strict";

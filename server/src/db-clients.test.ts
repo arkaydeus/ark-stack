@@ -6,7 +6,7 @@
 // PgBouncer behaviour (connect, read-only preview, revoke with KILL_CLIENT) is covered by
 // scripts/test-pgbouncer-public.ts against the pinned containers.
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test, spyOn } from "bun:test";
 import { createPublicKey, generateKeyPairSync, X509Certificate } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -25,7 +25,8 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
 
 const { app } = await import("./app.ts");
 const { auth } = await import("./auth.ts");
-const { sql } = await import("./db.ts");
+const { sql, db } = await import("./db.ts");
+const clientModule = await import("./modules/db-clients.ts");
 const { runOperation } = await import("./coordinator.ts");
 const x509 = await import("./modules/x509.ts");
 
@@ -35,7 +36,10 @@ const password = "Db-Clients-Test-Password-123!";
 const appUrl = process.env.DATABASE_APP_URL ?? "";
 
 type Actor = { userId: string; cookie: string };
-const actors = {} as Record<Role | "ownerWithoutMfa" | "rateOwner", Actor>;
+const actors = {} as Record<
+  Role | "ownerWithoutMfa" | "rateOwner" | "recoveryOwner" | "raceOwner" | "crossOwner",
+  Actor
+>;
 const suffix = createId("x")
   .slice(-8)
   .toLowerCase()
@@ -99,7 +103,7 @@ async function stepUp(actor: Actor, action: string, request: Record<string, unkn
 const clientsPath = `/api/databases/${databaseId}/clients`;
 
 /** Claim and execute exactly this operation, as the database worker does. */
-async function runQueued(operationId: string) {
+async function runQueued(operationId: string, runtime?: Parameters<typeof runOperation>[2]) {
   const [row] = await sql`
     UPDATE operations SET status = 'running', claim_token = ${createId("claim")}, heartbeat_at = now()
     WHERE id = ${operationId} AND status = 'queued' RETURNING *
@@ -121,7 +125,7 @@ async function runQueued(operationId: string) {
     updatedAt: row!.updated_at as Date,
   };
   try {
-    await runOperation(operation.kind as never, operation);
+    await runOperation(operation.kind as never, operation, runtime);
     await sql`UPDATE operations SET status = 'succeeded' WHERE id = ${operationId}`;
   } catch (error) {
     await sql`UPDATE operations SET status = 'failed', error = ${String(error)} WHERE id = ${operationId}`;
@@ -241,6 +245,9 @@ beforeAll(async () => {
   actors.viewer = await signUp("viewer", true);
   actors.ownerWithoutMfa = await signUp("owner", false);
   actors.rateOwner = await signUp("owner", true);
+  actors.recoveryOwner = await signUp("owner", true);
+  actors.raceOwner = await signUp("owner", true);
+  actors.crossOwner = await signUp("owner", true);
 });
 
 afterAll(async () => {
@@ -286,6 +293,7 @@ afterAll(async () => {
     await sql`DELETE FROM "user" WHERE id IN ${sql(ids)}`;
   }
   await sql`DELETE FROM audit_events WHERE resource_id = ${databaseId}`;
+  await sql`DELETE FROM alerts WHERE dedup_key LIKE ${`pgbouncer-revoke:${dbName}_%`}`;
   if (originalRegion) await sql`UPDATE platform_settings SET region = ${originalRegion} WHERE id = 'default'`;
   if (work) await rm(work, { recursive: true, force: true });
 });
@@ -632,5 +640,432 @@ describe("CSR submission hardening", () => {
     }
     expect(statuses.slice(0, 10).every((status) => status === 422)).toBe(true);
     expect(statuses[10]).toBe(429);
+  });
+});
+
+async function queueIssue(body: Record<string, unknown>) {
+  await stepUp(actors.recoveryOwner, "credential.rotate", { databaseId, ...body });
+  const response = await call(actors.recoveryOwner, clientsPath, { method: "POST", body });
+  expect(response.status, await response.clone().text()).toBe(202);
+  return response.json() as Promise<{ clientId: string; operationId: string; role: string }>;
+}
+async function queueRevoke(clientId: string, actor = actors.recoveryOwner) {
+  await stepUp(actor, "credential.rotate", { databaseId, clientId });
+  return call(actor, `${clientsPath}/${clientId}/revoke`, { method: "POST" });
+}
+
+// The coordinator uses real persistence/role changes and injected admin I/O. This exercises
+// its ordering and completion gates without global module mocks that affect other suites.
+describe("database client failure recovery and races", () => {
+  beforeEach(async () => {
+    await sql`DELETE FROM client_issue_limits WHERE user_id = ${actors.recoveryOwner.userId}`;
+  });
+  test("failed role creation and RELOAD stay non-revealable; API retries reuse every credential", async () => {
+    const body = { name: "recoverissue", environment: "production" };
+    const first = await queueIssue(body);
+    await expect(
+      runQueued(first.operationId, {
+        issue: (input) =>
+          clientModule.issueDatabaseClient(input, async () => {
+            throw new Error("role unavailable");
+          }),
+      }),
+    ).rejects.toThrow("role unavailable");
+    const [before] = await sql`SELECT dc.ca_id, dr.secret_id, cc.id AS cert_id, cc.key_secret_id
+      FROM database_clients dc JOIN database_roles dr ON dr.id = dc.role_id
+      JOIN client_certificates cc ON cc.ca_id = dc.ca_id WHERE dc.id = ${first.clientId}`;
+    expect((await reveal(actors.recoveryOwner, first.clientId)).status).toBe(409);
+    expect(
+      (await clientModule.listDatabaseClients(databaseId)).find((c) => c.id === first.clientId)?.status,
+    ).toBe("provisioning");
+    const second = await queueIssue(body);
+    expect(second.clientId).toBe(first.clientId);
+    await expect(
+      runQueued(second.operationId, {
+        reload: async () => {
+          throw new Error("reload unavailable");
+        },
+      }),
+    ).rejects.toThrow("reload unavailable");
+    expect((await reveal(actors.recoveryOwner, first.clientId)).status).toBe(409);
+    const third = await queueIssue(body);
+    await runQueued(third.operationId);
+    const [after] = await sql`SELECT dc.ca_id, dr.secret_id, cc.id AS cert_id, cc.key_secret_id
+      FROM database_clients dc JOIN database_roles dr ON dr.id = dc.role_id
+      JOIN client_certificates cc ON cc.ca_id = dc.ca_id WHERE dc.id = ${first.clientId}`;
+    expect(after).toEqual(before);
+    const bundle = (await (await reveal(actors.recoveryOwner, first.clientId)).json()) as Bundle;
+    const admin = cluster();
+    const [role] = await admin`SELECT rolcanlogin FROM pg_roles WHERE rolname = ${bundle.role}`;
+    await admin.end();
+    expect(role!.rolcanlogin).toBe(true);
+    // Authentication with the exact retained password (the runtime matrix covers public TLS).
+    const url = new URL(appUrl);
+    url.username = bundle.role;
+    url.password = encodeURIComponent(bundle.password);
+    const connection = postgres(url.toString(), { max: 1 });
+    try {
+      expect((await connection`SELECT current_user AS name`)[0]!.name).toBe(bundle.role);
+    } finally {
+      await connection.end();
+    }
+  });
+
+  test("a missing real group role fails safely and can be retried after provisioning", async () => {
+    const body = { name: "missinggroup", environment: "preview" };
+    const request = await queueIssue(body);
+    const admin = cluster();
+    try {
+      await admin.unsafe(`ALTER ROLE "${dbName}_readonly" RENAME TO "${dbName}_waiting"`);
+      await expect(runQueued(request.operationId)).rejects.toThrow(/Group role .* is missing/);
+      expect((await reveal(actors.recoveryOwner, request.clientId)).status).toBe(409);
+    } finally {
+      await admin.unsafe(`ALTER ROLE "${dbName}_waiting" RENAME TO "${dbName}_readonly"`);
+      await admin.end();
+    }
+    const retry = await queueIssue(body);
+    expect(retry.clientId).toBe(request.clientId);
+    await runQueued(retry.operationId);
+  });
+
+  test("a failed client insert retires the orphan CA and key, and the API can retry", async () => {
+    const body = { name: "orphan", environment: "production" };
+    const request = await queueIssue(body);
+    // Fail after certificate/secret creation but before linking the generation to a client.
+    const trigger = `fd17_${suffix}`;
+    await sql.unsafe(`CREATE FUNCTION ${trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.id = '${request.clientId}' THEN RAISE EXCEPTION 'injected client insert'; END IF; RETURN NEW; END $$`);
+    await sql.unsafe(
+      `CREATE TRIGGER ${trigger} BEFORE INSERT ON database_clients FOR EACH ROW EXECUTE FUNCTION ${trigger}()`,
+    );
+    try {
+      await expect(runQueued(request.operationId)).rejects.toMatchObject({
+        cause: { message: "injected client insert" },
+      });
+    } finally {
+      await sql.unsafe(`DROP TRIGGER ${trigger} ON database_clients`);
+      await sql.unsafe(`DROP FUNCTION ${trigger}()`);
+    }
+    const orphan =
+      await sql`SELECT cc.status, cc.key_secret_id, ca.status AS ca_status FROM client_certificates cc
+      JOIN private_cas ca ON ca.id = cc.ca_id WHERE cc.subject_cn = ${request.role}`;
+    expect(orphan).toHaveLength(1);
+    expect(orphan[0]).toMatchObject({ status: "revoked", ca_status: "revoked", key_secret_id: null });
+    const retry = await queueIssue(body);
+    expect(retry.clientId).toBe(request.clientId);
+    await runQueued(retry.operationId);
+  });
+
+  test("role rotation, RELOAD and KILL_CLIENT failures all resume, with isolated alerts", async () => {
+    const unaffected = await issue(actors.recoveryOwner, { name: "unaffected", environment: "production" });
+    const unaffectedBefore = await roleState(unaffected.role);
+    const keys: string[] = [];
+    for (const point of ["rotation", "reload", "kill"] as const) {
+      const target = await issue(actors.recoveryOwner, { name: `fail${point}`, environment: "preview" });
+      const response = await queueRevoke(target.clientId);
+      const queued = (await response.json()) as { operationId: string };
+      const order: string[] = [];
+      const runtime = {
+        reloadRequired: () => true,
+        reload: async () => {
+          order.push("reload");
+          if (point === "reload") throw new Error("injected reload");
+        },
+        kill: async (role: string) => {
+          order.push(`kill:${role}`);
+          throw new Error("injected kill");
+        },
+        ...(point === "rotation"
+          ? {
+              revoke: (input: Parameters<typeof clientModule.revokeDatabaseClient>[0]) =>
+                clientModule.revokeDatabaseClient(input, async () => {
+                  throw new Error("injected rotation");
+                }),
+            }
+          : {}),
+      };
+      await expect(runQueued(queued.operationId, runtime)).rejects.toThrow(`injected ${point}`);
+      expect(order).toEqual(
+        point === "rotation" ? [] : point === "reload" ? ["reload"] : ["reload", `kill:${target.role}`],
+      );
+      const [pending] =
+        await sql`SELECT revocation_completed_at FROM database_clients WHERE id = ${target.clientId}`;
+      expect(pending!.revocation_completed_at).toBeNull();
+      expect((await reveal(actors.recoveryOwner, target.clientId)).status).toBe(409);
+      if (point === "kill") {
+        keys.push(`pgbouncer-revoke:${target.role}`);
+        const [alert] = await sql`SELECT resolved_at FROM alerts WHERE dedup_key = ${keys[0]!}`;
+        expect(alert!.resolved_at).toBeNull();
+      }
+      const retry = await queueRevoke(target.clientId);
+      expect(retry.status).toBe(202);
+      const retried = (await retry.json()) as { operationId: string };
+      order.length = 0;
+      await runQueued(retried.operationId, {
+        reloadRequired: () => true,
+        reload: async (op) => {
+          order.push("reload");
+          await runOperation("pgbouncer.reload", op);
+        },
+        kill: async (role) => {
+          order.push(`kill:${role}`);
+          return { killed: 1, attempts: 1, remaining: 0 };
+        },
+      });
+      expect(order).toEqual(["reload", `kill:${target.role}`]);
+      const [done] =
+        await sql`SELECT revocation_completed_at FROM database_clients WHERE id = ${target.clientId}`;
+      expect(done!.revocation_completed_at).not.toBeNull();
+      expect((await roleState(target.role))!.rolcanlogin).toBe(false);
+      expect(await pgbouncerFile(PGBOUNCER_FILES.userlist)).not.toContain(`"${target.role}"`);
+      expect(await roleState(unaffected.role)).toEqual(unaffectedBefore);
+    }
+    const other = await issue(actors.recoveryOwner, { name: "otheralert", environment: "preview" });
+    const queued = (await (await queueRevoke(other.clientId)).json()) as { operationId: string };
+    await expect(
+      runQueued(queued.operationId, {
+        reloadRequired: () => true,
+        reload: async () => {},
+        kill: async () => {
+          throw new Error("other kill");
+        },
+      }),
+    ).rejects.toThrow("other kill");
+    const alerts =
+      await sql`SELECT dedup_key, resolved_at FROM alerts WHERE dedup_key IN ${sql([...keys, `pgbouncer-revoke:${other.role}`] as [...string[], string])}`;
+    expect(alerts).toHaveLength(2);
+    expect(alerts.find((a) => a.dedup_key === keys[0])!.resolved_at).not.toBeNull();
+    expect(alerts.find((a) => a.dedup_key !== keys[0])!.resolved_at).toBeNull();
+    const retry = (await (await queueRevoke(other.clientId)).json()) as { operationId: string };
+    await runQueued(retry.operationId, {
+      reloadRequired: () => true,
+      reload: async () => {},
+      kill: async () => ({ killed: 0, remaining: 0, attempts: 1 }),
+    });
+  });
+
+  test("concurrent issuance requests reserve one client identity before metadata exists", async () => {
+    const body = { name: "duplicateissue", environment: "preview" };
+    await Promise.all(
+      [actors.recoveryOwner, actors.raceOwner].map((actor) =>
+        stepUp(actor, "credential.rotate", { databaseId, ...body }),
+      ),
+    );
+    const responses = await Promise.all(
+      [actors.recoveryOwner, actors.raceOwner].map((actor) =>
+        call(actor, clientsPath, { method: "POST", body }),
+      ),
+    );
+    expect(responses.map((r) => r.status).toSorted()).toEqual([202, 409]);
+    const operations = await sql`SELECT id FROM operations WHERE kind = 'database.client_issue'
+      AND target_ids ? ${databaseId} AND payload->>'name' = 'duplicateissue'`;
+    expect(operations).toHaveLength(1);
+    await runQueued(String(operations[0]!.id));
+  });
+
+  test("queue serialization works with more callers than database pool connections", async () => {
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 12 }, () =>
+        clientModule.queueClientIssue({
+          databaseId,
+          name: "poolpressure",
+          environment: "preview",
+          roleKind: "readonly",
+          actorId: actors.recoveryOwner.userId,
+        }),
+      ),
+    );
+    const successes = outcomes.filter((o) => o.status === "fulfilled");
+    expect(successes).toHaveLength(1);
+    for (const outcome of outcomes)
+      if (outcome.status === "rejected")
+        expect(outcome.reason).toBeInstanceOf(clientModule.DatabaseClientError);
+    if (successes[0]?.status === "fulfilled") await runQueued(successes[0].value.operation.id);
+  });
+
+  test("duplicate concurrent revoke POSTs create one operation and one audit entry", async () => {
+    const target = await issue(actors.recoveryOwner, { name: "duplicate", environment: "preview" });
+    await Promise.all(
+      [actors.recoveryOwner, actors.raceOwner].map((actor) =>
+        stepUp(actor, "credential.rotate", { databaseId, clientId: target.clientId }),
+      ),
+    );
+    const responses = await Promise.all(
+      [actors.recoveryOwner, actors.raceOwner].map((actor) =>
+        call(actor, `${clientsPath}/${target.clientId}/revoke`, { method: "POST" }),
+      ),
+    );
+    expect(responses.map((r) => r.status).toSorted()).toEqual([202, 409]);
+    const operations =
+      await sql`SELECT id FROM operations WHERE kind = 'database.client_revoke' AND payload->>'clientId' = ${target.clientId}`;
+    const events =
+      await sql`SELECT id FROM audit_events WHERE action = 'database.client_revoke' AND detail->>'clientId' = ${target.clientId}`;
+    expect(operations).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    await runQueued(String(operations[0]!.id));
+  });
+
+  test("queued owner-only jobs reject a demoted owner before touching lifecycle state", async () => {
+    const target = await issue(actors.recoveryOwner, { name: "demoterevoke", environment: "preview" });
+    const queuedRevoke = (await (await queueRevoke(target.clientId)).json()) as { operationId: string };
+    const queuedIssue = await queueIssue({ name: "demoteissue", environment: "preview" });
+    const before =
+      await sql`SELECT status, ca_id, revoked_at FROM database_clients WHERE id = ${target.clientId}`;
+    const roleBefore = await roleState(target.role);
+    await sql`UPDATE platform_access SET role = 'operator' WHERE user_id = ${actors.recoveryOwner.userId}`;
+    try {
+      await expect(runQueued(queuedIssue.operationId)).rejects.toThrow("Only owners");
+      await expect(runQueued(queuedRevoke.operationId)).rejects.toThrow("Only owners");
+      expect(await sql`SELECT id FROM database_clients WHERE id = ${queuedIssue.clientId}`).toHaveLength(0);
+      const after =
+        await sql`SELECT status, ca_id, revoked_at FROM database_clients WHERE id = ${target.clientId}`;
+      expect([...after]).toEqual([...before]);
+      expect(await roleState(target.role)).toEqual(roleBefore);
+    } finally {
+      await sql`UPDATE platform_access SET role = 'owner' WHERE user_id = ${actors.recoveryOwner.userId}`;
+    }
+  });
+
+  test("separately authorized concurrent reveals return one bundle and one audit event", async () => {
+    const target = await issue(actors.raceOwner, { name: "racereveal", environment: "preview" });
+    const responses = await Promise.all([
+      reveal(actors.raceOwner, target.clientId),
+      reveal(actors.recoveryOwner, target.clientId),
+    ]);
+    expect(responses.map((r) => r.status).toSorted()).toEqual([200, 409]);
+    const events =
+      await sql`SELECT id FROM audit_events WHERE action = 'database.client_reveal' AND detail->>'clientId' = ${target.clientId}`;
+    expect(events).toHaveLength(1);
+    const [key] =
+      await sql`SELECT cc.key_secret_id FROM client_certificates cc JOIN database_clients dc ON dc.ca_id = cc.ca_id WHERE dc.id = ${target.clientId}`;
+    expect(key!.key_secret_id).toBeNull();
+  });
+
+  test("reveal racing a revoke request preserves a single consistent claim and key state", async () => {
+    const target = await issue(actors.raceOwner, { name: "racerevoke", environment: "preview" });
+    const [shown, requested] = await Promise.all([
+      reveal(actors.raceOwner, target.clientId),
+      queueRevoke(target.clientId),
+    ]);
+    expect([200, 409]).toContain(shown.status);
+    expect(requested.status).toBe(202);
+    const [row] = await sql`SELECT dc.revealed_at, dc.revoked_at, cc.key_secret_id FROM database_clients dc
+      JOIN client_certificates cc ON cc.ca_id = dc.ca_id WHERE dc.id = ${target.clientId}`;
+    expect(row!.revoked_at).not.toBeNull();
+    expect(row!.revealed_at !== null).toBe(shown.status === 200);
+    expect(row!.key_secret_id === null).toBe(shown.status === 200);
+    const events =
+      await sql`SELECT id FROM audit_events WHERE action = 'database.client_reveal' AND detail->>'clientId' = ${target.clientId}`;
+    expect(events).toHaveLength(shown.status === 200 ? 1 : 0);
+    expect((await reveal(actors.raceOwner, target.clientId)).status).toBe(409);
+    await runQueued(((await requested.json()) as { operationId: string }).operationId);
+    const [after] =
+      await sql`SELECT cc.key_secret_id FROM client_certificates cc JOIN database_clients dc ON dc.ca_id = cc.ca_id WHERE dc.id = ${target.clientId}`;
+    expect(after!.key_secret_id).toBeNull();
+  });
+
+  test("inventory query count is three for many clients and linked CA generations", async () => {
+    const existing = (await clientModule.listDatabaseClients(databaseId))[0]!;
+    const [base] = await sql`SELECT ca_id FROM database_clients WHERE id = ${existing.id}`;
+    for (let i = 0; i < 25; i++) {
+      const roleId = createId("role");
+      await sql`INSERT INTO database_roles (id, database_id, name, kind) VALUES (${roleId}, ${databaseId}, ${`${dbName}_inventory${i}_preview`}, 'client')`;
+      await sql`INSERT INTO database_clients (id, database_id, name, environment, role_kind, role_id, ca_id)
+        VALUES (${createId("dbc")}, ${databaseId}, ${`inventory${i}`}, 'preview', 'readonly', ${roleId}, ${base!.ca_id})`;
+    }
+    // A 70-generation cross-CA chain must not be truncated at the old 64-query bound.
+    let previous = existing.certificates[0]!.id;
+    const generated: string[] = [];
+    for (let generation = 0; generation < 70; generation++) {
+      const caId = createId("pca");
+      const certId = createId("cc");
+      await sql`INSERT INTO private_cas (id, purpose, name, cert_pem, key_secret_id, not_after)
+        SELECT ${caId}, purpose, name, cert_pem, key_secret_id, not_after FROM private_cas WHERE id = ${base!.ca_id}`;
+      await sql`INSERT INTO client_certificates (id, ca_id, subject_cn, serial, fingerprint_sha256, not_before, not_after)
+        SELECT ${certId}, ${caId}, subject_cn, ${String(generation)}, ${`inventory-${generation}`}, not_before, not_after
+        FROM client_certificates WHERE id = ${previous}`;
+      await sql`UPDATE client_certificates SET superseded_by = ${certId} WHERE id = ${previous}`;
+      previous = certId;
+      generated.push(certId);
+    }
+    // Spy at the actual database boundary; this counts queries rather than mirroring traversal.
+    const select = spyOn(db, "select");
+    try {
+      const list = await clientModule.listDatabaseClients(databaseId);
+      expect(list.length).toBeGreaterThan(25);
+      expect(select.mock.calls).toHaveLength(3);
+      const certificates = list.find((c) => c.id === existing.id)!.certificates;
+      expect(certificates).toHaveLength(existing.certificates.length + 70);
+      expect(certificates.map((c) => c.id)).toEqual(expect.arrayContaining(generated));
+    } finally {
+      select.mockRestore();
+    }
+  });
+
+  test("the recovery migration preserves completed legacy clients and gates failed issuance", async () => {
+    const migration = await Bun.file(
+      new URL("../drizzle/0019_database_client_recovery.sql", import.meta.url),
+    ).text();
+    await sql.begin(async (tx) => {
+      const schema = `fd17_migration_${suffix}`;
+      await tx.unsafe(`CREATE SCHEMA "${schema}"`);
+      try {
+        await tx.unsafe(`SET LOCAL search_path TO "${schema}"`);
+        await tx.unsafe('CREATE TABLE "user" (id text PRIMARY KEY)');
+        await tx.unsafe("CREATE TABLE database_clients (id text PRIMARY KEY)");
+        await tx.unsafe("CREATE TABLE operations (kind text, payload jsonb, status text)");
+        await tx`INSERT INTO database_clients (id) VALUES ('done'), ('failed'), ('legacy')`;
+        await tx`INSERT INTO operations (kind, payload, status) VALUES
+          ('database.client_issue', '{"clientId":"done"}', 'succeeded'),
+          ('database.client_issue', '{"clientId":"failed"}', 'failed')`;
+        await tx.unsafe(migration);
+        const rows =
+          await tx`SELECT id, issued_at, revocation_completed_at FROM database_clients ORDER BY id`;
+        expect(rows.find((r) => r.id === "done")!.issued_at).not.toBeNull();
+        expect(rows.find((r) => r.id === "failed")!.issued_at).toBeNull();
+        expect(rows.find((r) => r.id === "legacy")!.issued_at).not.toBeNull();
+        expect(rows.every((r) => r.revocation_completed_at === null)).toBe(true);
+        const [counter] = await tx`SELECT count(*)::int AS n FROM client_issue_limits`;
+        expect(counter!.n).toBe(0);
+      } finally {
+        await tx.unsafe(`DROP SCHEMA "${schema}" CASCADE`);
+      }
+    });
+  });
+
+  test("the sliding-window limit survives independent API processes and expires idle owners", async () => {
+    const child = () =>
+      Bun.spawn(
+        [
+          process.execPath,
+          "--eval",
+          `
+      const { consumeClientIssueAttempt } = await import('./server/src/modules/db-clients.ts');
+      const { sql } = await import('./server/src/db.ts');
+      const outcomes = await Promise.all(Array.from({length: 7}, () => consumeClientIssueAttempt(${JSON.stringify(actors.crossOwner.userId)})));
+      console.log(JSON.stringify(outcomes)); await sql.end();
+    `,
+        ],
+        { env: process.env, stdout: "pipe", stderr: "pipe" },
+      );
+    const processes = [child(), child()];
+    const results = await Promise.all(
+      processes.map(async (p) => {
+        const [code, stdout, stderr] = await Promise.all([
+          p.exited,
+          new Response(p.stdout).text(),
+          new Response(p.stderr).text(),
+        ]);
+        expect(code, stderr).toBe(0);
+        return JSON.parse(stdout) as boolean[];
+      }),
+    );
+    expect(results.flat().filter(Boolean)).toHaveLength(10);
+    expect(await clientModule.consumeClientIssueAttempt(actors.crossOwner.userId)).toBe(false);
+    expect(
+      await clientModule.consumeClientIssueAttempt(actors.crossOwner.userId, new Date(Date.now() + 600_001)),
+    ).toBe(true);
+    const rows = await sql`SELECT user_id FROM client_issue_limits`;
+    expect(rows.map((row) => String(row.user_id))).toEqual([actors.crossOwner.userId]);
   });
 });

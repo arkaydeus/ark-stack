@@ -27,14 +27,18 @@ import {
   generatePassword,
   redactValue,
   regionSummary,
+  planHash,
+  isInFlight,
   type DbClientRoleKind,
 } from "@ark-stack/shared";
-import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, isNotNull, lt, desc, sql } from "drizzle-orm";
 
 import { db } from "../db.ts";
 import { loadEnv } from "../env.ts";
 import {
   auditEvents,
+  clientIssueLimits,
+  operations,
   clientCertificates,
   databaseClients,
   databaseClusters,
@@ -92,17 +96,20 @@ async function auditEvent(input: {
 }
 
 /** The public database, its endpoint hostname, and the platform region (for Vercel `regions`). */
-export async function databaseClientContext(databaseId: string) {
-  const [database] = await db.select().from(managedDatabases).where(eq(managedDatabases.id, databaseId));
+export async function databaseClientContext(databaseId: string, executor: Pick<typeof db, "select"> = db) {
+  const [database] = await executor
+    .select()
+    .from(managedDatabases)
+    .where(eq(managedDatabases.id, databaseId));
   if (!database) throw new DatabaseClientError(404, "Database not found.");
-  const [cluster] = await db
+  const [cluster] = await executor
     .select()
     .from(databaseClusters)
     .where(eq(databaseClusters.id, database.clusterId));
   const [endpoint] = cluster?.endpointId
-    ? await db.select().from(endpoints).where(eq(endpoints.id, cluster.endpointId))
-    : (await db.select().from(endpoints).where(eq(endpoints.kind, "database"))).slice(0, 1);
-  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+    ? await executor.select().from(endpoints).where(eq(endpoints.id, cluster.endpointId))
+    : (await executor.select().from(endpoints).where(eq(endpoints.kind, "database"))).slice(0, 1);
+  const [settings] = await executor.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   return {
     database,
     host: endpoint?.hostname ?? "<database hostname>",
@@ -110,26 +117,42 @@ export async function databaseClientContext(databaseId: string) {
   };
 }
 
-/** Every certificate of a client: its CA generation, then the superseded_by chain both ways. */
-async function linkedCertificates(client: Pick<ClientRow, "caId">) {
+/** One recursive query for all connected generations, including cross-CA rollovers. */
+async function loadLinkedCertificates(caIds: string[], executor: Pick<typeof db, "select"> = db) {
+  if (!caIds.length) return [];
+  return executor.select().from(clientCertificates).where(sql`${clientCertificates.id} IN (
+    WITH RECURSIVE linked AS (
+      SELECT id, superseded_by FROM client_certificates WHERE ${inArray(clientCertificates.caId, caIds)}
+      UNION
+      SELECT c.id, c.superseded_by FROM client_certificates c JOIN linked l
+        ON c.id = l.superseded_by OR c.superseded_by = l.id
+    ) SELECT id FROM linked
+  )`);
+}
+
+function certificateChain(caId: string, rows: CertificateRow[]) {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const predecessors = new Map<string, CertificateRow[]>();
+  for (const row of rows)
+    if (row.supersededBy) {
+      const previous = predecessors.get(row.supersededBy) ?? [];
+      previous.push(row);
+      predecessors.set(row.supersededBy, previous);
+    }
   const seen = new Map<string, CertificateRow>();
-  let frontier = await db.select().from(clientCertificates).where(eq(clientCertificates.caId, client.caId));
-  for (let round = 0; frontier.length && round < 64; round++) {
-    for (const row of frontier) seen.set(row.id, row);
-    const ids = frontier.map((row) => row.id);
-    const successors = frontier.flatMap((row) => (row.supersededBy ? [row.supersededBy] : []));
-    const next = await db
-      .select()
-      .from(clientCertificates)
-      .where(
-        or(
-          inArray(clientCertificates.supersededBy, ids),
-          successors.length ? inArray(clientCertificates.id, successors) : undefined,
-        ),
-      );
-    frontier = next.filter((row) => !seen.has(row.id));
+  const todo = rows.filter((row) => row.caId === caId);
+  while (todo.length) {
+    const row = todo.pop()!;
+    if (seen.has(row.id)) continue;
+    seen.set(row.id, row);
+    if (row.supersededBy && byId.has(row.supersededBy)) todo.push(byId.get(row.supersededBy)!);
+    todo.push(...(predecessors.get(row.id) ?? []));
   }
   return [...seen.values()].toSorted((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
+
+async function linkedCertificates(client: Pick<ClientRow, "caId">) {
+  return certificateChain(client.caId, await loadLinkedCertificates([client.caId]));
 }
 
 /** The certificate a client connects with now: its current (or newest issued) generation. */
@@ -151,7 +174,8 @@ export type DatabaseClientSummary = {
   roleKind: DbClientRoleKind;
   readOnly: boolean;
   role: string;
-  status: "active" | "revoked";
+  status: "provisioning" | "active" | "revoked";
+  revocationCompletedAt: Date | null;
   keySource: "generated" | "csr";
   revealed: boolean;
   revealedAt: Date | null;
@@ -171,14 +195,17 @@ export type DatabaseClientSummary = {
 };
 
 /** Inventory view: names, states, serials and fingerprints. No PEM, key, password or secret ID. */
-export async function listDatabaseClients(databaseId: string): Promise<DatabaseClientSummary[]> {
-  const rows = await db
+export async function listDatabaseClients(
+  databaseId: string,
+  executor: Pick<typeof db, "select"> = db,
+): Promise<DatabaseClientSummary[]> {
+  const rows = await executor
     .select()
     .from(databaseClients)
     .where(eq(databaseClients.databaseId, databaseId))
     .orderBy(asc(databaseClients.createdAt), asc(databaseClients.id));
   const roleRows = rows.length
-    ? await db
+    ? await executor
         .select({ id: databaseRoles.id, name: databaseRoles.name })
         .from(databaseRoles)
         .where(
@@ -188,9 +215,13 @@ export async function listDatabaseClients(databaseId: string): Promise<DatabaseC
           ),
         )
     : [];
+  const allCertificates = await loadLinkedCertificates(
+    rows.map((row) => row.caId),
+    executor,
+  );
   const summaries: DatabaseClientSummary[] = [];
   for (const row of rows) {
-    const certificates = await linkedCertificates(row);
+    const certificates = certificateChain(row.caId, allCertificates);
     summaries.push({
       id: row.id,
       databaseId: row.databaseId,
@@ -199,7 +230,8 @@ export async function listDatabaseClients(databaseId: string): Promise<DatabaseC
       roleKind: row.roleKind,
       readOnly: row.roleKind === "readonly",
       role: roleRows.find((role) => role.id === row.roleId)?.name ?? "",
-      status: row.status,
+      status: row.status === "active" && !row.issuedAt ? "provisioning" : row.status,
+      revocationCompletedAt: row.revocationCompletedAt,
       keySource: row.keySource,
       revealed: row.revealedAt !== null,
       revealedAt: row.revealedAt,
@@ -221,8 +253,12 @@ export async function listDatabaseClients(databaseId: string): Promise<DatabaseC
   return summaries;
 }
 
-export async function getDatabaseClient(databaseId: string, clientId: string) {
-  const [row] = await db
+export async function getDatabaseClient(
+  databaseId: string,
+  clientId: string,
+  executor: Pick<typeof db, "select"> = db,
+) {
+  const [row] = await executor
     .select()
     .from(databaseClients)
     .where(and(eq(databaseClients.id, clientId), eq(databaseClients.databaseId, databaseId)));
@@ -234,15 +270,18 @@ export async function getDatabaseClient(databaseId: string, clientId: string) {
  * database is public, the role name is valid and free in Ark and in the cluster, and the
  * name/environment pair is unused (revoked clients keep their names).
  */
-export async function planDatabaseClient(input: { databaseId: string; name: string; environment: string }) {
-  const { database } = await databaseClientContext(input.databaseId);
+export async function planDatabaseClient(
+  input: { databaseId: string; name: string; environment: string },
+  executor: Pick<typeof db, "select"> = db,
+) {
+  const { database } = await databaseClientContext(input.databaseId, executor);
   if (database.exposure !== "public")
     throw new DatabaseClientError(
       409,
       "Database clients connect through the public PgBouncer; this database is private.",
     );
   const role = clientRoleName(database.name, input.name, input.environment);
-  const [existing] = await db
+  const [existing] = await executor
     .select({ id: databaseClients.id, status: databaseClients.status })
     .from(databaseClients)
     .where(
@@ -259,7 +298,7 @@ export async function planDatabaseClient(input: { databaseId: string; name: stri
         ? `${input.name}/${input.environment} was revoked; issue the new client under another name.`
         : `${input.name}/${input.environment} already exists for this database.`,
     );
-  const [taken] = await db
+  const [taken] = await executor
     .select({ id: databaseRoles.id })
     .from(databaseRoles)
     .where(eq(databaseRoles.name, role));
@@ -282,19 +321,20 @@ export type IssueDatabaseClientInput = {
  * `database.client_issue` (database worker), idempotent on `clientId`: a retry after a partial
  * run only re-applies the cluster role. The caller reloads PgBouncer afterwards.
  */
-export async function issueDatabaseClient(input: IssueDatabaseClientInput) {
+export async function issueDatabaseClient(input: IssueDatabaseClientInput, applyRole = applyClientRole) {
   const { rootKey, rootKeyId } = sealing();
   const [existing] = await db.select().from(databaseClients).where(eq(databaseClients.id, input.clientId));
   if (existing) {
     if (existing.databaseId !== input.databaseId) throw new Error("Client ID belongs to another database.");
-    if (existing.status !== "active") throw new DatabaseClientError(409, "The client was revoked.");
+    if (existing.status !== "active" || existing.revokedAt)
+      throw new DatabaseClientError(409, "The client was revoked.");
     const [role] = await db.select().from(databaseRoles).where(eq(databaseRoles.id, existing.roleId));
     const [secret] = role?.secretId
       ? await db.select().from(secrets).where(eq(secrets.id, role.secretId))
       : [];
     if (!role || !secret) throw new Error("The client role or its sealed password is missing.");
     const { database } = await databaseClientContext(input.databaseId);
-    await applyClientRole({
+    await applyRole({
       role: role.name,
       group: clientGroupRole(database.name, existing.roleKind),
       password: decryptSecret(rootKey, secret),
@@ -361,6 +401,7 @@ export async function issueDatabaseClient(input: IssueDatabaseClientInput) {
           roleId,
           caId: ca.id,
           status: "active",
+          issuedAt: null,
           keySource: input.csrPem === undefined ? "generated" : "csr",
           createdBy: input.actorId ?? null,
           ...(input.now ? { createdAt: input.now } : {}),
@@ -368,7 +409,7 @@ export async function issueDatabaseClient(input: IssueDatabaseClientInput) {
         .returning();
       return row!;
     });
-    await applyClientRole({
+    await applyRole({
       role,
       group: clientGroupRole(database.name, input.roleKind),
       password,
@@ -424,23 +465,138 @@ export async function auditIssued(
   });
 }
 
-/**
- * Record a pending revocation from the API: it blocks the one-time reveal at once, before the
- * worker runs. Returns false when the client is unknown or already revoked.
- */
-export async function requestRevocation(input: { databaseId: string; clientId: string; actorId: string }) {
-  const rows = await db
-    .update(databaseClients)
-    .set({ revokedAt: new Date(), revokedBy: input.actorId })
-    .where(
-      and(
-        eq(databaseClients.id, input.clientId),
-        eq(databaseClients.databaseId, input.databaseId),
-        eq(databaseClients.status, "active"),
-      ),
-    )
-    .returning({ id: databaseClients.id });
-  return rows.length === 1;
+/** Durable sliding window, serialized across API processes and pruned on every request. */
+export async function consumeClientIssueAttempt(userId: string, now = new Date(), executor = db) {
+  return executor.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`client-rate:${userId}`}))`);
+    await tx
+      .delete(clientIssueLimits)
+      .where(lt(clientIssueLimits.updatedAt, new Date(now.getTime() - 600_000)));
+    const [row] = await tx.select().from(clientIssueLimits).where(eq(clientIssueLimits.userId, userId));
+    const attempts = (row?.attempts ?? []).filter((at) => now.getTime() - at < 600_000);
+    if (attempts.length >= 10) return false;
+    attempts.push(now.getTime());
+    await tx
+      .insert(clientIssueLimits)
+      .values({ userId, attempts, updatedAt: now })
+      .onConflictDoUpdate({ target: clientIssueLimits.userId, set: { attempts, updatedAt: now } });
+    return true;
+  });
+}
+
+/** Queue intent and metadata atomically; failed attempts reuse the original client identity. */
+export async function queueClientIssue(
+  input: Omit<IssueDatabaseClientInput, "clientId" | "now"> & { actorId: string },
+) {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`client-queue:${input.databaseId}`}))`);
+    const [previous] = await tx
+      .select()
+      .from(operations)
+      .where(
+        and(
+          eq(operations.kind, "database.client_issue"),
+          sql`${operations.targetIds} @> ${JSON.stringify([input.databaseId])}::jsonb`,
+          sql`${operations.payload}->>'name' = ${input.name}`,
+          sql`${operations.payload}->>'environment' = ${input.environment}`,
+        ),
+      )
+      .orderBy(desc(operations.createdAt))
+      .limit(1);
+    const payload = {
+      name: input.name,
+      environment: input.environment,
+      roleKind: input.roleKind,
+      ...(input.csrPem === undefined ? {} : { csrPem: input.csrPem }),
+    };
+    let clientId = createId("dbc");
+    const { database } = await databaseClientContext(input.databaseId, tx);
+    const role = clientRoleName(database.name, input.name, input.environment);
+    if (previous) {
+      if (isInFlight(previous.status) || !["failed", "needs_recovery"].includes(previous.status))
+        throw new DatabaseClientError(409, "This client already exists or issuance is in progress.");
+      const { clientId: priorId, ...priorPayload } = previous.payload as Record<string, unknown>;
+      if (planHash(priorPayload) !== planHash(payload))
+        throw new DatabaseClientError(409, "Retry issuance with the original request settings.");
+      clientId = String(priorId);
+      const client = await getDatabaseClient(input.databaseId, clientId, tx);
+      if (client && (client.revokedAt || client.status === "revoked" || client.issuedAt))
+        throw new DatabaseClientError(409, "The client was already issued or revoked.");
+    } else await planDatabaseClient(input, tx);
+    const [operation] = await tx
+      .insert(operations)
+      .values({
+        id: createId("op"),
+        kind: "database.client_issue",
+        actorId: input.actorId,
+        targetIds: [input.databaseId],
+        payload: { clientId, ...payload },
+        idempotencyKey: createId("client-issue"),
+        planHash: planHash({ clientId, ...payload }),
+        status: "queued",
+      })
+      .returning();
+    return { clientId, role, operation: operation! };
+  });
+}
+
+export async function queueClientRevocation(input: {
+  databaseId: string;
+  clientId: string;
+  actorId: string;
+}) {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`client-queue:${input.databaseId}`}))`);
+    const [client] = await tx
+      .select()
+      .from(databaseClients)
+      .where(and(eq(databaseClients.id, input.clientId), eq(databaseClients.databaseId, input.databaseId)))
+      .for("update");
+    if (!client) throw new DatabaseClientError(404, "Database client not found.");
+    if (client.revocationCompletedAt) throw new DatabaseClientError(409, "This client is already revoked.");
+    const prior = await tx
+      .select()
+      .from(operations)
+      .where(
+        and(
+          eq(operations.kind, "database.client_revoke"),
+          sql`${operations.payload}->>'clientId' = ${input.clientId}`,
+        ),
+      );
+    if (prior.some((op) => isInFlight(op.status)))
+      throw new DatabaseClientError(409, "Revocation is already in progress.");
+    // Do not let a failed issuance be resumed while its revocation is queued.
+    const issueOps = await tx
+      .select()
+      .from(operations)
+      .where(
+        and(
+          eq(operations.kind, "database.client_issue"),
+          sql`${operations.payload}->>'clientId' = ${input.clientId}`,
+        ),
+      );
+    if (issueOps.some((op) => isInFlight(op.status)))
+      throw new DatabaseClientError(409, "Issuance is still in progress.");
+    await tx
+      .update(databaseClients)
+      .set({ revokedAt: client.revokedAt ?? new Date(), revokedBy: client.revokedBy ?? input.actorId })
+      .where(eq(databaseClients.id, input.clientId));
+    const payload = { clientId: input.clientId };
+    const [operation] = await tx
+      .insert(operations)
+      .values({
+        id: createId("op"),
+        kind: "database.client_revoke",
+        actorId: input.actorId,
+        targetIds: [input.databaseId, input.clientId],
+        payload,
+        idempotencyKey: createId("client-revoke"),
+        planHash: planHash(payload),
+        status: "queued",
+      })
+      .returning();
+    return operation!;
+  });
 }
 
 /**
@@ -449,12 +605,15 @@ export async function requestRevocation(input: { databaseId: string; clientId: s
  * one nobody sees, with NOLOGIN, and terminate its cluster backends. Idempotent. The caller then
  * reloads PgBouncer without the role and its CAs, and kills the role's PgBouncer sessions.
  */
-export async function revokeDatabaseClient(input: {
-  databaseId: string;
-  clientId: string;
-  actorId?: string | null;
-  now?: Date;
-}) {
+export async function revokeDatabaseClient(
+  input: {
+    databaseId: string;
+    clientId: string;
+    actorId?: string | null;
+    now?: Date;
+  },
+  revokeRole = revokeClientRole,
+) {
   const { rootKey, rootKeyId } = sealing();
   const client = await getDatabaseClient(input.databaseId, input.clientId);
   if (!client) throw new DatabaseClientError(404, "Database client not found.");
@@ -477,7 +636,7 @@ export async function revokeDatabaseClient(input: {
   for (const caId of caIds) await pki.setPrivateCaStatus(caId, "revoked");
 
   const password = generatePassword();
-  const cluster = await revokeClientRole({ role: role.name, password });
+  const cluster = await revokeRole({ role: role.name, password });
   const secretId = createId("sec");
   await db.transaction(async (tx) => {
     await tx.insert(secrets).values({
@@ -541,6 +700,7 @@ export async function revealDatabaseClient(input: {
           eq(databaseClients.id, input.clientId),
           eq(databaseClients.databaseId, input.databaseId),
           eq(databaseClients.status, "active"),
+          isNotNull(databaseClients.issuedAt),
           isNull(databaseClients.revealedAt),
           isNull(databaseClients.revokedAt),
         ),
@@ -552,6 +712,8 @@ export async function revealDatabaseClient(input: {
         .from(databaseClients)
         .where(and(eq(databaseClients.id, input.clientId), eq(databaseClients.databaseId, input.databaseId)));
       if (!current) throw new DatabaseClientError(404, "Database client not found.");
+      if (!current.issuedAt)
+        throw new DatabaseClientError(409, "Client issuance has not completed; retry issuance first.");
       if (current.status !== "active" || current.revokedAt)
         throw new DatabaseClientError(409, "This client was revoked; its credentials cannot be revealed.");
       throw new DatabaseClientError(

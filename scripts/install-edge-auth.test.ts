@@ -43,6 +43,8 @@ async function fixture() {
     await copyFile(join(root, "scripts", name), join(directory, "scripts", name));
   }
   await symlink(join(root, "node_modules"), join(directory, "node_modules"));
+  // Bootstrap imports the actual PgBouncer module; preserve its relative source tree.
+  await symlink(join(root, "server"), join(directory, "server"));
   for (const name of ["Caddyfile", "serve.json"]) {
     await copyFile(join(root, "infra/platform", name), join(directory, "infra/platform", name));
   }

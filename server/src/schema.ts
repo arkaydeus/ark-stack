@@ -740,6 +740,9 @@ export const databaseClients = pgTable(
     // 0018 (FD-17): issuance source, the one-time reveal gate and revocation history.
     keySource: text("key_source").$type<"generated" | "csr">().notNull().default("generated"),
     createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
+    // 0019: lifecycle completion, separate from admission intent.
+    issuedAt: timestamp("issued_at", { withTimezone: true }).defaultNow(),
+    revocationCompletedAt: timestamp("revocation_completed_at", { withTimezone: true }),
     revealedAt: timestamp("revealed_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     revokedBy: text("revoked_by").references(() => user.id, { onDelete: "set null" }),
@@ -755,6 +758,19 @@ export const databaseClients = pgTable(
       table.environment,
     ),
   ],
+);
+
+// Shared, expiring sliding-window counters for CSR submission (including rejected requests).
+export const clientIssueLimits = pgTable(
+  "client_issue_limits",
+  {
+    userId: text("user_id")
+      .primaryKey()
+      .references(() => user.id, { onDelete: "cascade" }),
+    attempts: jsonb("attempts").$type<number[]>().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [index("client_issue_limits_updated_at_idx").on(table.updatedAt)],
 );
 
 // Optional Vercel integration (R6), one per database client.
@@ -871,6 +887,7 @@ export const schema = {
   gateSessions,
   clientCertificates,
   databaseClients,
+  clientIssueLimits,
   vercelIntegrations,
   backupTargets,
   tailnetAclSnippets,

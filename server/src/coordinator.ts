@@ -476,7 +476,27 @@ async function addStep(operationId: string, name: string, evidence: Record<strin
   });
 }
 
-export async function runOperation(kind: OperationKind, operation: OperationRow) {
+type ClientOperationRuntime = {
+  issue: typeof issueDatabaseClient;
+  revoke: typeof revokeDatabaseClient;
+  reload: typeof reloadPgbouncer;
+  kill: typeof killRoleClients;
+  reloadRequired: typeof pgbouncerReloadRequired;
+};
+const clientOperationRuntime: ClientOperationRuntime = {
+  issue: issueDatabaseClient,
+  revoke: revokeDatabaseClient,
+  reload: reloadPgbouncer,
+  kill: killRoleClients,
+  reloadRequired: pgbouncerReloadRequired,
+};
+
+export async function runOperation(
+  kind: OperationKind,
+  operation: OperationRow,
+  overrides: Partial<ClientOperationRuntime> = {},
+) {
+  const runtime = { ...clientOperationRuntime, ...overrides };
   await assertExecutionAuthorized(operation);
   if (kind === "domain.verify") return verifyDomain(operation);
   if (kind === "certificate.issue" || kind === "certificate.renew") return issueCertificate(operation);
@@ -503,8 +523,8 @@ export async function runOperation(kind: OperationKind, operation: OperationRow)
   if (kind === "update.detect") return detectUpdates(operation);
   if (kind === "import.scan") return scanImportOp(operation);
   if (kind === "database.rotate") return rotateDatabase(operation);
-  if (kind === "database.client_issue") return issueDatabaseClientOp(operation);
-  if (kind === "database.client_revoke") return revokeDatabaseClientOp(operation);
+  if (kind === "database.client_issue") return issueDatabaseClientOp(operation, runtime);
+  if (kind === "database.client_revoke") return revokeDatabaseClientOp(operation, runtime);
   if (kind === "service.adopt") return adoptService(operation);
   if (kind === "mail.queue_retry" || kind === "mail.queue_delete") return queueMail(operation);
   if (kind === "mailbox.device") return reconcileMailboxDevice(operation);
@@ -524,6 +544,8 @@ export async function assertExecutionAuthorized(operation: OperationRow) {
   };
   if (access.role === "viewer") throw new Error("Operation actor no longer has mutation permission.");
   if (access.role === "owner") return;
+  if (["database.client_issue", "database.client_revoke"].includes(operation.kind))
+    throw new Error("Only owners may execute database client operations.");
   for (const targetId of operation.targetIds) {
     if (targetId === "platform") throw new Error("Only owners may execute platform-wide operations.");
     const [service] = await db.select().from(services).where(eq(services.id, targetId));
@@ -1593,12 +1615,12 @@ function pgbouncerSocket() {
  * password, then an inline PgBouncer reload so the role and its CA are admitted when this
  * operation succeeds. Evidence and audit carry no key, password or PEM material.
  */
-async function issueDatabaseClientOp(operation: OperationRow) {
+async function issueDatabaseClientOp(operation: OperationRow, runtime: ClientOperationRuntime) {
   const payload = operation.payload as Record<string, unknown>;
   const roleKind =
     payload.roleKind === "runtime" ? "runtime" : payload.roleKind === "readonly" ? "readonly" : null;
   if (!roleKind) throw new Error("database.client_issue needs a role kind.");
-  const result = await issueDatabaseClient({
+  const result = await runtime.issue({
     clientId: String(payload.clientId ?? ""),
     databaseId: operation.targetIds[0] ?? "",
     name: String(payload.name ?? ""),
@@ -1608,8 +1630,12 @@ async function issueDatabaseClientOp(operation: OperationRow) {
     actorId: operation.actorId,
   });
   await addStep(operation.id, "database-client-issued", issueEvidence(result));
+  await runtime.reload(operation);
+  await db
+    .update(databaseClients)
+    .set({ issuedAt: new Date() })
+    .where(and(eq(databaseClients.id, result.client.id), isNull(databaseClients.revokedAt)));
   await auditIssued(result, { actorId: operation.actorId, operationId: operation.id });
-  await reloadPgbouncer(operation);
 }
 
 /** Dedup key of the alert raised when a revoked client's PgBouncer sessions cannot be killed. */
@@ -1621,26 +1647,33 @@ export const PGBOUNCER_REVOKE_ALERT = "pgbouncer-revoke";
  * the reduced CA bundle and userlist, then KILL_CLIENT every live session of that role. Other
  * clients' sessions and credentials are untouched.
  */
-async function revokeDatabaseClientOp(operation: OperationRow) {
+async function revokeDatabaseClientOp(operation: OperationRow, runtime: ClientOperationRuntime) {
   const databaseId = operation.targetIds[0] ?? "";
-  const result = await revokeDatabaseClient({
+  const result = await runtime.revoke({
     databaseId,
     clientId: String((operation.payload as Record<string, unknown>).clientId ?? ""),
     actorId: operation.actorId,
   });
   await addStep(operation.id, "database-client-revoked", result);
-  await reloadPgbouncer(operation);
+  await runtime.reload(operation);
   let killed: number | null = null;
-  if (pgbouncerReloadRequired()) {
+  if (runtime.reloadRequired()) {
     try {
-      const kill = await killRoleClients(result.role, pgbouncerSocket());
+      const kill = await runtime.kill(result.role, pgbouncerSocket());
+      if (kill.remaining !== 0) throw new Error("Revoked client sessions remain.");
       killed = kill.killed;
+      await db
+        .update(alerts)
+        .set({ resolvedAt: new Date() })
+        .where(
+          and(eq(alerts.dedupKey, `${PGBOUNCER_REVOKE_ALERT}:${result.role}`), isNull(alerts.resolvedAt)),
+        );
       await addStep(operation.id, "pgbouncer-kill-client", { role: result.role, ...kill });
     } catch (error) {
       await raiseAlert({
         severity: "critical",
         title: `Revoked database client ${result.role} may still have live PgBouncer sessions`,
-        dedupKey: PGBOUNCER_REVOKE_ALERT,
+        dedupKey: `${PGBOUNCER_REVOKE_ALERT}:${result.role}`,
       });
       throw error;
     }
@@ -1650,6 +1683,10 @@ async function revokeDatabaseClientOp(operation: OperationRow) {
       reason: "no admin socket",
     });
   }
+  await db
+    .update(databaseClients)
+    .set({ revocationCompletedAt: new Date() })
+    .where(eq(databaseClients.id, result.clientId));
   await auditRevoked(
     { ...result, killed },
     { databaseId, actorId: operation.actorId, operationId: operation.id },
