@@ -5,6 +5,8 @@ import { spawn } from "node:child_process";
 
 import { generateInstallSecrets, mergeInstallEnv } from "@ark-stack/shared";
 
+import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
+
 const root = join(import.meta.dir, "..");
 
 function run(command: string, args: string[]) {
@@ -49,24 +51,7 @@ if (!existsSync(join(databaseCert, "fullchain.pem")) || !existsSync(join(databas
   ]);
   await chmod(join(databaseCert, "privkey.pem"), 0o600);
 }
-if (!existsSync(join(root, "tmp", "pgbouncer", "pgbouncer.ini"))) {
-  await Bun.write(
-    join(root, "tmp", "pgbouncer", "pgbouncer.ini"),
-    `[databases]
-
-[pgbouncer]
-listen_addr = 0.0.0.0
-listen_port = 5432
-auth_type = any
-client_tls_sslmode = disable
-server_tls_sslmode = disable
-admin_users =
-`,
-  );
-}
-if (!existsSync(join(root, "tmp", "pgbouncer", "userlist.txt"))) {
-  await Bun.write(join(root, "tmp", "pgbouncer", "userlist.txt"), "");
-}
+await seedPgbouncerBootstrap(join(root, "tmp", "pgbouncer"));
 await Bun.write(join(root, "tmp", "pgbouncer", "expose"), "0\n");
 if (!existsSync(join(root, "tmp", "edge", "Caddyfile"))) {
   await Bun.write(

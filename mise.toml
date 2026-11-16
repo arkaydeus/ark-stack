@@ -51,6 +51,10 @@ run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD 
 description = "Validate generated public/tailnet and static Caddy configurations"
 run = "bun scripts/test-edge-config.ts"
 
+[tasks."test:pgbouncer"]
+description = "Start app-postgres and pgbouncer-public from the platform Compose file and connect over TLS with SCRAM"
+run = "bun scripts/test-pgbouncer-public.ts"
+
 [tasks."test:agent"]
 description = "Run Docker agent policy tests"
 run = "go test ./..."
