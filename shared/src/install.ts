@@ -65,6 +65,9 @@ export function generateInstallSecrets() {
     ARK_CONTROL_DB_PASSWORD: controlPassword,
     ARK_APP_DB_PASSWORD: appPassword,
     ARK_API_DB_PASSWORD: apiPassword,
+    // PgBouncer console administrator (FD-16): only the database worker receives it; PgBouncer's
+    // userlist stores a SCRAM verifier.
+    ARK_PGBOUNCER_ADMIN_PASSWORD: randomBytes(32).toString("base64url"),
     STALWART_ADMIN_ADDRESS: "admin",
     STALWART_ADMIN_PASSWORD: randomBytes(32).toString("base64url"),
     DATABASE_URL: `postgres://ark_runtime:${apiPassword}@127.0.0.1:5433/ark_platform`,

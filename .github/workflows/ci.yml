@@ -50,6 +50,7 @@ jobs:
       ARK_CONTROL_DB_PASSWORD: ci-control-db-password-0123456789
       ARK_APP_DB_PASSWORD: ci-app-db-password-0123456789
       ARK_API_DB_PASSWORD: ci-api-db-password-0123456789
+      ARK_PGBOUNCER_ADMIN_PASSWORD: ci-pgbouncer-admin-password-0123456789
       STALWART_ADMIN_ADDRESS: admin
       STALWART_ADMIN_PASSWORD: ci-stalwart-password-0123456789
     steps:

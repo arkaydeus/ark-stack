@@ -2,7 +2,8 @@
 //
 // Each case builds a disposable schema inside DATABASE_URL's database (no CREATE DATABASE
 // privilege needed), applies the existing migrations through 0012, and then runs either the
-// literal §3.1 SQL from the design document or the shipped 0013 migration.
+// literal §3.1 SQL from the design document or the shipped 0013 migration. The region columns
+// that §3.1 lists ship separately in 0014 (FD-03), which is checked here as well.
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
@@ -26,6 +27,7 @@ const design = await Bun.file(join(root, "docs", "design", "front-door.md")).tex
 // The first ```sql block of the design is §3.1's migration.
 const literalSql = `${/```sql\n([\s\S]*?)\n```/.exec(design)?.[1] ?? ""}\n`;
 const migration0013 = await Bun.file(join(migrationsDir, "0013_front_door.sql")).text();
+const migration0014 = await Bun.file(join(migrationsDir, "0014_region.sql")).text();
 // FD-03 owns the region columns, so 0013 ships §3.1 without these two lines.
 const REGION_LINES = [
   "  ADD COLUMN region text NOT NULL DEFAULT 'us-east',",
@@ -225,6 +227,51 @@ describe("0013_front_door.sql", () => {
   }
 });
 
+describe("0014_region.sql", () => {
+  test("adds exactly the two §3.1 region lines that 0013 left out", () => {
+    for (const line of REGION_LINES) expect(migration0014).toContain(`${line}\n`);
+    expect(migration0014).toContain("ALTER TABLE platform_settings");
+  });
+
+  for (const kind of ["fresh", "upgrade"] as const) {
+    test(`applies after 0013 on a ${kind} schema with region = us-east`, async () => {
+      const db = await prepare(kind);
+      try {
+        await apply(db, ["0013_front_door.sql", "0014_region.sql"]);
+        // Earlier migrations seed the singleton row; a fresh install reads it straight back.
+        await db`INSERT INTO platform_settings (id) VALUES ('default') ON CONFLICT DO NOTHING`;
+        const [settings] = await db`
+          SELECT region, vps_region_label FROM platform_settings WHERE id = 'default'
+        `;
+        expect(settings).toEqual({ region: "us-east", vps_region_label: null });
+        const columns = await db`
+          SELECT column_name, is_nullable, column_default FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'platform_settings'
+            AND column_name IN ('region', 'vps_region_label')
+          ORDER BY column_name
+        `;
+        expect(columns.map((row) => [row.column_name, row.is_nullable, row.column_default])).toEqual([
+          ["region", "NO", "'us-east'::text"],
+          ["vps_region_label", "YES", null],
+        ]);
+
+        await db`UPDATE platform_settings SET region = 'eu-central', vps_region_label = 'Hetzner fsn1'`;
+        await expect(Promise.resolve(db`UPDATE platform_settings SET region = 'ap-south'`)).rejects.toThrow(
+          /platform_settings_region_check/,
+        );
+        await expect(
+          Promise.resolve(db`UPDATE platform_settings SET vps_region_label = ${"x".repeat(65)}`),
+        ).rejects.toThrow(/platform_settings_vps_region_label_check/);
+        await expect(Promise.resolve(db`UPDATE platform_settings SET vps_region_label = ''`)).rejects.toThrow(
+          /platform_settings_vps_region_label_check/,
+        );
+      } finally {
+        await db.end();
+      }
+    });
+  }
+});
+
 describe("front_routes constraints", () => {
   let db: Sql;
   let routeSeq = 0;
@@ -411,13 +458,15 @@ describe("Drizzle schema mirrors the migration", () => {
     schema.databaseClients,
     schema.vercelIntegrations,
     schema.backupTargets,
+    schema.tailnetAclSnippets,
   ];
 
   test("columns, nullability, defaults, checks, indexes and keys match a fresh migrate", async () => {
     const db = await scratch("drizzle");
     try {
-      // Every migration, not just 0013: later tickets extend these tables (0015 adds
-      // client_certificates.cert_pem for FD-13), and schema.ts mirrors the latest state.
+      // Every migration, not just 0013: later tickets add the region columns (0014),
+      // client_certificates.cert_pem (0015) and tailnet_acl_snippets (0016), and schema.ts
+      // mirrors the latest state.
       await apply(db, migrationFiles);
       for (const table of tables) {
         const config = getTableConfig(table);

@@ -41,7 +41,7 @@ export async function readCertificateMeta(certPath: string) {
     { timeout: 10_000 },
   );
   const expiresAt = parseOpenSslDate(enddate.replace(/^notAfter=/i, "").trim());
-  const digest = fingerprint.split("=")[1]?.replace(/:/g, "").toLowerCase();
+  const digest = fingerprint.split("=")[1]?.trim().replace(/:/g, "").toLowerCase();
   if (!digest) throw new Error("Could not read certificate fingerprint.");
   return { expiresAt, fingerprint: digest, renew: renewalDue(expiresAt) };
 }

@@ -1,4 +1,4 @@
-import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -14,8 +14,6 @@ import {
   funnelDisabled,
   jmapCall,
   nftAllowlist,
-  pgbouncerConfig,
-  pgbouncerUserlist,
   parseBearerChallenge,
   registryManifestUrl,
   renderCaddyfile,
@@ -420,6 +418,28 @@ export function pgbouncerDir() {
     : join(process.cwd(), "tmp", "pgbouncer");
 }
 
+/** Close admission independently of PgBouncer's live configuration. A running host ingress
+ * must acknowledge closure; local development without an ingress only writes the closed flag. */
+export async function fenceDatabasePublicListener(dir: string, timeoutMs = 10_000) {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const statusFile = join(dir, "allowlist.status");
+  const watching = await stat(statusFile).then(
+    () => true,
+    () => false,
+  );
+  // Remove stale acknowledgements before asking the host reconciler for a new one.
+  await rm(statusFile, { force: true });
+  await writeFile(join(dir, "expose"), "0\n", { mode: 0o600 });
+  if (!watching && process.env.ARK_EMBEDDED_WORKERS !== "0" && process.env.NODE_ENV !== "production") return;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = await readFile(statusFile, "utf8").catch(() => "");
+    if (/^exposed=false$/m.test(status)) return;
+    await Bun.sleep(25);
+  }
+  throw new Error("Public database ingress did not acknowledge closure; expose remains 0.");
+}
+
 export async function applyDatabaseAllowlist(
   dir: string,
   cidrs: string[],
@@ -443,17 +463,14 @@ export async function applyDatabaseAllowlist(
     // accept-only chain. Deleting the table instead would leave the host reconcilers with
     // nothing to read back, and they treat a missing table as a failed apply.
     if (process.env.ARK_APPLY_NFT === "0") {
-      await controlPublicDatabaseListener({ expose: false });
       if (requireApply) throw new Error("Database CIDR allowlist cannot be applied because ARK_APPLY_NFT=0.");
       return { file, applied: false, enforced: false, exposed: false, reason: "disabled" };
     }
     await exec("nft", ["-f", file], { timeout: 10_000 });
     await exec("nft", ["list", "table", "inet", "ark_db_ingress"], { timeout: 10_000 });
-    await controlPublicDatabaseListener({ expose });
     return { file, applied: true, enforced: cidrs.length > 0, exposed: expose };
   } catch (error) {
     await writeFile(join(dir, "expose"), "0\n", { mode: 0o600 }).catch(() => undefined);
-    await controlPublicDatabaseListener({ expose: false }).catch(() => undefined);
     const message = error instanceof Error ? error.message : "nft apply failed";
     if (requireApply)
       throw new Error(`Database CIDR allowlist was not applied; public listener is closed: ${message}`, {
@@ -461,57 +478,6 @@ export async function applyDatabaseAllowlist(
       });
     return { file, applied: false, enforced: false, exposed: false, reason: message };
   }
-}
-
-export async function controlPublicDatabaseListener(input: { expose: boolean }) {
-  if (process.env.ARK_PUBLIC_DB_CONTROL !== "1") {
-    return { controlled: false, expose: input.expose };
-  }
-  const compose = process.env.ARK_PLATFORM_COMPOSE ?? "infra/platform/docker-compose.yml";
-  if (input.expose) {
-    await exec(
-      "docker",
-      [
-        "compose",
-        "-f",
-        compose,
-        "up",
-        "-d",
-        "--wait",
-        "--wait-timeout",
-        "60",
-        "database-ingress",
-        "pgbouncer-public",
-      ],
-      { timeout: 90_000 },
-    );
-  }
-  return { controlled: true, expose: input.expose };
-}
-
-export async function writePgbouncer(input: {
-  mappings: Array<{ database: string; host: string }>;
-  users: Array<{ name: string; password: string }>;
-  certificateDir?: string;
-}) {
-  const dir = pgbouncerDir();
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  await writeFile(join(dir, "pgbouncer.ini"), pgbouncerConfig(input), { mode: 0o600 });
-  await writeFile(join(dir, "userlist.txt"), pgbouncerUserlist(input.users), { mode: 0o600 });
-  let reloaded = false;
-  if (process.env.ARK_PGBOUNCER_RELOAD === "1") {
-    await exec(
-      "docker",
-      ["kill", "-s", "HUP", process.env.ARK_PGBOUNCER_CONTAINER ?? "ark-platform-pgbouncer-public-1"],
-      {
-        timeout: 10_000,
-      },
-    );
-    reloaded = true;
-  } else if (process.env.NODE_ENV === "production") {
-    throw new Error("PgBouncer configuration was written but no restricted reload executor is configured.");
-  }
-  return { dir, reloaded };
 }
 
 /**
