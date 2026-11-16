@@ -1,4 +1,5 @@
 import { resolve4, resolve6, resolveCname, resolveMx, resolveTxt } from "node:dns/promises";
+import { resolve } from "node:path";
 
 import {
   assertCidrs,
@@ -64,6 +65,7 @@ import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
 import {
   applyDatabaseAllowlist,
+  fenceDatabasePublicListener,
   applyStalwartDevice,
   publishCloudflare,
   reconcileSes,
@@ -1437,7 +1439,25 @@ async function reloadPgbouncer(operation: OperationRow) {
     now,
     host: process.env.ARK_APP_PG_HOST ?? "app-postgres",
   });
+  // Revoke the route before any rendering, secret or socket error can leave old admission live.
+  if (!plan.routed) await fenceDatabasePublicListener(pgbouncerDir());
   const dbEndpoint = (await db.select().from(endpoints)).find((item) => item.kind === "database");
+  // A payload-less reload must recover an earlier failed renewal too. The latest pending row
+  // describes the files on disk; an older queued operation must not verify a superseded leaf.
+  const [pendingCertificate] = dbEndpoint
+    ? await db
+        .select()
+        .from(certificates)
+        .where(and(eq(certificates.endpointId, dbEndpoint.id), eq(certificates.status, "awaiting_reload")))
+        .orderBy(desc(certificates.expiresAt), desc(certificates.id))
+        .limit(1)
+    : [];
+  const certificateId = pendingCertificate?.id ?? "";
+  const expectedFingerprint =
+    pendingCertificate?.fingerprint ??
+    (typeof operation.payload.expectFingerprint === "string"
+      ? operation.payload.expectFingerprint
+      : undefined);
   const required = pgbouncerReloadRequired();
   const adminPassword = process.env.ARK_PGBOUNCER_ADMIN_PASSWORD ?? "";
   if (required && !adminPassword) {
@@ -1447,15 +1467,11 @@ async function reloadPgbouncer(operation: OperationRow) {
     plan,
     adminPassword: adminPassword || undefined,
     certificateDir: dbEndpoint
-      ? `${process.env.ARK_CERT_DIR ?? "/var/lib/ark/certs"}/${dbEndpoint.hostname}`
+      ? resolve(process.env.ARK_CERT_DIR ?? "/var/lib/ark/certs", dbEndpoint.hostname)
       : undefined,
   });
   const written = await writePgbouncerFiles(pgbouncerDir(), files);
 
-  const certificateId =
-    typeof operation.payload.certificateId === "string" ? operation.payload.certificateId : "";
-  const expectedFingerprint =
-    typeof operation.payload.expectFingerprint === "string" ? operation.payload.expectFingerprint : undefined;
   let reload: Awaited<ReturnType<typeof reloadAndVerify>> | null = null;
   if (required) {
     const socket = {
@@ -1463,6 +1479,8 @@ async function reloadPgbouncer(operation: OperationRow) {
       password: adminPassword,
     };
     try {
+      if (pendingCertificate && !expectedFingerprint)
+        throw new Error("Pending database certificate has no fingerprint.");
       reload = await reloadAndVerify({
         reload: () => reloadPgbouncerAdmin(socket),
         expectedFingerprint,

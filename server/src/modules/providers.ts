@@ -1,4 +1,4 @@
-import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -413,6 +413,28 @@ export function pgbouncerDir() {
   return process.env.ARK_STATE_DIR
     ? join(process.env.ARK_STATE_DIR, "pgbouncer")
     : join(process.cwd(), "tmp", "pgbouncer");
+}
+
+/** Close admission independently of PgBouncer's live configuration. A running host ingress
+ * must acknowledge closure; local development without an ingress only writes the closed flag. */
+export async function fenceDatabasePublicListener(dir: string, timeoutMs = 10_000) {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const statusFile = join(dir, "allowlist.status");
+  const watching = await stat(statusFile).then(
+    () => true,
+    () => false,
+  );
+  // Remove stale acknowledgements before asking the host reconciler for a new one.
+  await rm(statusFile, { force: true });
+  await writeFile(join(dir, "expose"), "0\n", { mode: 0o600 });
+  if (!watching && process.env.ARK_EMBEDDED_WORKERS !== "0" && process.env.NODE_ENV !== "production") return;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = await readFile(statusFile, "utf8").catch(() => "");
+    if (/^exposed=false$/m.test(status)) return;
+    await Bun.sleep(25);
+  }
+  throw new Error("Public database ingress did not acknowledge closure; expose remains 0.");
 }
 
 export async function applyDatabaseAllowlist(

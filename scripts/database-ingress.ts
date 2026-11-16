@@ -94,6 +94,11 @@ async function reconcile() {
   reconciling = true;
   const expose = await shouldExpose();
   try {
+    // Revocation must not wait for nft or the pooler's admin socket to recover.
+    if (!expose) {
+      stopListener();
+      await writeStatus({ applied: false, enforced: false, exposed: false });
+    }
     if (!existsSync(nftFile)) {
       stopListener();
       await writeStatus({ applied: true, enforced: false, exposed: false });
@@ -124,10 +129,22 @@ async function reconcile() {
 }
 
 await mkdir(dir, { recursive: true, mode: 0o700 });
-await reconcile();
 watch(dir, (_event, filename) => {
   // `writeStatus` writes into the directory being watched; reacting to it would make every
   // reconcile trigger another one.
   if (filename && filename.toString() === "allowlist.status") return;
   void reconcile();
 });
+
+// Watch before the initial pass so a revocation during startup cannot be lost.
+await reconcile();
+
+// File notifications may be coalesced or delayed across host filesystems. Poll only closure
+// requests (never reopen from polling) so revocation cannot retain an old public listener.
+setInterval(() => {
+  void shouldExpose()
+    .then((expose) => {
+      if (!expose && (server || !existsSync(statusFile))) void reconcile();
+    })
+    .catch((error) => console.error("public database closure poll failed", error));
+}, 250);

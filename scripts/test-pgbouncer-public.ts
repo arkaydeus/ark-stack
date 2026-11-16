@@ -15,9 +15,10 @@ import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createServer as createTlsServer } from "node:tls";
 
 import { PGBOUNCER_FILES, pgbouncerHba, renderClientCaBundle } from "@ark-stack/shared";
-import postgres from "postgres";
+import { assertTls12Rejected } from "./pgbouncer-smoke-checks.ts";
 
 import { planPgbouncer, renderPgbouncerFiles, writePgbouncerFiles } from "../server/src/modules/pgbouncer.ts";
 import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
@@ -26,6 +27,24 @@ import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 // the module opens a lazy pool at import; give it an address it never connects to.
 process.env.DATABASE_URL ??= "postgres://unused:unused@127.0.0.1:9/unused";
 const pki = await import("../server/src/modules/pki.ts");
+
+// macOS's system LibreSSL lacks PostgreSQL STARTTLS. Prefer an installed OpenSSL, and
+// fail explicitly rather than treating CLI usage errors as successful security checks.
+const openssl = [
+  process.env.ARK_OPENSSL_BIN,
+  Bun.which("openssl"),
+  "/opt/homebrew/opt/openssl@3/bin/openssl",
+  "/usr/local/opt/openssl@3/bin/openssl",
+]
+  .filter((candidate): candidate is string => Boolean(candidate))
+  .find((candidate) => {
+    const version = Bun.spawnSync([candidate, "version"]);
+    return version.exitCode === 0 && /^OpenSSL (?:[3-9]\.|1\.1\.1)/.test(version.stdout.toString());
+  });
+if (!openssl)
+  throw new Error(
+    "Install OpenSSL 1.1.1 or newer with PostgreSQL STARTTLS support (or set ARK_OPENSSL_BIN).",
+  );
 
 const root = resolve(import.meta.dir, "..");
 const composeFile = join(root, "infra", "platform", "docker-compose.yml");
@@ -183,10 +202,13 @@ async function chownState(owner: string) {
     "chown",
     "--volume",
     `${join(work, "tmp")}:/smoke`,
+    "--volume",
+    `${probeDir}:/probe`,
     pgbouncerImage,
     "-R",
     owner,
     "/smoke",
+    "/probe",
   ]);
 }
 
@@ -314,7 +336,7 @@ async function probe(args: string[], extraEnv: Record<string, string> = {}) {
 async function opensslFingerprint() {
   const handshake = await run(
     [
-      "openssl",
+      openssl,
       "s_client",
       "-starttls",
       "postgres",
@@ -327,19 +349,19 @@ async function opensslFingerprint() {
   );
   const leaf = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(handshake.stdout)?.[0];
   if (!leaf) throw new Error(`openssl s_client returned no certificate:\n${handshake.stderr}`);
-  const digest = await run(["openssl", "x509", "-noout", "-fingerprint", "-sha256"], { stdin: `${leaf}\n` });
-  return digest.stdout.split("=")[1]!.replace(/:/g, "").toLowerCase();
+  const digest = await run([openssl, "x509", "-noout", "-fingerprint", "-sha256"], { stdin: `${leaf}\n` });
+  return digest.stdout.split("=")[1]!.trim().replace(/:/g, "").toLowerCase();
 }
 
 async function fileFingerprint(path: string) {
-  const digest = await run(["openssl", "x509", "-in", path, "-noout", "-fingerprint", "-sha256"]);
-  return digest.stdout.split("=")[1]!.replace(/:/g, "").toLowerCase();
+  const digest = await run([openssl, "x509", "-in", path, "-noout", "-fingerprint", "-sha256"]);
+  return digest.stdout.split("=")[1]!.trim().replace(/:/g, "").toLowerCase();
 }
 
 /** A self-signed server certificate for the Compose service name and the loopback address. */
 async function serverCertificate(directory: string) {
   await run([
-    "openssl",
+    openssl,
     "req",
     "-x509",
     "-newkey",
@@ -425,11 +447,30 @@ try {
   const rogue = await issueClient(caRogue, appRole, "rogue");
 
   const built = await Bun.build({
-    entrypoints: [join(import.meta.dir, "pgbouncer-worker-probe.ts")],
+    entrypoints: [
+      join(import.meta.dir, "pgbouncer-worker-probe.ts"),
+      join(import.meta.dir, "pgbouncer-client-probe.ts"),
+    ],
     target: "bun",
     outdir: probeDir,
   });
   if (!built.success) throw new Error(`Could not bundle the worker probe:\n${built.logs.join("\n")}`);
+
+  await Bun.write(
+    join(probeDir, "client.json"),
+    JSON.stringify({
+      shop,
+      preview,
+      appRole,
+      limitedRole,
+      appPassword,
+      limitedPassword,
+      database,
+      limitedClientConnections,
+      serverCa: await Bun.file(serverCa).text(),
+    }),
+  );
+  await chmod(join(probeDir, "client.json"), 0o600);
 
   // The installer's closed bootstrap: no mapping, no client, and a deny-all CA bundle.
   await seedPgbouncerBootstrap(pgbouncerDir, { adminPassword });
@@ -693,15 +734,55 @@ try {
     "V-8 TLS 1.2 (psql)",
   );
   const tls12 = await run(
-    ["openssl", "s_client", "-starttls", "postgres", "-connect", `127.0.0.1:${loopbackPort}`, "-tls1_2"],
+    [
+      openssl,
+      "s_client",
+      "-starttls",
+      "postgres",
+      "-connect",
+      `127.0.0.1:${loopbackPort}`,
+      "-tls1_2",
+      "-cert",
+      shop.cert,
+      "-key",
+      shop.key,
+    ],
     { allowFailure: true, stdin: "" },
   );
-  if (tls12.status === 0 && /Protocol\s*:\s*TLSv1\.2/.test(tls12.stdout))
-    throw new Error("TLS 1.2 handshake succeeded.");
+  assertTls12Rejected(tls12);
   record(
     "V-8 TLS 1.2 (openssl s_client -tls1_2)",
     `refused — ${lastLine(tls12.stderr) || lastLine(tls12.stdout)}`,
   );
+  // Negative control: the assertion must fail against a real TLS-1.2-enabled listener.
+  const tls12Listener = createTlsServer(
+    {
+      key: await Bun.file(join(certDir, "privkey.pem")).text(),
+      cert: await Bun.file(join(certDir, "fullchain.pem")).text(),
+      minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.2",
+    },
+    (tlsClient) => tlsClient.end(),
+  );
+  try {
+    await new Promise<void>((done) => tls12Listener.listen(0, "127.0.0.1", done));
+    const port = (tls12Listener.address() as { port: number }).port;
+    const enabled = await run([openssl, "s_client", "-connect", `127.0.0.1:${port}`, "-tls1_2"], {
+      allowFailure: true,
+      stdin: "",
+    });
+    let caught = false;
+    try {
+      assertTls12Rejected(enabled);
+    } catch (error) {
+      caught = error instanceof Error && error.message === "TLS 1.2 handshake succeeded.";
+    }
+    if (!caught) throw new Error("TLS 1.2 negative control did not establish a successful handshake.");
+    record("TLS 1.2 rejection assertion negative control", "detects a real TLS-1.2-enabled listener");
+  } finally {
+    await new Promise<void>((done) => tls12Listener.close(() => done()));
+  }
+
   const crossed = await hostPsql({
     role: appRole,
     password: appPassword,
@@ -750,96 +831,30 @@ try {
   if (appSocket.status === 0) throw new Error("An application role was admitted over the unix socket.");
   record("application role over the unix socket", `rejected — ${lastLine(appSocket.stderr)}`);
 
-  // ---- max_user_client_connections -------------------------------------------------------------
-  const connect = async (
-    credentials: { certPem: string; keyPem: string },
-    role: string,
-    password: string,
-    max = 1,
-  ) =>
-    postgres({
-      host: "127.0.0.1",
-      port: Number(loopbackPort),
-      database,
-      username: role,
-      password,
-      max,
-      connect_timeout: 10,
-      idle_timeout: 0,
-      onnotice: () => undefined,
-      ssl: {
-        ca: await Bun.file(serverCa).text(),
-        cert: credentials.certPem,
-        key: credentials.keyPem,
-        servername: "localhost",
-        minVersion: "TLSv1.3",
-      },
-    });
-  const held: Array<{ sql: Awaited<ReturnType<typeof connect>>; reserved: { release: () => void } }> = [];
-  try {
-    for (let index = 0; index < limitedClientConnections; index++) {
-      const sql = await connect(preview, limitedRole, limitedPassword);
-      const reserved = await sql.reserve();
-      await reserved`SELECT 1`;
-      held.push({ sql, reserved });
-    }
-    const extra = await connect(preview, limitedRole, limitedPassword);
-    const overflow = await extra`SELECT 1`.then(
-      () => null,
-      (error: Error) => error,
-    );
-    await extra.end({ timeout: 2 });
-    if (!overflow || !/max_user_client_connections/.test(overflow.message)) {
-      throw new Error(
-        `Connection ${limitedClientConnections + 1} for ${limitedRole} was not refused: ${overflow?.message}`,
-      );
-    }
-    const other = await connect(shop, appRole, appPassword);
-    await other`SELECT 1`;
-    await other.end({ timeout: 2 });
-    record(
-      `max_user_client_connections=${limitedClientConnections} for ${limitedRole}`,
-      `connection ${limitedClientConnections + 1} refused — ${overflow.message}; ${appRole} unaffected`,
-    );
-  } finally {
-    for (const item of held) {
-      item.reserved.release();
-      await item.sql.end({ timeout: 2 });
-    }
-  }
-
-  // ---- Prepared statements in transaction mode (postgres.js default prepare: true) ------------
-  const pooled = await connect(shop, appRole, appPassword, 4);
-  const second = await connect(preview, limitedRole, limitedPassword, 1);
-  try {
-    const statements = await Promise.all(
-      Array.from({ length: 60 }, (_, index) =>
-        index % 3 === 0
-          ? pooled`SELECT ${index}::int + 1 AS value`.then((rows) => Number(rows[0]!.value) === index + 1)
-          : index % 3 === 1
-            ? pooled`SELECT ${String(index)}::text || 'x' AS value`.then(
-                (rows) => rows[0]!.value === `${index}x`,
-              )
-            : second`SELECT ${index}::bigint * 2 AS value`.then(
-                (rows) => Number(rows[0]!.value) === index * 2,
-              ),
-      ),
-    );
-    if (!statements.every(Boolean)) throw new Error("A prepared statement returned a wrong value.");
-    const inTransaction = await pooled.begin(async (tx) => {
-      const first = await tx`SELECT ${1}::int AS value`;
-      const again = await tx`SELECT ${2}::int AS value`;
-      return Number(first[0]!.value) + Number(again[0]!.value);
-    });
-    if (inTransaction !== 3) throw new Error("Prepared statements inside a transaction failed.");
-    record(
-      "postgres.js prepare: true in transaction mode",
-      "60 concurrent named prepared statements on 2 clients and a transaction succeeded",
-    );
-  } finally {
-    await pooled.end({ timeout: 2 });
-    await second.end({ timeout: 2 });
-  }
+  // Exercise the actual worker's pinned Linux TLS runtime, independent of the host's Bun TLS.
+  const clientProbe = await run([
+    "docker",
+    "run",
+    "--rm",
+    "--user",
+    arkUid,
+    "--read-only",
+    "--cap-drop",
+    "ALL",
+    "--network",
+    network,
+    "--volume",
+    `${probeDir}:/probe:ro`,
+    bunImage,
+    "bun",
+    "/probe/pgbouncer-client-probe.js",
+  ]);
+  const clientChecks = JSON.parse(clientProbe.stdout.trim()) as {
+    ok: boolean;
+    checks: Array<{ check: string; outcome: string }>;
+  };
+  if (!clientChecks.ok) throw new Error("Linux pooling probe failed.");
+  for (const { check, outcome } of clientChecks.checks) record(check, outcome);
 
   // ---- Server certificate swap: renewal reload verifies the served fingerprint ----------------
   const before = await opensslFingerprint();
