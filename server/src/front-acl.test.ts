@@ -5,7 +5,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 
-import { createId, parseEnvFile, type Role } from "@ark-stack/shared";
+import {
+  createId,
+  parseEnvFile,
+  evaluatePolicyTests,
+  parseHujson,
+  type TailnetPolicy,
+  type Role,
+} from "@ark-stack/shared";
 import { makeSignature } from "better-auth/crypto";
 
 if (!process.env.DATABASE_URL && existsSync(".env")) {
@@ -238,4 +245,32 @@ describe("ACL snippet API", () => {
       await sql`SELECT count(*)::int AS count FROM tailnet_acl_snippets WHERE scope = ${`route:${id}`}`;
     expect(after?.count).toBe(0);
   });
+});
+
+test("per-route assertions compose with other routes to the same machine", async () => {
+  const id = await addRoute({
+    kind: "tcp",
+    hostname: `shared-ssh-${suffix}.example.com`,
+    listenPort: 20047,
+    targetIp: "100.101.102.103",
+    targetPort: 22,
+    tlsMode: "plain",
+  });
+  const global = parseHujson(
+    ((await (await get(actors.owner, "/api/front/acl")).json()) as AclBody).snippet,
+  ) as TailnetPolicy;
+  for (const routeId of [routeIds[0], id]) {
+    const scoped = parseHujson(
+      ((await (await get(actors.owner, `/api/front/routes/${routeId}/acl`)).json()) as AclBody).snippet,
+    ) as TailnetPolicy;
+    expect(evaluatePolicyTests(scoped)).toEqual([]);
+    const merged = { ...global, tests: [...global.tests!, ...scoped.tests!] };
+    expect(evaluatePolicyTests(merged)).toEqual([]);
+    expect(
+      evaluatePolicyTests({
+        ...merged,
+        grants: [...merged.grants!, { src: ["tag:ark-edge"], dst: ["100.101.102.103"], ip: ["tcp:80"] }],
+      }).length,
+    ).toBeGreaterThan(0);
+  }
 });

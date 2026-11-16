@@ -116,7 +116,14 @@ async function loadInputs() {
     if ("reason" in resolved) omitted.push(resolved);
     else backups.push(resolved);
   }
-  return { routes, routeRows, backups, omitted, tailnet: tailnetName(nodes) };
+  return {
+    routes,
+    routeRows,
+    backups,
+    omitted,
+    knownAddresses: nodes.flatMap((node) => [node.ipv4, node.ipv6]).filter((ip): ip is string => ip !== null),
+    tailnet: tailnetName(nodes),
+  };
 }
 
 /**
@@ -133,12 +140,15 @@ export async function frontAclSnippet(scope: FrontAclScope): Promise<FrontAclRes
     route
       ? {
           routes: [route],
+          assertionRoutes: inputs.routes,
+          knownAddresses: inputs.knownAddresses,
           reservedTargets: inputs.backups,
           tailnet: inputs.tailnet,
           scope: { routeId: route.id, hostname: route.hostname },
         }
       : {
           routes: inputs.routes,
+          knownAddresses: inputs.knownAddresses,
           backupTargets: inputs.backups,
           omitted: inputs.omitted,
           tailnet: inputs.tailnet,

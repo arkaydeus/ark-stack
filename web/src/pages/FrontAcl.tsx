@@ -2,7 +2,7 @@
 // policy: the owner copies this snippet into it. Owner-only, like route management.
 
 import { Check, Copy } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,29 +15,49 @@ import { InlineError } from "./Auth";
 export function FrontAclView({ state }: { state: PlatformState }) {
   const isOwner = state.user.role === "owner";
   const [scope, setScope] = useState("global");
-  const [data, setData] = useState<FrontAclSnippet | null>(null);
+  const [response, setData] = useState<FrontAclSnippet | null>(null);
   const [routes, setRoutes] = useState<FrontAclSnippet["routes"]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  const requestId = useRef(0);
+  const data =
+    !loading &&
+    !error &&
+    (scope === "global"
+      ? response?.scope === "global"
+      : response?.scope === "route" && response.routeId === scope)
+      ? response
+      : null;
+
   const load = useCallback(async (next: string) => {
+    const id = ++requestId.current;
+    setData(null);
     setLoading(true);
     setError("");
     try {
       const path = next === "global" ? "/api/front/acl" : `/api/front/routes/${encodeURIComponent(next)}/acl`;
       const result = await api<FrontAclSnippet>(path);
+      if (id !== requestId.current) return;
+      if (next === "global" ? result.scope !== "global" : result.scope !== "route" || result.routeId !== next)
+        throw new Error("The server returned a different ACL scope. Regenerate to retry.");
       setData(result);
       if (result.scope === "global") setRoutes(result.routes);
     } catch (cause) {
+      if (id !== requestId.current) return;
       setError(cause instanceof Error ? cause.message : "Could not load the ACL snippet.");
     } finally {
-      setLoading(false);
+      if (id === requestId.current) setLoading(false);
     }
   }, []);
 
+  const invalidateRequests = useCallback(() => {
+    requestId.current++;
+  }, []);
   useEffect(() => {
     if (isOwner) void load(scope);
-  }, [isOwner, scope, load]);
+    return invalidateRequests;
+  }, [isOwner, scope, load, invalidateRequests]);
 
   if (!isOwner) {
     return (
@@ -59,9 +79,10 @@ export function FrontAclView({ state }: { state: PlatformState }) {
             Paste this into your tailnet policy file. It lets the edge node reach only the routed{" "}
             <span className="mono">host:port</span> targets, and the backup node only its backup target. Ark
             does not hold any Tailscale credential and never writes your policy. The{" "}
-            <span className="mono">tests</span> block makes Tailscale refuse to save the policy if another
-            rule, such as a broad <span className="mono">*</span> grant, lets these tags reach anything else,
-            so remove or narrow such rules first.
+            <span className="mono">tests</span> block checks sampled TCP and UDP ports on known nodes and Ark
+            tags. It catches broad allow-all rules, but cannot prove isolation on untested ports, other
+            protocols, or unobserved nodes. Review all existing grants and ACLs before saving; use the local
+            policy audit described in the operating guide for the full TCP/UDP port complement on known nodes.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -84,11 +105,12 @@ export function FrontAclView({ state }: { state: PlatformState }) {
                 ))}
               </select>
             </div>
-            {data && <CopyButton text={data.snippet} label="Copy snippet" />}
+            {data && <CopyButton key={`${scope}-${data.digest}`} text={data.snippet} label="Copy snippet" />}
             <Button variant="outline" onClick={() => void load(scope)} disabled={loading}>
               Regenerate
             </Button>
           </div>
+          {loading && <p role="status">Loading the selected scope’s snippet…</p>}
           {error && <InlineError>{error}</InlineError>}
           {data && (
             <>

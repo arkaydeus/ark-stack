@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  auditTailnetPolicy,
   ARK_BACKUP_TAG,
   ARK_EDGE_TAG,
   ARK_TAGS,
@@ -88,7 +89,7 @@ describe("generateTailnetAcl snapshot", () => {
     expect(snippet.hujson).toMatchInlineSnapshot(`
       "// Ark Stack front door — Tailscale policy snippet for all front-door routes and tailnet backup targets on tailnet tail1234.ts.net.
       // Merge each section into your tailnet policy file. Ark does not hold any Tailscale credential.
-      // The tests make Tailscale reject the policy if any other rule lets these tags reach more than this.
+      // Tests sample TCP/UDP ports on known nodes and Ark tags; they do not prove tailnet-wide isolation.
       {
         "tagOwners": {
           "tag:ark-edge": ["autogroup:admin"],
@@ -123,30 +124,455 @@ describe("generateTailnetAcl snapshot", () => {
         "tests": [
           {
             "src": "tag:ark-edge",
+            "proto": "tcp",
             "accept": ["ark-rt-box:22", "ark-rt-home:3000", "ark-rt-nas:1883", "ark-rt-pg-home:5432"],
             "deny": [
+              "ark-rt-box:80",
+              "ark-rt-box:443",
               "ark-rt-box:3389",
+              "ark-rt-box:5900",
+              "ark-rt-box:445",
+              "ark-rt-box:23",
+              "ark-rt-box:2375",
+              "ark-rt-box:8080",
+              "ark-rt-box:8443",
+              "ark-rt-box:65535",
+              "ark-rt-box:3000",
+              "ark-rt-box:1883",
+              "ark-rt-box:5432",
+              "ark-rt-box:8000",
               "ark-rt-home:22",
+              "ark-rt-home:80",
+              "ark-rt-home:443",
+              "ark-rt-home:3389",
+              "ark-rt-home:5900",
+              "ark-rt-home:445",
+              "ark-rt-home:23",
+              "ark-rt-home:2375",
+              "ark-rt-home:8080",
+              "ark-rt-home:8443",
+              "ark-rt-home:65535",
+              "ark-rt-home:1883",
+              "ark-rt-home:5432",
+              "ark-rt-home:8000",
               "ark-rt-nas:22",
+              "ark-rt-nas:80",
+              "ark-rt-nas:443",
+              "ark-rt-nas:3389",
+              "ark-rt-nas:5900",
+              "ark-rt-nas:445",
+              "ark-rt-nas:23",
+              "ark-rt-nas:2375",
+              "ark-rt-nas:8080",
+              "ark-rt-nas:8443",
+              "ark-rt-nas:65535",
+              "ark-rt-nas:3000",
+              "ark-rt-nas:5432",
+              "ark-rt-nas:8000",
               "ark-rt-pg-home:22",
+              "ark-rt-pg-home:80",
+              "ark-rt-pg-home:443",
+              "ark-rt-pg-home:3389",
+              "ark-rt-pg-home:5900",
+              "ark-rt-pg-home:445",
+              "ark-rt-pg-home:23",
+              "ark-rt-pg-home:2375",
+              "ark-rt-pg-home:8080",
+              "ark-rt-pg-home:8443",
+              "ark-rt-pg-home:65535",
+              "ark-rt-pg-home:3000",
+              "ark-rt-pg-home:1883",
+              "ark-rt-pg-home:8000",
+              "ark-backup-home:22",
+              "ark-backup-home:80",
+              "ark-backup-home:443",
+              "ark-backup-home:3389",
+              "ark-backup-home:5900",
+              "ark-backup-home:445",
+              "ark-backup-home:23",
+              "ark-backup-home:2375",
+              "ark-backup-home:8080",
+              "ark-backup-home:8443",
+              "ark-backup-home:65535",
+              "ark-backup-home:3000",
+              "ark-backup-home:1883",
+              "ark-backup-home:5432",
               "ark-backup-home:8000",
               "tag:ark-backup:22",
+              "tag:ark-backup:80",
+              "tag:ark-backup:443",
+              "tag:ark-backup:3389",
+              "tag:ark-backup:5900",
+              "tag:ark-backup:445",
+              "tag:ark-backup:23",
+              "tag:ark-backup:2375",
+              "tag:ark-backup:8080",
+              "tag:ark-backup:8443",
+              "tag:ark-backup:65535",
               "tag:ark-stack-admin:443",
+              "tag:ark-stack-admin:22",
+              "tag:ark-stack-admin:80",
+              "tag:ark-stack-admin:3389",
+              "tag:ark-stack-admin:5900",
+              "tag:ark-stack-admin:445",
+              "tag:ark-stack-admin:23",
+              "tag:ark-stack-admin:2375",
+              "tag:ark-stack-admin:8080",
+              "tag:ark-stack-admin:8443",
+              "tag:ark-stack-admin:65535",
               "tag:ark-vps:22",
+              "tag:ark-vps:80",
+              "tag:ark-vps:443",
+              "tag:ark-vps:3389",
+              "tag:ark-vps:5900",
+              "tag:ark-vps:445",
+              "tag:ark-vps:23",
+              "tag:ark-vps:2375",
+              "tag:ark-vps:8080",
+              "tag:ark-vps:8443",
+              "tag:ark-vps:65535",
+            ],
+          },
+          {
+            "src": "tag:ark-edge",
+            "proto": "udp",
+            "deny": [
+              "ark-rt-box:22",
+              "ark-rt-box:80",
+              "ark-rt-box:443",
+              "ark-rt-box:3389",
+              "ark-rt-box:5900",
+              "ark-rt-box:445",
+              "ark-rt-box:23",
+              "ark-rt-box:2375",
+              "ark-rt-box:8080",
+              "ark-rt-box:8443",
+              "ark-rt-box:65535",
+              "ark-rt-box:3000",
+              "ark-rt-box:1883",
+              "ark-rt-box:5432",
+              "ark-rt-box:8000",
+              "ark-rt-home:22",
+              "ark-rt-home:80",
+              "ark-rt-home:443",
+              "ark-rt-home:3389",
+              "ark-rt-home:5900",
+              "ark-rt-home:445",
+              "ark-rt-home:23",
+              "ark-rt-home:2375",
+              "ark-rt-home:8080",
+              "ark-rt-home:8443",
+              "ark-rt-home:65535",
+              "ark-rt-home:3000",
+              "ark-rt-home:1883",
+              "ark-rt-home:5432",
+              "ark-rt-home:8000",
+              "ark-rt-nas:22",
+              "ark-rt-nas:80",
+              "ark-rt-nas:443",
+              "ark-rt-nas:3389",
+              "ark-rt-nas:5900",
+              "ark-rt-nas:445",
+              "ark-rt-nas:23",
+              "ark-rt-nas:2375",
+              "ark-rt-nas:8080",
+              "ark-rt-nas:8443",
+              "ark-rt-nas:65535",
+              "ark-rt-nas:3000",
+              "ark-rt-nas:1883",
+              "ark-rt-nas:5432",
+              "ark-rt-nas:8000",
+              "ark-rt-pg-home:22",
+              "ark-rt-pg-home:80",
+              "ark-rt-pg-home:443",
+              "ark-rt-pg-home:3389",
+              "ark-rt-pg-home:5900",
+              "ark-rt-pg-home:445",
+              "ark-rt-pg-home:23",
+              "ark-rt-pg-home:2375",
+              "ark-rt-pg-home:8080",
+              "ark-rt-pg-home:8443",
+              "ark-rt-pg-home:65535",
+              "ark-rt-pg-home:3000",
+              "ark-rt-pg-home:1883",
+              "ark-rt-pg-home:5432",
+              "ark-rt-pg-home:8000",
+              "ark-backup-home:22",
+              "ark-backup-home:80",
+              "ark-backup-home:443",
+              "ark-backup-home:3389",
+              "ark-backup-home:5900",
+              "ark-backup-home:445",
+              "ark-backup-home:23",
+              "ark-backup-home:2375",
+              "ark-backup-home:8080",
+              "ark-backup-home:8443",
+              "ark-backup-home:65535",
+              "ark-backup-home:3000",
+              "ark-backup-home:1883",
+              "ark-backup-home:5432",
+              "ark-backup-home:8000",
+              "tag:ark-backup:22",
+              "tag:ark-backup:80",
+              "tag:ark-backup:443",
+              "tag:ark-backup:3389",
+              "tag:ark-backup:5900",
+              "tag:ark-backup:445",
+              "tag:ark-backup:23",
+              "tag:ark-backup:2375",
+              "tag:ark-backup:8080",
+              "tag:ark-backup:8443",
+              "tag:ark-backup:65535",
+              "tag:ark-stack-admin:443",
+              "tag:ark-stack-admin:22",
+              "tag:ark-stack-admin:80",
+              "tag:ark-stack-admin:3389",
+              "tag:ark-stack-admin:5900",
+              "tag:ark-stack-admin:445",
+              "tag:ark-stack-admin:23",
+              "tag:ark-stack-admin:2375",
+              "tag:ark-stack-admin:8080",
+              "tag:ark-stack-admin:8443",
+              "tag:ark-stack-admin:65535",
+              "tag:ark-vps:22",
+              "tag:ark-vps:80",
+              "tag:ark-vps:443",
+              "tag:ark-vps:3389",
+              "tag:ark-vps:5900",
+              "tag:ark-vps:445",
+              "tag:ark-vps:23",
+              "tag:ark-vps:2375",
+              "tag:ark-vps:8080",
+              "tag:ark-vps:8443",
+              "tag:ark-vps:65535",
             ],
           },
           {
             "src": "tag:ark-backup",
+            "proto": "tcp",
             "accept": ["ark-backup-home:8000"],
             "deny": [
-              "ark-backup-home:22",
               "ark-rt-box:22",
+              "ark-rt-box:80",
+              "ark-rt-box:443",
+              "ark-rt-box:3389",
+              "ark-rt-box:5900",
+              "ark-rt-box:445",
+              "ark-rt-box:23",
+              "ark-rt-box:2375",
+              "ark-rt-box:8080",
+              "ark-rt-box:8443",
+              "ark-rt-box:65535",
+              "ark-rt-box:3000",
+              "ark-rt-box:1883",
+              "ark-rt-box:5432",
+              "ark-rt-box:8000",
+              "ark-rt-home:22",
+              "ark-rt-home:80",
+              "ark-rt-home:443",
+              "ark-rt-home:3389",
+              "ark-rt-home:5900",
+              "ark-rt-home:445",
+              "ark-rt-home:23",
+              "ark-rt-home:2375",
+              "ark-rt-home:8080",
+              "ark-rt-home:8443",
+              "ark-rt-home:65535",
               "ark-rt-home:3000",
+              "ark-rt-home:1883",
+              "ark-rt-home:5432",
+              "ark-rt-home:8000",
+              "ark-rt-nas:22",
+              "ark-rt-nas:80",
+              "ark-rt-nas:443",
+              "ark-rt-nas:3389",
+              "ark-rt-nas:5900",
+              "ark-rt-nas:445",
+              "ark-rt-nas:23",
+              "ark-rt-nas:2375",
+              "ark-rt-nas:8080",
+              "ark-rt-nas:8443",
+              "ark-rt-nas:65535",
+              "ark-rt-nas:3000",
               "ark-rt-nas:1883",
+              "ark-rt-nas:5432",
+              "ark-rt-nas:8000",
+              "ark-rt-pg-home:22",
+              "ark-rt-pg-home:80",
+              "ark-rt-pg-home:443",
+              "ark-rt-pg-home:3389",
+              "ark-rt-pg-home:5900",
+              "ark-rt-pg-home:445",
+              "ark-rt-pg-home:23",
+              "ark-rt-pg-home:2375",
+              "ark-rt-pg-home:8080",
+              "ark-rt-pg-home:8443",
+              "ark-rt-pg-home:65535",
+              "ark-rt-pg-home:3000",
+              "ark-rt-pg-home:1883",
               "ark-rt-pg-home:5432",
+              "ark-rt-pg-home:8000",
+              "ark-backup-home:22",
+              "ark-backup-home:80",
+              "ark-backup-home:443",
+              "ark-backup-home:3389",
+              "ark-backup-home:5900",
+              "ark-backup-home:445",
+              "ark-backup-home:23",
+              "ark-backup-home:2375",
+              "ark-backup-home:8080",
+              "ark-backup-home:8443",
+              "ark-backup-home:65535",
+              "ark-backup-home:3000",
+              "ark-backup-home:1883",
+              "ark-backup-home:5432",
               "tag:ark-edge:443",
+              "tag:ark-edge:22",
+              "tag:ark-edge:80",
+              "tag:ark-edge:3389",
+              "tag:ark-edge:5900",
+              "tag:ark-edge:445",
+              "tag:ark-edge:23",
+              "tag:ark-edge:2375",
+              "tag:ark-edge:8080",
+              "tag:ark-edge:8443",
+              "tag:ark-edge:65535",
               "tag:ark-stack-admin:443",
+              "tag:ark-stack-admin:22",
+              "tag:ark-stack-admin:80",
+              "tag:ark-stack-admin:3389",
+              "tag:ark-stack-admin:5900",
+              "tag:ark-stack-admin:445",
+              "tag:ark-stack-admin:23",
+              "tag:ark-stack-admin:2375",
+              "tag:ark-stack-admin:8080",
+              "tag:ark-stack-admin:8443",
+              "tag:ark-stack-admin:65535",
               "tag:ark-vps:22",
+              "tag:ark-vps:80",
+              "tag:ark-vps:443",
+              "tag:ark-vps:3389",
+              "tag:ark-vps:5900",
+              "tag:ark-vps:445",
+              "tag:ark-vps:23",
+              "tag:ark-vps:2375",
+              "tag:ark-vps:8080",
+              "tag:ark-vps:8443",
+              "tag:ark-vps:65535",
+            ],
+          },
+          {
+            "src": "tag:ark-backup",
+            "proto": "udp",
+            "deny": [
+              "ark-rt-box:22",
+              "ark-rt-box:80",
+              "ark-rt-box:443",
+              "ark-rt-box:3389",
+              "ark-rt-box:5900",
+              "ark-rt-box:445",
+              "ark-rt-box:23",
+              "ark-rt-box:2375",
+              "ark-rt-box:8080",
+              "ark-rt-box:8443",
+              "ark-rt-box:65535",
+              "ark-rt-box:3000",
+              "ark-rt-box:1883",
+              "ark-rt-box:5432",
+              "ark-rt-box:8000",
+              "ark-rt-home:22",
+              "ark-rt-home:80",
+              "ark-rt-home:443",
+              "ark-rt-home:3389",
+              "ark-rt-home:5900",
+              "ark-rt-home:445",
+              "ark-rt-home:23",
+              "ark-rt-home:2375",
+              "ark-rt-home:8080",
+              "ark-rt-home:8443",
+              "ark-rt-home:65535",
+              "ark-rt-home:3000",
+              "ark-rt-home:1883",
+              "ark-rt-home:5432",
+              "ark-rt-home:8000",
+              "ark-rt-nas:22",
+              "ark-rt-nas:80",
+              "ark-rt-nas:443",
+              "ark-rt-nas:3389",
+              "ark-rt-nas:5900",
+              "ark-rt-nas:445",
+              "ark-rt-nas:23",
+              "ark-rt-nas:2375",
+              "ark-rt-nas:8080",
+              "ark-rt-nas:8443",
+              "ark-rt-nas:65535",
+              "ark-rt-nas:3000",
+              "ark-rt-nas:1883",
+              "ark-rt-nas:5432",
+              "ark-rt-nas:8000",
+              "ark-rt-pg-home:22",
+              "ark-rt-pg-home:80",
+              "ark-rt-pg-home:443",
+              "ark-rt-pg-home:3389",
+              "ark-rt-pg-home:5900",
+              "ark-rt-pg-home:445",
+              "ark-rt-pg-home:23",
+              "ark-rt-pg-home:2375",
+              "ark-rt-pg-home:8080",
+              "ark-rt-pg-home:8443",
+              "ark-rt-pg-home:65535",
+              "ark-rt-pg-home:3000",
+              "ark-rt-pg-home:1883",
+              "ark-rt-pg-home:5432",
+              "ark-rt-pg-home:8000",
+              "ark-backup-home:22",
+              "ark-backup-home:80",
+              "ark-backup-home:443",
+              "ark-backup-home:3389",
+              "ark-backup-home:5900",
+              "ark-backup-home:445",
+              "ark-backup-home:23",
+              "ark-backup-home:2375",
+              "ark-backup-home:8080",
+              "ark-backup-home:8443",
+              "ark-backup-home:65535",
+              "ark-backup-home:3000",
+              "ark-backup-home:1883",
+              "ark-backup-home:5432",
+              "ark-backup-home:8000",
+              "tag:ark-edge:443",
+              "tag:ark-edge:22",
+              "tag:ark-edge:80",
+              "tag:ark-edge:3389",
+              "tag:ark-edge:5900",
+              "tag:ark-edge:445",
+              "tag:ark-edge:23",
+              "tag:ark-edge:2375",
+              "tag:ark-edge:8080",
+              "tag:ark-edge:8443",
+              "tag:ark-edge:65535",
+              "tag:ark-stack-admin:443",
+              "tag:ark-stack-admin:22",
+              "tag:ark-stack-admin:80",
+              "tag:ark-stack-admin:3389",
+              "tag:ark-stack-admin:5900",
+              "tag:ark-stack-admin:445",
+              "tag:ark-stack-admin:23",
+              "tag:ark-stack-admin:2375",
+              "tag:ark-stack-admin:8080",
+              "tag:ark-stack-admin:8443",
+              "tag:ark-stack-admin:65535",
+              "tag:ark-vps:22",
+              "tag:ark-vps:80",
+              "tag:ark-vps:443",
+              "tag:ark-vps:3389",
+              "tag:ark-vps:5900",
+              "tag:ark-vps:445",
+              "tag:ark-vps:23",
+              "tag:ark-vps:2375",
+              "tag:ark-vps:8080",
+              "tag:ark-vps:8443",
+              "tag:ark-vps:65535",
             ],
           },
         ],
@@ -259,7 +685,7 @@ describe("determinism and secrecy", () => {
     const resolved = tailnetBackupTarget(row, [
       { stableId: "nBAK345CNTRL", dnsName: "backup-home.tail1234.ts.net.", ipv4: "100.66.2.9", ipv6: null },
     ]);
-    expect(resolved).toEqual(backup);
+    expect(resolved).toEqual({ ...backup, addresses: [backup.ip] });
     const snippet = generateTailnetAcl({
       ...sample,
       routes: withSecrets,
@@ -399,7 +825,12 @@ describe("grant safety", () => {
     const snippet = generateTailnetAcl({ routes: [] });
     expect(snippet.policy.grants).toEqual([]);
     expect(snippet.policy.hosts).toEqual({});
-    expect(snippet.policy.tests?.map((item) => item.src)).toEqual([ARK_EDGE_TAG, ARK_BACKUP_TAG]);
+    expect(snippet.policy.tests?.map((item) => [item.src, item.proto])).toEqual([
+      [ARK_EDGE_TAG, "tcp"],
+      [ARK_EDGE_TAG, "udp"],
+      [ARK_BACKUP_TAG, "tcp"],
+      [ARK_BACKUP_TAG, "udp"],
+    ]);
     expect(parseHujson(snippet.hujson)).toEqual(snippet.policy);
   });
 });
@@ -486,7 +917,7 @@ describe("tailnetBackupTarget", () => {
         {
           id: "b1",
           name: "home",
-          restUrl: "https://elsewhere.tail1234.ts.net/ark",
+          restUrl: "https://backup-home.tail1234.ts.net/ark",
           targetNodeStableId: "nBAK",
         },
         nodes,
@@ -565,5 +996,159 @@ describe("caller omissions", () => {
       "// Not granted: backup bkt_x: backup target has not been observed?{.\n{",
     );
     expect(parseHujson(snippet.hujson)).toEqual(snippet.policy);
+  });
+});
+
+describe("backup identity and dual-stack regressions", () => {
+  const node = {
+    stableId: "nBAK",
+    dnsName: "backup.tail1234.ts.net.",
+    ipv4: "100.66.2.9",
+    ipv6: "fd7a:115c:a1e0::9",
+  };
+  const row = {
+    id: "b1",
+    name: "backup",
+    restUrl: "http://backup.tail1234.ts.net:8000/ark",
+    targetNodeStableId: "nBAK",
+  };
+  test("a missing pinned identity never falls back to a same-name replacement", () => {
+    const result = tailnetBackupTarget({ ...row, targetNodeStableId: "nMISSING" }, [node]);
+    expect(result).toMatchObject({ kind: "backup", reason: "pinned backup node has not been observed" });
+    expect(
+      generateTailnetAcl({ routes: [], omitted: [result as import("./tailnet-acl.ts").AclOmission] }).policy
+        .grants,
+    ).toEqual([]);
+  });
+  test("duplicate observations resolve once; distinct matching identities are ambiguous", () => {
+    expect(tailnetBackupTarget({ ...row, targetNodeStableId: null }, [node, { ...node }])).toMatchObject({
+      stableId: "nBAK",
+      ip: node.ipv4,
+    });
+    expect(
+      tailnetBackupTarget({ ...row, targetNodeStableId: null }, [node, { ...node, stableId: "nOTHER" }]),
+    ).toMatchObject({ kind: "backup", reason: expect.stringContaining("ambiguous") });
+  });
+  test("literal URLs preserve their family and reject an address outside the pin", () => {
+    for (const ip of [node.ipv4, node.ipv6]) {
+      const host = ip.includes(":") ? `[${ip}]` : ip;
+      expect(tailnetBackupTarget({ ...row, restUrl: `http://${host}:8000/ark` }, [node])).toMatchObject({
+        ip,
+        stableId: node.stableId,
+      });
+    }
+    for (const host of ["100.66.2.10", "[fd7a:115c:a1e0::10]", "other.tail1234.ts.net"]) {
+      expect(tailnetBackupTarget({ ...row, restUrl: `http://${host}:8000/` }, [node])).toMatchObject({
+        kind: "backup",
+      });
+    }
+  });
+  test("the first observation wins when sources differ", () => {
+    expect(tailnetBackupTarget(row, [node, { ...node, ipv4: "100.66.2.10" }])).toMatchObject({
+      ip: node.ipv4,
+      addresses: expect.arrayContaining([node.ipv4, node.ipv6, "100.66.2.10"]),
+    });
+  });
+  test("global and per-route reservations cover both families, pinned or discovered", () => {
+    for (const pinned of [true, false]) {
+      for (const ip of [node.ipv4, node.ipv6]) {
+        const resolved = tailnetBackupTarget(
+          {
+            ...row,
+            targetNodeStableId: pinned ? node.stableId : null,
+            restUrl: `http://${ip.includes(":") ? `[${ip}]` : ip}:8000/`,
+          },
+          [node],
+        );
+        expect(resolved).not.toHaveProperty("reason");
+        const target = resolved as AclBackupTarget;
+        const route = {
+          ...routes[0]!,
+          targetNodeStableId: node.stableId,
+          targetIp: ip === node.ipv4 ? node.ipv6 : node.ipv4,
+          targetPort: 8000,
+        };
+        for (const scope of [
+          { backupTargets: [target] },
+          { reservedTargets: [target], assertionRoutes: [route] },
+        ]) {
+          const generated = generateTailnetAcl({ routes: [route], ...scope });
+          expect(generated.omitted).toContainEqual(expect.objectContaining({ kind: "route", id: route.id }));
+          expect((generated.policy.grants ?? []).filter((grant) => grant.src.includes(ARK_EDGE_TAG))).toEqual(
+            [],
+          );
+          expect(evaluatePolicyTests(generated.policy)).toEqual([]);
+        }
+      }
+    }
+  });
+});
+
+describe("policy isolation and composable assertions", () => {
+  const route = routes[0]!;
+  test("narrow TCP leaks, UDP on allowed ports and known non-target access fail native tests", () => {
+    const generated = generateTailnetAcl({
+      routes: [route],
+      knownAddresses: ["100.70.0.9", "fd7a:115c:a1e0::99"],
+    });
+    for (const [dst, ip] of [
+      ["ark-rt-home", "tcp:80"],
+      ["tag:ark-vps", "tcp:80"],
+      ["ark-rt-home", "udp:3000"],
+      ["100.70.0.9", "tcp:80"],
+      ["fd7a:115c:a1e0::99", "udp:22"],
+    ]) {
+      expect(
+        evaluatePolicyTests({
+          ...generated.policy,
+          grants: [...generated.policy.grants!, { src: [ARK_EDGE_TAG], dst: [dst!], ip: [ip!] }],
+        }).length,
+      ).toBeGreaterThan(0);
+    }
+    expect(parseHujson(generated.hujson)).toEqual(generated.policy);
+  });
+  test("the local audit covers every TCP/UDP range boundary, even unprobed ports", () => {
+    const expected = generateTailnetAcl({ routes: [route], knownAddresses: ["100.70.0.9"] }).policy;
+    expect(auditTailnetPolicy(expected, expected)).toEqual([]);
+    for (const extra of [
+      { grants: [{ src: [ARK_EDGE_TAG], dst: ["ark-rt-home"], ip: ["tcp:12345"] }] },
+      { grants: [{ src: [ARK_EDGE_TAG], dst: ["100.70.0.9"], ip: ["udp:49200-49300"] }] },
+      { acls: [{ action: "accept", src: [ARK_BACKUP_TAG], dst: ["100.70.0.9:49201-49301"], proto: "tcp" }] },
+    ]) {
+      expect(
+        auditTailnetPolicy(expected, {
+          ...expected,
+          grants: [...expected.grants!, ...(extra.grants ?? [])],
+          acls: extra.acls,
+        }).length,
+      ).toBeGreaterThan(0);
+    }
+  });
+  test("per-route assertions compose with the global policy and retain unauthorized denies", () => {
+    const other = { ...route, id: "rt_ssh", targetPort: 22 };
+    const all = [route, other];
+    const global = generateTailnetAcl({ routes: all }).policy;
+    for (const selected of all) {
+      const scoped = generateTailnetAcl({ routes: [selected], assertionRoutes: all }).policy;
+      expect(evaluatePolicyTests(scoped)).toEqual([]);
+      const merged = { ...global, tests: [...global.tests!, ...scoped.tests!] };
+      expect(evaluatePolicyTests(merged)).toEqual([]);
+      expect(
+        evaluatePolicyTests({
+          ...merged,
+          grants: [...merged.grants!, { src: [ARK_EDGE_TAG], dst: ["ark-rt-home"], ip: ["tcp:80"] }],
+        }).length,
+      ).toBeGreaterThan(0);
+    }
+  });
+  test("per-route aliases remain stable when machines share a short name", () => {
+    const other = { ...route, id: "rt_other", targetIp: "100.70.0.9", targetNodeStableId: "nOTHER" };
+    const global = generateTailnetAcl({ routes: [route, other] }).policy;
+    const scoped = generateTailnetAcl({ routes: [other], assertionRoutes: [route, other] }).policy;
+    expect(scoped.hosts).toEqual(global.hosts);
+    expect(evaluatePolicyTests({ ...global, tests: [...global.tests!, ...scoped.tests!] })).toEqual([]);
+    expect(scoped.grants).toEqual(
+      global.grants?.filter((grant) => global.hosts?.[grant.dst[0]!] === other.targetIp),
+    );
   });
 });

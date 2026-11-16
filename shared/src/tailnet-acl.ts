@@ -3,7 +3,7 @@
 // Ark never holds a key that can write the tailnet policy. Instead it generates the exact snippet
 // the owner pastes: one grant per (target host, port, protocol) for the edge node, one per backup
 // target for the backup node, and a `tests` block whose deny assertions make Tailscale reject the
-// whole policy if any other rule (for example a broad `*` grant) lets those tags reach more.
+// whole policy when a sampled destination is reachable. These tests are not an exhaustive audit.
 //
 // The generator is pure and deterministic: the same routes give byte-identical output whatever
 // their order, there are no timestamps, and only public routing facts (hostnames, ports, Tailscale
@@ -23,8 +23,8 @@ export const ARK_TAGS = [ARK_EDGE_TAG, ARK_BACKUP_TAG, ARK_ADMIN_TAG, ARK_VPS_TA
 /** The broad rule a pre-existing default policy often carries; the generated tests reject it. */
 export const BROAD_GRANT: TailnetGrant = { src: ["*"], dst: ["*"], ip: ["*"] };
 
-/** Ports probed by deny assertions, in preference order; the first one not granted is used. */
-const PROBE_PORTS = [22, 3389, 5900, 445, 23, 2375];
+/** Common ports sampled by native assertions, in addition to all configured service ports. */
+const PROBE_PORTS = [22, 80, 443, 3389, 5900, 445, 23, 2375, 8080, 8443, 65535];
 /** Ark-tag destinations the edge and backup identities must never reach. */
 const TAG_PROBES: Record<string, number> = {
   [ARK_EDGE_TAG]: 443,
@@ -61,11 +61,17 @@ export type AclBackupTarget = {
   ip: string;
   port: number;
   stableId?: string | null;
+  /** All observed addresses of this identity, reserved across address families. */
+  addresses?: string[];
   targetName?: string | null;
 };
 
 export type AclSnippetInput = {
   routes: AclRoute[];
+  /** Complete route inventory used to make per-route assertions composable. */
+  assertionRoutes?: AclRoute[];
+  /** Observed addresses, including nodes without a route. Never granted by this field. */
+  knownAddresses?: string[];
   /** Backup targets granted to `tag:ark-backup` in this snippet. */
   backupTargets?: AclBackupTarget[];
   /**
@@ -215,14 +221,6 @@ function ipSlug(ip: string) {
   return slug(ip.replaceAll(":", "-").replaceAll(".", "-")) || "host";
 }
 
-function probePort(grantedPorts: Iterable<number>) {
-  const used = new Set(grantedPorts);
-  const port = PROBE_PORTS.find((item) => !used.has(item));
-  if (port !== undefined) return port;
-  for (let item = 1; item <= 65535; item++) if (!used.has(item)) return item;
-  return 1;
-}
-
 /**
  * Builds the policy snippet. Routes and backup targets are sorted internally, so input order never
  * changes the output.
@@ -247,6 +245,17 @@ export function generateTailnetAcl(input: AclSnippetInput): AclSnippet {
   // Backup targets first: they are reserved, so an edge route can never share one.
   const backups = new Map<string, AclBackupTarget[]>(); // ip -> targets
   const reserved = new Set<string>();
+  const reservedIdentities = new Set<string>();
+  const reserve = (target: AclBackupTarget) => {
+    if (!isPort(target.port)) return;
+    for (const address of [target.ip, ...(target.addresses ?? [])]) {
+      const ip = tailnetIp(address);
+      if (ip) reserved.add(`${ip}|${target.port}`);
+    }
+    if (target.stableId && STABLE_ID.test(target.stableId)) {
+      reservedIdentities.add(`${target.stableId}|${target.port}`);
+    }
+  };
   for (const target of [...(input.backupTargets ?? [])].toSorted((a, b) => compare(a.id, b.id))) {
     const problem = backupProblem(target);
     if (problem) {
@@ -254,12 +263,11 @@ export function generateTailnetAcl(input: AclSnippetInput): AclSnippet {
       continue;
     }
     const ip = tailnetIp(target.ip) as string;
-    reserved.add(`${ip}|${target.port}`);
+    reserve(target);
     backups.set(ip, [...(backups.get(ip) ?? []), target]);
   }
   for (const target of input.reservedTargets ?? []) {
-    const ip = tailnetIp(target?.ip);
-    if (ip && isPort(target.port)) reserved.add(`${ip}|${target.port}`);
+    reserve(target);
   }
 
   const edge = new Map<string, AclRoute[]>(); // ip -> routes
@@ -270,7 +278,10 @@ export function generateTailnetAcl(input: AclSnippetInput): AclSnippet {
       continue;
     }
     const ip = tailnetIp(route.targetIp) as string;
-    if (reserved.has(`${ip}|${route.targetPort}`)) {
+    if (
+      reserved.has(`${ip}|${route.targetPort}`) ||
+      reservedIdentities.has(`${route.targetNodeStableId}|${route.targetPort}`)
+    ) {
       omitted.push({
         kind: "route",
         id: route.id,
@@ -361,15 +372,92 @@ export function generateTailnetAcl(input: AclSnippetInput): AclSnippet {
 
   const edgeAccept = granted(edgeHosts);
   const backupAccept = granted(backupHosts);
-  const tests: TailnetTest[] = [
-    withLists(ARK_EDGE_TAG, edgeAccept, [...probes(edgeHosts), ...backupAccept, ...tagProbes(ARK_EDGE_TAG)]),
-    withLists(ARK_BACKUP_TAG, backupAccept, [
-      ...probes(backupHosts),
-      ...edgeAccept,
-      ...tagProbes(ARK_BACKUP_TAG),
-    ]),
-    ...testUsers.map((user) => ({ src: user, deny: [`${ARK_EDGE_TAG}:${TAG_PROBES[ARK_EDGE_TAG]}`] })),
+  const knownAddresses = [
+    ...new Set((input.knownAddresses ?? []).map(tailnetIp).filter((ip): ip is string => ip !== null)),
+  ].toSorted(compare);
+  const destinations = [
+    ...new Set([...Object.keys(hosts), ...knownAddresses.filter((ip) => !Object.values(hosts).includes(ip))]),
   ];
+  const probePorts = [
+    ...new Set([
+      ...PROBE_PORTS,
+      ...edgeHosts.flatMap((entry) => [...entry.ports.keys()]),
+      ...backupHosts.flatMap((entry) => [...entry.ports.keys()]),
+    ]),
+  ];
+  const tests: TailnetTest[] = [];
+  for (const [src, accept] of [
+    [ARK_EDGE_TAG, edgeAccept],
+    [ARK_BACKUP_TAG, backupAccept],
+  ] as const) {
+    const allowed = (host: string, port: number) =>
+      grantLines.some(
+        ({ grant }) =>
+          grant.src.includes(src) &&
+          grant.dst.some((alias) => (hosts[alias] ?? alias) === (hosts[host] ?? host)) &&
+          grant.ip.includes(`tcp:${port}`),
+      );
+    const tcpDeny = destinations.flatMap((host) => {
+      return probePorts.filter((port) => !allowed(host, port)).map((port) => testDestination(host, port));
+    });
+    tests.push({ ...withLists(src, [...accept], [...tcpDeny, ...tagProbes(src)]), proto: "tcp" });
+    tests.push({
+      src,
+      proto: "udp",
+      deny: [
+        ...new Set([
+          ...destinations.flatMap((host) => probePorts.map((port) => testDestination(host, port))),
+          ...tagProbes(src),
+        ]),
+      ],
+    });
+  }
+  tests.push(
+    ...testUsers.map((user) => ({ src: user, deny: [`${ARK_EDGE_TAG}:${TAG_PROBES[ARK_EDGE_TAG]}`] })),
+  );
+
+  // Build assertions against all legitimate grants, while emitting only the selected grants.
+  // Full-inventory aliases also prevent same-short-name collisions when snippets are merged.
+  if (input.assertionRoutes) {
+    const complete = generateTailnetAcl({
+      ...input,
+      routes: input.assertionRoutes,
+      assertionRoutes: undefined,
+      backupTargets: [...(input.backupTargets ?? []), ...(input.reservedTargets ?? [])],
+      reservedTargets: undefined,
+      scope: null,
+    });
+    const completeHosts = complete.policy.hosts ?? {};
+    for (const line of grantLines) {
+      line.grant.dst = line.grant.dst.map(
+        (alias) =>
+          Object.keys(completeHosts).find(
+            (key) =>
+              key.startsWith(alias.startsWith("ark-backup-") ? "ark-backup-" : "ark-rt-") &&
+              completeHosts[key] === hosts[alias],
+          ) ?? alias,
+      );
+    }
+    for (const key of Object.keys(hosts)) delete hosts[key];
+    Object.assign(hosts, completeHosts);
+    tests.splice(
+      0,
+      tests.length,
+      ...(complete.policy.tests ?? []).map((test) => ({
+        ...test,
+        accept: test.accept?.filter((entry) => {
+          const split = entry.lastIndexOf(":");
+          return policyAllows(
+            { hosts, grants: grantLines.map((line) => line.grant) },
+            test.src,
+            entry.slice(0, split),
+            Number(entry.slice(split + 1)),
+            test.proto,
+          );
+        }),
+      })),
+    );
+  }
 
   const policy: TailnetPolicy = {
     tagOwners: owners,
@@ -391,7 +479,7 @@ export function generateTailnetAcl(input: AclSnippetInput): AclSnippet {
     "// Merge each section into your tailnet policy file. Ark does not hold any Tailscale credential.",
   );
   out.push(
-    "// The tests make Tailscale reject the policy if any other rule lets these tags reach more than this.",
+    "// Tests sample TCP/UDP ports on known nodes and Ark tags; they do not prove tailnet-wide isolation.",
   );
   for (const item of omitted.toSorted((a, b) => compare(a.kind, b.kind) || compare(a.id, b.id))) {
     out.push(`// Not granted: ${item.kind} ${commentText(item.id)}: ${item.reason}.`);
@@ -401,9 +489,10 @@ export function generateTailnetAcl(input: AclSnippetInput): AclSnippet {
   for (const [tag, owner] of Object.entries(owners)) out.push(`    ${json(tag)}: ${inline(owner)},`);
   out.push("  },");
   out.push(Object.keys(hosts).length ? '  "hosts": {' : '  "hosts": {},');
-  for (const host of [...edgeHosts, ...backupHosts]) {
-    for (const comment of host.comments) out.push(`    // ${commentText(comment)}`);
-    out.push(`    ${json(host.alias)}: ${json(host.ip)},`);
+  for (const [alias, ip] of Object.entries(hosts)) {
+    const host = (alias.startsWith("ark-backup-") ? backupHosts : edgeHosts).find((item) => item.ip === ip);
+    for (const comment of host?.comments ?? []) out.push(`    // ${commentText(comment)}`);
+    out.push(`    ${json(alias)}: ${json(ip)},`);
   }
   if (Object.keys(hosts).length) out.push("  },");
   out.push(grantLines.length ? '  "grants": [' : '  "grants": [],');
@@ -417,6 +506,7 @@ export function generateTailnetAcl(input: AclSnippetInput): AclSnippet {
   for (const test of tests) {
     out.push("    {");
     out.push(`      "src": ${json(test.src)},`);
+    if (test.proto) out.push(`      "proto": ${json(test.proto)},`);
     if (test.accept) out.push(...arrayLines("accept", test.accept));
     if (test.deny) out.push(...arrayLines("deny", test.deny));
     out.push("    },");
@@ -437,14 +527,15 @@ function granted(entries: HostEntry[]) {
   return entries.flatMap((host) => [...host.ports.keys()].map((port) => `${host.alias}:${port}`));
 }
 
-/** One ungranted port per host, so a broader rule to that host fails a deny assertion. */
-function probes(entries: HostEntry[]) {
-  return entries.map((host) => `${host.alias}:${probePort(host.ports.keys())}`);
+function testDestination(host: string, port: number) {
+  return `${host.includes(":") && !host.startsWith("tag:") ? `[${host}]` : host}:${port}`;
 }
 
 /** The other Ark tags, which `self` must never reach. */
 function tagProbes(self: string) {
-  return ARK_TAGS.filter((tag) => tag !== self).map((tag) => `${tag}:${TAG_PROBES[tag]}`);
+  return ARK_TAGS.filter((tag) => tag !== self).flatMap((tag) =>
+    [...new Set([TAG_PROBES[tag], ...PROBE_PORTS])].map((port) => `${tag}:${port}`),
+  );
 }
 
 function withLists(src: string, accept: string[], deny: string[]): TailnetTest {
@@ -518,26 +609,43 @@ export function tailnetBackupTarget(
     .replace(/^\[|\]$/g, "")
     .toLowerCase()
     .replace(/\.$/, "");
-  const byId = row.targetNodeStableId
-    ? nodes.find((node) => node.stableId === row.targetNodeStableId)
-    : undefined;
-  const byName = nodes.filter((node) => node.dnsName.toLowerCase().replace(/\.$/, "") === host);
-  const node = byId ?? (byName.length === 1 ? byName[0] : undefined);
-  const ip =
-    tailnetIp(node?.ipv4) ?? tailnetIp(node?.ipv6) ?? (row.targetNodeStableId ? null : tailnetIp(host));
-  if (!ip) {
-    return {
-      kind: "backup",
-      id: row.id,
-      reason: "backup target has not been observed on the tailnet yet",
-    };
-  }
+  // Observers are ordered by the caller (backup first). Deduplicate identities, not rows.
+  const unique = [...new Map(nodes.toReversed().map((node) => [node.stableId, node])).values()];
+  const literal = parseIpLiteral(host);
+  if (literal && !tailnetIp(host))
+    return { kind: "backup", id: row.id, reason: "backup URL is not a Tailscale address" };
+  const matches = unique.filter((node) =>
+    literal
+      ? [node.ipv4, node.ipv6].some((ip) => tailnetIp(ip) === tailnetIp(host))
+      : node.dnsName.toLowerCase().replace(/\.$/, "") === host,
+  );
+  const node = row.targetNodeStableId
+    ? unique.find((item) => item.stableId === row.targetNodeStableId)
+    : matches.length === 1
+      ? matches[0]
+      : undefined;
+  const omit = (reason: string): AclOmission => ({ kind: "backup", id: row.id, reason });
+  if (row.targetNodeStableId && !node) return omit("pinned backup node has not been observed");
+  if (matches.length > 1) return omit("backup target name or address is ambiguous");
+  if (node && !matches.some((item) => item.stableId === node.stableId))
+    return omit("backup URL does not match the pinned identity");
+  const ip = literal ? tailnetIp(host) : (tailnetIp(node?.ipv4) ?? tailnetIp(node?.ipv6));
+  if (!ip) return omit("backup target has not been observed on the tailnet yet");
+
   return {
     id: row.id,
     name: row.name,
     ip,
     port,
     stableId: node?.stableId ?? row.targetNodeStableId,
+    addresses: [
+      ...new Set(
+        nodes
+          .filter((item) => item.stableId === node?.stableId)
+          .flatMap((item) => [tailnetIp(item.ipv4), tailnetIp(item.ipv6)])
+          .filter((address): address is string => address !== null),
+      ),
+    ],
     targetName: cleanName(node?.dnsName) ?? (parseIpLiteral(host) ? null : cleanName(host)),
   };
 }
@@ -693,4 +801,82 @@ export function diffLines(previous: string, next: string): DiffLine[] {
   while (i < a.length) out.push({ op: "remove", line: a[i++] as string });
   while (j < b.length) out.push({ op: "add", line: b[j++] as string });
   return out;
+}
+
+/**
+ * Compare the full TCP/UDP port space on known destinations against a trusted global snippet.
+ * Grant/ACL access is constant between port-range boundaries, so checking every boundary covers
+ * the complement without rendering 65,536 test destinations per host. This local model supports
+ * the same selectors as policyAllows; live Tailscale validation is still required for policies
+ * with groups, posture, via or other capabilities this evaluator does not model.
+ */
+export function auditTailnetPolicy(expected: TailnetPolicy, candidate: TailnetPolicy): PolicyTestFailure[] {
+  for (const policy of [expected, candidate]) {
+    const supportedSelector = (value: string) =>
+      value === "*" ||
+      (ARK_TAGS as readonly string[]).includes(value) ||
+      USER.test(value) ||
+      ["autogroup:tagged", "autogroup:member", "autogroup:self"].includes(value) ||
+      !!resolveAddress(policy, value.split("/")[0] ?? value);
+    for (const rule of [...(policy.grants ?? []), ...(policy.acls ?? [])]) {
+      const isGrant = "ip" in rule;
+      const keys = isGrant ? ["src", "dst", "ip"] : ["action", "src", "dst", "proto"];
+      if (
+        Object.keys(rule).some((key) => !keys.includes(key)) ||
+        rule.src.some((src) => !supportedSelector(src)) ||
+        rule.dst.some(
+          (entry) =>
+            !supportedSelector(
+              isGrant ? entry : entry.slice(0, entry.lastIndexOf(":")).replace(/^\[|\]$/g, ""),
+            ),
+        )
+      ) {
+        throw new ValidationError(
+          "The local audit cannot model this rule's selectors or conditions; validate and review it with Tailscale.",
+        );
+      }
+    }
+  }
+  const ports = new Set([0, 1, 65535]);
+  for (const policy of [expected, candidate]) {
+    const specs = [
+      ...(policy.grants ?? []).flatMap((grant) => grant.ip),
+      ...(policy.acls ?? []).flatMap((acl) =>
+        acl.dst.flatMap((dst) => dst.slice(dst.lastIndexOf(":") + 1).split(",")),
+      ),
+    ];
+    for (const spec of specs) {
+      const range = spec.slice(spec.lastIndexOf(":") + 1);
+      const [low, high = low] = range.split("-").map(Number);
+      for (const port of [low, high === undefined ? undefined : high + 1]) {
+        if (port !== undefined && Number.isInteger(port) && port >= 0 && port <= 65535) ports.add(port);
+      }
+    }
+  }
+  const known = new Set<string>(Object.values(expected.hosts ?? {}));
+  for (const test of expected.tests ?? []) {
+    for (const entry of [...(test.accept ?? []), ...(test.deny ?? [])]) {
+      const host = entry.slice(0, entry.lastIndexOf(":")).replace(/^\[|\]$/g, "");
+      known.add(expected.hosts?.[host] ?? host);
+    }
+  }
+  const failures: PolicyTestFailure[] = [];
+  for (const src of [ARK_EDGE_TAG, ARK_BACKUP_TAG]) {
+    for (const host of known) {
+      for (const proto of ["tcp", "udp"]) {
+        for (const port of [...ports].toSorted((a, b) => a - b)) {
+          const wanted = policyAllows(expected, src, host, port, proto);
+          if (policyAllows(candidate, src, host, port, proto) !== wanted) {
+            failures.push({
+              src,
+              destination: `${proto}/${testDestination(host, port)}`,
+              expected: wanted ? "accept" : "deny",
+            });
+            break;
+          }
+        }
+      }
+    }
+  }
+  return failures;
 }
