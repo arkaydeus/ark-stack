@@ -23,6 +23,7 @@ import {
   pinComposeImage,
   PGBOUNCER_PORT,
   PGBOUNCER_SOCKET_DIR,
+  planEdge,
   planHash,
   validateMaintenanceBundle,
   type BackupStatus,
@@ -1294,15 +1295,16 @@ async function changeMode(operation: OperationRow) {
         : null
       : (process.env.ARK_TAILNET_AUTH_ORIGIN ?? null);
   if (!destinationOrigin) throw new Error("The destination administration origin is not configured.");
+  const plan = await edgePlan(adminMode, settings?.adminHostname);
+  if (adminMode === "public" && plan.adminHostname && plan.awaitingCertificate.includes(plan.adminHostname)) {
+    throw new Error(`The admin certificate for ${plan.adminHostname} is not issued yet.`);
+  }
   if (new URL(destinationOrigin).origin !== new URL(env.authUrl).origin) {
     throw new Error(
       `Better Auth is configured for ${env.authUrl}; restart with BETTER_AUTH_URL=${destinationOrigin} before switching ingress.`,
     );
   }
-  const edge = await writeEdge({
-    adminMode,
-    adminHostname: settings?.adminHostname ?? undefined,
-  });
+  const edge = await writeEdge(plan);
   await db
     .update(platformSettings)
     .set({ adminMode, authOrigin: destinationOrigin, updatedAt: new Date() })
@@ -1569,17 +1571,29 @@ async function reloadPgbouncer(operation: OperationRow) {
   });
 }
 
+// The edge serves only hostnames whose current certificate is `issued`. Public `http` endpoints
+// have no upstream yet, so they are rendered as unrouted (a fixed 503 naming no internal host).
+async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
+  return planEdge({
+    adminMode,
+    adminHostname,
+    endpoints: await db.select().from(endpoints),
+    certificates: await db.select().from(certificates),
+  });
+}
+
 async function applyEdge(operation: OperationRow) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
-  const ends = await db.select().from(endpoints);
-  const written = await writeEdge({
-    adminMode: settings?.adminMode === "tailnet" ? "tailnet" : "public",
-    adminHostname: settings?.adminHostname ?? undefined,
-    appRoutes: ends
-      .filter((item) => item.kind === "http" && item.exposure === "public")
-      .map((item) => ({ hostname: item.hostname, upstream: "app-edge:8080" })),
+  const plan = await edgePlan(
+    settings?.adminMode === "tailnet" ? "tailnet" : "public",
+    settings?.adminHostname,
+  );
+  const written = await writeEdge(plan);
+  await addStep(operation.id, "edge-apply", {
+    ...written,
+    unrouted: plan.appRoutes.map((route) => route.hostname),
+    awaitingCertificate: plan.awaitingCertificate,
   });
-  await addStep(operation.id, "edge-apply", written);
 }
 
 async function detectUpdates(operation: OperationRow) {

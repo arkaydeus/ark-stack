@@ -214,7 +214,9 @@ describe("payload-less renewal recovery", () => {
     ).find((row) => row.status === "awaiting_reload")!;
     const ca = await pki.createPrivateCa({ purpose: "db-client", name: `reload-${clientId}` });
     caId = ca.id;
-    caKeyId = ca.keySecretId;
+    // The inventory summary never exposes the key secret ID, so read it from the row for cleanup.
+    const [caRow] = await db.select().from(privateCas).where(eq(privateCas.id, ca.id));
+    caKeyId = caRow?.keySecretId ?? "";
     const issued = await pki.issueClientCertificate({
       caId,
       subjectCn: "recovery_shop_production",

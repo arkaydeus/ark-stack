@@ -37,6 +37,8 @@ import {
   sqlInput,
   sqlCancelInput,
   settingsInput,
+  regionSettingsInput,
+  regionSummary,
   buildDomainPlan,
   nextBackupStatus,
   redactLogLine,
@@ -63,6 +65,7 @@ import {
   requireDomainMailbox,
   requireMfa,
   requireOperator,
+  requireOwner,
   requirePrivileged,
   requireProject,
   type SessionValue,
@@ -78,6 +81,7 @@ import { db, sql } from "./db.ts";
 import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
+import { frontAclSnippet } from "./modules/front-acl.ts";
 import { cancelWorkspaceQuery } from "./modules/database.ts";
 import { writeApprovedCompose } from "./modules/docker.ts";
 import { listMailQueue } from "./modules/queue.ts";
@@ -689,6 +693,7 @@ app.get("/api/state", async (c) => {
       ),
     },
     settings,
+    region: regionSummary(settings ?? null),
     domains: visibleDomains.map((domain) => ({
       ...redactDomain(domain, access),
       records: records.filter((record) => record.domainId === domain.id),
@@ -2346,6 +2351,63 @@ app.put("/api/settings", async (c) => {
     .where(eq(platformSettings.id, "default"));
   await audit(access.userId, "settings.update", "platform", "platform", input, undefined, access.role);
   return c.json({ ok: true });
+});
+
+// Region preset (front door §3.15, FD-03). Every signed-in role can read the suggestions; the
+// Vercel guide and backup wizard render them. The setting never touches AWS_REGION or SES.
+app.get("/api/settings/region", async (c) => {
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  return c.json(regionSummary(settings ?? null));
+});
+
+app.put("/api/settings/region", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const request = await c.req.json();
+  const input = regionSettingsInput.parse(request);
+  // Validate before consuming the single-use grant, so a typo does not burn a password+MFA round.
+  // Bind to the original JSON, just as /api/step-up does; normalize only the stored values.
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "platform.update",
+    privilegedRequestHash("platform.update", request),
+  );
+  const [previous] = await db
+    .select({ region: platformSettings.region, vpsRegionLabel: platformSettings.vpsRegionLabel })
+    .from(platformSettings)
+    .where(eq(platformSettings.id, "default"));
+  const values = { region: input.region, vpsRegionLabel: input.vpsRegionLabel, updatedAt: new Date() };
+  const [settings] = await db
+    .insert(platformSettings)
+    .values({ id: "default", ...values })
+    .onConflictDoUpdate({ target: platformSettings.id, set: values })
+    .returning();
+  await audit(
+    access.userId,
+    "settings.region",
+    "platform",
+    "platform",
+    { ...input, previous: previous ?? null },
+    undefined,
+    access.role,
+  );
+  return c.json(regionSummary(settings ?? null));
+});
+
+// Tailscale policy snippets (front door §3.7, FD-07). Owner-only, like route management (R12):
+// the snippet maps the tailnet machines behind every public route. Ark never writes the policy.
+app.get("/api/front/acl", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(await frontAclSnippet({ kind: "global" }));
+});
+
+app.get("/api/front/routes/:id/acl", async (c) => {
+  requireOwner(c.get("access"));
+  const snippet = await frontAclSnippet({ kind: "route", routeId: c.req.param("id") });
+  if (!snippet) throw new HTTPException(404, { message: "Route not found." });
+  return c.json(snippet);
 });
 
 app.get("/api/metrics", async (c) => {

@@ -55,6 +55,10 @@ run = ["bun test scripts/edge-test", "bun scripts/test-edge-config.ts"]
 description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM and admin-socket reloads"
 run = "bun scripts/test-pgbouncer-public.ts"
 
+[tasks."test:tailnet-acl"]
+description = "Validate the generated Tailscale policy snippet against a scratch tailnet (skips without ARK_TEST_TS_POLICY_API_KEY)"
+run = "bun scripts/test-tailnet-acl.ts"
+
 [tasks."test:agent"]
 description = "Run Docker agent policy tests"
 run = "go test ./..."

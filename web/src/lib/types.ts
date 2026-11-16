@@ -1,5 +1,37 @@
 export type Role = "owner" | "operator" | "viewer";
 
+export type PlatformRegion = "us-east" | "us-west" | "eu-west" | "eu-central";
+
+/** Mirrors `regionSummary` in shared/src/region.ts. */
+export type RegionSummary = {
+  region: PlatformRegion;
+  label: string;
+  vercelRegion: string;
+  vercelLocation: string;
+  backupRegionHint: string;
+  docsLabel: string;
+  vpsRegionLabel: string | null;
+  vercelConfig: { regions: string[] };
+  vercelSnippet: string;
+  latencyHint: string;
+  options: Array<{ region: PlatformRegion; label: string; vercelRegion: string }>;
+};
+
+/** Mirrors `FrontAclResponse` in server/src/modules/front-acl.ts (front door §3.7). */
+export type FrontAclSnippet = {
+  scope: "global" | "route";
+  routeId: string | null;
+  tailnet: string | null;
+  snippet: string;
+  digest: string;
+  generatedAt: string;
+  sshExample: string;
+  omitted: Array<{ kind: "route" | "backup"; id: string; reason: string }>;
+  previous: { digest: string; generatedAt: string | null } | null;
+  diff: Array<{ op: "same" | "add" | "remove"; line: string }> | null;
+  routes: Array<{ id: string; kind: string; hostname: string; listenPort: number; status: string }>;
+};
+
 export type PlatformState = {
   user: { id: string; name: string; email: string; role: Role; twoFactorEnabled?: boolean };
   setup: {
@@ -17,7 +49,11 @@ export type PlatformState = {
     dnsProvider: string;
     defaultQuotaGb: number;
     allowExternalForwarding: boolean;
+    region?: PlatformRegion;
+    vpsRegionLabel?: string | null;
   } | null;
+  /** Region preset and its derived suggestions (front door §3.15). Absent on an older API. */
+  region?: RegionSummary;
   domains: Array<{
     id: string;
     name: string;

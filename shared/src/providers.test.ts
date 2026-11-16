@@ -79,6 +79,14 @@ describe("provider adapters", () => {
         adminHostname: "admin.example.com",
         challengeDir: "/acme",
         apiUpstream: "api:3000",
+        certificates: [
+          {
+            hostname: "admin.example.com",
+            status: "issued",
+            fullchain: "/certs/admin.example.com/fullchain.pem",
+            privkey: "/certs/admin.example.com/privkey.pem",
+          },
+        ],
       }),
     ).toContain("respond @unknownApi 404");
     expect(registryManifestUrl("docker.io/library/nginx:1.27.3").url).toContain("/nginx/manifests/1.27.3");
