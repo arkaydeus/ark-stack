@@ -756,6 +756,8 @@ This matters because the Caddyfile is a text format; the existing code already r
 
 (ark_upstream) {
 	header_up Cookie "(^|;\s*)__Host-ark_gate[^;]*" ""
+	# Stripping the first cookie leaves its following separator; remove it as a second pass.
+	header_up Cookie "^;\s*" ""
 	header_down -Server
 	header_down Set-Cookie "(?i);\s*domain=[^;]*" ""
 	flush_interval -1

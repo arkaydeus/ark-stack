@@ -3,12 +3,15 @@
 // header stripping, Server/Via removal, WebSockets across reloads and idle, and certificate reloads.
 // The bump procedure for the pinned images is in docs/operating.md ("Third-party image pins").
 import { X509Certificate, randomBytes } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { connect } from "node:tls";
 
 import { renderCaddyfile } from "@ark-stack/shared";
+
+import { checkReleasePins } from "./edge-test/pins.ts";
+import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 
 const caddyImage = "caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c";
 // Same pin as the Dockerfile runtime stage; hosts the fixture upstream and generates fixture certificates.
@@ -21,8 +24,9 @@ const idleSeconds = 80;
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-${suffix}-`));
 const network = `ark-edge-${suffix}`;
-const containers: string[] = [];
-let networkCreated = false;
+const runtime = new EdgeTestRuntime(directory, network);
+const containers = runtime.containers;
+const removeSignalHandlers = runtime.installSignalHandlers();
 
 type Report = { name: string; lines: string[] };
 type CaddyContainer = {
@@ -32,14 +36,7 @@ type CaddyContainer = {
 };
 
 async function docker(...args: string[]) {
-  const child = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
-  const [status, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  if (status !== 0) throw new Error(`docker ${args[0]} failed: ${stderr.trim().slice(0, 2000)}`);
-  return stdout.trim();
+  return runtime.docker(...args);
 }
 
 function expect(report: Report, condition: boolean, claim: string, observed: string) {
@@ -71,6 +68,7 @@ async function checkPins() {
       `infra/platform/docker-compose.yml must pin edge and tailnet-gateway to the tested ${caddyImage}; found ${JSON.stringify(caddyPins)}.`,
     );
   }
+  checkReleasePins(await Bun.file(join(root, "infra/platform/release.json")).json(), caddyImage);
   const dockerfile = await Bun.file(join(root, "Dockerfile")).text();
   if (!dockerfile.includes(bunImage)) {
     throw new Error(`Dockerfile no longer pins ${bunImage}; update the edge-test fixture image to match.`);
@@ -78,7 +76,7 @@ async function checkPins() {
   const version = await docker("run", "--rm", caddyImage, "caddy", "version");
   if (!version.startsWith("v2.11.9 ")) throw new Error(`${caddyImage} reports ${version}, expected v2.11.9.`);
   console.log(
-    `Compose edge and tailnet-gateway pin the tested image ${caddyImage} (${version.split(" ")[0]}).`,
+    `Compose and release.json pin the tested image ${caddyImage} (${version.split(" ")[0]}); release bundle digest matches.`,
   );
 }
 
@@ -153,8 +151,8 @@ async function publishedPort(container: string, port: number) {
 }
 
 async function startUpstream() {
+  runtime.networkCreated = true;
   await docker("network", "create", network);
-  networkCreated = true;
   const name = `ark-edge-upstream-${suffix}`;
   containers.push(name);
   await docker(
@@ -275,10 +273,7 @@ async function headerBehaviour(caddy: CaddyContainer, report: Report) {
   const cookie = seen.cookie ?? "";
   expect(
     report,
-    !cookie.includes("ark_gate") &&
-      !cookie.includes("gate-secret") &&
-      cookie.includes("a=1") &&
-      cookie.includes("b=2"),
+    cookie === "a=1; b=2",
     "gate cookie is stripped from the upstream Cookie, other cookies kept",
     `sent Cookie: ${forged.Cookie} -> upstream Cookie: ${cookie}`,
   );
@@ -287,10 +282,24 @@ async function headerBehaviour(caddy: CaddyContainer, report: Report) {
   });
   expect(
     report,
-    !(leading.cookie ?? "").includes("ark_gate") && (leading.cookie ?? "").includes("c=3"),
+    leading.cookie === "c=3",
     "gate cookie is stripped when it is the first cookie",
     `upstream Cookie: ${leading.cookie}`,
   );
+  for (const [sent, expected] of [
+    ["a=1; __Host-ark_gate=gate-secret", "a=1"],
+    ["__Host-ark_gate=gate-secret", ""],
+    ["__Host-ark_gate_state=state-secret; __Host-ark_gate=gate-secret; c=3", "c=3"],
+    ["a=1; c=3", "a=1; c=3"],
+  ]) {
+    const observed = await upstreamSaw(`${caddy.url(8080)}/headers`, { Cookie: sent });
+    expect(
+      report,
+      (observed.cookie ?? "") === expected,
+      "gate cookies are stripped at the end, alone or together; ordinary cookies stay intact",
+      `sent Cookie: ${sent} -> upstream Cookie: ${JSON.stringify(observed.cookie ?? "")}`,
+    );
+  }
 
   const sso = await upstreamSaw(`${caddy.url(8081)}/headers`);
   expect(
@@ -609,10 +618,7 @@ async function run(name: string, test: (report: Report) => Promise<unknown>) {
 }
 
 async function dumpLogs() {
-  for (const container of containers) {
-    const logs = await docker("logs", "--tail", "40", container).catch(() => "");
-    if (logs) console.error(`\n--- ${container} (last 40 lines) ---\n${logs}`);
-  }
+  await runtime.dumpLogs();
 }
 
 let failed = false;
@@ -636,8 +642,7 @@ try {
   console.error((error as Error).message);
   await dumpLogs();
 } finally {
-  if (containers.length) await docker("rm", "--force", ...containers).catch(() => "");
-  if (networkCreated) await docker("network", "rm", network).catch(() => "");
-  await rm(directory, { recursive: true, force: true });
+  await runtime.cleanup();
+  removeSignalHandlers();
 }
 if (failed) process.exit(1);
