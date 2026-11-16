@@ -32,6 +32,7 @@ Useful commands:
 | `mise run test:upgrade`           | representative additive schema upgrade      |
 | `mise run test:stalwart`          | disposable native Stalwart lifecycle test   |
 | `mise run test:edge`              | Caddy validation, edge and harness tests    |
+| `mise run test:pgbouncer`         | disposable public PgBouncer TLS/SCRAM test  |
 | `mise run recover -- status`      | local lockout / bootstrap inspection        |
 | `mise run recover:mfa -- …`       | token- and confirmation-gated MFA reset     |
 | `mise run host:install`           | build and start the complete host topology  |
