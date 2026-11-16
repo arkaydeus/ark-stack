@@ -148,7 +148,7 @@ export const platformSettings = pgTable(
       .notNull()
       .default("us-east"),
     vpsRegionLabel: text("vps_region_label"),
-    // Public database port per-source limits (0016, FD-18). Rendered into `inet ark_db_ingress`.
+    // Public database port per-source limits (0017, FD-18). Rendered into `inet ark_db_ingress`.
     dbIngressMaxConnections: integer("db_ingress_max_connections").notNull().default(128),
     dbIngressRatePerSecond: integer("db_ingress_rate_per_second").notNull().default(30),
     dbIngressRateBurst: integer("db_ingress_rate_burst").notNull().default(60),

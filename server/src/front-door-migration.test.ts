@@ -272,14 +272,14 @@ describe("0014_region.sql", () => {
   }
 });
 
-describe("0016_db_ingress_limits.sql", () => {
+describe("0017_db_ingress_limits.sql", () => {
   for (const kind of ["fresh", "upgrade"] as const) {
     test(`applies on a ${kind} schema with the §3.11 defaults and bounded limits`, async () => {
       const db = await prepare(kind);
       try {
         await apply(
           db,
-          through("0016").filter((file) => file.slice(0, 4) > "0012"),
+          through("0017").filter((file) => file.slice(0, 4) > "0012"),
         );
         await db`INSERT INTO platform_settings (id) VALUES ('default') ON CONFLICT DO NOTHING`;
         const [settings] = await db`
@@ -511,8 +511,8 @@ describe("Drizzle schema mirrors the migration", () => {
     const db = await scratch("drizzle");
     try {
       // Every migration, not just 0013: later tickets add the region columns (0014),
-      // client_certificates.cert_pem (0015), database ingress limits and tailnet_acl_snippets
-      // (both 0016). Migrations are tracked by full filename, and schema.ts
+      // client_certificates.cert_pem (0015), tailnet_acl_snippets (0016) and database ingress limits
+      // (0017). Migrations are tracked by full filename, and schema.ts
       // mirrors the latest state.
       await apply(db, migrationFiles);
       for (const table of tables) {

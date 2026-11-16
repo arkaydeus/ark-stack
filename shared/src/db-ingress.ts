@@ -29,7 +29,7 @@ export const DB_INGRESS_LIMIT_DEFAULTS = {
   newConnectionBurst: 60,
 } as const;
 
-/** Bounds the API, the database CHECKs (0016) and the renderer all enforce. */
+/** Bounds the API, the database CHECKs (0017) and the renderer all enforce. */
 export const DB_INGRESS_LIMIT_BOUNDS = {
   maxConnectionsPerSource: { min: 1, max: 65_535 },
   newConnectionsPerSecond: { min: 1, max: 10_000 },
@@ -87,7 +87,7 @@ export function dbIngressLimits(
   };
 }
 
-/** The effective limits for a `platform_settings` row (columns from 0016). */
+/** The effective limits for a `platform_settings` row (columns from 0017). */
 export function platformDbIngressLimits(
   settings:
     | {

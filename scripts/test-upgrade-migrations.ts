@@ -349,7 +349,7 @@ table inet ark_db_ingress {
       /platform_settings_region_check/,
       "Only the shared/src/region.ts presets may be stored.",
     );
-    // 0016 stores the defaults; the startup reconciliation below upgrades the persisted policy.
+    // 0017 stores the defaults; the startup reconciliation below upgrades the persisted policy.
     const [ingressLimits] = await verified`
       SELECT db_ingress_max_connections, db_ingress_rate_per_second, db_ingress_rate_burst
       FROM platform_settings WHERE id = 'default'
