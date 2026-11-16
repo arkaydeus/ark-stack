@@ -1125,6 +1125,7 @@ export function SettingsView({ state, reload }: { state: PlatformState; reload: 
         </label>
       </FormCard>
       <RegionSettings state={state} reload={reload} />
+      <DbIngressSettings state={state} reload={reload} />
       <Card>
         <CardHeader>
           <CardTitle>Administrator MFA</CardTitle>
@@ -1301,6 +1302,117 @@ function RegionSettings({ state, reload }: { state: PlatformState; reload: () =>
       <Field
         label="Current password"
         name="regionPassword"
+        type="password"
+        autoComplete="current-password"
+        required
+      />
+      {message && <p className="text-sm text-muted-foreground md:col-span-2">{message}</p>}
+    </FormCard>
+  );
+}
+
+/**
+ * Per-source limits on the public database port (front door §3.11). nftables enforces them for
+ * every source on tcp/5432, with IPv6 sources grouped by /64. Vercel functions share AWS egress
+ * addresses, so the defaults are generous.
+ */
+function DbIngressSettings({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  const limits = state.dbIngress;
+  const [message, setMessage] = useState("");
+  if (!limits) return null;
+  const summary = (
+    <dl className="grid gap-2 text-sm md:col-span-2 md:grid-cols-[max-content_1fr] md:gap-x-6">
+      <dt className="text-muted-foreground">Concurrent connections per source</dt>
+      <dd>
+        {limits.maxConnectionsPerSource}{" "}
+        <span className="text-xs text-muted-foreground">
+          (default {limits.defaults.maxConnectionsPerSource})
+        </span>
+      </dd>
+      <dt className="text-muted-foreground">New connections per source</dt>
+      <dd>
+        {limits.newConnectionsPerSecond}/second, burst {limits.newConnectionBurst}{" "}
+        <span className="text-xs text-muted-foreground">
+          (default {limits.defaults.newConnectionsPerSecond}/second, burst{" "}
+          {limits.defaults.newConnectionBurst})
+        </span>
+      </dd>
+      <dd className="text-xs text-muted-foreground md:col-span-2">
+        Applies to tcp/{limits.port}. IPv4 sources are limited per address and IPv6 sources per{" "}
+        {limits.ipv6Grouping}. Drops are exported as ark_nft_drop_packets_total.
+      </dd>
+    </dl>
+  );
+  if (state.user.role !== "owner") {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Public database port limits</CardTitle>
+          <CardDescription>Only an owner can change these limits.</CardDescription>
+        </CardHeader>
+        <CardContent>{summary}</CardContent>
+      </Card>
+    );
+  }
+  const key = `${limits.maxConnectionsPerSource}-${limits.newConnectionsPerSecond}-${limits.newConnectionBurst}`;
+  return (
+    <FormCard
+      title="Public database port limits"
+      description="Caps each source's concurrent connections and new-connection rate on the public PostgreSQL port. Vercel functions share AWS egress addresses, so keep these generous. Saving needs your password."
+      onSubmit={async (form) => {
+        setMessage("");
+        const request = {
+          maxConnectionsPerSource: Number(form.get("maxConnectionsPerSource")),
+          newConnectionsPerSecond: Number(form.get("newConnectionsPerSecond")),
+          newConnectionBurst: Number(form.get("newConnectionBurst")),
+        };
+        await api("/api/step-up", {
+          method: "POST",
+          body: JSON.stringify({
+            password: form.get("dbIngressPassword"),
+            action: "platform.update",
+            request,
+          }),
+        });
+        await api("/api/settings/db-ingress", { method: "PUT", body: JSON.stringify(request) });
+        await reload();
+        setMessage("Limits saved. The firewall rules are being reapplied.");
+      }}
+    >
+      {summary}
+      <Field
+        key={`conn-${key}`}
+        label="Concurrent connections per source"
+        name="maxConnectionsPerSource"
+        type="number"
+        required
+        min={limits.bounds.maxConnectionsPerSource.min}
+        max={limits.bounds.maxConnectionsPerSource.max}
+        defaultValue={limits.maxConnectionsPerSource}
+      />
+      <Field
+        key={`rate-${key}`}
+        label="New connections per second, per source"
+        name="newConnectionsPerSecond"
+        type="number"
+        required
+        min={limits.bounds.newConnectionsPerSecond.min}
+        max={limits.bounds.newConnectionsPerSecond.max}
+        defaultValue={limits.newConnectionsPerSecond}
+      />
+      <Field
+        key={`burst-${key}`}
+        label="New-connection burst"
+        name="newConnectionBurst"
+        type="number"
+        required
+        min={limits.bounds.newConnectionBurst.min}
+        max={limits.bounds.newConnectionBurst.max}
+        defaultValue={limits.newConnectionBurst}
+      />
+      <Field
+        label="Current password"
+        name="dbIngressPassword"
         type="password"
         autoComplete="current-password"
         required

@@ -43,6 +43,8 @@ async function fixture() {
     await copyFile(join(root, "scripts", name), join(directory, "scripts", name));
   }
   await symlink(join(root, "node_modules"), join(directory, "node_modules"));
+  // The PgBouncer bootstrap uses the worker renderer and its X.509 helpers.
+  await symlink(join(root, "server"), join(directory, "server"));
   for (const name of ["Caddyfile", "serve.json"]) {
     await copyFile(join(root, "infra/platform", name), join(directory, "infra/platform", name));
   }
@@ -99,6 +101,7 @@ for (const inherited of ["tskey-auth-inherited-other", ""]) {
       ).toEqual([`TS_EDGE_AUTHKEY=${installedKey}`]);
       expect(stdout + stderr).not.toContain(installedKey);
       expect((await stat(envPath)).mode & 0o777).toBe(0o600);
+      expect((await stat(join(directory, "tmp/db-ingress"))).isDirectory()).toBe(true);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
