@@ -1,0 +1,34 @@
+# Test-only Caddyfile for `mise run test:edge` (WebSocket across reload and idle).
+# `ark_upstream` reproduces docs/design/front-door.md §3.5; the harness substitutes
+# __STREAM_CLOSE_DELAY__ and __GENERATION__ before each `/load`, so every load is a real config change.
+{
+	admin 0.0.0.0:2019
+	auto_https off
+	servers {
+		timeouts {
+			read_header 10s
+			idle 2m
+		}
+		protocols h1 h2
+	}
+}
+
+(ark_upstream) {
+	header_up Cookie "(^|;\s*)__Host-ark_gate[^;]*" ""
+	header_down -Server
+	header_down Set-Cookie "(?i);\s*domain=[^;]*" ""
+	flush_interval -1
+	stream_close_delay __STREAM_CLOSE_DELAY__
+	transport http {
+		dial_timeout 5s
+		response_header_timeout 60s
+		keepalive 90s
+	}
+}
+
+:8080 {
+	header X-Ark-Test-Generation __GENERATION__
+	reverse_proxy upstream:3000 {
+		import ark_upstream
+	}
+}
