@@ -286,7 +286,7 @@ services:
     pids_limit: 64
 
   edge:
-    image: caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+    image: caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
     ports: ["80:80", "443:443"]
     volumes:
       - ../../tmp/acme:/var/lib/ark/acme:ro
@@ -322,7 +322,7 @@ services:
     cap_drop: [ALL]
 
   tailnet-gateway:
-    image: caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+    image: caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
     profiles: [tailnet]
     network_mode: service:tailscale
     volumes: [./TailnetCaddyfile:/etc/caddy/Caddyfile:ro]
