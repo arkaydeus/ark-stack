@@ -105,6 +105,8 @@ import {
   auditEvents,
   backups,
   certificates,
+  clientCertificates,
+  databaseClients,
   databaseClusters,
   databaseRoles,
   dnsRecords,
@@ -619,10 +621,19 @@ async function requireSecretScope(access: Access, secret: typeof secrets.$inferS
   assertSecretRevealable(secret);
   // Database client keys and passwords are owner-only and leave only through the client's own
   // one-time reveal (FD-17), never through the generic endpoint operators can reach.
+  const clientKey =
+    secret.kind === CLIENT_KEY_SECRET_KIND
+      ? await db
+          .select({ id: databaseClients.id })
+          .from(clientCertificates)
+          .innerJoin(databaseClients, eq(databaseClients.caId, clientCertificates.caId))
+          .where(eq(clientCertificates.keySecretId, secret.id))
+          .limit(1)
+      : [];
   if (
     secret.kind === CLIENT_PASSWORD_SECRET_KIND ||
     secret.kind.startsWith(`${CLIENT_PASSWORD_SECRET_KIND}.`) ||
-    (secret.kind === CLIENT_KEY_SECRET_KIND && secret.purpose === "db-client")
+    clientKey.length > 0
   ) {
     throw new HTTPException(403, {
       message: "Database client credentials are revealed only through the client's one-time reveal.",

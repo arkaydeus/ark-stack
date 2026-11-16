@@ -7,7 +7,12 @@
 // - the V-8 mTLS matrix, the admin identity's transport restriction, max_user_client_connections,
 //   postgres.js prepared statements in transaction mode, and a server certificate swap whose new
 //   fingerprint is verified through the published port with `openssl s_client`;
-// - a simulated reload failure that retries and never reports success.
+// - a simulated reload failure that retries and never reports success;
+// - FD-17 database clients: Ark's §3.12 node-postgres module (real `pg` + `@vercel/functions`)
+//   connects with a client's revealed env values, a preview client's role is denied INSERT, UPDATE
+//   and DELETE while production's can write, and revoking client B (reduced CA bundle, rotated
+//   NOLOGIN password, RELOAD, KILL_CLIENT) closes B's live session and new handshakes with
+//   `unknown ca` while client A's sessions, password and new connections are unaffected.
 //
 // The Compose file's relative bind mounts (`../../tmp/...`) are redirected into a temporary
 // directory with `--project-directory`, so the repository's own `tmp/` state is never touched.
@@ -17,7 +22,21 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer as createTlsServer } from "node:tls";
 
-import { PGBOUNCER_FILES, pgbouncerHba, renderClientCaBundle } from "@ark-stack/shared";
+import {
+  DB_CLIENT_CONNECTION_LIMITS,
+  NODE_POSTGRES_SNIPPET,
+  PGBOUNCER_FILES,
+  buildProvisionPlan,
+  clientGroupRole,
+  clientRoleName,
+  clientRoleSql,
+  databaseClientGuide,
+  defaultClientRoleKind,
+  pgbouncerHba,
+  renderClientCaBundle,
+  revokedClientRoleSql,
+  terminateRoleSessionsSql,
+} from "@ark-stack/shared";
 import { assertTls12Rejected } from "./pgbouncer-smoke-checks.ts";
 
 import { planPgbouncer, renderPgbouncerFiles, writePgbouncerFiles } from "../server/src/modules/pgbouncer.ts";
@@ -328,6 +347,9 @@ async function probe(args: string[], extraEnv: Record<string, string> = {}) {
     failures?: string[];
     error?: string;
     rows?: Array<Record<string, unknown>>;
+    ids?: string[];
+    killed?: number;
+    remaining?: number;
     environment: { dockerCli: string | null; dockerSocket: boolean; uid: number };
   };
 }
@@ -597,51 +619,54 @@ try {
 
   // ---- Admit two clients through the worker's renderer, then RELOAD over the socket ----------
   const now = new Date();
+  const smokeClients = [
+    {
+      id: "dbc_shop",
+      databaseId: "mdb_smoke",
+      environment: "production",
+      status: "active",
+      caId: "pca_smoke_shop",
+      role: { name: appRole, connectionLimit: 20, password: appPassword },
+    },
+    {
+      id: "dbc_preview",
+      databaseId: "mdb_smoke",
+      environment: "preview",
+      status: "active",
+      caId: "pca_smoke_preview",
+      role: { name: limitedRole, connectionLimit: 5, password: limitedPassword },
+    },
+  ];
+  const smokeCertificates = [
+    {
+      id: "ccert_shop",
+      caId: "pca_smoke_shop",
+      status: "issued",
+      rolloverState: "current",
+      supersededBy: null,
+      notAfter: shop.notAfter,
+    },
+    {
+      id: "ccert_preview",
+      caId: "pca_smoke_preview",
+      status: "issued",
+      rolloverState: "current",
+      supersededBy: null,
+      notAfter: preview.notAfter,
+    },
+  ];
+  const smokeCas = [caShop, caPreview].map((item, index) => ({
+    id: index === 0 ? "pca_smoke_shop" : "pca_smoke_preview",
+    purpose: "db-client",
+    status: "active",
+    certPem: item.certPem,
+    notAfter: item.notAfter,
+  }));
   const plan = planPgbouncer({
     databases: [{ id: "mdb_smoke", name: database, exposure: "public" }],
-    clients: [
-      {
-        id: "dbc_shop",
-        databaseId: "mdb_smoke",
-        environment: "production",
-        status: "active",
-        caId: "pca_smoke_shop",
-        role: { name: appRole, connectionLimit: 20, password: appPassword },
-      },
-      {
-        id: "dbc_preview",
-        databaseId: "mdb_smoke",
-        environment: "preview",
-        status: "active",
-        caId: "pca_smoke_preview",
-        role: { name: limitedRole, connectionLimit: 5, password: limitedPassword },
-      },
-    ],
-    certificates: [
-      {
-        id: "ccert_shop",
-        caId: "pca_smoke_shop",
-        status: "issued",
-        rolloverState: "current",
-        supersededBy: null,
-        notAfter: shop.notAfter,
-      },
-      {
-        id: "ccert_preview",
-        caId: "pca_smoke_preview",
-        status: "issued",
-        rolloverState: "current",
-        supersededBy: null,
-        notAfter: preview.notAfter,
-      },
-    ],
-    cas: [caShop, caPreview].map((item, index) => ({
-      id: index === 0 ? "pca_smoke_shop" : "pca_smoke_preview",
-      purpose: "db-client",
-      status: "active",
-      certPem: item.certPem,
-      notAfter: item.notAfter,
-    })),
+    clients: smokeClients,
+    certificates: smokeCertificates,
+    cas: smokeCas,
     now,
     host: "app-postgres",
     settings: { previewMaxUserClientConnections: limitedClientConnections },
@@ -904,6 +929,408 @@ try {
     "simulated stale certificate (served fingerprint ≠ renewed)",
     `failed after ${stale.attempts} attempts — ${stale.failures?.at(-1)}`,
   );
+
+  // ---- FD-17 database clients: connect, read-only preview, revoke ------------------------------
+  const fdDatabase = "ark_fd17";
+  const provision = buildProvisionPlan({
+    name: fdDatabase,
+    passwords: { owner: secret(), migration: secret(), runtime: secret(), readonly: secret() },
+    withPgvector: false,
+    withTestDatabase: false,
+  });
+  const appSql = (statements: string[], dbname = "postgres", extra: string[] = []) =>
+    run([
+      "docker",
+      "exec",
+      appContainer,
+      "psql",
+      "--username",
+      "ark_cluster_admin",
+      "--dbname",
+      dbname,
+      "--set",
+      "ON_ERROR_STOP=1",
+      ...extra,
+      ...statements.flatMap((statement) => ["--command", statement]),
+    ]);
+  // The database worker's provisioning: owner, migration, runtime and readonly roles and grants.
+  await appSql(provision.statements);
+  await appSql(provision.extensionStatements, fdDatabase);
+  await appSql(
+    [
+      `SET ROLE "${fdDatabase}_migration"`,
+      "CREATE TABLE fd17_items (id serial PRIMARY KEY, value text NOT NULL)",
+      "INSERT INTO fd17_items (value) VALUES ('seed')",
+    ],
+    fdDatabase,
+  );
+  const fdClients = await Promise.all(
+    [
+      { key: "a", id: "dbc_fd17_a", name: "shop", environment: "production" },
+      { key: "b", id: "dbc_fd17_b", name: "shop", environment: "preview" },
+    ].map(async (client) => {
+      const role = clientRoleName(fdDatabase, client.name, client.environment);
+      const roleKind = defaultClientRoleKind(client.environment);
+      const caId = `pca_${client.id}`;
+      const ca = pki.createCaMaterial({
+        id: caId,
+        purpose: "db-client",
+        name: `${client.name}/${client.environment}`,
+      });
+      return {
+        ...client,
+        role,
+        roleKind,
+        caId,
+        ca,
+        password: secret(),
+        issued: await issueClient(ca, role, `fd17-${client.key}`),
+      };
+    }),
+  );
+  const [clientA, clientB] = fdClients as [(typeof fdClients)[0], (typeof fdClients)[0]];
+  if (clientB.roleKind !== "readonly" || clientA.roleKind !== "runtime")
+    throw new Error("Preview must default to readonly and production to runtime (R5).");
+  for (const client of fdClients) {
+    await appSql(
+      clientRoleSql({
+        role: client.role,
+        group: clientGroupRole(fdDatabase, client.roleKind),
+        password: client.password,
+        connectionLimit: DB_CLIENT_CONNECTION_LIMITS[client.roleKind],
+        exists: false,
+      }),
+    );
+  }
+  const fdPlan = (revokedB: boolean) =>
+    planPgbouncer({
+      databases: [
+        { id: "mdb_smoke", name: database, exposure: "public" },
+        { id: "mdb_fd17", name: fdDatabase, exposure: "public" },
+      ],
+      clients: [
+        ...smokeClients,
+        ...fdClients.map((client) => {
+          const revoked = revokedB && client === clientB;
+          return {
+            id: client.id,
+            databaseId: "mdb_fd17",
+            environment: client.environment,
+            status: revoked ? "revoked" : "active",
+            caId: client.caId,
+            role: {
+              name: client.role,
+              connectionLimit: DB_CLIENT_CONNECTION_LIMITS[client.roleKind],
+              password: revoked ? null : client.password,
+            },
+          };
+        }),
+      ],
+      certificates: [
+        ...smokeCertificates,
+        ...fdClients.map((client) => ({
+          id: `ccert_${client.id}`,
+          caId: client.caId,
+          status: revokedB && client === clientB ? "revoked" : "issued",
+          rolloverState: "current",
+          supersededBy: null,
+          notAfter: client.issued.notAfter,
+        })),
+      ],
+      cas: [
+        ...smokeCas,
+        ...fdClients.map((client) => ({
+          id: client.caId,
+          purpose: "db-client",
+          status: revokedB && client === clientB ? "revoked" : "active",
+          certPem: client.ca.certPem,
+          notAfter: client.ca.notAfter,
+        })),
+      ],
+      now: new Date(),
+      host: "app-postgres",
+      settings: { previewMaxUserClientConnections: limitedClientConnections },
+    });
+  const applyPlan = async (next: ReturnType<typeof planPgbouncer>) => {
+    const rendered = renderPgbouncerFiles({
+      plan: next,
+      adminPassword,
+      certificateDir: "/var/lib/ark/certs/database",
+    });
+    await asHost(() => writePgbouncerFiles(pgbouncerDir, rendered));
+    const reloaded = await probe(["reload"]);
+    if (!reloaded.ok) throw new Error(`RELOAD failed: ${reloaded.error}`);
+    return rendered;
+  };
+  const admitted = fdPlan(false);
+  for (const client of fdClients) {
+    if (
+      !admitted.users.some((user) => user.name === client.role) ||
+      !admitted.caBundle.includes(client.ca.certPem.trim())
+    )
+      throw new Error(`${client.role} was not admitted with its CA generation.`);
+  }
+  await applyPlan(admitted);
+
+  // Bundle Ark's §3.12 module, unmodified, with the real pg and @vercel/functions packages. It
+  // is generated under the repository's ignored tmp/ so the packages resolve from node_modules.
+  const appDir = join(root, "tmp", `fd17-vercel-${suffix}`);
+  await mkdir(join(appDir, "lib"), { recursive: true });
+  await Bun.write(join(appDir, "lib", "db.ts"), NODE_POSTGRES_SNIPPET);
+  try {
+    await asHost(async () => {
+      for (const entry of [
+        join(appDir, "lib", "db.ts"),
+        join(import.meta.dir, "pgbouncer-vercel-probe.ts"),
+      ]) {
+        const output = await Bun.build({
+          entrypoints: [entry],
+          target: "bun",
+          outdir: join(probeDir, "vercel"),
+          external: ["pg-native"],
+        });
+        if (!output.success) throw new Error(`Could not bundle ${entry}:\n${output.logs.join("\n")}`);
+      }
+      await Bun.write(join(probeDir, "server-ca.pem"), await Bun.file(serverCa).text());
+    });
+  } finally {
+    await rm(appDir, { recursive: true, force: true });
+  }
+
+  type FdClient = (typeof fdClients)[number];
+  /** The probe's env is exactly the client's one-time reveal (`vercel.env`), host aside. */
+  const revealedEnv = (client: FdClient) =>
+    Object.fromEntries(
+      databaseClientGuide({
+        host: "pgbouncer-public",
+        database: fdDatabase,
+        role: client.role,
+        environment: client.environment,
+        roleKind: client.roleKind,
+        region: "us-east",
+        secrets: { password: client.password, certPem: client.issued.certPem, keyPem: client.issued.keyPem },
+      }).env.map((item) => [item.name, item.value]),
+    );
+  const vercelCommand = (client: FdClient, mode: string, detach?: string) => {
+    const values = revealedEnv(client);
+    return {
+      values,
+      command: [
+        "docker",
+        "run",
+        ...(detach ? ["--detach", "--name", detach] : ["--rm"]),
+        "--user",
+        arkUid,
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--network",
+        network,
+        "--volume",
+        `${probeDir}:/probe:ro`,
+        ...Object.keys(values).flatMap((name) => ["--env", name]),
+        // Stands in for the publicly trusted certificate production serves (§3.12 needs no CA).
+        "--env",
+        "NODE_EXTRA_CA_CERTS=/probe/server-ca.pem",
+        bunImage,
+        "bun",
+        "/probe/vercel/pgbouncer-vercel-probe.js",
+        mode,
+      ],
+    };
+  };
+  const vercelProbe = async (client: FdClient, mode: string) => {
+    const { values, command } = vercelCommand(client, mode);
+    const result = await run(command, { allowFailure: true, env: values });
+    const line = result.stdout.split("\n").findLast((item) => item.startsWith("{"));
+    if (!line) throw new Error(`Vercel probe printed no result:\n${result.stderr || result.stdout}`);
+    return JSON.parse(line) as Record<string, unknown> & {
+      ok: boolean;
+      error?: string;
+      code?: string;
+    };
+  };
+  type Outcome = { ok: boolean; code?: string | null; error?: string; user?: string };
+
+  for (const client of fdClients) {
+    const connected = await vercelProbe(client, "connect");
+    if (!connected.ok || connected.user !== client.role || connected.tls !== "TLSv1.3" || !connected.attached)
+      throw new Error(
+        `The §3.12 node-postgres module did not connect as ${client.role}: ${JSON.stringify(connected)}`,
+      );
+    record(
+      `FD-17 connect: §3.12 node-postgres Pool + attachDatabasePool with the revealed env (${client.environment})`,
+      `connected as ${connected.user} to ${connected.database} over ${connected.tls}; attachDatabasePool attached`,
+    );
+  }
+  const writesA = (await vercelProbe(clientA, "write")) as unknown as Record<string, Outcome>;
+  for (const action of ["select", "insert", "update", "delete"]) {
+    if (!writesA[action]?.ok)
+      throw new Error(`Production ${action} failed: ${JSON.stringify(writesA[action])}`);
+  }
+  record(
+    `FD-17 production client (${clientA.role}, IN ROLE ${fdDatabase}_runtime)`,
+    "SELECT, INSERT, UPDATE and DELETE succeed",
+  );
+  const writesB = (await vercelProbe(clientB, "write")) as unknown as Record<string, Outcome>;
+  if (!writesB.select?.ok) throw new Error(`Preview SELECT failed: ${JSON.stringify(writesB.select)}`);
+  for (const action of ["insert", "update", "delete"]) {
+    const outcome = writesB[action];
+    if (outcome?.ok || outcome?.code !== "42501" || !/permission denied/.test(outcome.error ?? ""))
+      throw new Error(`Preview ${action} was not refused: ${JSON.stringify(outcome)}`);
+  }
+  record(
+    `FD-17 preview client (${clientB.role}, IN ROLE ${fdDatabase}_readonly)`,
+    `SELECT succeeds; INSERT, UPDATE and DELETE refused — ${writesB.insert!.code} ${writesB.insert!.error}`,
+  );
+
+  // Revocation with live sessions: hold one session per client across the revoke.
+  const verifiers = async () => {
+    const rows = await appSql(
+      [
+        `SELECT rolname || '|' || rolcanlogin || '|' || rolpassword FROM pg_authid WHERE rolname IN ('${clientA.role}', '${clientB.role}') ORDER BY rolname`,
+      ],
+      "postgres",
+      ["--tuples-only", "--no-align"],
+    );
+    return new Map(
+      rows.stdout.split("\n").map((line) => {
+        const [name, login, scram] = line.split("|");
+        return [name!, { login: login === "true", verifier: scram! }] as const;
+      }),
+    );
+  };
+  const holders = fdClients.map((client) => ({ client, name: `${project}-hold-${client.key}` }));
+  try {
+    for (const holder of holders) {
+      const { values, command } = vercelCommand(holder.client, "hold", holder.name);
+      await run(command, { env: values });
+    }
+    const deadline = Date.now() + 30_000;
+    for (const holder of holders) {
+      for (;;) {
+        const logs = await run(["docker", "logs", holder.name], { allowFailure: true });
+        if (logs.stdout.includes('"ready":true')) break;
+        if (Date.now() > deadline)
+          throw new Error(`${holder.name} never held a session:\n${logs.stdout}${logs.stderr}`);
+        await Bun.sleep(250);
+      }
+    }
+    const sessionsBefore = {
+      a: (await probe(["clients", clientA.role])).ids ?? [],
+      b: (await probe(["clients", clientB.role])).ids ?? [],
+    };
+    if (!sessionsBefore.a?.length || !sessionsBefore.b?.length)
+      throw new Error(`Held sessions are not visible in SHOW CLIENTS: ${JSON.stringify(sessionsBefore)}`);
+    const rolesBefore = await verifiers();
+
+    // database.client_revoke, in the worker's order (§3.10.4):
+    // 1. B, its certificate and its CA generation revoked: the bundle drops B's CA.
+    const reduced = fdPlan(true);
+    if (
+      reduced.caBundle.includes(clientB.ca.certPem.trim()) ||
+      !reduced.caBundle.includes(clientA.ca.certPem.trim())
+    )
+      throw new Error("The reduced bundle must drop exactly B's CA generation.");
+    if (reduced.users.some((user) => user.name === clientB.role)) throw new Error("B is still in [users].");
+    // 2. Rotate B's password to one nobody sees, NOLOGIN, and end its cluster backends.
+    await appSql([...revokedClientRoleSql(clientB.role, secret()), terminateRoleSessionsSql(clientB.role)]);
+    // 3. Userlist and CA bundle written atomically, then RELOAD over the admin socket.
+    await applyPlan(reduced);
+    const survivedReload = (await probe(["clients", clientB.role])).ids ?? [];
+    // 4. KILL_CLIENT every session of B's role.
+    const killed = await probe(["kill", clientB.role]);
+    if (!killed.ok) throw new Error(`KILL_CLIENT failed: ${killed.error}`);
+    const sessionsAfter = {
+      a: (await probe(["clients", clientA.role])).ids ?? [],
+      b: (await probe(["clients", clientB.role])).ids ?? [],
+    };
+
+    for (const holder of holders)
+      await run(["docker", "kill", "--signal", "USR1", holder.name], { allowFailure: true });
+    const held: Record<string, { existing: Outcome; ended: boolean; errors: string[] }> = {};
+    for (const holder of holders) {
+      await run(["docker", "wait", holder.name]);
+      const logs = await run(["docker", "logs", holder.name]);
+      const line = logs.stdout.split("\n").findLast((item) => item.includes('"done":true'));
+      if (!line) throw new Error(`${holder.name} reported nothing:\n${logs.stdout}${logs.stderr}`);
+      held[holder.client.key] = JSON.parse(line);
+    }
+    const rolesAfter = await verifiers();
+
+    if (!survivedReload.length)
+      throw new Error("B's session should survive the RELOAD (V-8); KILL_CLIENT must be what closes it.");
+    if ((killed.killed ?? 0) < 1 || sessionsAfter.b.length)
+      throw new Error(`B's sessions were not killed: ${JSON.stringify({ killed, sessionsAfter })}`);
+    if (held.b?.existing.ok) throw new Error("B's held session still answers after revocation.");
+    record(
+      "FD-17 revoke B: existing session",
+      `${survivedReload.length} session(s) survived the RELOAD as expected, KILL_CLIENT closed ${killed.killed ?? 0}; the held node-postgres client then fails — ${held.b?.existing.error ?? held.b?.errors.at(-1)}`,
+    );
+    expectRejected(
+      await hostPsql({
+        role: clientB.role,
+        password: clientB.password,
+        dbname: fdDatabase,
+        client: clientB.issued,
+        sql: "SELECT 1",
+      }),
+      /unknown ca/,
+      "FD-17 revoke B: new connection (psql, B's certificate)",
+    );
+    // In TLS 1.3 the server checks the client certificate after the client's handshake is done,
+    // so node-postgres sees the connection closed rather than the alert name. Tie the failure to
+    // PgBouncer's own certificate-verification failure for exactly this attempt.
+    const verifyFailures = async () => {
+      const logs = await run(["docker", "logs", bouncer], { allowFailure: true });
+      return (`${logs.stdout}\n${logs.stderr}`.match(/certificate verify failed/g) ?? []).length;
+    };
+    const failuresBefore = await verifyFailures();
+    const newB = await vercelProbe(clientB, "connect");
+    const failuresAfter = await verifyFailures();
+    if (newB.ok || /SASL|password/i.test(newB.error ?? "") || failuresAfter <= failuresBefore)
+      throw new Error(
+        `B's new connection should fail at TLS certificate verification: ${JSON.stringify({ newB, failuresBefore, failuresAfter })}`,
+      );
+    record(
+      "FD-17 revoke B: new connection (§3.12 node-postgres module)",
+      `rejected at TLS — client: ${newB.error}; PgBouncer: certificate verify failed (+${failuresAfter - failuresBefore})`,
+    );
+    if (
+      !rolesBefore.get(clientB.role)?.login ||
+      rolesBefore.get(clientB.role)?.verifier === rolesAfter.get(clientB.role)?.verifier ||
+      rolesAfter.get(clientB.role)?.login
+    )
+      throw new Error("B's password was not rotated with NOLOGIN.");
+    record(
+      "FD-17 revoke B: password",
+      `SCRAM verifier changed (${rolesBefore.get(clientB.role)!.verifier.slice(0, 28)}… → ${rolesAfter.get(clientB.role)!.verifier.slice(0, 28)}…), rolcanlogin=false`,
+    );
+    if (
+      !held.a?.existing.ok ||
+      held.a.ended ||
+      JSON.stringify(sessionsAfter.a) !== JSON.stringify(sessionsBefore.a)
+    )
+      throw new Error(
+        `A's session was disturbed: ${JSON.stringify({ held: held.a, sessionsBefore, sessionsAfter })}`,
+      );
+    if (
+      rolesBefore.get(clientA.role)?.verifier !== rolesAfter.get(clientA.role)?.verifier ||
+      !rolesAfter.get(clientA.role)?.login
+    )
+      throw new Error(
+        `A's password or login changed: ${JSON.stringify({ before: rolesBefore.get(clientA.role), after: rolesAfter.get(clientA.role) })}`,
+      );
+    const newA = await vercelProbe(clientA, "connect");
+    if (!newA.ok || newA.user !== clientA.role)
+      throw new Error(`A's new connection failed: ${JSON.stringify(newA)}`);
+    record(
+      "FD-17 revoke B: client A unaffected",
+      `held session alive (same console id ${sessionsBefore.a.join(",")}, query ok as ${held.a.existing.user ?? clientA.role}), SCRAM verifier unchanged, new connection ok over ${newA.tls}`,
+    );
+  } finally {
+    for (const holder of holders) await run(["docker", "rm", "--force", holder.name], { allowFailure: true });
+  }
 
   const health = await inspect(bouncer, "{{.State.Health.Status}} restarts={{.RestartCount}}");
   if (!health.startsWith("healthy restarts=0")) throw new Error(`pgbouncer-public degraded: ${health}`);
