@@ -202,3 +202,61 @@ describe("edge plan", () => {
     expect(renderCaddyfile({ ...base, ...plan })).not.toContain("admin.example.com");
   });
 });
+
+describe("tailnet routes (front door §3.2, FD-06)", () => {
+  const route = { id: "rt_k3x9", hostname: "www.example.com", ip: "100.101.102.103", port: 3000 };
+  const v6 = { id: "rt_v6", hostname: "v6.example.com", ip: "fd7a:115c:a1e0::103", port: 8080 };
+  const certificates = [certificate("www.example.com", "issued"), certificate("v6.example.com", "issued")];
+
+  test("renders an allowed route with its pinned address and a marker, and redirects it on :80", () => {
+    const caddyfile = renderCaddyfile({
+      ...base,
+      adminMode: "tailnet",
+      certificates,
+      tailnetRoutes: [route, v6],
+    });
+    expect(caddyfile).toContain("# ark-tailnet-route rt_k3x9 100.101.102.103:3000\nwww.example.com {");
+    expect(sites(caddyfile).get("www.example.com")).toContain("reverse_proxy 100.101.102.103:3000");
+    expect(sites(caddyfile).get("v6.example.com")).toContain("reverse_proxy [fd7a:115c:a1e0::103]:8080");
+    expect(sites(caddyfile).get(":80")).toContain("@known host www.example.com v6.example.com");
+    expect(caddyfile).toContain("grace_period 5s");
+  });
+
+  test("the closed variant renders no tailnet route at all", () => {
+    const closed = renderCaddyfile({ ...base, adminMode: "tailnet", certificates });
+    expect(closed).not.toContain("ark-tailnet-route");
+    expect(closed).not.toContain("100.101.102.103");
+    expect([...sites(closed).keys()]).toEqual([":80"]);
+  });
+
+  test("a route without an issued certificate is not rendered", () => {
+    const caddyfile = renderCaddyfile({
+      ...base,
+      adminMode: "tailnet",
+      certificates: [],
+      tailnetRoutes: [route],
+    });
+    expect(caddyfile).not.toContain("100.101.102.103");
+  });
+
+  test("refuses non-tailnet, reserved or non-canonical targets and bad ids", () => {
+    for (const bad of [
+      { ...route, ip: "172.17.0.2" },
+      { ...route, ip: "100.100.100.100" },
+      { ...route, ip: "fd7a:115c:a1e0:0::103" },
+      { ...route, ip: "100.101.102.103:3000" },
+      { ...route, port: 0 },
+      { ...route, id: "rt_K3X9\nreverse_proxy 10.0.0.1:80" },
+    ]) {
+      expect(() =>
+        renderCaddyfile({ ...base, adminMode: "tailnet", certificates, tailnetRoutes: [bad] }),
+      ).toThrow();
+    }
+  });
+
+  test("planEdge waits for the route's certificate", () => {
+    const plan = planEdge({ adminMode: "tailnet", endpoints: [], certificates: [], tailnetRoutes: [route] });
+    expect(plan.tailnetRoutes).toEqual([route]);
+    expect(plan.awaitingCertificate).toEqual(["www.example.com"]);
+  });
+});

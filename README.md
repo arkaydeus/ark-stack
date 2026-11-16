@@ -45,7 +45,7 @@ Useful commands:
 
 ## Publishing images
 
-`mise run images:publish` builds all seven Bake targets for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing.
+`mise run images:publish` builds all eight Bake targets for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing.
 
 Set both `GHCR_TOKEN` and `GHCR_USER` to use an explicit token without a GitHub CLI login. Otherwise, log in with `gh` and grant its token package access using `gh auth refresh -h github.com -s write:packages`. Login and push use a temporary Docker configuration, removed on success or failure; the existing Docker context and Buildx builder are preserved.
 

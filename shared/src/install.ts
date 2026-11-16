@@ -15,6 +15,7 @@ export const installEnvKeys = [
   "ARK_METRICS_TOKEN",
   "ARK_OFFHOST_HEARTBEAT_TOKEN",
   "ARK_EDGE_GATE_TOKEN",
+  "ARK_EDGE_WATCHDOG_TOKEN",
   "ARK_CONTROL_DB_PASSWORD",
   "ARK_APP_DB_PASSWORD",
   "ARK_API_DB_PASSWORD",
@@ -35,6 +36,7 @@ export const placeholderSecretValues = new Set([
   "dev-metrics-token",
   "dev-offhost-heartbeat-token",
   "dev-edge-gate-token",
+  "dev-edge-watchdog-token",
 ]);
 
 const insecureDefaultPaths: Record<string, string[]> = {
@@ -62,6 +64,8 @@ export function generateInstallSecrets() {
     ARK_OFFHOST_HEARTBEAT_TOKEN: randomBytes(24).toString("base64url"),
     // Shared by `edge` and `api` to authenticate gate calls (docs/design/front-door.md §3.9, FD-11).
     ARK_EDGE_GATE_TOKEN: randomBytes(32).toString("base64url"),
+    // The edge watchdog's read-only lease credential (docs/design/front-door.md §3.2, FD-06).
+    ARK_EDGE_WATCHDOG_TOKEN: randomBytes(32).toString("base64url"),
     ARK_CONTROL_DB_PASSWORD: controlPassword,
     ARK_APP_DB_PASSWORD: appPassword,
     ARK_API_DB_PASSWORD: apiPassword,
@@ -167,6 +171,9 @@ export function assertNoPlaceholderSecrets(env: Record<string, string | undefine
     // FD-11 will pass the gate token into the API. Older deployments do not consume it yet;
     // refuse a published value when supplied without requiring it in those deployments.
     if (key === "ARK_EDGE_GATE_TOKEN" && env[key] === undefined) continue;
+    // Optional for the API: without it the watchdog cannot read the lease and tailnet routes stay
+    // withdrawn. A published placeholder is still refused.
+    if (key === "ARK_EDGE_WATCHDOG_TOKEN" && !env[key]) continue;
     const value = env[key] ?? "";
     if (!value || isPlaceholderValue(key, value)) {
       throw new Error(

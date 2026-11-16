@@ -8,6 +8,7 @@ export const imageTargets = [
   "database-ingress",
   "database-worker",
   "domain-worker",
+  "edge-watchdog",
   "mail-worker",
 ];
 export const imageSource = "https://github.com/arkaydeus/ark-stack";

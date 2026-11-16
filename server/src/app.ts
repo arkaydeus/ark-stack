@@ -78,6 +78,7 @@ import {
 import {
   assertExecutionAuthorized,
   claimQueued,
+  EDGE_WITHDRAWAL_ALERT,
   enqueue,
   finalizeAgentCompletion,
   heartbeatClaim,
@@ -87,6 +88,8 @@ import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
 import { frontAclSnippet } from "./modules/front-acl.ts";
+import { EDGE_OBSERVE_TARGET, edgePolicy, tailnetOverview } from "./modules/edge-observe.ts";
+import { raiseAlert } from "./modules/alerts.ts";
 import { cancelWorkspaceQuery } from "./modules/database.ts";
 import { writeApprovedCompose } from "./modules/docker.ts";
 import { dbIngressCountersFile } from "./modules/providers.ts";
@@ -316,9 +319,52 @@ app.use("/api/internal/*", async (c, next) => {
     }
   }
   if (!identity && secureEqual(supplied, `Bearer ${env.internalToken}`)) identity = "module";
+  // The edge-local lease watchdog (front door §3.2, FD-06) reads the lease and reports withdrawal
+  // events; it may not heartbeat, claim or complete operations.
+  const watchdogToken = process.env.ARK_EDGE_WATCHDOG_TOKEN?.trim() ?? "";
+  if (!identity && watchdogToken && secureEqual(supplied, `Bearer ${watchdogToken}`)) {
+    identity = "edge-watchdog";
+  }
   if (!identity) throw new HTTPException(401, { message: "Invalid worker credential." });
+  if (identity === "edge-watchdog" && !c.req.path.startsWith("/api/internal/edge/")) {
+    throw new HTTPException(403, { message: "The edge watchdog may only read the edge lease." });
+  }
+  if (identity !== "edge-watchdog" && c.req.path.startsWith("/api/internal/edge/")) {
+    throw new HTTPException(403, { message: "Only the edge watchdog reads the edge lease." });
+  }
   c.set("worker", identity);
   await next();
+});
+
+// Read-only lease and policy for the edge-local watchdog and launch guard (front door §3.2): the
+// latest generation's lease and the tailnet backends the proxies may dial right now. Polled every
+// second, independently of the operation workers.
+app.get("/api/internal/edge/lease", async (c) => {
+  c.header("cache-control", "no-store");
+  return c.json(await edgePolicy());
+});
+
+app.post("/api/internal/edge/watchdog-event", async (c) => {
+  const body = z
+    .object({
+      event: z.enum(["withdrawn", "withdrawal_failed", "proxy_stopped", "stop_failed", "policy_unavailable"]),
+      proxy: z.string().max(40).optional(),
+      detail: z.string().max(1000),
+    })
+    .parse(await c.req.json());
+  const detail = String(redactLogLine(body.detail)).slice(0, 500);
+  await audit(undefined, `edge.watchdog.${body.event}`, "edge", body.proxy ?? "edge", { detail });
+  if (body.event !== "withdrawn") {
+    await raiseAlert({
+      severity: "critical",
+      title:
+        body.event === "proxy_stopped"
+          ? `Edge watchdog stopped ${body.proxy ?? "a proxy"} after a failed route withdrawal`
+          : `Edge watchdog: ${body.event.replaceAll("_", " ")} (${body.proxy ?? "edge"}): ${detail}`,
+      dedupKey: EDGE_WITHDRAWAL_ALERT,
+    });
+  }
+  return c.json({ ok: true });
 });
 
 app.post("/api/internal/heartbeat", async (c) => {
@@ -2469,6 +2515,23 @@ app.put("/api/settings/db-ingress", async (c) => {
 app.get("/api/front/acl", async (c) => {
   requireOwner(c.get("access"));
   return c.json(await frontAclSnippet({ kind: "global" }));
+});
+
+// Edge node's view of the tailnet (front door §3.3, FD-06): latest complete generation, lease and
+// every route's identity state. Owner-only, like the rest of route management.
+app.get("/api/front/tailnet", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(await tailnetOverview());
+});
+
+app.post("/api/front/tailnet/observe", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  // Read-only, with no exposure effect; a queued or running observation is reused.
+  const operation = await enqueue({ kind: "edge.observe", targetIds: [EDGE_OBSERVE_TARGET] });
+  await audit(access.userId, "front.tailnet.observe", "tailnet", "edge", {}, operation?.id, access.role);
+  return c.json({ operation }, 202);
 });
 
 app.get("/api/front/routes/:id/acl", async (c) => {

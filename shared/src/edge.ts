@@ -1,6 +1,8 @@
 import type { AdminMode } from "./dns-plan.ts";
 import { ValidationError } from "./errors.ts";
 import { normalizeHostname } from "./hostnames.ts";
+import { checkTailnetAddress, parseIpLiteral } from "./tailnet.ts";
+import { backendKey } from "./tailnet-observe.ts";
 
 /** Where the `edge` container mounts Ark's lego certificates (read-only), one directory per hostname. */
 export const EDGE_CERT_DIR = "/var/lib/ark/certs";
@@ -25,6 +27,16 @@ export type EdgeCertificate = {
  */
 export type EdgeAppRoute = { hostname: string; upstream?: string };
 
+/**
+ * A front-door HTTP route to a tailnet backend (docs/design/front-door.md §3.2, FD-06). Only routes
+ * that are enabled, `ready` and allowed by a fresh lease are passed in; the pinned IP is the only
+ * part of the target ever rendered. FD-09 adds the gate, header policy and per-route options.
+ */
+export type EdgeTailnetRoute = { id: string; hostname: string; ip: string; port: number };
+
+/** Marks a tailnet route's site so the launch guard and audits can find it in the Caddyfile. */
+export const TAILNET_ROUTE_MARKER = "# ark-tailnet-route";
+
 const UNROUTED_BODY = "This hostname is not routed yet.";
 const PATH = /^\/[A-Za-z0-9._/-]+$/;
 const UPSTREAM = /^[A-Za-z0-9.-]+:\d{1,5}$/;
@@ -34,6 +46,22 @@ function checkedHostname(hostname: string) {
     throw new ValidationError(`Edge hostname ${JSON.stringify(hostname)} is not normalized.`);
   }
   return hostname;
+}
+
+const ROUTE_ID = /^rt_[a-z0-9]+$/;
+
+function checkedTailnetRoute(route: EdgeTailnetRoute) {
+  const ip = parseIpLiteral(route.ip);
+  if (!ip || checkTailnetAddress(ip) || ip.canonical !== route.ip) {
+    throw new ValidationError(
+      `Tailnet route target ${JSON.stringify(route.ip)} is not a canonical Tailscale address.`,
+    );
+  }
+  if (!Number.isInteger(route.port) || route.port < 1 || route.port > 65535) {
+    throw new ValidationError(`Tailnet route port ${JSON.stringify(route.port)} is invalid.`);
+  }
+  if (!ROUTE_ID.test(route.id)) throw new ValidationError(`Route id ${JSON.stringify(route.id)} is invalid.`);
+  return { ...route, upstream: backendKey(ip.canonical, route.port) };
 }
 
 function checkedPath(path: string) {
@@ -88,12 +116,19 @@ export function planEdge(input: {
   endpoints: Array<{ id: string; kind: string; hostname: string; exposure: string }>;
   certificates: Array<{ endpointId: string; status: string; lastDeployedAt: Date | null }>;
   certDir?: string;
+  /** Tailnet HTTP routes allowed by the current lease (§3.2); every other route is omitted. */
+  tailnetRoutes?: EdgeTailnetRoute[];
 }) {
   const appRoutes: EdgeAppRoute[] = input.endpoints
     .filter((item) => item.kind === "http" && item.exposure === "public")
     .map((item) => ({ hostname: item.hostname }));
+  const tailnetRoutes = (input.tailnetRoutes ?? []).toSorted((a, b) => a.hostname.localeCompare(b.hostname));
   const adminHostname = input.adminMode === "public" ? (input.adminHostname ?? undefined) : undefined;
-  const wanted = new Set([...(adminHostname ? [adminHostname] : []), ...appRoutes.map((r) => r.hostname)]);
+  const wanted = new Set([
+    ...(adminHostname ? [adminHostname] : []),
+    ...appRoutes.map((r) => r.hostname),
+    ...tailnetRoutes.map((r) => r.hostname),
+  ]);
   const certificates = currentEdgeCertificates(input).filter((item) => wanted.has(item.hostname));
   const issued = new Set(
     certificates.filter((item) => item.status === "issued").map((item) => item.hostname),
@@ -103,6 +138,7 @@ export function planEdge(input: {
     adminHostname,
     certificates,
     appRoutes,
+    tailnetRoutes,
     awaitingCertificate: [...wanted].filter((hostname) => !issued.has(hostname)).toSorted(),
   };
 }
@@ -113,6 +149,10 @@ export function planEdge(input: {
  * site at all, and Caddy's own certificate automation and redirects are off (`auto_https off`).
  * The `:80` block serves ACME HTTP-01 challenges, redirects served hostnames to HTTPS with 308 and
  * answers 404 for every other host.
+ *
+ * Tailnet routes are preceded by a `# ark-tailnet-route <id> <ip:port>` marker. Rendering with
+ * `tailnetRoutes` omitted gives the closed variant the Caddy launch guard starts from when the lease
+ * is not valid (§3.2).
  */
 export function renderCaddyfile(input: {
   adminMode: AdminMode;
@@ -121,6 +161,7 @@ export function renderCaddyfile(input: {
   apiUpstream: string;
   certificates?: EdgeCertificate[];
   appRoutes?: EdgeAppRoute[];
+  tailnetRoutes?: EdgeTailnetRoute[];
 }) {
   const issued = new Map<string, EdgeCertificate>();
   const seen = new Set<string>();
@@ -133,11 +174,11 @@ export function renderCaddyfile(input: {
     if (certificate.status === "issued") issued.set(hostname, certificate);
   }
   const served: string[] = [];
-  const site = (hostname: string, body: string) => {
+  const site = (hostname: string, body: string, marker = "") => {
     const certificate = issued.get(checkedHostname(hostname));
     if (!certificate || served.includes(hostname)) return "";
     served.push(hostname);
-    return `${hostname} {
+    return `${marker}${hostname} {
   ${tlsLine(certificate)}
 ${body}}
 `;
@@ -180,6 +221,20 @@ ${body}}
     })
     .filter(Boolean)
     .join("\n");
+  const tailnet = (input.tailnetRoutes ?? [])
+    .map(checkedTailnetRoute)
+    .map((route) =>
+      site(
+        route.hostname,
+        `  reverse_proxy ${route.upstream}
+`,
+        `${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
+`,
+      ),
+    )
+    .filter(Boolean)
+    .join("\n");
+  const sites = [admin, routes, tailnet].filter(Boolean).join("\n");
   const known = served.length
     ? `  @known host ${served.join(" ")}
   handle @known {
@@ -192,6 +247,9 @@ ${body}}
   # Ark issues every certificate with lego and loads it per site with \`tls\`. Caddy must never
   # obtain certificates itself, and the :80 block below owns the HTTP-to-HTTPS redirects.
   auto_https off
+  # A reload (route withdrawal included) gives in-flight requests on the old server 5 s, so a
+  # withdrawn route stops serving promptly (docs/design/front-door.md §3.2).
+  grace_period 5s
 }
 
 :80 {
@@ -205,7 +263,7 @@ ${known}  handle {
   }
 }
 
-${admin}${admin && routes ? "\n" : ""}${routes}`;
+${sites}`;
 }
 
 export function renderTailscaleServe(upstream = "http://127.0.0.1:8080") {
