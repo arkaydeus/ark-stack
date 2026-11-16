@@ -95,7 +95,9 @@ export function planEdge(input: {
   const adminHostname = input.adminMode === "public" ? (input.adminHostname ?? undefined) : undefined;
   const wanted = new Set([...(adminHostname ? [adminHostname] : []), ...appRoutes.map((r) => r.hostname)]);
   const certificates = currentEdgeCertificates(input).filter((item) => wanted.has(item.hostname));
-  const issued = new Set(certificates.filter((item) => item.status === "issued").map((item) => item.hostname));
+  const issued = new Set(
+    certificates.filter((item) => item.status === "issued").map((item) => item.hostname),
+  );
   return {
     adminMode: input.adminMode,
     adminHostname,

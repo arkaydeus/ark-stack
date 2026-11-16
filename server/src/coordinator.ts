@@ -1261,12 +1261,16 @@ async function changeMode(operation: OperationRow) {
         : null
       : (process.env.ARK_TAILNET_AUTH_ORIGIN ?? null);
   if (!destinationOrigin) throw new Error("The destination administration origin is not configured.");
+  const plan = await edgePlan(adminMode, settings?.adminHostname);
+  if (adminMode === "public" && plan.adminHostname && plan.awaitingCertificate.includes(plan.adminHostname)) {
+    throw new Error(`The admin certificate for ${plan.adminHostname} is not issued yet.`);
+  }
   if (new URL(destinationOrigin).origin !== new URL(env.authUrl).origin) {
     throw new Error(
       `Better Auth is configured for ${env.authUrl}; restart with BETTER_AUTH_URL=${destinationOrigin} before switching ingress.`,
     );
   }
-  const edge = await writeEdge(await edgePlan(adminMode, settings?.adminHostname));
+  const edge = await writeEdge(plan);
   await db
     .update(platformSettings)
     .set({ adminMode, authOrigin: destinationOrigin, updatedAt: new Date() })

@@ -164,6 +164,7 @@ services:
       ARK_EDGE_RELOAD_URL: http://edge-admin:2019
       ARK_LEGO_BIN: /usr/local/bin/lego
       ARK_ACME_EMAIL: ${ARK_ACME_EMAIL:-}
+      ARK_ACME_STAGING: ${ARK_ACME_STAGING:-1}
       DNS_API_TOKEN: ${DNS_API_TOKEN:-}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
     volumes:

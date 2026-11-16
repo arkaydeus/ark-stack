@@ -5,7 +5,7 @@
 // certificate reloads through the real `writeEdge`).
 // The bump procedure for the pinned images is in docs/operating.md ("Third-party image pins").
 import { X509Certificate, randomBytes } from "node:crypto";
-import { copyFile, mkdir, mkdtemp } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
@@ -27,8 +27,8 @@ const idleSeconds = 80;
 
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-${suffix}-`));
-// Ark writes certificates and the Caddyfile as the uid the edge runs as (1000 in production).
-const user = `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`;
+// Match the production worker and edge identity, independent of the host uid.
+const productionUser = "1000:1000";
 const network = `ark-edge-${suffix}`;
 const runtime = new EdgeTestRuntime(directory, network);
 const containers = runtime.containers;
@@ -98,6 +98,7 @@ const fixtureCerts = {
 };
 
 async function generateFixtureCertificates() {
+  await chmod(directory, 0o755);
   const hostnames = [...issuedHostnames, ...Object.keys(unissued)];
   const script = [
     "set -e",
@@ -106,12 +107,13 @@ async function generateFixtureCertificates() {
     '  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj "/CN=$host" -addext "subjectAltName=DNS:$host" -keyout "/out/$name/privkey.pem" -out "/out/$name/fullchain.pem" 2>/dev/null',
     '  chmod 600 "/out/$name/privkey.pem"',
     "done",
+    "chown -R 1000:1000 /out/certs /out/renewed",
   ].join("\n");
   await docker(
     "run",
     "--rm",
     "--user",
-    user,
+    "0:0",
     "--env",
     "HOME=/tmp",
     "--volume",
@@ -201,7 +203,9 @@ async function validateConfigurations() {
     certificates,
     appRoutes: [{ hostname: "example.com" }, { hostname: "www.example.com", upstream: "app:8080" }],
   });
-  const tlsSites = appConfig.match(/^ {2}tls \/var\/lib\/ark\/certs\/\S+\/fullchain\.pem \S+\/privkey\.pem$/gm);
+  const tlsSites = appConfig.match(
+    /^ {2}tls \/var\/lib\/ark\/certs\/\S+\/fullchain\.pem \S+\/privkey\.pem$/gm,
+  );
   if (tlsSites?.length !== 3) {
     throw new Error(`Generated app-route config should load 3 Ark certificates, found ${tlsSites?.length}.`);
   }
@@ -609,6 +613,19 @@ async function startProductionEdge(): Promise<Edge> {
   await mkdir(join(acme, ".well-known", "acme-challenge"), { recursive: true });
   await mkdir(edgeDir);
   await Bun.write(join(acme, ".well-known", "acme-challenge", "fixture-token"), "fixture-token.key-auth");
+  // The worker writes this directory as uid 1000 in production too.
+  await docker(
+    "run",
+    "--rm",
+    "--user",
+    "0:0",
+    "--volume",
+    `${edgeDir}:/edge`,
+    bunImage,
+    "chown",
+    "1000:1000",
+    "/edge",
+  );
   const name = `ark-edge-production-${suffix}`;
   containers.push(name);
   await docker(
@@ -621,7 +638,7 @@ async function startProductionEdge(): Promise<Edge> {
     "--network-alias",
     "edge-admin",
     "--user",
-    user,
+    productionUser,
     "--cap-drop",
     "ALL",
     "--security-opt",
@@ -676,7 +693,7 @@ async function edgeApply(edge: Edge, mode: "write" | "load-without-revalidate", 
     "--network",
     network,
     "--user",
-    user,
+    productionUser,
     "--env",
     "HOME=/tmp",
     "--env",
@@ -779,6 +796,19 @@ function short(fingerprint: string) {
 
 async function tlsTest(report: Report) {
   const edge = await productionEdgeFixture();
+  const identity = await docker(
+    "exec",
+    edge.name,
+    "sh",
+    "-c",
+    'id -u; id -g; stat -c "%u:%g %a" /var/lib/ark/certs/admin.example.com/privkey.pem',
+  );
+  expect(
+    report,
+    identity === "1000\n1000\n1000:1000 600",
+    "production edge runs as 1000:1000 and reads uid-1000 0600 keys with all capabilities dropped",
+    identity,
+  );
   for (const hostname of issuedHostnames) {
     const expected = await fingerprintOf(edgeCertificatePaths(hostname, fixtureCerts.served).fullchain);
     const served = await servedFingerprint(edge.port(443), hostname);
@@ -870,8 +900,20 @@ async function certificateReloadTest(report: Report) {
   );
 
   // A renewal replaces the files at the same paths, as issueCertificateFiles does.
-  await copyFile(renewed.fullchain, live.fullchain);
-  await copyFile(renewed.privkey, live.privkey);
+  await docker(
+    "run",
+    "--rm",
+    "--user",
+    productionUser,
+    "--volume",
+    `${fixtureCerts.served}:/live`,
+    "--volume",
+    `${fixtureCerts.renewed}:/renewed:ro`,
+    bunImage,
+    "sh",
+    "-c",
+    `cp /renewed/${hostname}/fullchain.pem /live/${hostname}/fullchain.pem && cp /renewed/${hostname}/privkey.pem /live/${hostname}/privkey.pem`,
+  );
   const plain = JSON.parse(await edgeApply(edge, "load-without-revalidate")) as { status: number };
   const afterPlain = await servedFingerprint(edge.port(443), hostname);
   expect(
