@@ -10,7 +10,8 @@ import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { parseEnvFile } from "@ark-stack/shared";
-import { getTableConfig, type PgTable } from "drizzle-orm/pg-core";
+import { SQL } from "drizzle-orm";
+import { getTableConfig, PgDialect, type PgTable } from "drizzle-orm/pg-core";
 import postgres from "postgres";
 
 if (!process.env.DATABASE_URL && existsSync(".env")) {
@@ -103,9 +104,10 @@ async function expectSessionOriginContract(db: Sql, legacySessions: string[]) {
   await expect(insertSessionWithoutOrigin(db, "missing-origin")).rejects.toThrow(
     /null value in column "origin"/,
   );
+  // Assimilate Postgres.js's lazy Query before passing it to Bun's promise matcher.
   await expect(
-    db`INSERT INTO session (id, expires_at, token, user_id, origin)
-       VALUES ('bad-origin', now() + interval '1 day', 'bad-origin-token', 'legacy', 'public')`,
+    Promise.resolve(db`INSERT INTO session (id, expires_at, token, user_id, origin)
+       VALUES ('bad-origin', now() + interval '1 day', 'bad-origin-token', 'legacy', 'public')`),
   ).rejects.toThrow(/session_origin_check/);
   await db`INSERT INTO session (id, expires_at, token, user_id, origin)
            VALUES ('gate-session', now() + interval '1 day', 'gate-token', 'legacy', 'gate')`;
@@ -305,27 +307,93 @@ describe("front_routes constraints", () => {
     await expect(
       route({ kind: "tcp", endpoint: "ep_ssh", listenPort: 20004, targetPort: 0 }),
     ).rejects.toThrow(/front_routes_target_port_check/);
-    await expect(db`UPDATE front_routes SET access_mode = 'open' WHERE id = 'rt_1'`).rejects.toThrow(
-      /front_routes_access_mode_check/,
-    );
-    await expect(db`UPDATE front_routes SET tls_mode = 'none' WHERE id = 'rt_1'`).rejects.toThrow(
-      /front_routes_tls_mode_check/,
-    );
+    await expect(
+      Promise.resolve(db`UPDATE front_routes SET access_mode = 'open' WHERE id = 'rt_1'`),
+    ).rejects.toThrow(/front_routes_access_mode_check/);
+    await expect(
+      Promise.resolve(db`UPDATE front_routes SET tls_mode = 'none' WHERE id = 'rt_1'`),
+    ).rejects.toThrow(/front_routes_tls_mode_check/);
   });
 
   test("endpoints in use cannot be deleted, and tailnet nodes need a snapshot", async () => {
-    await expect(db`DELETE FROM endpoints WHERE id = 'ep_www'`).rejects.toThrow(/foreign key/);
+    await expect(Promise.resolve(db`DELETE FROM endpoints WHERE id = 'ep_www'`)).rejects.toThrow(
+      /foreign key/,
+    );
     await expect(
-      db`INSERT INTO tailnet_nodes (source, generation, stable_id, dns_name, host_name, observed_at)
-         VALUES ('edge', 'g1', 'nHome', 'home.tail1234.ts.net', 'home', now())`,
+      Promise.resolve(db`INSERT INTO tailnet_nodes (source, generation, stable_id, dns_name, host_name, observed_at)
+         VALUES ('edge', 'g1', 'nHome', 'home.tail1234.ts.net', 'home', now())`),
     ).rejects.toThrow(/foreign key/);
     await expect(
-      db`INSERT INTO tailnet_snapshots (source, generation, completed_at, valid_until)
-         VALUES ('vps', 'g1', now(), now() + interval '6 minutes')`,
+      Promise.resolve(db`INSERT INTO tailnet_snapshots (source, generation, completed_at, valid_until)
+         VALUES ('vps', 'g1', now(), now() + interval '6 minutes')`),
     ).rejects.toThrow(/tailnet_snapshots_source_check/);
     await db.end();
   });
 });
+
+// Let PostgreSQL normalize both versions: IN, BETWEEN, casts and parentheses can have
+// different spellings in Drizzle and SQL while representing the same expression.
+const dialect = new PgDialect();
+const identifier = (name: string) => `"${name.replaceAll('"', '""')}"`;
+const expression = (value: SQL) => dialect.sqlToQuery(value.inlineParams()).sql;
+
+async function expectMirrorExpressions(db: Sql, config: ReturnType<typeof getTableConfig>) {
+  for (const check of config.checks) {
+    await db.unsafe(
+      `ALTER TABLE ${identifier(config.name)} ADD CONSTRAINT fd_mirror_check CHECK (${expression(check.value)})`,
+    );
+    try {
+      const rows = await db`
+        SELECT conname, pg_get_expr(conbin, conrelid) AS expression FROM pg_constraint
+        WHERE conrelid = ${config.name}::regclass AND conname IN (${check.name}, 'fd_mirror_check')
+      `;
+      expect(rows.find((row) => row.conname === check.name)?.expression, check.name).toBe(
+        rows.find((row) => row.conname === "fd_mirror_check")?.expression,
+      );
+    } finally {
+      await db.unsafe(`ALTER TABLE ${identifier(config.name)} DROP CONSTRAINT fd_mirror_check`);
+    }
+  }
+  for (const { config: index } of config.indexes) {
+    const columns = index.columns
+      .map((column) => {
+        if (column instanceof SQL) return expression(column);
+        if (!("name" in column) || !column.name) throw new Error("Expected a named index column.");
+        const { order, nulls, opClass } = column.indexConfig ?? {};
+        return `${identifier(column.name)}${opClass ? ` ${identifier(opClass)}` : ""} ${order ?? "asc"} NULLS ${nulls ?? (order === "desc" ? "first" : "last")}`;
+      })
+      .join(", ");
+    await db.unsafe(
+      `CREATE ${index.unique ? "UNIQUE " : ""}INDEX fd_mirror_index ON ${identifier(config.name)} USING ${identifier(index.method ?? "btree")} (${columns})${index.where ? ` WHERE ${expression(index.where)}` : ""}`,
+    );
+    try {
+      const rows = await db`
+        SELECT rel.relname, idx.indisunique, am.amname,
+          ARRAY(SELECT pg_get_indexdef(idx.indexrelid, n, true)
+                FROM generate_series(1, idx.indnkeyatts) n) AS columns,
+          pg_get_expr(idx.indpred, idx.indrelid) AS predicate
+        FROM pg_index idx JOIN pg_class rel ON rel.oid = idx.indexrelid
+        JOIN pg_am am ON am.oid = rel.relam
+        WHERE idx.indrelid = ${config.name}::regclass
+          AND rel.relname IN (${index.name!}, 'fd_mirror_index')
+      `;
+      const shape = (name: string) => {
+        const row = rows.find((candidate) => candidate.relname === name);
+        return (
+          row && {
+            unique: row.indisunique,
+            method: row.amname,
+            columns: row.columns,
+            predicate: row.predicate,
+          }
+        );
+      };
+      expect(shape(index.name!), index.name).toEqual(shape("fd_mirror_index"));
+    } finally {
+      await db.unsafe("DROP INDEX fd_mirror_index");
+    }
+  }
+}
 
 describe("Drizzle schema mirrors the migration", () => {
   const tables: PgTable[] = [
@@ -399,7 +467,35 @@ describe("Drizzle schema mirrors the migration", () => {
           expect(found?.indexdef.includes("UNIQUE")).toBe(item.config.unique);
           expect(found?.indexdef.includes(" WHERE ")).toBe(Boolean(item.config.where));
         }
+        await expectMirrorExpressions(db, config);
       }
+    } finally {
+      await db.end();
+    }
+  });
+
+  test("mirror comparison detects wrong index columns, predicates and check expressions", async () => {
+    const db = await scratch("mirror");
+    try {
+      await apply(db, through("0013"));
+      const config = getTableConfig(schema.frontRoutes);
+      const index = config.indexes[0]!;
+      const check = config.checks[0]!;
+      for (const change of [
+        { ...index.config, columns: index.config.columns.toReversed() },
+        { ...index.config, where: new SQL(["kind = 'tcp'"]) },
+      ]) {
+        await expect(
+          expectMirrorExpressions(db, { ...config, checks: [], indexes: [{ ...index, config: change }] }),
+        ).rejects.toThrow();
+      }
+      await expect(
+        expectMirrorExpressions(db, {
+          ...config,
+          indexes: [],
+          checks: [{ ...check, value: new SQL(["kind IN ('http', 'tls')"]) }],
+        }),
+      ).rejects.toThrow();
     } finally {
       await db.end();
     }

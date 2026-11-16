@@ -156,6 +156,9 @@ describe("validateRouteTarget: syntax", () => {
     "home.tail1234.ts.net/admin",
     "[fd7a:115c:a1e0::1]",
     "fd7a:115c:a1e0::1%eth0",
+    "::fd7a:115c:a1e0:0:0:0:0:1",
+    "fd7a:115c:a1e0:0:0:0:0::1",
+    "fd7a:115c:a1e0:0:0:0:0:1::",
     "100.101.102.103:3000",
     "100.101.102.103/32",
     "0100.101.102.103",
@@ -303,6 +306,30 @@ describe("revalidateRouteTarget", () => {
     expect(revalidateRouteTarget({ ...base, peers: [self, renamed, impostor] })).toMatchObject({
       ok: false,
       status: "identity_mismatch",
+    });
+  });
+
+  test.each([4, 6])("an IPv%d literal follows its pinned StableID after address reassignment", (family) => {
+    const enteredIp = (family === 4 ? home.ipv4 : home.ipv6)!;
+    const newIp = family === 4 ? "100.101.102.200" : "fd7a:115c:a1e0::77";
+    const address = family === 4 ? "ipv4" : "ipv6";
+    const moved = { ...home, [address]: newIp };
+    const newOwner = node({ stableId: "nOther", dnsName: "other.tail1234.ts.net", [address]: enteredIp });
+    const ipRoute = { ...route, targetInput: enteredIp, targetIp: enteredIp };
+    expect(validateRouteTarget(input({ target: enteredIp }))).toMatchObject({ ok: true, stableId: "nHome" });
+    expect(validateRouteTarget(input({ target: enteredIp, peers: [self, moved, newOwner] }))).toMatchObject({
+      ok: true,
+      stableId: "nOther",
+    });
+    expect(revalidateRouteTarget({ ...base, peers: [self, moved, newOwner], route: ipRoute })).toEqual({
+      ok: true,
+      stableId: "nHome",
+      ip: newIp,
+      ipChanged: true,
+    });
+    expect(revalidateRouteTarget({ ...base, peers: [self, newOwner], route: ipRoute })).toMatchObject({
+      ok: false,
+      status: "awaiting_acl",
     });
   });
 

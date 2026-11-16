@@ -277,7 +277,6 @@ const workerPrefixes: Record<string, string[]> = {
     "certificate.",
     "edge.",
     "admin.",
-    "integration.",
     "backup.",
     "update.detect",
     "import.",

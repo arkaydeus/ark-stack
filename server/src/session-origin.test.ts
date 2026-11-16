@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import { createHmac } from "node:crypto";
 
 import { createId, parseEnvFile } from "@ark-stack/shared";
 
@@ -35,11 +36,11 @@ describe("Better Auth session insert paths set origin", () => {
   const authUrl = process.env.BETTER_AUTH_URL ?? "http://127.0.0.1:3000";
   const email = `${createId("usr")}@example.com`;
   const password = "Origin-Test-Password-123!";
-  const post = (path: string, body: unknown) =>
+  const post = (path: string, body: unknown, cookie = "") =>
     auth.handler(
       new Request(`${authUrl}/api/auth/${path}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Origin: authUrl },
+        headers: { "Content-Type": "application/json", Origin: authUrl, Cookie: cookie },
         body: JSON.stringify(body),
       }),
     );
@@ -48,14 +49,74 @@ describe("Better Auth session insert paths set origin", () => {
   `;
 
   test("sign-up and sign-in record origin = admin", async () => {
-    const signUp = await post("sign-up/email", { name: "Origin test", email, password });
+    const signUp = await post("sign-up/email", { name: "Origin test", email, password, origin: "gate" });
     expect(signUp.status).toBe(200);
-    const signIn = await post("sign-in/email", { email, password });
+    const signIn = await post("sign-in/email", { email, password, origin: "gate" });
     expect(signIn.status).toBe(200);
     const token = (await signIn.json()).token as string;
     const [session] = await sql`SELECT origin FROM session WHERE token = ${token}`;
     expect(session?.origin).toBe("admin");
     expect((await sessionsFor()).map((row) => row.origin)).toEqual(["admin", "admin"]);
+  });
+
+  test("TOTP enrollment replaces the session and TOTP login creates an admin session", async () => {
+    const mfaEmail = `${createId("usr")}@example.com`;
+    const cookies = new Map<string, string>();
+    const browserPost = async (path: string, body: unknown) => {
+      const response = await post(path, body, [...cookies].map(([k, v]) => `${k}=${v}`).join("; "));
+      for (const cookie of response.headers.getSetCookie()) {
+        const pair = cookie.split(";")[0]!;
+        const separator = pair.indexOf("=");
+        cookies.set(pair.slice(0, separator), pair.slice(separator + 1));
+      }
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    const rows = () => sql`
+      SELECT s.id, s.origin FROM session s JOIN "user" u ON u.id = s.user_id WHERE u.email = ${mfaEmail}
+    `;
+    try {
+      await browserPost("sign-up/email", { name: "MFA origin", email: mfaEmail, password, origin: "gate" });
+      const [original] = await rows();
+      expect(original?.origin).toBe("admin");
+      const { totpURI } = await browserPost("two-factor/enable", { password, origin: "gate" });
+      const secret = new URL(totpURI).searchParams.get("secret")!;
+      // RFC 4648 Base32 decoding and RFC 6238 SHA-1 TOTP, independent of Better Auth's generator.
+      const bits = [...secret.toUpperCase().replace(/=+$/, "")]
+        .map((char) => "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".indexOf(char).toString(2).padStart(5, "0"))
+        .join("");
+      const key = Buffer.from(bits.match(/.{8}/g)!.map((byte) => Number.parseInt(byte, 2)));
+      const code = () => {
+        const counter = Buffer.alloc(8);
+        counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30_000)));
+        const digest = createHmac("sha1", key).update(counter).digest();
+        const offset = digest[digest.length - 1]! & 15;
+        return ((digest.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).toString().padStart(6, "0");
+      };
+      await browserPost("two-factor/verify-totp", { code: code(), origin: "gate" });
+      const enrolled = await rows();
+      expect(enrolled).toHaveLength(1);
+      expect(enrolled[0]?.origin).toBe("admin");
+      expect(enrolled[0]?.id).not.toBe(original?.id);
+      const [user] = await sql`SELECT two_factor_enabled FROM "user" WHERE email = ${mfaEmail}`;
+      expect(user?.two_factor_enabled).toBe(true);
+
+      await browserPost("sign-out", {});
+      expect(await rows()).toHaveLength(0);
+      cookies.clear();
+      const login = await browserPost("sign-in/email", { email: mfaEmail, password, origin: "gate" });
+      expect(login.twoFactorRedirect).toBe(true);
+      expect(await rows()).toHaveLength(0);
+      const verified = await browserPost("two-factor/verify-totp", { code: code(), origin: "gate" });
+      const signedIn = await rows();
+      expect(signedIn).toHaveLength(1);
+      expect(signedIn[0]?.origin).toBe("admin");
+      expect(signedIn[0]?.id).not.toBe(enrolled[0]?.id);
+      const [persisted] = await sql`SELECT id, origin FROM session WHERE token = ${verified.token}`;
+      expect(persisted).toEqual(signedIn[0]);
+    } finally {
+      await sql`DELETE FROM "user" WHERE email = ${mfaEmail}`;
+    }
   });
 
   test("a server-side sign-in with no request context is refused and inserts nothing", async () => {

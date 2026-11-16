@@ -55,7 +55,8 @@ export function parseIpv6(ip: string) {
   const tail = halves.length === 2 ? ipv6Parts(halves[1] ?? "") : [];
   if (head.some((item) => !item) || tail.some((item) => !item)) return null;
   const missing = 8 - head.length - tail.length;
-  if (halves.length === 2 ? missing < 0 : head.length !== 8) return null;
+  // `::` must stand for at least one group, even when all eight groups are explicit.
+  if (halves.length === 2 ? missing < 1 : head.length !== 8) return null;
   const parts = halves.length === 2 ? [...head, ...Array(missing).fill("0"), ...tail] : head;
   if (parts.length !== 8) return null;
   const bytes = new Uint8Array(16);
