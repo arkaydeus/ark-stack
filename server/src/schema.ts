@@ -148,6 +148,10 @@ export const platformSettings = pgTable(
       .notNull()
       .default("us-east"),
     vpsRegionLabel: text("vps_region_label"),
+    // Public database port per-source limits (0016, FD-18). Rendered into `inet ark_db_ingress`.
+    dbIngressMaxConnections: integer("db_ingress_max_connections").notNull().default(128),
+    dbIngressRatePerSecond: integer("db_ingress_rate_per_second").notNull().default(30),
+    dbIngressRateBurst: integer("db_ingress_rate_burst").notNull().default(60),
   },
   (table) => [
     check(
@@ -162,6 +166,10 @@ export const platformSettings = pgTable(
     check(
       "platform_settings_vps_region_label_check",
       sql`${table.vpsRegionLabel} IS NULL OR char_length(${table.vpsRegionLabel}) BETWEEN 1 AND 64`,
+    ),
+    check(
+      "platform_settings_db_ingress_limits_check",
+      sql`${table.dbIngressMaxConnections} BETWEEN 1 AND 65535 AND ${table.dbIngressRatePerSecond} BETWEEN 1 AND 10000 AND ${table.dbIngressRateBurst} BETWEEN ${table.dbIngressRatePerSecond} AND 100000`,
     ),
   ],
 );

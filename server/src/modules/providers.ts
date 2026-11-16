@@ -23,6 +23,7 @@ import {
   sesIdentityPlan,
   signAwsRequest,
   stalwartRef,
+  type DbIngressLimits,
   type DnsWrite,
   type EdgeAppRoute,
   type ExternalInventory,
@@ -420,13 +421,26 @@ export function pgbouncerDir() {
     : join(process.cwd(), "tmp", "pgbouncer");
 }
 
+/**
+ * Where the host-namespace `database-ingress` reconciler writes its nft drop counter snapshot
+ * (front door §3.11, FD-18). The API reads it for /api/metrics/prometheus.
+ */
+export function dbIngressCountersFile() {
+  if (process.env.ARK_DB_INGRESS_METRICS_DIR) {
+    return join(process.env.ARK_DB_INGRESS_METRICS_DIR, "counters.json");
+  }
+  return process.env.ARK_STATE_DIR
+    ? join(process.env.ARK_STATE_DIR, "db-ingress", "counters.json")
+    : join(process.cwd(), "tmp", "db-ingress", "counters.json");
+}
+
 export async function applyDatabaseAllowlist(
   dir: string,
   cidrs: string[],
   port = 5432,
-  options: { expose?: boolean } = {},
+  options: { expose?: boolean; limits?: DbIngressLimits } = {},
 ) {
-  const rules = nftAllowlist(cidrs, port);
+  const rules = nftAllowlist(cidrs, port, options.limits);
   const file = join(dir, "allowlist.nft");
   const expose = Boolean(options.expose);
   await mkdir(dir, { recursive: true, mode: 0o700 });

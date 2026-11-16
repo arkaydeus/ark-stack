@@ -17,6 +17,22 @@ export type RegionSummary = {
   options: Array<{ region: PlatformRegion; label: string; vercelRegion: string }>;
 };
 
+export type DbIngressLimits = {
+  maxConnectionsPerSource: number;
+  newConnectionsPerSecond: number;
+  newConnectionBurst: number;
+};
+
+type Bounds = { min: number; max: number };
+
+/** Mirrors `dbIngressLimitsSummary` in shared/src/db-ingress.ts. */
+export type DbIngressSummary = DbIngressLimits & {
+  defaults: DbIngressLimits;
+  bounds: Record<keyof DbIngressLimits, Bounds>;
+  ipv6Grouping: "/64";
+  port: number;
+};
+
 export type PlatformState = {
   user: { id: string; name: string; email: string; role: Role; twoFactorEnabled?: boolean };
   setup: {
@@ -39,6 +55,8 @@ export type PlatformState = {
   } | null;
   /** Region preset and its derived suggestions (front door §3.15). Absent on an older API. */
   region?: RegionSummary;
+  /** Per-source limits on the public database port (front door §3.11). Absent on an older API. */
+  dbIngress?: DbIngressSummary;
   domains: Array<{
     id: string;
     name: string;

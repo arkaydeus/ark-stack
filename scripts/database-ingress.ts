@@ -1,9 +1,11 @@
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { watch } from "node:fs";
 import { createServer, connect } from "node:net";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+
+import { DB_INGRESS_TABLE, dbIngressAllowlistEnforced, parseNftCounters } from "@ark-stack/shared";
 
 const dir = process.env.ARK_PGBOUNCER_DIR ?? join(process.cwd(), "tmp", "pgbouncer");
 const nftFile = join(dir, "allowlist.nft");
@@ -11,6 +13,12 @@ const exposeFile = join(dir, "expose");
 const statusFile = join(dir, "allowlist.status");
 const backendPort = Number(process.env.ARK_PGBOUNCER_LOOPBACK_PORT ?? "15432");
 const listenPort = Number(process.env.ARK_PUBLIC_DB_PORT ?? "5432");
+// Drop counters for /api/metrics/prometheus (front door §3.11, FD-18). A separate directory, so
+// the API can mount it read-only without seeing the PgBouncer userlist or TLS key, and so the
+// periodic write does not wake the watcher below.
+const metricsDir = process.env.ARK_DB_INGRESS_METRICS_DIR ?? join(process.cwd(), "tmp", "db-ingress");
+const countersFile = join(metricsDir, "counters.json");
+const counterIntervalMs = Number(process.env.ARK_DB_INGRESS_COUNTER_INTERVAL_MS ?? "15000");
 
 let server: ReturnType<typeof createServer> | null = null;
 let reconciling = false;
@@ -41,8 +49,25 @@ async function shouldExpose() {
 async function applyNft() {
   if (!existsSync(nftFile)) throw new Error(`Allowlist file not found: ${nftFile}`);
   await run("nft", ["-f", nftFile]);
-  const listed = await run("nft", ["list", "table", "inet", "ark_db_ingress"]);
+  const listed = await run("nft", ["list", "table", "inet", DB_INGRESS_TABLE]);
   if (!listed.includes("ark_db")) throw new Error("nft readback did not show ark_db_ingress");
+}
+
+async function exportCounters() {
+  // Nothing has been applied yet, so there is no table to read.
+  if (!existsSync(nftFile)) return;
+  try {
+    const json = await run("nft", ["-j", "list", "counters", "table", "inet", DB_INGRESS_TABLE]);
+    const snapshot = parseNftCounters(json);
+    // Counters are not secret, and the API reads them as a different uid.
+    const temporary = `${countersFile}.${process.pid}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(snapshot)}\n`, { mode: 0o644 });
+    await rename(temporary, countersFile);
+  } catch (error) {
+    // No table yet (nothing applied) or nft failed: leave the last snapshot, whose age the
+    // metrics endpoint reports, rather than inventing zeros.
+    console.error(`nft counter export failed: ${error instanceof Error ? error.message : error}`);
+  }
 }
 
 function stopListener() {
@@ -102,10 +127,11 @@ async function reconcile() {
     await applyNft();
     if (expose) startListener();
     else stopListener();
-    // An empty allowlist installs an accept-only chain, so the table exists but nothing is
-    // enforced. Report that honestly rather than claiming enforcement.
-    const enforced = (await Bun.file(nftFile).text()).includes("drop");
+    // An empty allowlist installs only the per-source limits, so the table exists but no CIDR
+    // allowlist is enforced. Report that honestly rather than claiming enforcement.
+    const enforced = dbIngressAllowlistEnforced(await Bun.file(nftFile).text());
     await writeStatus({ applied: true, enforced, exposed: expose && Boolean(server) });
+    await exportCounters();
   } catch (error) {
     stopListener();
     await writeStatus({
@@ -124,7 +150,9 @@ async function reconcile() {
 }
 
 await mkdir(dir, { recursive: true, mode: 0o700 });
+await mkdir(metricsDir, { recursive: true, mode: 0o755 });
 await reconcile();
+setInterval(() => void exportCounters(), counterIntervalMs);
 watch(dir, (_event, filename) => {
   // `writeStatus` writes into the directory being watched; reacting to it would make every
   // reconcile trigger another one.

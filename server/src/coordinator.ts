@@ -22,6 +22,7 @@ import {
   pinComposeImage,
   planEdge,
   planHash,
+  platformDbIngressLimits,
   validateMaintenanceBundle,
   type BackupStatus,
   type DnsWrite,
@@ -1369,8 +1370,12 @@ async function reloadPgbouncer(operation: OperationRow) {
   const publicDatabases = databases.filter((item) => item.exposure === "public");
   const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
   if (cidrs.length) assertCidrs(cidrs);
+  // Per-source limits on the public port are platform settings (front door §3.11, FD-18).
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const limits = platformDbIngressLimits(settings);
   const allowlist = await applyDatabaseAllowlist(written.dir, cidrs, 5432, {
     expose: publicDatabases.length > 0,
+    limits,
   });
   for (const database of databases) {
     const allowlistReady = !database.sourceCidrs?.length || allowlist.enforced;
@@ -1392,6 +1397,7 @@ async function reloadPgbouncer(operation: OperationRow) {
     mappings: mappings.length,
     users: users.length,
     cidrs,
+    limits,
     ...written,
     ...allowlist,
   });

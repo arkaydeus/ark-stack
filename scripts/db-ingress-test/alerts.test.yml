@@ -1,0 +1,48 @@
+# promtool unit tests for the database ingress alerts in infra/monitoring/alerts.yml
+# (docs/design/front-door.md §3.11, FD-18). Run by `mise run test:db-ingress`.
+rule_files:
+  - /monitoring/alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      # One drop per second, sustained: the alert fires once the 10-minute `for` has elapsed.
+      - series: 'ark_nft_drop_packets_total{table="ark_db_ingress",chain="ark_db_limits",reason="rate",family="ipv4"}'
+        values: "0+60x40"
+      # A single burst of drops, then nothing: never sustained for 10 minutes, so no alert.
+      - series: 'ark_nft_drop_packets_total{table="ark_db_ingress",chain="ark_db_limits",reason="concurrent",family="ipv6"}'
+        values: "0 50 50x40"
+      - series: 'ark_nft_counters_present{table="ark_db_ingress"}'
+        values: "1x40"
+      - series: 'ark_nft_counters_age_seconds{table="ark_db_ingress"}'
+        values: "15x20 400x20"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ArkDatabaseIngressDrops
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ArkDatabaseIngressDrops
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: rate
+              family: ipv4
+            exp_annotations:
+              summary: The public database port has been dropping connections for 10 minutes
+              description: >-
+                nftables table ark_db_ingress dropped 1.00 packets/s for reason rate (ipv4). A
+                client may be over the per-source limits in platform settings, or someone is
+                abusing the public pooler.
+      - eval_time: 20m
+        alertname: ArkDatabaseIngressCountersStale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ArkDatabaseIngressCountersStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              table: ark_db_ingress
+            exp_annotations:
+              summary: The database-ingress reconciler has stopped reporting nftables counters

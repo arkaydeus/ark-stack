@@ -87,6 +87,11 @@ services:
       # The app image runs with a read-only root filesystem and only /tmp is writable, so the
       # approved-compose artefacts cannot default to a path under the working directory.
       ARK_COMPOSE_DIR: /tmp/ark-compose
+      # nft drop counters written by database-ingress, exported on /api/metrics/prometheus
+      # (docs/design/front-door.md §3.11, FD-18). Its own directory, so the API never sees the
+      # PgBouncer userlist or TLS key.
+      ARK_DB_INGRESS_METRICS_DIR: /var/lib/ark/db-ingress
+    volumes: [../../tmp/db-ingress:/var/lib/ark/db-ingress:ro]
     expose: ["3000"]
     # Bootstrap and host-local recovery only; never bind the raw API publicly.
     ports: ["127.0.0.1:3000:3000"]
@@ -299,7 +304,10 @@ services:
       ARK_PGBOUNCER_DIR: /var/lib/ark/pgbouncer
       ARK_PGBOUNCER_LOOPBACK_PORT: "15432"
       ARK_PUBLIC_DB_PORT: "5432"
-    volumes: [../../tmp/pgbouncer:/var/lib/ark/pgbouncer]
+      ARK_DB_INGRESS_METRICS_DIR: /var/lib/ark/db-ingress
+    volumes:
+      - ../../tmp/pgbouncer:/var/lib/ark/pgbouncer
+      - ../../tmp/db-ingress:/var/lib/ark/db-ingress
     depends_on: [pgbouncer-public]
     restart: unless-stopped
     pids_limit: 64

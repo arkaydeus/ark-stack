@@ -197,6 +197,21 @@ try {
       /platform_settings_region_check/,
       "Only the shared/src/region.ts presets may be stored.",
     );
+    // 0016_db_ingress_limits.sql (FD-18) gives an upgraded install the §3.11 per-source limits.
+    const [ingressLimits] = await verified`
+      SELECT db_ingress_max_connections, db_ingress_rate_per_second, db_ingress_rate_burst
+      FROM platform_settings WHERE id = 'default'
+    `;
+    assert.deepEqual(
+      ingressLimits,
+      { db_ingress_max_connections: 128, db_ingress_rate_per_second: 30, db_ingress_rate_burst: 60 },
+      "An upgraded install must default to 128 concurrent and 30/s (burst 60) per source on tcp/5432.",
+    );
+    await assert.rejects(
+      verified`UPDATE platform_settings SET db_ingress_max_connections = 0 WHERE id = 'default'`,
+      /platform_settings_db_ingress_limits_check/,
+      "A zero connection cap would lock every client out.",
+    );
     const frontDoorTables = await verified`
       SELECT table_name FROM information_schema.tables
       WHERE table_schema = 'public' AND table_name IN ('tailnet_snapshots', 'tailnet_nodes',

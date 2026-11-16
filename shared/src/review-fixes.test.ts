@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { assertCidrs, clientAllowed, nftAllowlist, parseCidr, parseIpv6 } from "./cidr.ts";
+import { assertCidrs, clientAllowed, parseCidr, parseIpv6 } from "./cidr.ts";
+import { dbIngressAllowlistEnforced, nftAllowlist } from "./db-ingress.ts";
 import { chooseCloudflareMutation } from "./cloudflare.ts";
 import { canonicalizeComposeSource, validateComposeSource } from "./compose-policy.ts";
 import { generatePassword } from "./crypto.ts";
@@ -105,11 +106,13 @@ describe("CIDR parsing and the generated nft policy", () => {
   test("an empty allowlist still installs a readable table", () => {
     const open = nftAllowlist([]);
     expect(open).toContain("table inet ark_db_ingress {");
-    expect(open).toContain("    accept");
-    expect(open).not.toContain("    drop");
+    // Only the per-source limits drop; there is no allowlist chain.
+    expect(open).not.toContain("ark_db_allow");
+    expect(dbIngressAllowlistEnforced(open)).toBe(false);
     const enforced = nftAllowlist(["10.0.0.0/8"]);
-    expect(enforced).toContain("ip saddr 10.0.0.0/8 accept");
-    expect(enforced).toContain("    drop");
+    expect(enforced).toContain("ip saddr 10.0.0.0/8 return");
+    expect(enforced).toContain('    counter name "drop_allowlist" drop');
+    expect(dbIngressAllowlistEnforced(enforced)).toBe(true);
   });
 });
 
