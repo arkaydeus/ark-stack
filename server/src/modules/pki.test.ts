@@ -13,10 +13,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { parseEnvFile } from "@ark-stack/shared";
+import { createId, privilegedRequestHash, parseEnvFile } from "@ark-stack/shared";
 
-import type { ClientCertificateSummary } from "./pki.ts";
-import type { ParsedCertificate } from "./x509.ts";
+import type { ClientCertificateSummary, IssueClientCertificateInput } from "./pki.ts";
+import type { ParsedCertificate, Node } from "./x509.ts";
 
 if (!process.env.DATABASE_URL && existsSync(".env")) {
   Object.assign(process.env, parseEnvFile(await Bun.file(".env").text()));
@@ -26,7 +26,8 @@ const pki = await import("./pki.ts");
 const x509 = await import("./x509.ts");
 const { assertSecretRevealable } = await import("../access.ts");
 const { db, sql } = await import("../db.ts");
-const { clientCertificates, privateCas, secrets } = await import("../schema.ts");
+const { clientCertificates, privateCas, secrets, projects, user, session, platformAccess, stepUpGrants } =
+  await import("../schema.ts");
 const { decryptSecret } = await import("@ark-stack/shared");
 const { eq, inArray } = await import("drizzle-orm");
 
@@ -80,6 +81,14 @@ async function newCa(
   return ca;
 }
 
+/** Most tests deliberately bind generated keys to the existing owner-only platform resource. */
+function issue(input: IssueClientCertificateInput) {
+  return pki.issueClientCertificate({
+    keyOwner: { resourceType: "platform", resourceId: "platform" },
+    ...input,
+  });
+}
+
 /** An OpenSSL-made CSR. The key goes to /dev/null: only the request is kept. */
 function csr(keySpec: string[], extensions: string[] = []) {
   const result = openssl([
@@ -114,7 +123,7 @@ describe("chain verification with OpenSSL", () => {
   test("an issued certificate verifies strictly against its CA and fails against another CA", async () => {
     const ca = await newCa();
     const other = await newCa(); // same purpose and name: only the key and serialNumber differ
-    const { certificate } = await pki.issueClientCertificate({
+    const { certificate } = await issue({
       caId: ca.id,
       subjectCn: "appdb_storefront_production",
     });
@@ -143,6 +152,60 @@ describe("chain verification with OpenSSL", () => {
   });
 });
 
+describe("strict name encoding", () => {
+  test("PrintableString rejects invalid ASCII and non-ASCII characters", () => {
+    expect(x509.printableString("AZaz09 '()+,-./:=?")[0]).toBe(0x13);
+    for (const value of ["pca_id", "@", "é", "\u0000", "\n"])
+      expect(() => x509.printableString(value)).toThrow(x509.DerError);
+  });
+
+  test("CA and leaf names use valid PrintableStrings and parse and verify in Go", async () => {
+    const ca = await newCa("go-parser");
+    const { certificate } = await issue({ caId: ca.id, subjectCn: "strict-client" });
+    const caParsed = parsePem(ca.certPem);
+    const leafParsed = parsePem(certificate.certPem!);
+    expect(leafParsed.issuerDer).toEqual(caParsed.subjectDer);
+    function checkStrings(node: Node) {
+      if (node.tag === 0x13) expect(node.content.toString("ascii")).toMatch(/^[A-Za-z0-9 '()+,./:=?-]*$/);
+      if (node.tag & 0x20) for (const child of x509.children(node)) checkStrings(child);
+    }
+    for (const der of [caParsed.subjectDer, caParsed.issuerDer, leafParsed.subjectDer, leafParsed.issuerDer])
+      checkStrings(x509.decode(der));
+    const caPath = await file("go-ca.pem", ca.certPem);
+    const leafPath = await file("go-leaf.pem", certificate.certPem!);
+    const child = Bun.spawn(
+      ["go", "run", join(import.meta.dir, "testdata/parse-certificates.go"), caPath, leafPath],
+      {
+        env: { ...process.env, GO111MODULE: "off" },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const [code, out, err] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    expect(code, out + err).toBe(0);
+    expect(out).toContain("CA and leaf parsed; client chain verified");
+  }, 60_000);
+
+  for (const purpose of pki.CA_PURPOSES) {
+    test(`${purpose} enforces the full common name boundary before persistence`, async () => {
+      const max = 64 - `Ark ${purpose} CA `.length;
+      const ca = await newCa("a".repeat(max), purpose);
+      expect(new X509Certificate(ca.certPem).subject.split("\n")[0]).toBe(
+        `CN=Ark ${purpose} CA ${"a".repeat(max)}`,
+      );
+      for (const length of [max + 1, 48]) {
+        const name = "a".repeat(length);
+        await expect(pki.createPrivateCa({ purpose, name })).rejects.toThrow(pki.PkiPolicyError);
+        expect((await pki.listPrivateCas({ purpose })).filter((row) => row.name === name)).toHaveLength(0);
+      }
+    });
+  }
+});
+
 describe("certificate profiles", () => {
   test("the CA is ECDSA P-256 with CA:TRUE pathlen:0, keyCertSign+cRLSign, SKI and AKI, for 5 years", async () => {
     const ca = await newCa("profile-ca", "tcp-client");
@@ -167,7 +230,7 @@ describe("certificate profiles", () => {
     const node = new X509Certificate(ca.certPem);
     expect(node.ca).toBe(true);
     expect(node.subject).toContain(`CN=Ark tcp-client CA profile-ca`);
-    expect(node.subject).toContain(ca.id);
+    expect(node.subject).toContain(ca.id.replaceAll("_", "-"));
     expect(node.fingerprint256.replaceAll(":", "").toLowerCase()).toBe(ca.fingerprintSha256);
 
     // OpenSSL's own parser agrees.
@@ -183,7 +246,7 @@ describe("certificate profiles", () => {
   test("a client certificate has EKU clientAuth, SKI, AKI = CA SKI, and exactly 90 days", async () => {
     const ca = await newCa("profile-leaf", "db-client", new Date("2026-11-16T00:00:00Z"));
     const now = new Date("2026-11-16T12:00:00.750Z");
-    const { certificate, caCertPem } = await pki.issueClientCertificate({
+    const { certificate, caCertPem } = await issue({
       caId: ca.id,
       subjectCn: "appdb_storefront_preview",
       now,
@@ -238,7 +301,7 @@ describe("certificate profiles", () => {
 
   test("a CA that expires within 90 days refuses to issue", async () => {
     const ca = await newCa("nearly-expired", "db-client", new Date(Date.now() - (5 * 365 - 30) * DAY));
-    await expect(pki.issueClientCertificate({ caId: ca.id, subjectCn: "late" })).rejects.toThrow(
+    await expect(issue({ caId: ca.id, subjectCn: "late" })).rejects.toThrow(
       /expires before a 90-day certificate/,
     );
   });
@@ -252,9 +315,7 @@ describe("certificate profiles", () => {
     );
     const ca = await newCa("cn-policy");
     for (const subjectCn of ["", "a".repeat(65), "x,O=Evil", "role\u0000"]) {
-      await expect(pki.issueClientCertificate({ caId: ca.id, subjectCn })).rejects.toThrow(
-        pki.PkiPolicyError,
-      );
+      await expect(issue({ caId: ca.id, subjectCn })).rejects.toThrow(pki.PkiPolicyError);
     }
     expect(await pki.listClientCertificates(ca.id)).toHaveLength(0);
   });
@@ -263,10 +324,10 @@ describe("certificate profiles", () => {
 describe("issuance", () => {
   test("a generated key is sealed as a once secret and matches the certificate", async () => {
     const ca = await newCa("generated");
-    const { certificate } = await pki.issueClientCertificate({
+    const { certificate } = await issue({
       caId: ca.id,
       subjectCn: "appdb_generated",
-      keyOwner: { resourceType: "database", resourceId: "db_example" },
+      keyOwner: { resourceType: "platform", resourceId: "platform" },
     });
     expect(certificate.keySecretId).toBeTruthy();
     const [secret] = await db.select().from(secrets).where(eq(secrets.id, certificate.keySecretId!));
@@ -274,8 +335,8 @@ describe("issuance", () => {
       kind: pki.CLIENT_KEY_SECRET_KIND,
       once: true,
       sensitivity: "credential",
-      resourceType: "database",
-      resourceId: "db_example",
+      resourceType: "platform",
+      resourceId: "platform",
       keyId: process.env.ARK_ROOT_KEY_ID ?? "k1",
       revealedAt: null,
     });
@@ -294,7 +355,7 @@ describe("issuance", () => {
       "keyUsage=critical,digitalSignature",
       "extendedKeyUsage=clientAuth",
     ]);
-    const { certificate } = await pki.issueClientCertificate({
+    const { certificate } = await issue({
       caId: ca.id,
       subjectCn: "appdb_csr",
       csrPem: request,
@@ -319,7 +380,7 @@ describe("issuance", () => {
       ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-384"],
       ["-newkey", "rsa:3072"],
     ]) {
-      const { certificate } = await pki.issueClientCertificate({
+      const { certificate } = await issue({
         caId: ca.id,
         subjectCn: "shape",
         csrPem: csr(keySpec),
@@ -354,7 +415,7 @@ describe("issuance", () => {
     for (const [label, pem, message] of cases) {
       let error: unknown;
       try {
-        await pki.issueClientCertificate({ caId: ca.id, subjectCn: "rejected", csrPem: pem });
+        await issue({ caId: ca.id, subjectCn: "rejected", csrPem: pem });
       } catch (caught) {
         error = caught;
       }
@@ -367,11 +428,127 @@ describe("issuance", () => {
   test("retired and revoked CAs cannot issue", async () => {
     const ca = await newCa("retire-me");
     expect((await pki.setPrivateCaStatus(ca.id, "retired")).status).toBe("retired");
-    await expect(pki.issueClientCertificate({ caId: ca.id, subjectCn: "x" })).rejects.toThrow(/retired/);
+    await expect(issue({ caId: ca.id, subjectCn: "x" })).rejects.toThrow(/retired/);
     expect((await pki.setPrivateCaStatus(ca.id, "revoked")).status).toBe("revoked");
-    await expect(pki.issueClientCertificate({ caId: ca.id, subjectCn: "x" })).rejects.toThrow(/revoked/);
+    await expect(issue({ caId: ca.id, subjectCn: "x" })).rejects.toThrow(/revoked/);
     // Revocation is final.
     expect((await pki.setPrivateCaStatus(ca.id, "retired")).status).toBe("revoked");
+  });
+});
+
+describe("key delivery", () => {
+  test("generated issuance requires a supported existing owner; CSR issuance needs none", async () => {
+    const ca = await newCa("owner-policy");
+    for (const keyOwner of [
+      undefined,
+      { resourceType: "client_certificate", resourceId: "ccert_missing" },
+      { resourceType: "constructor", resourceId: "x" },
+      { resourceType: "platform", resourceId: "wrong" },
+      { resourceType: "database", resourceId: "db_missing" },
+      { resourceType: "project", resourceId: "" },
+    ]) {
+      await expect(
+        pki.issueClientCertificate({ caId: ca.id, subjectCn: "missing-owner", keyOwner: keyOwner as never }),
+      ).rejects.toThrow(pki.PkiPolicyError);
+    }
+    expect(await pki.listClientCertificates(ca.id)).toHaveLength(0);
+    const result = await pki.issueClientCertificate({
+      caId: ca.id,
+      subjectCn: "csr-no-owner",
+      csrPem: csr(P256),
+    });
+    expect(result.certificate.keySecretId).toBeNull();
+  });
+
+  test("authenticated resource owner reveals once; a foreign operator cannot reveal or consume the grant", async () => {
+    const { app } = await import("../app.ts");
+    const { auth } = await import("../auth.ts");
+    const projectId = createId("prj");
+    const users: string[] = [];
+    await db.insert(projects).values({ id: projectId, name: "PKI delivery", slug: projectId });
+    const origin = process.env.BETTER_AUTH_URL ?? "http://127.0.0.1:3000";
+    async function actor(projectIds: string[]) {
+      const email = `${createId("usr")}@example.test`;
+      const response = await auth.handler(
+        new Request(`${origin}/api/auth/sign-up/email`, {
+          method: "POST",
+          // Keep this fixture outside other tests' per-IP signup rate-limit bucket.
+          headers: {
+            "content-type": "application/json",
+            origin,
+            "x-forwarded-for": `192.0.2.${50 + users.length}`,
+          },
+          body: JSON.stringify({ name: "PKI delivery", email, password: "PKI-Delivery-Test-Password-123!" }),
+        }),
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      const id = body.user.id as string;
+      users.push(id);
+      const [stored] = await db.select().from(session).where(eq(session.token, body.token));
+      expect(stored).toBeDefined();
+      await db
+        .update(user)
+        .set({ twoFactorEnabled: true, mfaEnrolledAt: new Date(stored!.createdAt.getTime() - 60_000) })
+        .where(eq(user.id, id));
+      await db.insert(platformAccess).values({ userId: id, role: "operator", projectIds, domainIds: [] });
+      return {
+        id,
+        sessionId: stored!.id,
+        cookie: response.headers
+          .getSetCookie()
+          .map((value) => value.split(";")[0])
+          .join("; "),
+      };
+    }
+    try {
+      const allowed = await actor([projectId]);
+      const forbidden = await actor([]);
+      const ca = await newCa("reveal");
+      const { certificate } = await pki.issueClientCertificate({
+        caId: ca.id,
+        subjectCn: "reveal",
+        keyOwner: { resourceType: "project", resourceId: projectId },
+      });
+      const secretId = certificate.keySecretId!;
+      async function grant(who: typeof allowed) {
+        const id = createId("sup");
+        await db.insert(stepUpGrants).values({
+          id,
+          userId: who.id,
+          sessionId: who.sessionId,
+          action: "secret.reveal",
+          planHash: privilegedRequestHash("secret.reveal", { secretId }),
+          expiresAt: new Date(Date.now() + 60_000),
+        });
+        return id;
+      }
+      const reveal = (who: typeof allowed) =>
+        app.request(`${origin}/api/secrets/${secretId}/reveal`, {
+          method: "POST",
+          headers: { origin, cookie: who.cookie, "content-type": "application/json" },
+          body: "{}",
+        });
+      const deniedGrant = await grant(forbidden);
+      expect((await reveal(forbidden)).status).toBe(403);
+      const [denied] = await db.select().from(stepUpGrants).where(eq(stepUpGrants.id, deniedGrant));
+      expect(denied!.consumedAt).toBeNull();
+      const [sealed] = await db.select().from(secrets).where(eq(secrets.id, secretId));
+      expect(sealed!.revealedAt).toBeNull();
+      await grant(allowed);
+      const first = await reveal(allowed);
+      expect(first.status, await first.clone().text()).toBe(200);
+      expect(first.headers.get("cache-control")).toBe("no-store");
+      const key = createPrivateKey((await first.json()).value);
+      expect(createPublicKey(key).export({ type: "spki", format: "der" })).toEqual(
+        new X509Certificate(certificate.certPem!).publicKey.export({ type: "spki", format: "der" }),
+      );
+      await grant(allowed);
+      expect((await reveal(allowed)).status).toBe(409);
+    } finally {
+      if (users.length) await db.delete(user).where(inArray(user.id, users));
+      await db.delete(projects).where(eq(projects.id, projectId));
+    }
   });
 });
 
@@ -382,7 +559,7 @@ describe("persistence", () => {
     expect((await pki.listPrivateCas({ purpose: "http-client" })).map((item) => item.id)).toContain(ca.id);
     expect((await pki.listPrivateCas({ status: "retired" })).map((item) => item.id)).not.toContain(ca.id);
 
-    const { certificate } = await pki.issueClientCertificate({
+    const { certificate } = await issue({
       caId: ca.id,
       subjectCn: "persisted",
       rolloverState: "pending",
@@ -429,18 +606,191 @@ describe("persistence", () => {
   });
 });
 
+describe("missing identifiers", () => {
+  test("lookups return null and mutations reject missing CA and certificate IDs", async () => {
+    const caId = createId("pca");
+    const id = createId("ccert");
+    expect(await pki.getPrivateCa(caId)).toBeNull();
+    expect(await pki.getClientCertificate(id)).toBeNull();
+    for (const mutate of [
+      () => issue({ caId, subjectCn: "missing" }),
+      () => pki.generateCaCrl({ caId }),
+      () => pki.setPrivateCaStatus(caId, "retired"),
+      () => pki.revokeClientCertificate({ id }),
+    ])
+      await expect(mutate()).rejects.toThrow(pki.PkiPolicyError);
+  });
+});
+
+/** Wait for an observed PostgreSQL lock dependency instead of assuming task scheduling. */
+async function waitForBlockedBy(pid: number, count = 1) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const [row] =
+      await sql`SELECT count(*)::int AS n FROM pg_stat_activity WHERE ${pid}::int = ANY(pg_blocking_pids(pid))`;
+    if (row!.n >= count) return;
+    await Bun.sleep(10);
+  }
+  throw new Error("Expected PKI operations to wait on the held row lock.");
+}
+
+describe("transaction concurrency and rollback", () => {
+  test("retirement holds issuance until commit, then issuance refuses without writing a key", async () => {
+    const ca = await newCa("retirement-race");
+    let pending: ReturnType<typeof issue> | undefined;
+    await sql.begin(async (tx) => {
+      const [connection] = await tx`SELECT pg_backend_pid() AS pid`;
+      await tx`UPDATE private_cas SET status = 'retired' WHERE id = ${ca.id}`;
+      pending = issue({ caId: ca.id, subjectCn: "racing" });
+      // Observe rejection below, after releasing the lock.
+      void pending.catch(() => {});
+      await waitForBlockedBy(connection!.pid);
+    });
+    await expect(pending!).rejects.toThrow(/retired/);
+    expect(await pki.listClientCertificates(ca.id)).toHaveLength(0);
+  });
+
+  test("issuance holding a shared CA lock completes before queued retirement", async () => {
+    const ca = await newCa("issuance-race");
+    const reservation = await sql.reserve();
+    let locked = false;
+    let issuing: ReturnType<typeof issue> | undefined;
+    let retiring: ReturnType<typeof pki.setPrivateCaStatus> | undefined;
+    try {
+      await reservation`BEGIN`;
+      locked = true;
+      const [connection] = await reservation`SELECT pg_backend_pid() AS pid`;
+      // Compatible with issuance's SHARE, incompatible with retirement's UPDATE.
+      await reservation`SELECT id FROM private_cas WHERE id = ${ca.id} FOR SHARE`;
+      // Pause issuance after its CA lock, at its client-key INSERT.
+      await reservation`LOCK TABLE secrets IN SHARE MODE`;
+      issuing = issue({ caId: ca.id, subjectCn: "before-retirement" });
+      void issuing.catch(() => {});
+      await waitForBlockedBy(connection!.pid);
+      retiring = pki.setPrivateCaStatus(ca.id, "retired");
+      void retiring.catch(() => {});
+      await waitForBlockedBy(connection!.pid, 2);
+      await reservation`COMMIT`;
+      locked = false;
+      const result = await issuing;
+      expect(result.certificate.status).toBe("issued");
+      expect((await retiring).status).toBe("retired");
+      await expect(issue({ caId: ca.id, subjectCn: "too-late" })).rejects.toThrow(/retired/);
+      expect(await pki.listClientCertificates(ca.id)).toHaveLength(1);
+    } finally {
+      if (locked) await reservation`ROLLBACK`;
+      reservation.release();
+      await Promise.allSettled([issuing, retiring].filter(Boolean));
+    }
+  });
+
+  test("concurrent duplicate revocations keep the first result and remove the key once", async () => {
+    const ca = await newCa("duplicate-revocations");
+    const { certificate } = await issue({ caId: ca.id, subjectCn: "duplicate" });
+    const now = new Date("2026-11-20T00:00:00Z");
+    let pending: ReturnType<typeof pki.revokeClientCertificate>[] = [];
+    await sql.begin(async (tx) => {
+      const [connection] = await tx`SELECT pg_backend_pid() AS pid`;
+      await tx`SELECT id FROM client_certificates WHERE id = ${certificate.id} FOR UPDATE`;
+      pending = ["keyCompromise", "superseded", "unspecified"].map((reason) =>
+        pki.revokeClientCertificate({
+          id: certificate.id,
+          reason: reason as import("./pki.ts").CrlReason,
+          now,
+        }),
+      );
+      await waitForBlockedBy(connection!.pid);
+    });
+    const results = await Promise.all(pending);
+    for (const result of results) expect(result).toEqual(results[0]!);
+    expect(results[0]!.revokedAt).toEqual(now);
+    expect(await db.select().from(secrets).where(eq(secrets.id, certificate.keySecretId!))).toHaveLength(0);
+  });
+
+  test("parallel CRLs receive consecutive numbers and concurrent revocations reach the final CRL", async () => {
+    const ca = await newCa("parallel-crls");
+    const certs = await Promise.all(
+      ["one", "two", "three"].map((subjectCn) => issue({ caId: ca.id, subjectCn })),
+    );
+    const now = new Date("2026-11-21T00:00:00Z");
+    const initial = await pki.generateCaCrl({ caId: ca.id, now });
+    let pending: ReturnType<typeof pki.generateCaCrl>[] = [];
+    await sql.begin(async (tx) => {
+      const [connection] = await tx`SELECT pg_backend_pid() AS pid`;
+      await tx`SELECT id FROM private_cas WHERE id = ${ca.id} FOR UPDATE`;
+      pending = Array.from({ length: 3 }, () => pki.generateCaCrl({ caId: ca.id, now }));
+      await waitForBlockedBy(connection!.pid);
+    });
+    const [crls] = await Promise.all([
+      Promise.all(pending),
+      Promise.all(certs.map(({ certificate }) => pki.revokeClientCertificate({ id: certificate.id, now }))),
+    ]);
+    const numbers = crls.map((crl) => BigInt(crl.crlNumber)).toSorted((a, b) => (a < b ? -1 : 1));
+    expect(numbers).toEqual([1n, 2n, 3n].map((offset) => BigInt(initial.crlNumber) + offset));
+    const final = await pki.generateCaCrl({ caId: ca.id, now });
+    expect(BigInt(final.crlNumber)).toBe(numbers[2]! + 1n);
+    expect(final.revokedSerials.toSorted()).toEqual(
+      certs.map(({ certificate }) => certificate.serial).toSorted(),
+    );
+    expect((await pki.getPrivateCa(ca.id))!.crlPem).toBe(final.crlPem);
+  });
+
+  test("a failed certificate INSERT rolls back its already-inserted generated secret", async () => {
+    const ca = await newCa("rollback");
+    const before = await db
+      .select({ id: secrets.id })
+      .from(secrets)
+      .where(eq(secrets.kind, pki.CLIENT_KEY_SECRET_KIND));
+    // This CHECK is evaluated by PostgreSQL at the final INSERT, after the key INSERT.
+    await expect(
+      issue({ caId: ca.id, subjectCn: "rollback", rolloverState: "invalid" as never }),
+    ).rejects.toThrow(/client_certificates/);
+    expect(await pki.listClientCertificates(ca.id)).toHaveLength(0);
+    const after = await db
+      .select({ id: secrets.id })
+      .from(secrets)
+      .where(eq(secrets.kind, pki.CLIENT_KEY_SECRET_KIND));
+    expect(after.map((row) => row.id).toSorted()).toEqual(before.map((row) => row.id).toSorted());
+  });
+});
+
 describe("CRL", () => {
+  test("invalid runtime reasons are rejected and legacy unknown reasons cannot poison CRLs", async () => {
+    const ca = await newCa("reason-policy");
+    const { certificate } = await issue({ caId: ca.id, subjectCn: "bad-reason" });
+    for (const reason of ["constructor", "toString", "__proto__", "unknown"]) {
+      await expect(
+        pki.revokeClientCertificate({ id: certificate.id, reason: reason as never }),
+      ).rejects.toThrow(pki.PkiPolicyError);
+      expect((await pki.getClientCertificate(certificate.id))!.status).toBe("issued");
+    }
+    await pki.revokeClientCertificate({ id: certificate.id });
+    for (const reason of ["constructor", "toString", "__proto__", "unknown"]) {
+      await db
+        .update(clientCertificates)
+        .set({ revokedReason: reason })
+        .where(eq(clientCertificates.id, certificate.id));
+      const crl = await pki.generateCaCrl({ caId: ca.id });
+      const parsed = x509.parseCrl(x509.fromPem(crl.crlPem, ["X509 CRL"]));
+      expect(parsed.revoked).toMatchObject([{ serial: certificate.serial, reasonCode: null }]);
+      const caPath = await file("reason-ca.pem", ca.certPem);
+      const crlPath = await file("reason-crl.pem", crl.crlPem);
+      expect(openssl(["crl", "-in", crlPath, "-CAfile", caPath, "-noout"]).code).toBe(0);
+    }
+  });
+
   test("the CRL lists revoked serials, is signed by the CA, and carries the configured nextUpdate", async () => {
-    const ca = await newCa("crl");
-    const other = await newCa("crl-other");
+    const issuedAt = new Date("2026-11-16T00:00:00Z");
+    const revokedAt = new Date(issuedAt.getTime() + 4 * DAY);
+    const now = new Date(issuedAt.getTime() + 5 * DAY);
+    const ca = await newCa("crl", "db-client", issuedAt);
+    const other = await newCa("crl-other", "db-client", issuedAt);
     const issued: ClientCertificateSummary[] = [];
     for (const name of ["keep", "lost", "retired"]) {
-      issued.push((await pki.issueClientCertificate({ caId: ca.id, subjectCn: name })).certificate);
+      issued.push((await issue({ caId: ca.id, subjectCn: name, now: issuedAt })).certificate);
     }
-    await pki.revokeClientCertificate({ id: issued[1]!.id, reason: "keyCompromise" });
-    await pki.revokeClientCertificate({ id: issued[2]!.id });
+    await pki.revokeClientCertificate({ id: issued[1]!.id, reason: "keyCompromise", now: revokedAt });
+    await pki.revokeClientCertificate({ id: issued[2]!.id, now: revokedAt });
 
-    const now = new Date("2026-11-21T00:00:00Z");
     const crl = await pki.generateCaCrl({ caId: ca.id, nextUpdateDays: 7, now });
     expect(crl.revokedSerials.toSorted()).toEqual([issued[1]!.serial, issued[2]!.serial].toSorted());
     expect(crl.nextUpdate.getTime() - crl.thisUpdate.getTime()).toBe(7 * DAY);
@@ -485,7 +835,7 @@ describe("CRL", () => {
       caPath,
       "-attime",
     ];
-    const at = String(Math.floor(new Date("2026-11-22T00:00:00Z").getTime() / 1000));
+    const at = String(Math.floor((now.getTime() + DAY) / 1000));
     for (const [index, certificate] of issued.entries()) {
       const leaf = await file(`crl-leaf-${index}.pem`, certificate.certPem!);
       const result = openssl([...crlCheck, at, leaf]);
@@ -534,16 +884,13 @@ describe("CA key confinement", () => {
       const ca = await newCa("confined");
       caId = ca.id;
       responses.push(ca, await pki.getPrivateCa(ca.id), await pki.listPrivateCas());
-      const issued = await pki.issueClientCertificate({ caId: ca.id, subjectCn: "confined" });
-      responses.push(
-        issued,
-        await pki.issueClientCertificate({ caId: ca.id, subjectCn: "confined-csr", csrPem: csr(P256) }),
-      );
+      const issued = await issue({ caId: ca.id, subjectCn: "confined" });
+      responses.push(issued, await issue({ caId: ca.id, subjectCn: "confined-csr", csrPem: csr(P256) }));
       responses.push(await pki.revokeClientCertificate({ id: issued.certificate.id }));
       responses.push(await pki.generateCaCrl({ caId: ca.id }));
       responses.push(await pki.listClientCertificates(ca.id));
       try {
-        await pki.issueClientCertificate({ caId: ca.id, subjectCn: "x", csrPem: "nonsense" });
+        await issue({ caId: ca.id, subjectCn: "x", csrPem: "nonsense" });
       } catch (error) {
         responses.push(String(error));
       }

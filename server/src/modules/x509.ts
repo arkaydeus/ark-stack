@@ -52,7 +52,10 @@ export const sequence = (...items: Buffer[]) => tlv(0x30, ...items);
 export const set = (...items: Buffer[]) => tlv(0x31, ...items);
 export const octetString = (value: Buffer) => tlv(0x04, value);
 export const utf8String = (value: string) => tlv(0x0c, Buffer.from(value, "utf8"));
-export const printableString = (value: string) => tlv(0x13, Buffer.from(value, "ascii"));
+export function printableString(value: string) {
+  if (!/^[A-Za-z0-9 '()+,./:=?-]*$/.test(value)) throw new DerError("Invalid PrintableString character.");
+  return tlv(0x13, Buffer.from(value, "ascii"));
+}
 export const booleanTrue = () => tlv(0x01, Buffer.from([0xff]));
 /** `[n] EXPLICIT` (constructed context-specific). */
 export const explicit = (tagNumber: number, value: Buffer) => tlv(0xa0 | tagNumber, value);

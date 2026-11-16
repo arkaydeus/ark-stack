@@ -32,7 +32,16 @@ import { and, asc, desc, eq, ne } from "drizzle-orm";
 
 import { db } from "../db.ts";
 import { loadEnv } from "../env.ts";
-import { clientCertificates, privateCas, secrets } from "../schema.ts";
+import {
+  clientCertificates,
+  privateCas,
+  secrets,
+  managedDatabases,
+  mailboxes,
+  domainClaims,
+  services,
+  projects,
+} from "../schema.ts";
 import * as x509 from "./x509.ts";
 
 // ---- Policy ------------------------------------------------------------------------------------
@@ -113,7 +122,7 @@ function caSubject(purpose: CaPurpose, name: string, id: string): x509.NameAttri
   // every generation has a distinct DN while the CN stays within RFC 5280's 64-character bound.
   return [
     { type: "CN", value: `Ark ${purpose} CA ${name}` },
-    { type: "serialNumber", value: id },
+    { type: "serialNumber", value: id.replaceAll("_", "-") },
   ];
 }
 
@@ -142,6 +151,8 @@ export function createCaMaterial(input: {
   if (!CA_NAME.test(input.name))
     throw new PkiPolicyError("CA names are 1-48 letters, digits, spaces, '.', '_', '/' or '-'.");
   if (!/^[A-Za-z0-9_]{1,64}$/.test(input.id)) throw new PkiPolicyError("Invalid CA ID.");
+  if (`Ark ${input.purpose} CA ${input.name}`.length > 64)
+    throw new PkiPolicyError("The full CA common name must be at most 64 characters.");
   const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
   const spki = x509.spkiDer(privateKey);
   const keyId = x509.keyIdentifier(spki);
@@ -396,7 +407,7 @@ export function buildCrl(input: {
   const entries = input.revoked.map((entry) => {
     if (!/^[0-9A-F]+$/.test(entry.serial)) throw new Error("Revoked serials must be uppercase hex.");
     const serial = Buffer.from(entry.serial.length % 2 ? `0${entry.serial}` : entry.serial, "hex");
-    const code = entry.reason ? (CRL_REASONS[entry.reason] ?? 0) : 0;
+    const code = entry.reason && Object.hasOwn(CRL_REASONS, entry.reason) ? CRL_REASONS[entry.reason] : 0;
     return x509.sequence(
       x509.integerFromBytes(serial),
       x509.time(wholeSeconds(entry.revokedAt)),
@@ -568,6 +579,30 @@ async function loadSigner(executor: Executor, ca: PrivateCaRow): Promise<CaSigne
   return { certPem: ca.certPem, privateKey };
 }
 
+const KEY_OWNER_TABLES = {
+  database: managedDatabases,
+  mailbox: mailboxes,
+  domain: domainClaims,
+  service: services,
+  project: projects,
+} as const;
+export type ClientKeyOwner = {
+  resourceType: keyof typeof KEY_OWNER_TABLES | "platform";
+  resourceId: string;
+};
+
+/** Match the resources resolved by the generic reveal endpoint; never invent an owner. */
+async function assertKeyOwner(executor: Executor, owner: ClientKeyOwner | undefined) {
+  if (!owner || !owner.resourceId)
+    throw new PkiPolicyError("Generated client keys require a supported keyOwner.");
+  if (owner.resourceType === "platform" && owner.resourceId === "platform") return;
+  if (!Object.hasOwn(KEY_OWNER_TABLES, owner.resourceType))
+    throw new PkiPolicyError("Unsupported generated client key owner.");
+  const table = KEY_OWNER_TABLES[owner.resourceType as keyof typeof KEY_OWNER_TABLES];
+  const [row] = await executor.select({ id: table.id }).from(table).where(eq(table.id, owner.resourceId));
+  if (!row) throw new PkiPolicyError("Generated client key owner not found.");
+}
+
 export type IssueClientCertificateInput = {
   caId: string;
   /** The client's login-role name, for audit only (§3.10.1). */
@@ -577,9 +612,9 @@ export type IssueClientCertificateInput = {
   rolloverState?: "current" | "pending";
   /**
    * The resource that owns the sealed generated key, for the generic reveal endpoint's scope
-   * check (FD-17 passes the database). Defaults to the certificate itself.
+   * check (FD-17 passes the database). Required for generated keys; must exist.
    */
-  keyOwner?: { resourceType: string; resourceId: string };
+  keyOwner?: ClientKeyOwner;
   now?: Date;
 };
 
@@ -595,6 +630,7 @@ export async function issueClientCertificate(input: IssueClientCertificateInput)
     const [ca] = await tx.select().from(privateCas).where(eq(privateCas.id, input.caId)).for("share");
     if (!ca) throw new PkiPolicyError("CA not found.");
     if (ca.status !== "active") throw new PkiPolicyError(`The CA is ${ca.status}; it cannot issue.`);
+    if (!csrKey) await assertKeyOwner(tx, input.keyOwner);
     const signer = await loadSigner(tx, ca);
     const id = createId("ccert");
     let keySecretId: string | null = null;
@@ -613,7 +649,7 @@ export async function issueClientCertificate(input: IssueClientCertificateInput)
     });
     if (generatedPem !== null) {
       keySecretId = createId("sec");
-      const owner = input.keyOwner ?? { resourceType: "client_certificate", resourceId: id };
+      const owner = input.keyOwner!;
       await tx.insert(secrets).values({
         id: keySecretId,
         kind: CLIENT_KEY_SECRET_KIND,
@@ -667,7 +703,7 @@ export async function listClientCertificates(caId: string) {
  */
 export async function revokeClientCertificate(input: { id: string; reason?: CrlReason; now?: Date }) {
   const reason = input.reason ?? "unspecified";
-  if (!(reason in CRL_REASONS)) throw new PkiPolicyError("Unknown revocation reason.");
+  if (!Object.hasOwn(CRL_REASONS, reason)) throw new PkiPolicyError("Unknown revocation reason.");
   return db.transaction(async (tx) => {
     const [current] = await tx
       .select()
