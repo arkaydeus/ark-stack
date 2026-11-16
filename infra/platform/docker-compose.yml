@@ -305,9 +305,15 @@ services:
 
   edge:
     image: caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
+    # Ark writes the Caddyfile and every certificate key as uid 1000 with mode 0600 (the installer
+    # chowns tmp/edge and tmp/certs to it). As root with every capability dropped, Caddy could not
+    # read them and would exit at startup. The image's /data/caddy and /config/caddy are 1777.
+    user: "1000:1000"
     ports: ["80:80", "443:443"]
     volumes:
       - ../../tmp/acme:/var/lib/ark/acme:ro
+      # Ark-issued lego certificates, loaded per site with `tls` (docs/design/front-door.md §3.14).
+      - ../../tmp/certs:/var/lib/ark/certs:ro
       - ../../tmp/edge/Caddyfile:/etc/caddy/Caddyfile:ro
       - ark_edge_data:/data
     depends_on: [api]

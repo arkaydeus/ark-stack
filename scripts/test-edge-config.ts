@@ -1,14 +1,18 @@
-// `mise run test:edge`: validates every rendered and static Caddyfile on the pinned Caddy image, then
-// runs the edge behaviour tests from docs/design/front-door.md §3.5 and FD-24 in disposable containers:
-// header stripping, Server/Via removal, WebSockets across reloads and idle, and certificate reloads.
+// `mise run test:edge`: validates every rendered and static Caddyfile on the pinned Caddy image against
+// fixture certificates, then runs the edge behaviour tests from docs/design/front-door.md §3.5, §3.14,
+// FD-24 and FD-02 in disposable containers: header stripping, Server/Via removal, WebSockets across
+// reloads and idle, and the production edge serving Ark-issued certificates (TLS, the :80 block, and
+// certificate reloads through the real `writeEdge`).
 // The bump procedure for the pinned images is in docs/operating.md ("Third-party image pins").
 import { X509Certificate, randomBytes } from "node:crypto";
 import { copyFile, mkdir, mkdtemp } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { connect } from "node:tls";
 
-import { renderCaddyfile } from "@ark-stack/shared";
+import { EDGE_CERT_DIR, edgeCertificatePaths, planEdge, renderCaddyfile } from "@ark-stack/shared";
 
 import { checkReleasePins } from "./edge-test/pins.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
@@ -23,6 +27,8 @@ const idleSeconds = 80;
 
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-${suffix}-`));
+// Ark writes certificates and the Caddyfile as the uid the edge runs as (1000 in production).
+const user = `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`;
 const network = `ark-edge-${suffix}`;
 const runtime = new EdgeTestRuntime(directory, network);
 const containers = runtime.containers;
@@ -80,6 +86,65 @@ async function checkPins() {
   );
 }
 
+// ---- Fixture certificates -------------------------------------------------------------------------------
+
+// Hostnames laid out like Ark's certificate directory (<dir>/<hostname>/{fullchain,privkey}.pem).
+// `pending` and `failed` have files on disk too, so the tests prove the status gate, not file absence.
+const issuedHostnames = ["admin.example.com", "example.com", "www.example.com"];
+const unissued = { "pending.example.com": "pending", "failed.example.com": "failed" } as const;
+const fixtureCerts = {
+  served: join(directory, "certs"),
+  renewed: join(directory, "renewed"),
+};
+
+async function generateFixtureCertificates() {
+  const hostnames = [...issuedHostnames, ...Object.keys(unissued)];
+  const script = [
+    "set -e",
+    `for name in ${hostnames.map((name) => `certs/${name}`).join(" ")} renewed/www.example.com; do`,
+    '  host="${name#*/}"; mkdir -p "/out/$name"',
+    '  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj "/CN=$host" -addext "subjectAltName=DNS:$host" -keyout "/out/$name/privkey.pem" -out "/out/$name/fullchain.pem" 2>/dev/null',
+    '  chmod 600 "/out/$name/privkey.pem"',
+    "done",
+  ].join("\n");
+  await docker(
+    "run",
+    "--rm",
+    "--user",
+    user,
+    "--env",
+    "HOME=/tmp",
+    "--volume",
+    `${directory}:/out`,
+    bunImage,
+    "sh",
+    "-c",
+    script,
+  );
+}
+
+async function fingerprintOf(path: string) {
+  return new X509Certificate(await Bun.file(path).text()).fingerprint256;
+}
+
+// The rows the coordinator reads, turned into the writeEdge input by the production planner.
+function fixturePlan() {
+  const at = new Date();
+  const hostnames = [...issuedHostnames, ...Object.keys(unissued)];
+  const endpoints = hostnames.map((hostname) => ({
+    id: `end_${hostname}`,
+    kind: hostname === "admin.example.com" ? "admin" : "http",
+    hostname,
+    exposure: "public",
+  }));
+  const certificates = hostnames.map((hostname) => ({
+    endpointId: `end_${hostname}`,
+    status: unissued[hostname as keyof typeof unissued] ?? "issued",
+    lastDeployedAt: at,
+  }));
+  return planEdge({ adminMode: "public", adminHostname: "admin.example.com", endpoints, certificates });
+}
+
 // ---- Static validation -----------------------------------------------------------------------------------
 
 async function validate(name: string, source: string) {
@@ -92,6 +157,8 @@ async function validate(name: string, source: string) {
     `ark-edge-validate-${name}-${suffix}`,
     "--volume",
     `${file}:/etc/caddy/Caddyfile:ro`,
+    "--volume",
+    `${fixtureCerts.served}:${EDGE_CERT_DIR}:ro`,
     caddyImage,
     "caddy",
     "adapt",
@@ -107,11 +174,17 @@ async function validate(name: string, source: string) {
 }
 
 async function validateConfigurations() {
+  const certificates = issuedHostnames.map((hostname) => ({
+    hostname,
+    status: "issued",
+    ...edgeCertificatePaths(hostname),
+  }));
   const publicConfig = renderCaddyfile({
     adminMode: "public",
     adminHostname: "admin.example.com",
     challengeDir: "/var/lib/ark/acme",
     apiUpstream: "api:3000",
+    certificates,
   });
   const internal = publicConfig.indexOf("respond @internal 404");
   const browser = publicConfig.indexOf("reverse_proxy @browserApi");
@@ -120,22 +193,25 @@ async function validateConfigurations() {
   if (!(internal >= 0 && internal < browser && browser < unknown && unknown < fallback)) {
     throw new Error("Generated public route ordering does not preserve the deny boundary.");
   }
-  console.log("Validating rendered and static Caddyfiles:");
+  const appConfig = renderCaddyfile({
+    adminMode: "public",
+    adminHostname: "admin.example.com",
+    challengeDir: "/var/lib/ark/acme",
+    apiUpstream: "api:3000",
+    certificates,
+    appRoutes: [{ hostname: "example.com" }, { hostname: "www.example.com", upstream: "app:8080" }],
+  });
+  const tlsSites = appConfig.match(/^ {2}tls \/var\/lib\/ark\/certs\/\S+\/fullchain\.pem \S+\/privkey\.pem$/gm);
+  if (tlsSites?.length !== 3) {
+    throw new Error(`Generated app-route config should load 3 Ark certificates, found ${tlsSites?.length}.`);
+  }
+  console.log("Validating rendered and static Caddyfiles (tls files from fixture certificates):");
   await validate("generated-public", publicConfig);
   await validate(
     "generated-tailnet-edge",
     renderCaddyfile({ adminMode: "tailnet", challengeDir: "/var/lib/ark/acme", apiUpstream: "api:3000" }),
   );
-  await validate(
-    "generated-public-with-app-routes",
-    renderCaddyfile({
-      adminMode: "public",
-      adminHostname: "admin.example.com",
-      challengeDir: "/var/lib/ark/acme",
-      apiUpstream: "api:3000",
-      appRoutes: [{ hostname: "app.example.com", upstream: "app:8080" }],
-    }),
-  );
+  await validate("generated-public-with-app-routes", appConfig);
   await validate("bootstrap-edge", await Bun.file(join(root, "infra/platform/Caddyfile")).text());
   await validate("tailnet-gateway", await Bun.file(join(root, "infra/platform/TailnetCaddyfile")).text());
   console.log("Generated and static Caddy configurations validate with deny-first route ordering.");
@@ -164,6 +240,9 @@ async function startUpstream() {
     network,
     "--network-alias",
     "upstream",
+    // The production admin site proxies to api:3000.
+    "--network-alias",
+    "api",
     "--publish",
     "127.0.0.1::3000",
     "--volume",
@@ -216,14 +295,11 @@ async function waitForAdmin(caddy: CaddyContainer) {
   );
 }
 
-// Same request shape as `writeEdge`: POST the Caddyfile text to /load.
-async function load(caddy: CaddyContainer, caddyfile: string, mustRevalidate = false) {
+// POST the Caddyfile text straight to /load (the WebSocket fixtures change the config on every load).
+async function load(caddy: CaddyContainer, caddyfile: string) {
   const response = await fetch(`${caddy.url(2019)}/load`, {
     method: "POST",
-    headers: {
-      "content-type": "text/caddyfile",
-      ...(mustRevalidate ? { "cache-control": "must-revalidate" } : {}),
-    },
+    headers: { "content-type": "text/caddyfile" },
     body: caddyfile,
     signal: AbortSignal.timeout(20_000),
   });
@@ -521,20 +597,179 @@ async function websocketIdleTest(report: Report) {
   connection.socket.close(1000);
 }
 
-// ---- Certificate reload ----------------------------------------------------------------------------------
+// ---- Ark-issued certificates on the production edge (FD-02) ----------------------------------------------
 
-function servedFingerprint(port: number) {
-  return new Promise<string>((resolveFingerprint, reject) => {
-    const socket = connect(
-      { host: "127.0.0.1", port, servername: "edge.test", rejectUnauthorized: false },
-      () => {
-        const fingerprint = socket.getPeerCertificate().fingerprint256;
-        socket.end();
-        resolveFingerprint(fingerprint);
-      },
+type Edge = CaddyContainer & { edgeDir: string };
+
+// Mirrors the Compose `edge` service: bootstrap Caddyfile, `edge-admin` alias, the writer's uid with
+// every capability dropped, ACME webroot and certificate directory mounted read-only.
+async function startProductionEdge(): Promise<Edge> {
+  const acme = join(directory, "acme");
+  const edgeDir = join(directory, "edge");
+  await mkdir(join(acme, ".well-known", "acme-challenge"), { recursive: true });
+  await mkdir(edgeDir);
+  await Bun.write(join(acme, ".well-known", "acme-challenge", "fixture-token"), "fixture-token.key-auth");
+  const name = `ark-edge-production-${suffix}`;
+  containers.push(name);
+  await docker(
+    "run",
+    "--detach",
+    "--name",
+    name,
+    "--network",
+    network,
+    "--network-alias",
+    "edge-admin",
+    "--user",
+    user,
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges:true",
+    "--publish",
+    "127.0.0.1::80",
+    "--publish",
+    "127.0.0.1::443",
+    "--volume",
+    `${join(root, "infra/platform/Caddyfile")}:/etc/caddy/Caddyfile:ro`,
+    "--volume",
+    `${acme}:/var/lib/ark/acme:ro`,
+    "--volume",
+    `${fixtureCerts.served}:${EDGE_CERT_DIR}:ro`,
+    caddyImage,
+  );
+  const ports = new Map([
+    [80, await publishedPort(name, 80)],
+    [443, await publishedPort(name, 443)],
+  ]);
+  const port = (inner: number) => {
+    const outer = ports.get(inner);
+    if (outer === undefined) throw new Error(`${name} does not publish ${inner}`);
+    return outer;
+  };
+  return { name, port, url: (inner, scheme = "http") => `${scheme}://127.0.0.1:${port(inner)}`, edgeDir };
+}
+
+// Bundles scripts/edge-test/write-edge.ts, including the production writeEdge and its dependencies,
+// so the container needs nothing from the host's node_modules (which may link outside the repo).
+let writeEdgeBundle: Promise<string> | undefined;
+function bundleWriteEdge() {
+  writeEdgeBundle ??= (async () => {
+    const outdir = join(directory, "write-edge");
+    const built = await Bun.build({
+      entrypoints: [join(fixtures, "write-edge.ts")],
+      target: "bun",
+      outdir,
+    });
+    if (!built.success) throw new Error(`Bundling write-edge.ts failed: ${built.logs.join("\n")}`);
+    return outdir;
+  })();
+  return writeEdgeBundle;
+}
+
+// Runs the bundled write-edge.ts beside the edge, as the domain worker would.
+async function edgeApply(edge: Edge, mode: "write" | "load-without-revalidate", input?: unknown) {
+  const bundle = await bundleWriteEdge();
+  return docker(
+    "run",
+    "--rm",
+    "--network",
+    network,
+    "--user",
+    user,
+    "--env",
+    "HOME=/tmp",
+    "--env",
+    "ARK_EDGE_DIR=/edge",
+    "--env",
+    "ARK_EDGE_RELOAD_URL=http://edge-admin:2019",
+    "--env",
+    "ARK_ACME_WEBROOT=/var/lib/ark/acme",
+    "--volume",
+    `${bundle}:/harness:ro`,
+    "--volume",
+    `${edge.edgeDir}:/edge`,
+    "--workdir",
+    "/tmp",
+    bunImage,
+    "bun",
+    "/harness/write-edge.js",
+    mode,
+    ...(input === undefined ? [] : [JSON.stringify(input)]),
+  );
+}
+
+let productionEdge: Promise<Edge> | undefined;
+
+// One production edge, configured once through writeEdge, serves the TLS, :80 and reload tests.
+function productionEdgeFixture() {
+  productionEdge ??= (async () => {
+    const edge = await startProductionEdge();
+    await waitFor(`${edge.name} bootstrap :80`, async () =>
+      (await plainGet(edge, "unknown.example.net", "/")).status === 404 ? true : undefined,
     );
+    const applied = JSON.parse(await edgeApply(edge, "write", fixturePlan())) as { applied: boolean };
+    if (!applied.applied) throw new Error("writeEdge did not apply the configuration.");
+    return edge;
+  })();
+  return productionEdge;
+}
+
+function servedFingerprint(port: number, servername: string) {
+  return new Promise<string>((resolveFingerprint, reject) => {
+    const socket = connect({ host: "127.0.0.1", port, servername, rejectUnauthorized: false }, () => {
+      const fingerprint = socket.getPeerCertificate().fingerprint256;
+      socket.end();
+      resolveFingerprint(fingerprint);
+    });
     socket.setTimeout(10_000, () => socket.destroy(new Error("TLS handshake timed out")));
     socket.on("error", reject);
+  });
+}
+
+type Reply = { status: number; headers: Record<string, string | string[] | undefined>; body: string };
+
+function collect(resolveReply: (reply: Reply) => void) {
+  return (response: import("node:http").IncomingMessage) => {
+    let body = "";
+    response.setEncoding("utf8");
+    response.on("data", (chunk: string) => (body += chunk));
+    response.on("end", () =>
+      resolveReply({ status: response.statusCode ?? 0, headers: response.headers, body }),
+    );
+  };
+}
+
+// Plain HTTP to the edge's :80 with an explicit Host header (fetch cannot override Host).
+function plainGet(edge: Edge, host: string, path: string) {
+  return new Promise<Reply>((resolveReply, reject) => {
+    const request = httpRequest(
+      { host: "127.0.0.1", port: edge.port(80), path, headers: { host }, timeout: 10_000 },
+      collect(resolveReply),
+    );
+    request.on("timeout", () => request.destroy(new Error("HTTP request timed out")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+function secureGet(edge: Edge, host: string, path: string) {
+  return new Promise<Reply>((resolveReply, reject) => {
+    const request = httpsRequest(
+      {
+        host: "127.0.0.1",
+        port: edge.port(443),
+        servername: host,
+        path,
+        headers: { host },
+        rejectUnauthorized: false,
+        timeout: 10_000,
+      },
+      collect(resolveReply),
+    );
+    request.on("timeout", () => request.destroy(new Error("HTTPS request timed out")));
+    request.on("error", reject);
+    request.end();
   });
 }
 
@@ -542,61 +777,124 @@ function short(fingerprint: string) {
   return `…${fingerprint.slice(-20)}`;
 }
 
-async function certificateReloadTest(report: Report) {
-  const certs = join(directory, "certs");
-  await mkdir(certs);
-  await docker(
-    "run",
-    "--rm",
-    "--user",
-    `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`,
-    "--env",
-    "HOME=/tmp",
-    "--volume",
-    `${certs}:/out`,
-    bunImage,
-    "sh",
-    "-c",
-    "set -e; for name in old new; do openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj /CN=edge.test -addext subjectAltName=DNS:edge.test -keyout /out/$name.key -out /out/$name.pem 2>/dev/null; done",
+async function tlsTest(report: Report) {
+  const edge = await productionEdgeFixture();
+  for (const hostname of issuedHostnames) {
+    const expected = await fingerprintOf(edgeCertificatePaths(hostname, fixtureCerts.served).fullchain);
+    const served = await servedFingerprint(edge.port(443), hostname);
+    expect(
+      report,
+      served === expected,
+      `TLS handshake for ${hostname} shows its Ark fixture certificate`,
+      `served ${short(served)}, fixture ${short(expected)}`,
+    );
+  }
+  for (const [hostname, status] of Object.entries(unissued)) {
+    const outcome = await servedFingerprint(edge.port(443), hostname).then(
+      (fingerprint) => `served ${short(fingerprint)}`,
+      (error: Error) => `handshake refused (${error.message.split("\n")[0]})`,
+    );
+    expect(
+      report,
+      outcome.startsWith("handshake refused"),
+      `${hostname} (certificate ${status}, files on disk) is not served`,
+      outcome,
+    );
+  }
+  const admin = await secureGet(edge, "admin.example.com", "/");
+  const internal = await secureGet(edge, "admin.example.com", "/api/internal/anything");
+  expect(
+    report,
+    admin.status === 200 && admin.body === "ok" && internal.status === 404,
+    "admin site proxies to api:3000 over the Ark certificate and still denies /api/internal/*",
+    `GET / -> ${admin.status} ${JSON.stringify(admin.body)}; GET /api/internal/anything -> ${internal.status}`,
   );
-  const fingerprint = async (name: string) =>
-    new X509Certificate(await Bun.file(join(certs, `${name}.pem`)).text()).fingerprint256;
-  const [oldFingerprint, newFingerprint] = [await fingerprint("old"), await fingerprint("new")];
-  const install = async (name: string) => {
-    await copyFile(join(certs, `${name}.pem`), join(certs, "fullchain.pem"));
-    await copyFile(join(certs, `${name}.key`), join(certs, "privkey.pem"));
-  };
-  await install("old");
+  const unrouted = await secureGet(edge, "example.com", "/anything");
+  expect(
+    report,
+    unrouted.status === 503 &&
+      unrouted.body === "This hostname is not routed yet." &&
+      unrouted.headers.server === undefined &&
+      !/api|upstream|edge-admin|app-edge|:\d+/.test(unrouted.body),
+    "unrouted endpoint answers a fixed 503 naming no internal host",
+    `${unrouted.status} ${JSON.stringify(unrouted.body)}, Server: ${unrouted.headers.server}`,
+  );
+}
 
-  const caddyfile = await fixture("certificate.Caddyfile");
-  const caddy = await startCaddy("certificate", caddyfile, [8443, 2019], [`${certs}:/certs:ro`]);
-  await waitForAdmin(caddy);
-  await load(caddy, caddyfile, true);
-  const initial = await waitFor("the fixture certificate", () => servedFingerprint(caddy.port(8443)));
+async function redirectTest(report: Report) {
+  const edge = await productionEdgeFixture();
+  for (const hostname of issuedHostnames) {
+    const reply = await plainGet(edge, hostname, "/path?x=1");
+    expect(
+      report,
+      reply.status === 308 && reply.headers.location === `https://${hostname}/path?x=1`,
+      `http://${hostname} redirects to HTTPS with 308`,
+      `${reply.status} Location: ${reply.headers.location}`,
+    );
+  }
+  for (const hostname of [...Object.keys(unissued), "unknown.example.net"]) {
+    const reply = await plainGet(edge, hostname, "/path?x=1");
+    expect(
+      report,
+      reply.status === 404 && reply.headers.location === undefined,
+      `http://${hostname} (not served) returns 404`,
+      `${reply.status} ${JSON.stringify(reply.body)}`,
+    );
+  }
+  for (const hostname of ["example.com", "pending.example.com", "unknown.example.net"]) {
+    const reply = await plainGet(edge, hostname, "/.well-known/acme-challenge/fixture-token");
+    expect(
+      report,
+      reply.status === 200 && reply.body === "fixture-token.key-auth",
+      `ACME HTTP-01 challenge is served for ${hostname} without a redirect`,
+      `${reply.status} ${JSON.stringify(reply.body)}`,
+    );
+  }
+}
+
+async function certificateReloadTest(report: Report) {
+  const edge = await productionEdgeFixture();
+  const hostname = "www.example.com";
+  const live = edgeCertificatePaths(hostname, fixtureCerts.served);
+  const renewed = edgeCertificatePaths(hostname, fixtureCerts.renewed);
+  const [oldFingerprint, newFingerprint] = [
+    await fingerprintOf(live.fullchain),
+    await fingerprintOf(renewed.fullchain),
+  ];
+  const initial = await servedFingerprint(edge.port(443), hostname);
   expect(
     report,
     initial === oldFingerprint,
-    "initial certificate is served",
-    `fingerprint ${short(initial)}`,
+    "writeEdge applied the issued certificate",
+    `served ${short(initial)}`,
   );
 
-  await install("new");
-  const plain = await load(caddy, caddyfile);
-  const afterPlain = await servedFingerprint(caddy.port(8443));
+  // A renewal replaces the files at the same paths, as issueCertificateFiles does.
+  await copyFile(renewed.fullchain, live.fullchain);
+  await copyFile(renewed.privkey, live.privkey);
+  const plain = JSON.parse(await edgeApply(edge, "load-without-revalidate")) as { status: number };
+  const afterPlain = await servedFingerprint(edge.port(443), hostname);
   expect(
     report,
-    plain === 200 && afterPlain === oldFingerprint,
-    "files swapped, identical /load without Cache-Control: must-revalidate keeps the old certificate",
-    `/load ${plain}; served ${short(afterPlain)} (old ${short(oldFingerprint)})`,
+    plain.status === 200 && afterPlain === oldFingerprint,
+    "control: files swapped, identical /adapt + /load without Cache-Control: must-revalidate keeps the old certificate",
+    `/load ${plain.status}; served ${short(afterPlain)} (old ${short(oldFingerprint)})`,
   );
 
-  const forced = await load(caddy, caddyfile, true);
-  const afterForced = await servedFingerprint(caddy.port(8443));
+  const applied = JSON.parse(await edgeApply(edge, "write", fixturePlan())) as { applied: boolean };
+  const afterWrite = await servedFingerprint(edge.port(443), hostname);
   expect(
     report,
-    forced === 200 && afterForced === newFingerprint,
-    "identical /load with Cache-Control: must-revalidate serves the new certificate",
-    `/load ${forced}; served ${short(afterForced)} (new ${short(newFingerprint)})`,
+    applied.applied && afterWrite === newFingerprint,
+    "identical config re-applied through writeEdge (must-revalidate) serves the renewed certificate",
+    `applied ${applied.applied}; served ${short(afterWrite)} (new ${short(newFingerprint)})`,
+  );
+  const other = await servedFingerprint(edge.port(443), "example.com");
+  expect(
+    report,
+    other === (await fingerprintOf(edgeCertificatePaths("example.com", fixtureCerts.served).fullchain)),
+    "other hostnames keep their certificates across the reload",
+    `example.com served ${short(other)}`,
   );
 }
 
@@ -624,6 +922,7 @@ async function dumpLogs() {
 let failed = false;
 try {
   await checkPins();
+  await generateFixtureCertificates();
   await validateConfigurations();
   console.log(`\nEdge behaviour tests on ${caddyImage} (the idle test takes ${idleSeconds} s):`);
   await startUpstream();
@@ -632,9 +931,14 @@ try {
     run("header stripping", async (report) => headerBehaviour(await headerFixture(), report)),
     run("server and via removal", async (report) => viaBehaviour(await headerFixture(), report)),
     run("websocket across reload", websocketReloadTests),
-    run("certificate reload", certificateReloadTest),
+    // The reload test swaps certificate files, so it runs after the read-only TLS and :80 tests.
+    (async () => [
+      await run("ark certificates: tls", tlsTest),
+      await run("ark certificates: http redirect", redirectTest),
+      await run("ark certificates: reload through writeEdge", certificateReloadTest),
+    ])(),
   ]);
-  failed = results.includes(false);
+  failed = results.flat().includes(false);
   if (failed) await dumpLogs();
   else console.log("\nAll edge behaviour tests passed.");
 } catch (error) {
