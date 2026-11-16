@@ -48,7 +48,7 @@ description = "Run native mail lifecycle checks against a disposable pinned Stal
 run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts"
 
 [tasks."test:edge"]
-description = "Validate generated public/tailnet and static Caddy configurations"
+description = "Validate Caddy configurations and exercise literal front-door design examples (Docker, Python 3, OpenSSL)"
 run = "bun scripts/test-edge-config.ts"
 
 [tasks."test:agent"]

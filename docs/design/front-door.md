@@ -1,11 +1,11 @@
 # Front door: public routes to tailnet services, and database access from Vercel
 
-Status: proposed design and implementation plan, **revision 2**. No product code has changed. Revision 1 was prepared on 16 November 2026 against `main` at `f14666a`. Revision 2, also dated 16 November 2026, is rebased onto `main` at `36db9ee`: better-auth is now 1.7.25, and the latest migration is `0012_drop_account_issuer.sql`. It applies the user's answers to the revision 1 open questions, which are recorded in [§0.1 Resolved decisions](#01-resolved-decisions).
+Status: proposed design and implementation plan, **revision 3** (review corrections, 16 November 2026). No product code has changed. The corrected examples and acceptance criteria below supersede revision 2 prototypes; those prototypes do not prove the revised security properties. Revision 1 was prepared on 16 November 2026 against `main` at `f14666a`. Revision 2, also dated 16 November 2026, is rebased onto `main` at `36db9ee`: better-auth is now 1.7.25, and the latest migration is `0012_drop_account_issuer.sql`. It applies the user's answers to the revision 1 open questions, which are recorded in [§0.1 Resolved decisions](#01-resolved-decisions).
 
 This document designs two related capabilities for Ark Stack:
 
-1. A **public front door on the VPS**. It exposes HTTP(S), TLS-based TCP and raw TCP services that run anywhere on the user's Tailscale tailnet, under the user's own public hostnames: `www.example.com`, the apex `example.com`, `db.example.com` and so on. Clients use plain hostnames on standard ports wherever the protocol allows it. Internet clients never learn a tailnet address, and the user's other machines stay reachable only through the tailnet.
-2. **Database access from Vercel.** Without static IPs, the public PgBouncer endpoint is protected by client certificates (mTLS), TLS, SCRAM and least-privilege roles. Certificates roll over automatically every 90 days.
+1. A **public front door on the VPS**. It exposes HTTP(S), TLS-based TCP and raw TCP services that run anywhere on the user's Tailscale tailnet, under the user's own public hostnames: `www.example.com`, the apex `example.com`, `db.example.com` and so on. Clients use plain hostnames on standard ports wherever the protocol allows it. Edge-controlled headers and error pages do not disclose a configured tailnet authority; upstream bodies and application-generated URLs require owner auditing (§3.5). The user's other machines stay reachable only through the tailnet.
+2. **Database access from Vercel.** Without static IPs, the public PgBouncer endpoint is protected by client certificates (mTLS), TLS, SCRAM and least-privilege roles. Certificates last 90 days; automatic rollover starts 30 days before expiry.
 
 Every claim about the current code cites a file and line. Every claim about an upstream product cites its documentation, or names the prototype that checked it (see [§7 Verification log](#7-verification-log)). Anything still uncertain is marked **Unverified** or listed under [§6 Remaining questions](#6-remaining-questions).
 
@@ -48,7 +48,7 @@ The user's revision 2 answers are listed in [§0.1](#01-resolved-decisions).
 | PostgreSQL by hostname       | `psql "host=pg.example.com sslnegotiation=direct sslmode=verify-full"` reaches a tailnet Postgres on the normal port 5432. Supported by libpq 17+, node-postgres 8.22+, postgres.js 4.1.1, pgJDBC 42.7.4+, Npgsql 9+ and pgx 5.7.5+. PgBouncer 1.26.1 shares 5432: it is the default for classic clients and also accepts direct TLS itself (V-13).                                                                                                               |
 | HTTP access gate             | Caddy `forward_auth` calls the Ark API, and a one-time-code handshake sets a host-only `__Host-` cookie on each route domain. Login happens on the **public `login.<domain>` origin**, which exposes only sign-in, MFA and gate endpoints.                                                                                                                                                                                                                        |
 | SSRF guard                   | Targets must be Tailscale addresses that appear in the edge node's own netmap. Each route is pinned to the target's `StableNodeID`, Ark renders only the IP, and Tailscale ACL grants enforce the same boundary on the receiving node.                                                                                                                                                                                                                            |
-| PgBouncer mTLS               | `client_tls_sslmode = verify-full`, with **one private CA per app environment** in one bundle. Preview deployments use a **read-only role**. Revocation removes the CA, rotates the password, then sends `RELOAD` and `KILL_CLIENT` (V-8). PgBouncer is upgraded to 1.26.1 (FD-01, started separately).                                                                                                                                                           |
+| PgBouncer mTLS               | `client_tls_sslmode = verify-full`, with **one private CA per app environment and certificate generation** in one bundle. Preview deployments use a **read-only role**. Revocation removes the CA, rotates the password, then sends `RELOAD` and `KILL_CLIENT` (V-8). PgBouncer is upgraded to 1.26.1 (FD-01, started separately).                                                                                                                                |
 | Client certificates          | **90-day lifetime with automatic rollover.** The next certificate is issued 30 days before expiry, both are valid during the overlap, and Ark raises a "rollover pending" alert. An optional **Vercel integration** uses a project-scoped, expiring Vercel token to push env vars and redeploy (§3.10.5).                                                                                                                                                         |
 | Public DB and TCP limits     | nftables per-source `ct count` and `limit rate` meters on every public TCP port. Per-route CIDR allowlists are enforced in HAProxy, because nftables cannot see SNI and Docker's native IPv6 keeps real client addresses.                                                                                                                                                                                                                                         |
 | DNS                          | Plain hostnames, including the apex and `www`. A and AAAA records come from the existing reviewed-diff flow. **AAAA is published only after an IPv6 preflight passes**, with a per-domain off switch.                                                                                                                                                                                                                                                             |
@@ -231,20 +231,20 @@ Four Tailscale identities live on the VPS. They are kept separate:
 
 **Assets**
 
-| Asset                                            | Where it lives                                        | Impact if lost                                                                                                                                   |
-| ------------------------------------------------ | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Tailnet reachability                             | `edge-ts` and `backup-ts` node keys and state volumes | An attacker can reach every granted route target `host:port`, and the home backup server's port. They cannot reach anything else on the tailnet. |
-| Route target services                            | Home machines and others on the tailnet               | Data exposure or compromise of those services.                                                                                                   |
-| Ark sessions and gate cookies                    | `session`, `gate_sessions` tables; browsers           | Impersonation on SSO routes.                                                                                                                     |
-| `BETTER_AUTH_SECRET`, `ARK_ROOT_KEY`             | `.env` on the VPS, process env                        | Full control of Ark: decrypt every secret and mint sessions.                                                                                     |
-| Private CA keys (DB clients, TCP clients)        | `secrets` table, encrypted with the root key          | An attacker can mint client certificates for PgBouncer or TLS-TCP routes.                                                                        |
-| DB client cert, key and password                 | Vercel env vars                                       | Connections as that app environment's role, from anywhere, until expiry (≤ 90 days) or revocation.                                               |
-| **Vercel project tokens** (optional integration) | `secrets` table, sealed                               | Full control of that one Vercel project: env vars, deployments, and therefore code running on the app's production domain (§3.10.5).             |
-| Public TLS keys                                  | `/var/lib/ark/certs`                                  | Impersonation of public hostnames.                                                                                                               |
-| Cloudflare token                                 | domain-worker env                                     | DNS hijack of the zones it covers.                                                                                                               |
-| Backup credentials                               | `secrets` table, sealed                               | Write-only by design: an attacker can add data and read backups, but not delete or overwrite existing recovery points (§3.18).                   |
-| Application data                                 | `app-postgres`, tailnet databases                     | Exfiltration or tampering.                                                                                                                       |
-| Backups                                          | S3-compatible bucket; home machine                    | Data exposure (restic and pgBackRest encrypt at rest); loss of recovery points if delete were possible.                                          |
+| Asset                                            | Where it lives                                                                                                          | Impact if lost                                                                                                                                                                |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tailnet reachability                             | `edge-ts` and `backup-ts` node keys and state volumes                                                                   | An attacker can reach every granted route target `host:port`, and the home backup server's port. They cannot reach anything else on the tailnet.                              |
+| Route target services                            | Home machines and others on the tailnet                                                                                 | Data exposure or compromise of those services.                                                                                                                                |
+| Ark sessions and gate cookies                    | `session`, `gate_sessions` tables; browsers                                                                             | Impersonation on SSO routes.                                                                                                                                                  |
+| `BETTER_AUTH_SECRET`, `ARK_ROOT_KEY`             | `.env` on the VPS, process env                                                                                          | Full control of Ark: decrypt every secret and mint sessions.                                                                                                                  |
+| Private CA keys (DB clients, TCP clients)        | `secrets` table; decryptable by api, database-worker, domain-worker, mail-worker and backup-worker with shared root key | An attacker can mint client certificates for PgBouncer or TLS-TCP routes.                                                                                                     |
+| DB client cert, key and password                 | Vercel env vars                                                                                                         | Connections as that app environment's role, from permitted sources until expiry plus the enforced ≤5 s retirement drain, or revocation; expiry alone does not close sessions. |
+| **Vercel project tokens** (optional integration) | `secrets` table; same five root-key holders as CA keys, including publicly exposed api                                  | Full control of that one Vercel project: env vars, deployments, and therefore code running on the app's production domain (§3.10.5).                                          |
+| Public TLS keys                                  | `/var/lib/ark/certs`                                                                                                    | Impersonation of public hostnames.                                                                                                                                            |
+| Cloudflare token                                 | domain-worker env                                                                                                       | DNS hijack of the zones it covers.                                                                                                                                            |
+| Backup credentials                               | `secrets` table, sealed                                                                                                 | Write-only by design: an attacker can add data and read backups, but not delete or overwrite existing recovery points (§3.18).                                                |
+| Application data                                 | `app-postgres`, tailnet databases                                                                                       | Exfiltration or tampering.                                                                                                                                                    |
+| Backups                                          | S3-compatible bucket; home machine                                                                                      | Data exposure (restic and pgBackRest encrypt at rest); loss of recovery points if delete were possible.                                                                       |
 
 **Attackers**
 
@@ -265,18 +265,18 @@ Four Tailscale identities live on the VPS. They are kept separate:
 
 **Trust boundaries**
 
-| #   | Boundary                                     | Controls                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| --- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| B1  | Internet ↔ VPS public ports                  | Host nft default-deny on `input`, plus `forward`-chain control of DNAT'd ports. Only 80, 443, 5432, the enabled shared SNI ports, the configured route ports and UDP 41641/41642 are open. Per-source `ct count` and `limit rate` on every public TCP port.                                                                                                                                                                                                                                                                                                                                                                |
-| B2  | Internet ↔ HAProxy (`edge-l4`)               | TLS ClientHello or Postgres preamble required within 5 s, otherwise reject (V-13). SNI is attacker-chosen plaintext, so routing by SNI grants no authority by itself: each route still applies its own CIDR, TLS and client-certificate policy. Unknown SNI never reaches a tailnet target. `maxconn` per frontend and route; stick-table per-source limits; `hard-stop-after`.                                                                                                                                                                                                                                            |
-| B3  | HAProxy ↔ Caddy                              | PROXY v2 over loopback only. Caddy binds its HTTPS sites to `127.0.0.1:8443`, trusts PROXY headers only from `127.0.0.1/32`, and uses `fallback_policy reject` for any other source. For an allowed source the header is optional: a loopback TLS connection without one succeeded in V-14. **The guarantee therefore rests on the loopback bind.** Only processes inside the `edge-ts` netns (tailscaled, HAProxy, Caddy) can reach 8443, and a peer on a Docker network cannot connect at all (V-14). The listener wrapper is scoped to `servers 127.0.0.1:8443`, so the public `:80` server never parses PROXY headers. |
-| B4  | Internet ↔ Caddy (HTTP semantics)            | Lego TLS; deny-before-fallback routing; header stripping; body and timeout limits; Caddy ignores incoming `X-Forwarded-*` from untrusted clients ([docs](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults)). SNI/Host mismatch (domain fronting between Ark sites) is refused with `strict_sni_host on`. Without that option Caddy 2.11.9 served the mismatched Host (200); with it, the response is 421 (V-14).                                                                                                                                                                                   |
-| B5  | Caddy ↔ Ark API (forward_auth, login origin) | Internal `admin` network; edge token header; path allowlist for the login origin; API checks `Host` against registered route hostnames.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| B6  | Edge netns ↔ tailnet                         | Tailscale ACL grants, enforced by the receiving node; `--shields-up` on the edge node; Ark's upstream allowlist; StableID pinning.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| B7  | Gate user ↔ login origin                     | **Public (R1).** Only the login and MFA endpoints are exposed. Gate sessions are flagged and refused by the admin API. Rate limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| B8  | Internet ↔ PgBouncer                         | nft per-source limits; HAProxy CIDR allowlist for the PgBouncer backend; TLS 1.3; `verify-full` client certificate; SCRAM; runtime or read-only roles; per-role and per-database limits. PgBouncer is reachable only from `edge-ts` over the dedicated `pgbouncer-ingress` network, so the edge namespace never joins `database-management` and cannot reach `app-postgres`.                                                                                                                                                                                                                                               |
-| B9  | Operator ↔ admin UI                          | Tailnet only (`adminMode: "tailnet"`); Better Auth with MFA; step-up for exposure changes; route management owner-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| B10 | Ark ↔ providers                              | Scoped Cloudflare token (Zone:DNS:Edit plus Zone:Read); optional **project-scoped, expiring** Vercel token; write-only object-storage credentials; no Tailscale credential of any kind (R10).                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| #   | Boundary                                     | Controls                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --- | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B1  | Internet ↔ VPS public ports                  | Host nft default-deny on `input`, plus `forward`-chain control of DNAT'd ports. The permitted set is the union of enabled platform services: 80/443/5432, enabled SNI and route ports, UDP 41641/41642, plus TCP 25/465/587/993 when mail is enabled. Per-source `ct count` and `limit rate` on every public TCP port.                                                                                                                                                                                                                                                                                                            |
+| B2  | Internet ↔ HAProxy (`edge-l4`)               | TLS ClientHello or Postgres preamble required within 5 s, otherwise reject (V-13). SNI is attacker-chosen plaintext, so routing by SNI grants no authority by itself: each route still applies its own CIDR, TLS and client-certificate policy. Unknown SNI never reaches a tailnet target. `maxconn` per frontend and route; stick-table per-source limits; `hard-stop-after`.                                                                                                                                                                                                                                                   |
+| B3  | HAProxy ↔ Caddy                              | PROXY headers are required on the loopback-only HTTPS listener ([pinned wrapper source](https://github.com/caddyserver/caddy/blob/v2.11.9/modules/caddyhttp/proxyprotocol/listenerwrapper.go)) (`fallback_policy require`, **no `allow` list**, which would override it with optional USE). HAProxy emits v2. Headerless loopback TLS must fail; only tailscaled, HAProxy and Caddy share this netns. This prevents accidental headerless bypass, not a malicious process in the trusted edge netns forging PROXY. Public :80 never parses PROXY. V-14 proved the old optional behavior; FD-25 must prove the corrected contract. |
+| B4  | Internet ↔ Caddy (HTTP semantics)            | Lego TLS; deny-before-fallback routing; header stripping; body and timeout limits; Caddy ignores incoming `X-Forwarded-*` from untrusted clients ([docs](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults)). SNI/Host mismatch (domain fronting between Ark sites) is refused with `strict_sni_host on`. Without that option Caddy 2.11.9 served the mismatched Host (200); with it, the response is 421 (V-14).                                                                                                                                                                                          |
+| B5  | Caddy ↔ Ark API (forward_auth, login origin) | Internal `admin` network; edge token header; path allowlist for the login origin; API checks `Host` against registered route hostnames.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| B6  | Edge netns ↔ tailnet                         | Tailscale ACL grants, enforced by the receiving node; `--shields-up` on the edge node; Ark's upstream allowlist; StableID pinning.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| B7  | Gate user ↔ login origin                     | **Public (R1).** Only the login and MFA endpoints are exposed. Gate sessions are flagged and refused by the admin API. Rate limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| B8  | Internet ↔ PgBouncer                         | nft per-source limits; HAProxy CIDR allowlist for the PgBouncer backend; TLS 1.3; `verify-full` client certificate; SCRAM; runtime or read-only roles; per-role and per-database limits. PgBouncer is reachable only from `edge-ts` over the dedicated `pgbouncer-ingress` network, so the edge namespace never joins `database-management` and cannot reach `app-postgres`.                                                                                                                                                                                                                                                      |
+| B9  | Operator ↔ admin UI                          | Tailnet only (`adminMode: "tailnet"`); Better Auth with MFA; step-up for exposure changes; route management owner-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| B10 | Ark ↔ providers                              | Scoped Cloudflare token (Zone:DNS:Edit plus Zone:Read); optional **project-scoped, expiring** Vercel token; write-only object-storage credentials; no Tailscale credential of any kind (R10).                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 **What a full VPS compromise exposes**
 
@@ -288,7 +288,7 @@ Several things limit the damage:
 - **The tailnet policy is out of reach.** Ark holds no Tailscale API credential at all, so the attacker cannot widen the policy or add grants.
 - **Tailnet Lock blocks new nodes.** If it is enabled, the attacker cannot add new nodes with a stolen or reused auth key, because trusted nodes must sign every new node ([Tailnet Lock](https://tailscale.com/docs/features/tailnet-lock)). Edge and backup keys are one-off keys revoked after enrollment.
 - **Existing backups survive.** The S3 credentials cannot delete or overwrite them: Object Lock or bucket lock, plus no-delete policies. The home `rest-server` runs `--append-only` (V-18). Pruning happens off-host.
-- **Client certificates expire within 90 days** even if nobody revokes them.
+- **Client certificates expire within 90 days** for new TLS handshakes even if nobody revokes them; the enforced retirement drain bounds live access to expiry +5 s (§3.10.4).
 
 Route targets must still do their own authentication for anything sensitive. The SSO gate is a perimeter, not a substitute.
 
@@ -296,7 +296,7 @@ Route targets must still do their own authentication for anything sensitive. The
 
 - Rate limiting on HTTP routes beyond the login origin would need the unofficial `caddy-ratelimit` plugin and a custom build. It is deferred (FD-23).
 - A WebSocket that was open when access was revoked survives until the next edge reload plus `stream_close_delay` (5 minutes). The user accepts this (R7; V-3, V-15).
-- PgBouncer cannot bind a client certificate to a role, so app A's certificate plus app B's password would be admitted. Exploiting that needs two separate secrets, and it is mitigated by one CA per app environment plus a per-role password (V-8).
+- PgBouncer cannot bind a client certificate to a role, so app A's certificate plus app B's password would be admitted. Exploiting that needs two separate secrets, and it is mitigated by one CA per app environment/generation plus a per-role password (V-8).
 - During a rollover overlap, a superseded client certificate stays valid until its own expiry, at most 30 days. Immediate invalidation needs CA rotation (§3.10.4).
 - HAProxy is a single chokepoint for 443 and 5432. A HAProxy vulnerability or DoS affects every route. Mitigations: the LTS branch, digest pin with a documented bump procedure, `maxconn` and per-source limits, and nft per-source limits in front.
 - SNI is visible on the wire, so route hostnames are public (they are in DNS and CT logs anyway). No ECH is offered, because no HTTPS DNS records are published.
@@ -316,6 +316,8 @@ ALTER TABLE platform_settings
   ADD COLUMN region text NOT NULL DEFAULT 'us-east',
   ADD COLUMN vps_region_label text,               -- free text: "Hetzner ash", "DO nyc3"; recorded only
   ADD COLUMN public_ipv6 text,
+  ADD COLUMN pooler_source_cidrs jsonb NOT NULL DEFAULT '[]',
+  ADD COLUMN pooler_allow_internet boolean NOT NULL DEFAULT false,
   ADD COLUMN ipv6_status text NOT NULL DEFAULT 'unchecked'
     CHECK (ipv6_status IN ('unchecked', 'passed', 'failed', 'not_present')),
   ADD COLUMN ipv6_checked_at timestamptz,
@@ -330,16 +332,38 @@ ALTER TABLE platform_settings
 -- Per-domain AAAA switch (R9). Effective AAAA = aaaa_enabled AND ipv6_status = 'passed'.
 ALTER TABLE domain_claims ADD COLUMN aaaa_enabled boolean NOT NULL DEFAULT true;
 
--- Snapshot of the edge node's netmap (self + visible peers), written by edge.observe
+-- Complete snapshots are independent for edge and backup observation sources.
+CREATE TABLE tailnet_snapshots (
+  source text PRIMARY KEY CHECK (source IN ('edge', 'backup')),
+  generation text NOT NULL,
+  completed_at timestamptz NOT NULL,
+  valid_until timestamptz NOT NULL  -- completed_at + 6 minutes
+);
 CREATE TABLE tailnet_nodes (
-  stable_id text PRIMARY KEY,                     -- tailcfg.StableNodeID
+  source text NOT NULL REFERENCES tailnet_snapshots(source),
+  generation text NOT NULL,
+  stable_id text NOT NULL,                     -- tailcfg.StableNodeID
   dns_name text NOT NULL,                         -- MagicDNS FQDN, e.g. home.tail1234.ts.net
   host_name text NOT NULL,
   ipv4 text, ipv6 text,
   tags jsonb NOT NULL DEFAULT '[]',
   is_self boolean NOT NULL DEFAULT false,
   online boolean,
-  observed_at timestamptz NOT NULL
+  observed_at timestamptz NOT NULL,
+  PRIMARY KEY (source, stable_id)
+);
+
+-- Private CAs must precede front_routes, which references them
+CREATE TABLE private_cas (
+  id text PRIMARY KEY,
+  purpose text NOT NULL CHECK (purpose IN ('db-client', 'tcp-client', 'http-client')),
+  name text NOT NULL,
+  cert_pem text NOT NULL,
+  key_secret_id text NOT NULL REFERENCES secrets(id),
+  crl_pem text, crl_next_update timestamptz,   -- used where the consumer supports CRLs (HAProxy)
+  not_after timestamptz NOT NULL,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired', 'revoked')),
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
 -- One row per public route
@@ -363,12 +387,13 @@ CREATE TABLE front_routes (
   tls_mode text CHECK (tls_mode IN ('passthrough', 'terminate', 'terminate_mtls', 'plain')),
     -- tls/postgres: passthrough | terminate | terminate_mtls; tcp: plain (forced)
   tcp_options jsonb NOT NULL DEFAULT '{}',    -- maxConn, perSourceConn, perSourceRate, idleTimeout
-  source_cidrs jsonb NOT NULL DEFAULT '[]',
+  source_cidrs jsonb NOT NULL DEFAULT '[]',  -- empty = deny all
+  allow_internet boolean NOT NULL DEFAULT false, -- explicit exposure.public step-up; renders open CIDRs
   client_ca_id text REFERENCES private_cas(id),   -- tls/postgres terminate_mtls now; http mTLS later (reserved)
   rate_limit jsonb,                               -- reserved; not rendered in v1
   enabled boolean NOT NULL DEFAULT false,
   status text NOT NULL DEFAULT 'draft',
-    -- draft | awaiting_acl | awaiting_dns | issuing_certificate | ready | identity_mismatch | disabled | error
+    -- draft | awaiting_acl | awaiting_dns | issuing_certificate | ready | identity_mismatch | observation_expired | disabled | error
   last_error text,
   created_by text REFERENCES "user"(id),
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -414,20 +439,13 @@ CREATE TABLE gate_sessions (
   revoked_at timestamptz
 );
 CREATE INDEX gate_sessions_user_idx ON gate_sessions(user_id);
-ALTER TABLE session ADD COLUMN origin text NOT NULL DEFAULT 'admin' CHECK (origin IN ('admin', 'gate'));
+ALTER TABLE session ADD COLUMN origin text CHECK (origin IN ('admin', 'gate'));
+-- Existing sessions were created before the public gate existed. Backfill explicitly.
+UPDATE session SET origin = 'admin';
+ALTER TABLE session ALTER COLUMN origin SET NOT NULL;
+-- No SQL default: every future insert must supply an origin.
 
--- Private CAs and client certificates
-CREATE TABLE private_cas (
-  id text PRIMARY KEY,
-  purpose text NOT NULL CHECK (purpose IN ('db-client', 'tcp-client', 'http-client')),
-  name text NOT NULL,
-  cert_pem text NOT NULL,
-  key_secret_id text NOT NULL REFERENCES secrets(id),
-  crl_pem text, crl_next_update timestamptz,   -- used where the consumer supports CRLs (HAProxy)
-  not_after timestamptz NOT NULL,
-  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired', 'revoked')),
-  created_at timestamptz NOT NULL DEFAULT now()
-);
+-- Client certificates
 CREATE TABLE client_certificates (
   id text PRIMARY KEY,
   ca_id text NOT NULL REFERENCES private_cas(id) ON DELETE CASCADE,
@@ -440,13 +458,16 @@ CREATE TABLE client_certificates (
   status text NOT NULL DEFAULT 'issued' CHECK (status IN ('issued', 'revoked', 'expired')),
   rollover_state text NOT NULL DEFAULT 'current'
     CHECK (rollover_state IN ('current', 'pending', 'delivered', 'superseded')),
-    -- pending: issued as successor, not yet delivered; delivered: pushed/confirmed; superseded: predecessor
+    -- delivered is a transient transition inside the promotion transaction; delivered_at is durable history
+    -- pending: not delivered; current: delivered active successor; superseded: predecessor
   superseded_by text REFERENCES client_certificates(id),
   delivered_at timestamptz,
   revoked_at timestamptz, revoked_reason text,
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (ca_id, serial)
 );
+CREATE UNIQUE INDEX client_certificates_successor_unique
+  ON client_certificates(superseded_by) WHERE superseded_by IS NOT NULL;
 CREATE TABLE database_clients (
   id text PRIMARY KEY,
   database_id text NOT NULL REFERENCES managed_databases(id) ON DELETE CASCADE,
@@ -499,7 +520,7 @@ CREATE TABLE backup_targets (
 Notes:
 
 - **Routes reuse `endpoints`** (schema.ts lines 150-159) for hostname uniqueness, domain linkage and certificates. Add the endpoint kinds `route` and `gate` (the login origin). One hostname may carry an HTTP route on 443 and a Postgres route on 5432, for example, but not both an HTTP and a TLS-TCP route on 443.
-- **`session.origin`** is set by a Better Auth `databaseHooks.session.create.before` hook from the request host. In 1.7.25 the hook signature is `(session, context: GenericEndpointContext | null)`, and `ctx.request` can be missing for server-side `auth.api.*` calls (from source, via research). When the context or request is missing, the hook does not guess from absent headers: Ark's own server-side calls pass the origin explicitly (gate-user creation sets `gate`), and any other context-free creation is refused. `session.additionalFields` is supported in 1.7.25.
+- **`session.origin`** is set by a Better Auth `databaseHooks.session.create.before` hook from the request host. In 1.7.25 the hook signature is `(session, context: GenericEndpointContext | null)`, and `ctx.request` can be missing for server-side `auth.api.*` calls (from source, via research). When the context or request is missing, the hook does not guess from absent headers: Ark's own server-side calls pass the origin explicitly (gate-user creation sets `gate`), and any other context-free creation is refused. `session.additionalFields` is supported in 1.7.25. Mark origin as server-authored (`input: false`); browser payloads cannot choose it.
 - **`database_roles.connectionLimit`** (schema.ts line 210) becomes the source of PgBouncer's per-role `max_user_connections`.
 - **Reserved for later:** `front_routes.rate_limit` and `client_ca_id` (for HTTP) stay unused in v1, so HTTP mTLS and HTTP rate limits can arrive without another migration.
 - **Manual records:** apex and `www` hostnames need no special casing, because Ark only ever writes A/AAAA records (no CNAME at the apex).
@@ -517,13 +538,15 @@ export function validateRouteTarget(input: {
   target: string; // "home.tail1234.ts.net" | "100.101.102.103" | "fd7a:115c:a1e0::1"
   port: number;
   peers: TailnetNode[]; // from the latest edge.observe snapshot
+  snapshot: { source: "edge" | "backup"; generation: string; validUntil: string };
+  now: string; // reject expired or incomplete snapshots; never mix observation sources
   self: TailnetNode; // the edge node
   forbiddenTags: string[]; // ["tag:ark-edge", "tag:ark-stack-admin", "tag:ark-vps", "tag:ark-backup"]
   tailnetSuffix: string; // ".tail1234.ts.net", learned from self.dns_name
 }): { ok: true; stableId: string; ip: string } | { ok: false; reason: string };
 ```
 
-Rules, applied in this order. All failures are closed.
+Rules, applied in this order. All failures are closed. A snapshot must be complete and unexpired before any target is accepted.
 
 1. **Syntax.** The target is either an IP literal or a lowercase FQDN ending in the tailnet's MagicDNS suffix. Ports, userinfo, schemes, paths, `localhost`, and bare single labels are rejected. Reuse `normalizeHostname` (`shared/src/hostnames.ts:8`) for the name form. Its `.internal`/`.local` blocklist does not apply to `.ts.net`.
 2. **Range.** An IP must fall in `100.64.0.0/10` or `fd7a:115c:a1e0::/48`, and not in `RESERVED`. Reuse `ipv4ToInt` (`cidr.ts:23`) and `parseIpv6` (`cidr.ts:27`), and factor out the existing `prefixMatch` (`cidr.ts:75`) as an export. This rejects loopback, RFC 1918 Docker networks (`172.16.0.0/12`, which the API trusts as proxies; compose line 71), link-local `169.254.0.0/16` (cloud metadata), `::1`, `fe80::/10`, and public addresses.
@@ -535,7 +558,11 @@ Rules, applied in this order. All failures are closed.
    - If the IP changed but the `stable_id` is the same, `target_ip` is updated automatically and an audit event is written.
    - If a name the user entered now resolves to a different `stable_id`, the route becomes `identity_mismatch` and is omitted until an operator re-confirms the target with step-up. This stops a renamed or re-registered machine from taking over a route.
 
-Because Tailscale only distributes peers that the policy lets the edge reach, appearing in the netmap is also evidence that the ACL grant exists. That is how status moves from `awaiting_acl` to ready.
+Netmap presence is necessary but **not sufficient** evidence of an outbound grant: peers may appear because they can connect to the edge. Only a successful TCP probe from the edge netns to the exact target port (§3.7), together with valid identity, permits `ready`. A member → edge rule must not make the reverse direction ready.
+
+**Snapshot lifetime and withdrawal.** `edge.observe` commits self and the entire peer set as one generation, deleting peers absent from that completed generation in the same transaction. Partial/failed reads never extend `valid_until`. Observations run every 5 minutes; validity lasts 6 minutes from completion. On missing identity, name replacement, IP change or expiry, durably enqueue active-config withdrawal and `edge.drain`, rather than only changing status. An independent edge-local watchdog checks the persisted lease at least every second: it withdraws affected backends, drains their sessions across all HAProxy generations, and forces a Caddy reload with `stream_close_delay 0s` for identity withdrawal. If withdrawal cannot be applied, it stops the affected proxy's listeners (all listeners of that proxy if isolation is unavailable) and alerts; stale configuration must not keep serving. This watchdog must work when the observer or domain worker is unavailable. Startup with no fresh lease is closed. A small launch guard for each proxy must obtain a valid lease from the watchdog before exec, including container restarts after a fail-closed stop; the official proxy binaries remain unchanged. The watchdog reads the durable policy/revocation journal independently of the operation worker at least every second through a read-only, token-authenticated internal API. If that API or the watchdog fails, proxy supervision expires the lease and stops admission; it cannot silently restart from stale files. It uses the HAProxy master CLI and Caddy admin API for withdrawal/stop, never Docker or host-root access. FD-06 supplies the watchdog, internal read-only lease/journal endpoint and Caddy launch guard; FD-25 supplies the HAProxy launch guard/control adapter. Both are in the image plan.
+
+Identity pinning is polling-based: a removed/replaced peer may remain reachable until detection, at most 6 minutes plus 5 seconds for enforced withdrawal after the last complete observation. Tailscale destination ACLs remain the immediate network boundary; Ark does not claim continuous identity validation.
 
 Defence in depth beyond Ark's validator:
 
@@ -564,7 +591,7 @@ Every mutation keeps the existing patterns:
 | `DELETE /api/front/routes/:id`                                              | **owner**                         | `resource.delete`                                                                                                     | Drain, remove the config, and keep the endpoint if anything else still uses it.                                                                                                                                                                                                                                                              |
 | `GET /api/front/routes/:id/acl`                                             | operator (read)                   | none                                                                                                                  | Return the ACL snippet (§3.7).                                                                                                                                                                                                                                                                                                               |
 | `GET /api/front/routes/:id/dns`                                             | operator (read)                   | none                                                                                                                  | Return the record plan and provider guide (manual), or the dry-run diff (Cloudflare, §3.13).                                                                                                                                                                                                                                                 |
-| `PUT /api/front/routes/:id/access`                                          | **owner**                         | `role.grant`                                                                                                          | Replace the allowed-user list (users only, R11).                                                                                                                                                                                                                                                                                             |
+| `PUT /api/front/routes/:id/access`                                          | **owner**                         | `role.grant`                                                                                                          | Replace the allowed-user list (users only, R11); removals atomically enqueue edge.drain for open sockets (§3.9.3).                                                                                                                                                                                                                           |
 | `POST /api/front/routes/:id/client-ca`                                      | **owner**                         | `credential.rotate`                                                                                                   | Create or rotate the client CA for a `terminate_mtls` route.                                                                                                                                                                                                                                                                                 |
 | `POST /api/front/routes/:id/client-certs`                                   | **owner**                         | `credential.rotate`                                                                                                   | Issue a route client certificate. Returns a one-time secret ID, revealed through the existing `/api/secrets/:id/reveal`.                                                                                                                                                                                                                     |
 | `POST /api/front/routes/:id/client-certs/:certId/revoke`                    | owner or operator                 | none (tightening)                                                                                                     | Add it to the CRL, then enqueue `edge.l4_apply` and `edge.drain`. Operators may tighten.                                                                                                                                                                                                                                                     |
@@ -595,29 +622,30 @@ All new browser API prefixes must be added to the tailnet gateway allowlist (`in
 - `/api/backups/targets*`
 - `/api/settings/ipv6*`
 
-`/api/gate/check` and `/api/gate/callback` must be added to **neither** list.
+`/api/gate/check`, `/api/gate/bypass-check`, `/api/gate/callback` and `/api/gate/logout-route` must be added to **neither** list; exact route-host callback/logout rewrites are the only public exposure for those two handlers.
 
 ### 3.4 Operations and workers
 
-Extend `OperationKind` (`shared/src/operations.ts:51-82`). The names below are chosen to fit the existing worker prefix allowlists (`app.ts:262-285`). Only one allowlist change is needed: `integration.` is added to the domain worker.
+Extend `OperationKind` (`shared/src/operations.ts:51-82`). The names below are chosen to fit the existing worker prefix allowlists (`app.ts:262-285`). `integration.` is added to the domain worker and `backup.observe` stays within the backup worker prefix. Certificate issuance enqueues `pgbouncer.reload` for the database worker rather than executing its console commands in the domain worker.
 
-| Kind                                    | Worker                             | Does                                                                                                                                                                                                                                                                                                                                                 |
-| --------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `edge.observe`                          | domain                             | Reads the edge node's LocalAPI status (read-only), or the observer sidecar if that fallback is deployed (§3.6). Upserts `tailnet_nodes`, re-validates route pinning, and updates route statuses. Runs every 5 min and on demand.                                                                                                                     |
-| `edge.apply` (extended)                 | domain                             | Renders the Caddyfile: the admin site (public mode only), the gate login origin, and HTTP routes. POSTs `/adapt`, then `/load` with `Cache-Control: must-revalidate` (V-17).                                                                                                                                                                         |
-| `edge.l4_apply`                         | domain                             | Renders `haproxy.cfg`: 443 SNI map, 5432 Postgres router, shared SNI ports, raw-TCP frontends, per-route allowlist files, combined cert PEMs, CA and CRL files. Also renders the `ark_front` nft ruleset. Validates with `haproxy -c`, then sends `reload` on the master socket, which returns `Success=1` or `Success=0` (V-14).                    |
-| `edge.drain`                            | domain                             | For a disabled, revoked or deleted L4 route, runs `shutdown sessions server be_<id>/target` over the HAProxy admin socket, then reloads. For HTTP routes, forces an `edge.apply`.                                                                                                                                                                    |
-| `domain.verify` (reused)                | domain                             | Already verifies endpoint A/AAAA records and enqueues `certificate.issue` (coordinator.ts lines 645-666). Route endpoints are ordinary endpoints.                                                                                                                                                                                                    |
-| `domain.ipv6_preflight`                 | domain                             | IPv6 preflight (§3.13.4). Writes `platform_settings.ipv6_status` and evidence, then re-plans AAAA records for every domain.                                                                                                                                                                                                                          |
-| `certificate.issue` / `.renew` (reused) | domain                             | Unchanged, except that after issuance it enqueues `edge.l4_apply` as well as `edge.apply` whenever HAProxy terminates TLS for that hostname.                                                                                                                                                                                                         |
-| `dns.publish` (reused)                  | domain                             | Unchanged mutation logic. Gains a dry-run mode (§3.13).                                                                                                                                                                                                                                                                                              |
-| `integration.vercel_push`               | domain (new `integration.` prefix) | Pushes the successor certificate and key to Vercel env vars, triggers a redeploy, waits for `READY`, and marks the certificate `delivered` (§3.10.5). The domain worker is the only worker on a non-internal network (`admin`), and it already holds an external provider token (Cloudflare).                                                        |
-| `database.client_issue`                 | database                           | Creates the CA (if new) and the certificate. Seals the key as a `once` secret. Writes `client-ca-bundle.pem`, then enqueues `pgbouncer.reload`.                                                                                                                                                                                                      |
-| `database.client_rollover`              | database                           | Scheduled daily. For every `current` certificate with `not_after − now ≤ 30 days` and no successor, issues a successor from the same CA as a `once` secret, marked `pending`. If an integration exists, enqueues `integration.vercel_push`; otherwise raises the rollover-pending alert. No PgBouncer change is needed, because the CA is unchanged. |
-| `database.client_revoke`                | database                           | Removes the CA from the bundle, rotates the role password (reusing `rotateRolePassword`, coordinator.ts line 43), `RELOAD`s, and `KILL_CLIENT`s that role's clients.                                                                                                                                                                                 |
-| `pgbouncer.reload` (extended)           | database                           | Writes the new config (§3.10) and reloads through the admin socket.                                                                                                                                                                                                                                                                                  |
-| `backup.create` (extended)              | backup                             | Writes to **both** targets (§3.18).                                                                                                                                                                                                                                                                                                                  |
-| `backup.verify_target`                  | backup                             | Runs the append-only canary on a target.                                                                                                                                                                                                                                                                                                             |
+| Kind                                    | Worker                             | Does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edge.observe`                          | domain                             | Reads the edge node's LocalAPI status (read-only), or the observer sidecar if that fallback is deployed (§3.6). Atomically replaces the complete `edge` snapshot generation, removes absent peers, re-validates pinning, and durably withdraws/drains invalid active routes (§3.2). Runs every 5 min and on demand; the edge-local expiry watchdog is independent.                                                                                                                                                                                            |
+| `edge.apply` (extended)                 | domain                             | Renders the Caddyfile: the admin site (public mode only), the gate login origin, and HTTP routes. POSTs `/adapt`, then `/load` with `Cache-Control: must-revalidate` (V-17).                                                                                                                                                                                                                                                                                                                                                                                  |
+| `edge.l4_apply`                         | domain                             | Renders `haproxy.cfg`: 443 SNI map, 5432 Postgres router, shared SNI ports, raw-TCP frontends, per-route allowlist files, combined cert PEMs, CA and CRL files. Also renders the `ark_front` nft ruleset. Validates via the restricted version-matched validator (§3.8.6), then atomically promotes the generation and sends `reload` on the master socket, which returns `Success=1` or `Success=0` (V-14).                                                                                                                                                  |
+| `edge.drain`                            | domain                             | Serializes admission removal and draining across current and leaving HAProxy workers through the master CLI (§3.8.6). Every HTTP authorization revocation durably forces `edge.apply` (§3.9.3), even when configuration text is unchanged.                                                                                                                                                                                                                                                                                                                    |
+| `domain.verify` (reused)                | domain                             | Already verifies endpoint A/AAAA records and enqueues `certificate.issue` (coordinator.ts lines 645-666). Route endpoints are ordinary endpoints.                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `domain.ipv6_preflight`                 | domain                             | IPv6 preflight (§3.13.4). Writes `platform_settings.ipv6_status` and evidence, then re-plans AAAA records for every domain.                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `certificate.issue` / `.renew` (reused) | domain                             | After issuance or renewal, enqueue `edge.apply`; also `edge.l4_apply` for HAProxy-terminated hostnames and `pgbouncer.reload` for endpoint kind `database`. Record and retry dependent reload failures; issuance alone does not mean the new fingerprint is serving.                                                                                                                                                                                                                                                                                          |
+| `dns.publish` (reused)                  | domain                             | Gains reviewed keep/update/create/**delete** planning, Ark-owned provider record IDs and tombstones for AAAA withdrawal (§3.13).                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `integration.vercel_push`               | domain (new `integration.` prefix) | Pushes the successor certificate and key to Vercel env vars, triggers a redeploy, waits for `READY`, and records delivery/promotes the certificate to `current` atomically (§3.10.5). The domain worker is the only worker on a non-internal network (`admin`), and it already holds an external provider token (Cloudflare).                                                                                                                                                                                                                                 |
+| `database.client_issue`                 | database                           | Creates the CA (if new) and the certificate. Seals the key as a `once` secret. Writes `client-ca-bundle.pem`, then enqueues `pgbouncer.reload`.                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `database.client_rollover`              | database                           | Scheduled daily. For every unsuperseded `current` certificate with `not_after − now ≤ 30 days` and no successor, issues one successor from a fresh per-generation CA as a `once` secret, marked `pending`, under a per-client transaction lock and a unique non-null `superseded_by` linkage. If an integration exists, enqueues `integration.vercel_push`; otherwise raises the rollover-pending alert. Reload PgBouncer to trust both generation CAs before delivery; delivery atomically promotes the successor to `current` and preserves `delivered_at`. |
+| `database.client_revoke`                | database                           | Removes all of the client's current/pending/retiring generation CAs from the bundle, rotates the role password (reusing `rotateRolePassword`, coordinator.ts line 43), `RELOAD`s, and `KILL_CLIENT`s that role's clients.                                                                                                                                                                                                                                                                                                                                     |
+| `pgbouncer.reload` (extended)           | database                           | Writes the new config (§3.10) and reloads through the admin socket.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `backup.observe`                        | backup                             | Read backup-ts LocalAPI using the read-only UID/sidecar contract (§3.6), commit only complete `backup` generations, and suspend/drain REST transfers on identity expiry or replacement.                                                                                                                                                                                                                                                                                                                                                                       |
+| `backup.create` (extended)              | backup                             | Writes to **both** targets (§3.18).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `backup.verify_target`                  | backup                             | Runs the append-only canary on a target.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 `edge.*` and `pgbouncer.reload` are platform-wide and enqueued without an actor (as at coordinator.ts line 728), so the owner-only platform check (line 500) does not block a database operator's credential work.
 
@@ -626,6 +654,9 @@ Extend `OperationKind` (`shared/src/operations.ts:51-82`). The names below are c
 **Scheduled jobs:**
 
 - `edge.observe` every 5 min.
+- Edge-local identity lease watchdog every second, independently of operation workers.
+- `backup.observe` every 5 min with its own `backup` snapshot and expiry; backup operations validate it (§3.18.3).
+- Certificate-retirement admission fence and role drain at each predecessor `not_after` (§3.10.4).
 - `database.client_rollover` daily.
 - CRL refresh for TLS-TCP route CAs weekly (`crl_next_update` minus 7 days).
 - `domain.ipv6_preflight` weekly, and on any change to the public IP.
@@ -695,8 +726,8 @@ This matters because the Caddyfile is a text format; the existing code already r
 	servers 127.0.0.1:8443 {
 		listener_wrappers {
 			proxy_protocol {
-				allow 127.0.0.1/32
-				fallback_policy reject
+				# No allow list: it would select optional USE instead of REQUIRE.
+				fallback_policy require
 			}
 			tls
 		}
@@ -763,7 +794,9 @@ login.example.com {
 	@gateApi path /api/auth/sign-in/email /api/auth/sign-out /api/auth/get-session /api/auth/two-factor/verify-totp /api/auth/two-factor/verify-backup-code /api/auth/two-factor/enable /api/auth/two-factor/get-totp-uri
 	@gatePages path /gate/*
 	handle @gateApi {
-		reverse_proxy api:3000
+		reverse_proxy api:3000 {
+			header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}
+		}
 	}
 	handle @gatePages {
 		reverse_proxy api:3000
@@ -791,17 +824,34 @@ www.example.com {
 	request_body {
 		max_size 25MB
 	}
-	handle /.ark/gate/* {
+	handle /.ark/gate/callback {
+		rewrite * /api/gate/callback
 		reverse_proxy api:3000 {
 			header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}
 			header_up X-Ark-Route rt_k3x9
 		}
 	}
+	handle /.ark/gate/logout {
+		rewrite * /api/gate/logout-route
+		reverse_proxy api:3000 {
+			header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}
+			header_up X-Ark-Route rt_k3x9
+		}
+	}
+	handle /.ark/gate/* {
+		respond 404
+	}
 	@bypass path /webhooks/*
 	handle @bypass {
+		# Required raw-URI guard: success only for unambiguous original paths (§3.9.5).
+		forward_auth api:3000 {
+			uri /api/gate/bypass-check?route=rt_k3x9
+			header_up X-Ark-Original-Uri {http.request.orig_uri}
+			header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}
+		}
 		reverse_proxy 100.101.102.103:3000 {
 			import ark_upstream
-			header_down Location "^https?://(100\.101\.102\.103|home\.tail1234\.ts\.net)(:3000)?(/|$)" "https://www.example.com/"
+			header_down Location "(?i)^(?:https?:)?//(?:100\.101\.102\.103|home\.tail1234\.ts\.net\.?)(?::3000)?([/?#].*|$)" "https://www.example.com${1}"
 		}
 	}
 	handle {
@@ -812,7 +862,7 @@ www.example.com {
 		}
 		reverse_proxy 100.101.102.103:3000 {
 			import ark_upstream
-			header_down Location "^https?://(100\.101\.102\.103|home\.tail1234\.ts\.net)(:3000)?(/|$)" "https://www.example.com/"
+			header_down Location "(?i)^(?:https?:)?//(?:100\.101\.102\.103|home\.tail1234\.ts\.net\.?)(?::3000)?([/?#].*|$)" "https://www.example.com${1}"
 		}
 	}
 }
@@ -827,19 +877,21 @@ No-leak rules and where each one is enforced:
 | Client-forged `X-Forwarded-*`           | Caddy ignores them from untrusted clients and rewrites them ([docs](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults)); no `trusted_proxies` at the edge. Behind the SNI router, the client address comes from PROXY v2: the upstream saw the real client, not `127.0.0.1` (V-14)                      | V-5: forged `X-Forwarded-For: 6.6.6.6` replaced |
 | Client-forged identity                  | `request_header -X-Ark-*` before `forward_auth`                                                                                                                                                                                                                                                                                | V-6                                             |
 | `Server`, `Via`                         | Site-level deferred `header { -Server -Via }`, plus `header -Server` inside `handle_errors`. `header_down -Via` alone does **not** work, because Caddy ≥ 2.10 adds `Via` after it ([v2.10.0 notes](https://github.com/caddyserver/caddy/releases/tag/v2.10.0)); re-confirmed on 2.11.9                                         | V-5, V-6, V-16                                  |
-| `Location` pointing at the tailnet      | `header_down Location <regex> https://<public>/`                                                                                                                                                                                                                                                                               | V-5                                             |
+| `Location` pointing at the tailnet      | Anchored known-authority rewrite for absolute and scheme-relative URLs, plus fail-closed handling for unsupported authority forms (§3.5)                                                                                                                                                                                       | V-5                                             |
 | `Set-Cookie; Domain=` for tailnet names | `header_down Set-Cookie "(?i);\s*domain=[^;]*" ""`. Cookies become host-only on the public name                                                                                                                                                                                                                                | V-5                                             |
 | Gate cookie sent to upstream            | `header_up Cookie` regex strip                                                                                                                                                                                                                                                                                                 | V-5, V-6                                        |
 | Tailnet names in error pages            | `handle_errors 502 503 504` serves static files; Caddy has no access log by default                                                                                                                                                                                                                                            | V-6                                             |
 | Tailnet names in certificates           | Certificates only for public route hostnames. `issueCertificateFiles` already checks the SAN (certificates.ts line 108). Route hostnames under `*.ts.net` or the tailnet suffix are refused. Let's Encrypt logs every certificate to CT ([LE CT logs](https://letsencrypt.org/docs/ct-logs/)), so a mistake would be permanent | design                                          |
-| Edge-to-API secret                      | `X-Ark-Edge-Token` is set only on `forward_auth` and gate requests, never upstream                                                                                                                                                                                                                                             | V-6                                             |
+| Edge-to-API secret                      | `X-Ark-Edge-Token` is set only on internal prechecks, exact gate handlers and allowlisted login API requests, never on route upstream requests                                                                                                                                                                                 | V-6                                             |
+
+The `Location` renderer escapes every known internal authority, including IPv4, bracketed IPv6 canonical/expanded forms, and the target name (optional final DNS dot and explicit target port). Its anchored authority rewrite accepts absolute HTTP(S) and scheme-relative URLs, preserving path/query/fragment, including authority-only and query-only targets. Reject malformed or unsupported authority-bearing redirects with a static 502 rather than passing them through. FD-09 verifies this policy against the literal rendered example and IPv6 fixtures. This is an edge-controlled-header guarantee only: upstream HTML, scripts, links, certificate SANs and application public-URL settings require owner auditing before exposure; arbitrary response bodies are not sanitized.
 
 WebSockets:
 
 - `flush_interval -1` turns off buffering.
 - There is no default `stream_timeout`; long idle connections are bounded only by the upstream and client.
 - `stream_close_delay 5m` keeps upgraded connections open for 5 minutes after a Caddy reload. Without it they close immediately with code 1001 (V-3).
-- **Upgraded connections are never re-checked by `forward_auth`**, so revocation latency for an open socket is bounded by the next reload plus that delay. `edge.drain` forces a reload. The user accepts up to about 5 minutes (R7).
+- **Upgraded connections are never re-checked by `forward_auth`**, so revocation latency for an open socket is bounded from the revocation event by its mandatory durable drain/reload and dispatch deadline (§3.9.3). The user accepts up to about 5 minutes from revocation (R7), with the mandatory drain and failure response in §3.9.3.
 - **Prototyped on 2.11.9 behind HAProxy** (V-15). A WebSocket survived:
   - a Caddy `/load` reload;
   - an HAProxy master-CLI `reload` (old workers keep established connections until `hard-stop-after`, 30 min);
@@ -1119,7 +1171,7 @@ Whether each GUI exposes the parameter in its UI is unverified. Most accept extr
 - `database-ingress` stops listening on 5432. Its relay (`scripts/database-ingress.ts:54-76`) is retired. It remains as the host-netns reconciler that applies `ark_db_ingress` and `ark_front` nft tables.
 - The loopback publish `127.0.0.1:15432` is removed.
 - PgBouncer does not support the PROXY protocol, so it sees HAProxy's address ([issue #241](https://github.com/pgbouncer/pgbouncer/issues/241) is still open), exactly as it saw the Bun relay's address before.
-- Per-database **CIDR allowlists** (`managed_databases.source_cidrs`) move from the nft `ark_db_allow` chain into HAProxy, as a `tcp-request content reject if !{ src -f pgbouncer.lst }` rule in `be_pgbouncer` (see the example in §3.8.5). 5432 is now shared, so a port-wide nft allowlist would also block Postgres routes. HAProxy sees real client addresses, IPv4 by DNAT and IPv6 by Docker native IPv6 (§3.17). nft keeps the port-wide per-source limits.
+- **One pooler-wide CIDR policy**, stored as `platform_settings.pooler_source_cidrs` with `pooler_allow_internet` default false, is enforced in `be_pgbouncer`. Classic SSLRequest contains no database name, and HAProxy cannot inspect the encrypted StartupMessage afterwards. Therefore this listener cannot enforce database-specific source policies. Do not union `managed_databases.source_cidrs` or report database-specific CIDR enforcement. Reject publication when databases request different CIDRs or a restricted database would share an unrestricted Vercel pooler; require the owner to adopt one reviewed common policy, or keep the restricted database private/use a separate enforced listener. UI/API status must state this boundary. 5432 nft retains port-wide source limits; HAProxy sees the real source (§3.17).
 - When no public database exists, `be_pgbouncer` is not rendered, so `SSLRequest` connections are rejected. This replaces the `expose` file toggle.
 
 **Old targets and old clients.**
@@ -1153,14 +1205,14 @@ Terminated routes use HAProxy's documented loop-back pattern: the SNI frontend s
 
 #### 3.8.5 Rendered configuration
 
-The excerpt below was validated with `haproxy -c` on `haproxy:3.2.26-alpine` (V-20). It shows 443, 5432 and one raw-TCP port. Frontends and backends need distinct names, because 3.3 drops support for shared names.
+The revision 2 ancestor of this excerpt was syntax-validated on `haproxy:3.2.26-alpine` (V-20). The corrected literal example requires fresh validation and the FD-14 runtime matrix; V-20 alone proves neither CIDR enforcement nor fragmented handshakes. It shows 443, 5432 and one raw-TCP port. Frontends and backends need distinct names, because 3.3 drops support for shared names.
 
 ```haproxy
 global
     log stdout format raw local0
     maxconn 4000
     ssl-default-bind-options ssl-min-ver TLSv1.2
-    stats socket /var/run/haproxy/admin.sock mode 600 level admin
+    stats socket /var/run/haproxy/admin.sock mode 660 gid 4400 level admin
     hard-stop-after 30m
 
 defaults
@@ -1188,8 +1240,7 @@ frontend fe_tls443
     tcp-request connection reject if { sc0_conn_cur gt 64 } || { sc0_conn_rate gt 200 }
     tcp-request content accept if { req.ssl_hello_type 1 }
     tcp-request content reject
-    # TLS-TCP routes (per-route CIDR lists apply only to the matched route)
-    tcp-request content reject if { req.ssl_sni -i mqtt.example.com } !{ src -f /usr/local/etc/haproxy/allow/rt_p7q2.lst }
+    # Backend rules enforce each matched route policy. Content rules after accept are unreachable.
     use_backend be_rt_p7q2_tls if { req.ssl_sni -i mqtt.example.com }
     # Everything else, including HTTP routes, login and unknown SNI, goes to Caddy.
     # Caddy has certificates only for configured names, so unknown SNI fails the handshake there.
@@ -1200,6 +1251,10 @@ backend be_caddy
 
 # rt_p7q2 mqtt.example.com:443 -> nas.tail1234.ts.net (100.88.1.20:1883), terminate_mtls
 backend be_rt_p7q2_tls
+    tcp-request content reject if !{ src -f /usr/local/etc/haproxy/allow/rt_p7q2.lst }
+    stick-table type ipv6 size 10k expire 10m store conn_cur,conn_rate(10s)
+    tcp-request content track-sc1 src
+    tcp-request content reject if { sc1_conn_cur gt 10 } || { sc1_conn_rate gt 20 }
     server loop abns@rt_p7q2 send-proxy-v2
 
 frontend fe_rt_p7q2_tls
@@ -1230,7 +1285,8 @@ frontend fe_pg5432
     default_backend be_reject
 
 backend be_pgbouncer
-    # Union of managed_databases.source_cidrs for public databases (empty list renders 0.0.0.0/0 and ::/0)
+    # One explicit pooler-wide policy, never a union advertised as per-database isolation.
+    # Empty = deny all; open CIDRs require pooler_allow_internet plus exposure.public.
     tcp-request content reject if !{ src -f /usr/local/etc/haproxy/allow/pgbouncer.lst }
     server pgbouncer pgbouncer-public:5432 maxconn 2000
 
@@ -1262,10 +1318,15 @@ backend be_rt_t001
 
 #### 3.8.6 Operational details
 
-- **Allowlist files** hold one CIDR per line. An empty route allowlist is rendered as `0.0.0.0/0` and `::/0`, so the rule stays explicit.
+**Production executor and ownership.** FD-25 adds a first-party `haproxy-validator` bake target based on the **same digest** as edge-l4, with the same HAProxy/OpenSSL build. A minimal non-root daemon accepts only `POST /v1/validate` over `/var/run/haproxy-validator/validate.sock` with a generation ID matching `[a-f0-9]{64}`. It runs a fixed argv, `haproxy -c -f /usr/local/etc/haproxy/generations/<id>/haproxy.cfg`; it accepts no command, flags or arbitrary paths, resolves files beneath that read-only directory, refuses symlinks escaping it, and has a 10 s timeout and bounded diagnostics. No Docker CLI/socket is present. Both serving and validation containers mount identical absolute configuration/certificate paths. Worker writes a complete immutable generation, validation returns its hash, worker verifies no bytes changed, atomically swaps `current`, then requests reload under the apply lock; invalid candidates never alter `current`. Referenced allowlists, certs and CRLs live inside the hashed generation. Keep prior generations until their workers leave.
+
+Installer/init runs before the unprivileged services: inspect the pinned HAProxy image's numeric UID/GID (UID 99 in the tested image), reserve non-conflicting shared GID **4400**, and add only HAProxy, domain-worker, the lease watchdog and validator to that supplemental group. Create `ark_haproxy_run` as `99:4400` mode `2770`, validator socket directory as its daemon UID:`4400` mode `2770`; sockets are `0660` group `4400`, including master and admin. Config generations are owned by the worker's existing `bun` UID:`4400`, directories `2750`, files and combined private-key PEMs `0640`, worker umask `0027`; HAProxy/validator mounts are read-only and worker owns the writable source. Do not assume identical usernames imply identical numeric IDs. Worker remains `bun`, no root/capabilities or Docker access. FD-25 verifies actual image users with `cap_drop: [ALL]` and `no-new-privileges`, including socket directory traversal and reload/session shutdown. The validator and edge-local lease watchdog are new narrowly scoped first-party targets, version-pinned and covered by image-policy checks.
+
+- **Allowlist files** hold one CIDR per line. Empty means deny all in HAProxy and nftables, and enable is refused. Only `allow_internet = true`, saved under an owner-confirmed `exposure.public` step-up, renders `0.0.0.0/0` and `::/0`; `terminate` still requires a restricted non-empty list. The same explicit contract applies to the pooler.
+- **Content inspection is terminal.** The first `accept` or `reject` ends inspection in that section. No frontend CIDR rule belongs below its terminal accept. Every TLS-TCP backend (passthrough and the pre-termination loop backend) applies CIDRs and a route stick table before forwarding; the pre-termination connection still carries the original source, and `accept-proxy` restores it on the inner frontend. A complete ClientHello is buffered up to 5 s before selecting SNI; fragmented input must neither bypass policy nor be prematurely accepted. Backend admission precedes TLS termination, so rejected sources never reach the target. Shared-port limits are additional aggregate controls.
 - **Every CA in `ca-file` needs a CRL** in `crl-file`, because OpenSSL CRL checking fails when the issuer's CRL is missing. Ark always generates one (empty if nothing is revoked) with 14-day validity, refreshed weekly. Revocation was proven in V-14: after the CRL update and a master-CLI `reload`, the revoked certificate got `certificate revoked`.
-- **Reload.** HAProxy runs as `haproxy -W -db -S /var/run/haproxy/master.sock`. The domain worker sends `reload` on the master CLI after `haproxy -c` passes on a candidate file. The command is synchronous and returns `Success=1` (or `Success=0`) followed by the startup log (V-14), so no Docker socket is needed. Old workers keep established connections until they close, or until `hard-stop-after` (30 min). A WebSocket survived this (V-15).
-- **Revocation and disable.** `edge.drain` runs `shutdown sessions server be_rt_x/target` on the admin socket **before** reloading, then reloads to remove the frontend.
+- **Reload.** HAProxy runs as `haproxy -W -db -S /var/run/haproxy/master.sock,gid,4400,mode,660 -f /usr/local/etc/haproxy/current/haproxy.cfg`. The domain worker sends `reload` on the master CLI after the restricted validator accepts the immutable candidate generation. The command is synchronous and returns `Success=1` (or `Success=0`) followed by the startup log (V-14), so no Docker socket is needed. Old workers keep established connections until they close, or until `hard-stop-after` (30 min). A WebSocket survived this (V-15).
+- **Revocation and disable.** Serialize all apply, reload and drain operations under one durable edge lock. First persist the revoked policy and fence new admission: disable the affected route server (the loop server and target for terminated routes) in every accepting worker, then reload a generation with that route removed/restricted. Do not kill sessions before fencing admission. Enumerate `show proc` through the master CLI, address each current and leaving worker by `@!<pid>`, disable its affected servers and `shutdown sessions server <backend>/<server>` in every generation that contains them. Re-enumerate until stable, then verify zero affected sessions with worker-local session/stat inspection; connections racing the fence are included. Use the generation manifest to find prior backend names. All affected sessions close within 5 s of revocation; unrelated routes stay available. Failure keeps admission fenced, retries durably and alerts; never report success from only the current admin socket. `hard-stop-after` is a general resource bound, not the revocation mechanism.
 - **Client addresses.** HAProxy sees the real client for IPv4 (Docker DNAT keeps the source) and for IPv6 once Docker native IPv6 is enabled with `userland-proxy: false` (§3.17). Until then, IPv6 clients that arrive through `docker-proxy` would appear as the gateway. AAAA records are therefore only published after the IPv6 preflight, which checks this (§3.13.4).
 - **No PROXY protocol to targets by default.** It is offered as an option (`send-proxy-v2`) for targets that support it. It is never sent to PgBouncer.
 
@@ -1275,16 +1336,19 @@ backend be_rt_t001
 
 - **Admin origin.** Tailnet only, unchanged (`https://ark-stack-admin.<tailnet>.ts.net`).
 - **Gate login origin.** `https://login.<base-domain>`, served by the public edge, which allowlists only these paths: the Better Auth sign-in, sign-out, get-session and two-factor endpoints, plus `/gate/*`. **Decided (R1): the login origin is public.** It is reached through the 443 SNI router like any HTTP hostname. A tailnet-only login mode is not offered.
-- **Better Auth.** Configured with a dynamic `baseURL`: `{ allowedHosts: [adminHost, loginHost], protocol: "https", fallback: adminOrigin }`. Better Auth then "derives the host from the Host header and request URL, validates it against allowedHosts, and constructs the request-specific base URL", and forwarded headers are ignored unless opted in (Better Auth v1.7 options and dynamic-base-URL guide, via Context7).
+- **Better Auth.** Configured with a dynamic `baseURL`: `{ allowedHosts: [adminHost, loginHost], protocol: "https" }`. Better Auth then "derives the host from the Host header and request URL, validates it against allowedHosts, and constructs the request-specific base URL", and forwarded headers are ignored unless opted in (Better Auth v1.7 options and dynamic-base-URL guide, via Context7).
 
 Re-checked against the pinned **1.7.25** source (tag `v1.7.25`, via research):
 
 - `BaseURLConfig = string | DynamicBaseURLConfig`, with `allowedHosts`, `fallback` and `protocol`.
-- Since 1.7.0 the dynamic form ignores `x-forwarded-host` and `x-forwarded-proto` unless `advanced.trustedProxyHeaders: true`. Ark leaves that off: Caddy forwards the original `Host` to the HTTP upstream `api:3000`, and 2.11 rewrites `Host` only for HTTPS upstreams. Set `protocol: "https"` explicitly.
+- Since 1.7.0 the dynamic form ignores `x-forwarded-host` and `x-forwarded-proto` unless `advanced.trustedProxyHeaders: true`. Ark leaves that off: Caddy forwards the original `Host` to the HTTP upstream `api:3000`, and 2.11 rewrites `Host` only for HTTPS upstreams. Set `protocol: "https"` explicitly. Reject any request whose canonical Host is neither registered adminHost nor loginHost **before** Better Auth, with no fallback to admin. Derive session origin by positive match only; reject contradictory/malformed Host and request-URL authority. Context-free callers must provide origin explicitly, and an insert omitting it fails at the database.
 
 `changeMode` currently requires `BETTER_AUTH_URL` to equal the destination origin (coordinator.ts lines 1262-1267), so that check must become "admin origin ∈ allowedHosts". `useSecureCookies` stays true. FD-10 still adds an integration test, because the behaviour was confirmed in source, not at runtime.
 
-- **Session separation.** Sessions created on the login origin get `session.origin = 'gate'`. The `/api/*` middleware (app.ts lines 484-518) rejects `gate` sessions with 403. It also rejects users with no `platform_access` row, instead of defaulting them to `viewer` (line 514). The gate check accepts only `gate` sessions. An admin who also uses gated routes therefore has two independent sessions, and stealing one gives nothing on the other side.
+- **Session separation.** Sessions created on the login origin get `session.origin = 'gate'`. The `/api/*` middleware (app.ts lines 484-518) rejects `gate` sessions with 403. It also rejects users with no `platform_access` row, instead of defaulting them to `viewer` (line 514). The gate check accepts only `gate` sessions. An admin who also uses gated routes has separate sessions. This protects session authority; account-wide MFA endpoints must also enforce the following restriction.
+
+- **MFA management.** Keep `/two-factor/enable` and `/two-factor/get-totp-uri` on the public login allowlist only for first enrollment: a before hook requires a login-origin `gate` session and `twoFactorEnabled = false`. Already-enrolled users receive 403 for both paths, with the stored secret and backup codes unchanged. Re-enrollment, secret retrieval and all other account MFA management require an admin-origin session on the admin origin. Gate-only recovery uses an owner-assisted reset, which revokes sessions and enqueues drains. A gate session must never replace an existing admin MFA secret.
+- **Login cookies.** Configure every Better Auth login-origin authentication, MFA and auxiliary cookie name explicitly under `advanced.cookies` with `__Host-` names, `Secure`, `Path=/`, and no Domain; never accept the legacy `__Secure-ark_stack` names on this origin. Apply these settings to remembered-device and temporary two-factor cookies as well as the session token. This prevents sibling route JavaScript planting a parent-domain cookie that is honored by `/gate/authorize`; duplicate cookie names are refused. Tailnet admin sessions retain their own origin scope.
 
 #### 3.9.2 Handshake
 
@@ -1320,22 +1384,22 @@ sequenceDiagram
 
 #### 3.9.3 Security properties
 
-| Property                          | Mechanism                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **No open redirect**              | `/gate/authorize` takes a route **ID**, not a URL. The callback URL is built from `front_routes → endpoints.hostname`. `rd` must be a relative path: it starts with `/`, does not start with `//` or `/\`, contains no control characters or backslashes, is ≤ 2048 bytes, and is decoded exactly once. It is stored server-side in the handoff, and the final redirect is `https://<route host><rd>`. The login page's `next` must be a relative `/gate/authorize?…` path. |
-| **Code replay**                   | 256-bit random code; only its SHA-256 is stored; TTL 60 s; consumed atomically with `UPDATE … WHERE consumed_at IS NULL AND expires_at > now() RETURNING`, the same pattern as `consumePrivilegedGrant` (access.ts lines 39-65). Bound to the route, user, parent session and state.                                                                                                                                                                                        |
-| **Login CSRF and code injection** | `state` is a 128-bit nonce that the check endpoint sets as the `__Host-ark_gate_state` cookie **on the route domain**. The callback requires `state` = cookie, and H(state) = the handoff's `state_hash`. An attacker cannot plant their own code in a victim's browser without that browser's state cookie.                                                                                                                                                                |
-| **Code leakage**                  | Only in the callback URL, which immediately answers 303. `Referrer-Policy: no-referrer` on the authorize redirect and on the callback. The edge has no access log by default.                                                                                                                                                                                                                                                                                               |
-| **Host binding**                  | The callback rejects a request whose `Host` (set by the edge to the site address) ≠ the route hostname, or whose `X-Ark-Route` ≠ the handoff's route. A code for route A cannot mint a cookie on route B.                                                                                                                                                                                                                                                                   |
-| **Cookie flags**                  | The `__Host-` prefix forces `Secure`, `Path=/` and no `Domain`, so the cookie is host-only and cannot be shared with sibling subdomains or other routes. `HttpOnly`. `SameSite=Lax`: needed because the callback arrives by a cross-site top-level GET, and Strict would drop the state cookie. Lax still blocks the cookie on cross-site POSTs to the route.                                                                                                               |
-| **Upstream isolation**            | The edge strips `__Host-ark_gate*` from the `Cookie` header sent upstream (V-6), so a compromised target cannot harvest gate tokens. `X-Ark-*` request headers are always edge-authored.                                                                                                                                                                                                                                                                                    |
-| **Endpoint isolation**            | `/api/gate/check` and `/api/gate/callback` require `X-Ark-Edge-Token` (a new `ARK_EDGE_GATE_TOKEN` generated by the installer and passed to `api` and `edge`), and are absent from every public and tailnet path allowlist.                                                                                                                                                                                                                                                 |
-| **Fail closed**                   | If the API is unreachable, `forward_auth` gets an error and Caddy serves the static 502 (V-6).                                                                                                                                                                                                                                                                                                                                                                              |
-| **MFA**                           | The gate check requires `hasMfaAssurance` (shared `authz.ts`) on the parent session, the same rule `requireMfa` uses (access.ts lines 27-37). A user without TOTP is sent to enrolment on the login origin.                                                                                                                                                                                                                                                                 |
-| **Lifetime**                      | Gate session: absolute 12 h and idle 2 h by default (configurable per platform). It is never longer than the parent Better Auth session.                                                                                                                                                                                                                                                                                                                                    |
-| **Logout**                        | `POST /.ark/gate/logout` on a route (Origin must equal the route origin) revokes that gate session and clears the cookie. `POST /gate/logout` on the login origin signs out the Better Auth session; `gate_sessions.auth_session_id ON DELETE CASCADE` then kills every route session for it. Admin "sign out everywhere" deletes all of a user's sessions.                                                                                                                 |
-| **Revocation**                    | Removing a user from `front_route_access`, deleting the user, or a mode change (which already deletes all sessions, coordinator.ts line 1276) takes effect on the next request, within a ≤ 10 s positive cache in the API. Open WebSockets: see §3.5.                                                                                                                                                                                                                       |
-| **Brute force**                   | Better Auth's rate limiter (auth.ts lines 55-59) with `customRules` for `/sign-in/email` and `/two-factor/*` (for example 5/min per IP). The client IP comes from `X-Forwarded-For`, set by the edge and trusted from `172.16.0.0/12` (compose line 71). Optional CAPTCHA is out of scope.                                                                                                                                                                                  |
+| Property                          | Mechanism                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **No open redirect**              | `/gate/authorize` takes a route **ID**, not a URL. The callback URL is built from `front_routes → endpoints.hostname`. `rd` must be a relative path: it starts with `/`, does not start with `//` or `/\`, contains no control characters or backslashes, is ≤ 2048 bytes, and is decoded exactly once. It is stored server-side in the handoff, and the final redirect is `https://<route host><rd>`. The login page's `next` must be a relative `/gate/authorize?…` path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| **Code replay**                   | 256-bit random code; only its SHA-256 is stored; TTL 60 s; consumed atomically with `UPDATE … WHERE consumed_at IS NULL AND expires_at > now() RETURNING`, the same pattern as `consumePrivilegedGrant` (access.ts lines 39-65). Bound to the route, user, parent session and state.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **Login CSRF and code injection** | `state` is a 128-bit nonce that the check endpoint sets as the `__Host-ark_gate_state` cookie **on the route domain**. The callback requires `state` = cookie, and H(state) = the handoff's `state_hash`. An attacker cannot plant their own code in a victim's browser without that browser's state cookie.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Code leakage**                  | Only in the callback URL, which immediately answers 303. `Referrer-Policy: no-referrer` on the authorize redirect and on the callback. The edge has no access log by default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Host binding**                  | The callback rejects a request whose `Host` (set by the edge to the site address) ≠ the route hostname, or whose `X-Ark-Route` ≠ the handoff's route. A code for route A cannot mint a cookie on route B.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **Cookie flags**                  | The `__Host-` prefix forces `Secure`, `Path=/` and no `Domain`, so the cookie is host-only and cannot be shared with sibling subdomains or other routes. `HttpOnly`. `SameSite=Lax`: needed because the callback arrives by a cross-site top-level GET, and Strict would drop the state cookie. Lax still blocks the cookie on cross-site POSTs to the route.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Upstream isolation**            | The edge strips `__Host-ark_gate*` from the `Cookie` header sent upstream (V-6), so a compromised target cannot harvest gate tokens. `X-Ark-*` request headers are always edge-authored.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **Endpoint isolation**            | `/api/gate/check`, `/api/gate/callback` and `/api/gate/logout-route` require `X-Ark-Edge-Token` (a new `ARK_EDGE_GATE_TOKEN` generated by the installer and passed to `api` and `edge`), and are absent from every public and tailnet path allowlist.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| **Fail closed**                   | If the API is unreachable, `forward_auth` gets an error and Caddy serves the static 502 (V-6).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **MFA**                           | The gate check requires `hasMfaAssurance` (shared `authz.ts`) on the parent session, the same rule `requireMfa` uses (access.ts lines 27-37). A user without TOTP is sent to enrolment on the login origin.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| **Lifetime**                      | Gate session: absolute 12 h and idle 2 h by default (configurable per platform). It is never longer than the parent Better Auth session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **Logout**                        | `POST /.ark/gate/logout` on a route (Origin must equal the route origin) revokes that gate session and clears the cookie. `POST /gate/logout` on the login origin signs out the Better Auth session; `gate_sessions.auth_session_id ON DELETE CASCADE` then kills every route session for it. Admin "sign out everywhere" deletes all of a user's sessions.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| **Revocation**                    | Removing a user from `front_route_access`, deleting the user, or a mode change (which already deletes all sessions, coordinator.ts line 1276) takes effect on the next request, within a ≤ 10 s positive cache in the API. Every access-list removal, user/session deletion, parent-session sign-out, logout-everywhere, MFA reset, route logout and mode change writes durable `edge.drain` outbox work in the same transaction (capture affected route IDs before cascades). After commit force a Caddy `/load` with `Cache-Control: must-revalidate`, even for identical text; begin within 5 s. Open sockets close within about 5 minutes of the revocation event (maximum 305 s including dispatch), without unrelated reloads. If apply cannot complete within 5 s, the edge-local watchdog withdraws the affected HTTP route with zero stream-close delay, or stops Caddy if that cannot be isolated, and raises a critical alert. Retry work survives worker restart; failure is not reported as completed. |
+| **Brute force**                   | Better Auth's rate limiter (auth.ts lines 55-59) with `customRules` for `/sign-in/email` and `/two-factor/*` (for example 5/min per IP). Remove Docker-wide trusted proxy ranges. Caddy overwrites forwarding headers and adds the edge token on the allowlisted login API handlers and gate calls; API uses forwarded client IP only after verifying that token on those exact paths. Other callers use the transport peer address and ignore XFF. After the namespace move the edge peer is edge-ts's admin-network address, not the old Caddy container; a recorded peer address is an additional check, never a subnet trust grant. Optional CAPTCHA is out of scope.                                                                                                                                                                                                                                                                                                                                           |
 
 #### 3.9.4 Gate check contract
 
@@ -1348,9 +1412,13 @@ sequenceDiagram
 
 `last_seen_at` is updated at most once a minute.
 
+The token authenticates only the internal `/api/gate/check` and `/api/gate/bypass-check` prechecks, the two exact callback/logout API handlers, and trusted-client-IP handling on the exact allowlisted login handlers. `/api/gate/bypass-check` verifies the unmodified original URI from the edge-set `X-Ark-Original-Uri` header and returns 204 or 400; it grants no session or admin authority. A route-host public proxy may map only `GET /.ark/gate/callback` → `/api/gate/callback` (preserving the full query) and `POST /.ark/gate/logout` → `/api/gate/logout-route`; wrong methods return 405 and all other `/.ark/gate/*` paths return 404 before any bypass or upstream. Never translate the wildcard prefix into `/api/gate/*`; the edge token grants no authority to `/api/gate/users` or other admin handlers.
+
+**Origin and CSRF contract.** Pass original `Origin`, `Upgrade` and `Sec-Fetch-Site` through forward_auth. A cookie-authenticated browser WebSocket upgrade requires an exact origin match against `https://<route hostname>` (scheme, host and port), or an owner-reviewed explicit origin exception in `http_options.allowedOrigins`; missing, `null`, suffix and sibling-origin values are refused with 403. Non-browser clients must supply an allowed Origin or use a separately configured non-cookie credential; absence is not a browser bypass. For cookie-authenticated unsafe HTTP methods, require the same Origin validation (or an application CSRF token verified by an explicitly documented integration); reject missing Origin by default. GET/HEAD must be read-only at the upstream. SameSite is a site boundary and does not isolate sibling origins. The gate's own callback uses one-time state instead, and logout requires exact Origin. Enforce this at the gate check before authorizing the upgraded/unsafe request.
+
 #### 3.9.5 Bypass paths
 
-Bypass paths are path-prefix matchers rendered before `forward_auth` (§3.5). They are validated so that they cannot shadow `/.ark/gate/*`, and a bypass of `/` or `/*` is refused, because that is what `access_mode: public` is for. The UI warns that webhook endpoints must authenticate their callers themselves (signatures).
+Bypass paths are path-prefix matchers rendered before `forward_auth` (§3.5). Before any bypass dispatch, a mandatory raw-request-URI guard rejects with 400 dot-dot segments, semicolons, backslashes, and percent-encoded dots/slashes/backslashes (case-insensitive, including nested encodings such as `%25`); malformed encodings are refused. The guard examines the original URI, not only Caddy's cleaned path, and runs even on public-mode bypasses. FD-11 must implement this guard as an API precheck before the bypass reverse_proxy; until it exists, configured bypasses are refused at enable/render time. Caddy's cleaned prefix matcher alone is insufficient for upstreams with different normalization rules. They are validated so that they cannot shadow `/.ark/gate/*`, and a bypass of `/` or `/*` is refused, because that is what `access_mode: public` is for. The UI warns that webhook endpoints must authenticate their callers themselves (signatures).
 
 #### 3.9.6 Gate users
 
@@ -1362,7 +1430,7 @@ Better Auth sign-up is closed after bootstrap (app.ts lines 208-236). Owners cre
 
 New module: `server/src/modules/pki.ts`, used by the database worker for DB clients and by the domain worker for TLS-TCP and Postgres route client CAs. It shells out to `openssl`, which `certificates.ts` already does, and which is present in the worker images.
 
-- **CA:** ECDSA P-256, `basicConstraints=critical,CA:TRUE,pathlen:0`, `keyUsage=critical,keyCertSign,cRLSign`, validity 5 years. Subject `CN=Ark <purpose> CA <name> <id>`. The key is sealed in `secrets` (`kind: "pki.ca_key"`), encrypted with the root key the same way existing secrets are.
+- **CA:** ECDSA P-256, `basicConstraints=critical,CA:TRUE,pathlen:0`, `keyUsage=critical,keyCertSign,cRLSign`, validity 5 years. Subject `CN=Ark <purpose> CA <name> <id>`. The key is sealed in `secrets` (`kind: "pki.ca_key"`), encrypted with the root key the same way existing secrets are. This key is shared by api, database-worker, domain-worker, mail-worker and backup-worker with database access; each can decrypt CA keys. API becomes public through the login origin. Sealing does not isolate these services; purpose-specific keys are a future hardening option.
 - **Client certificate:** ECDSA P-256, `extendedKeyUsage=clientAuth`, `keyUsage=critical,digitalSignature`, **validity 90 days (R6)** with automatic rollover (§3.10.4). `CN` = the client's login-role name, for audit only; PgBouncer does not bind it (V-8). Random 128-bit serial.
 - **Every certificate, CA and leaf, carries `subjectKeyIdentifier` and `authorityKeyIdentifier`.** Python 3.13+ clients reject certificates without an Authority Key Identifier by default (`VERIFY_X509_STRICT`). This was observed while prototyping V-14, with OpenSSL's minimal `x509 -req` output.
 - **Default issuance.** Ark generates the key, seals it as a `once` secret, and reveals it through the existing one-time reveal (app.ts line 1896), which needs a `secret.reveal` step-up. The plaintext key is deleted from storage after the reveal.
@@ -1386,10 +1454,13 @@ appdb_storefront_preview = pool_mode=transaction max_user_connections=5 max_user
 [pgbouncer]
 listen_addr = 0.0.0.0
 listen_port = 5432
-unix_socket_dir = /var/run/pgbouncer        ; shared only with database-worker
-auth_type = scram-sha-256
+; shared only with database-worker
+unix_socket_dir = /var/run/pgbouncer
+auth_type = hba
+auth_hba_file = /var/lib/ark/pgbouncer/pg_hba.conf
 auth_file = /var/lib/ark/pgbouncer/userlist.txt
-admin_users = ark_pgbouncer_admin           ; unix socket only (see below)
+; transport restriction is enforced in pg_hba.conf below, not by admin_users
+admin_users = ark_pgbouncer_admin
 pool_mode = transaction
 max_prepared_statements = 200
 ignore_startup_parameters = extra_float_digits
@@ -1399,7 +1470,8 @@ client_tls_ca_file = /var/lib/ark/pgbouncer/client-ca-bundle.pem
 client_tls_cert_file = /var/lib/ark/certs/db.example.com/fullchain.pem
 client_tls_key_file = /var/lib/ark/certs/db.example.com/privkey.pem
 client_tls_protocols = tlsv1.3
-server_tls_sslmode = disable                 ; internal database-management bridge, unchanged
+; internal database-management bridge, unchanged
+server_tls_sslmode = disable
 
 max_client_conn = 2000
 default_pool_size = 10
@@ -1410,6 +1482,21 @@ client_idle_timeout = 900
 server_idle_timeout = 60
 server_lifetime = 3600
 ```
+
+Render this complete, ordered `pg_hba.conf` alongside the INI (PgBouncer [HBA format](https://www.pgbouncer.org/config.html#hba-file-format)):
+
+```text
+local   pgbouncer  ark_pgbouncer_admin                     scram-sha-256
+local   all        all                                     reject
+host    all        ark_pgbouncer_admin  0.0.0.0/0           reject
+host    all        ark_pgbouncer_admin  ::/0                reject
+hostssl all        all                  0.0.0.0/0           scram-sha-256
+hostssl all        all                  ::/0                scram-sha-256
+host    all        all                  0.0.0.0/0           reject
+host    all        all                  ::/0                reject
+```
+
+The global `verify-full` policy still checks every network client's certificate. `admin_users` grants console authority only; the first-match HBA rules restrict the admin identity to local sockets, even with a valid application certificate. No trailing comments are allowed in INI values. FD-16 starts the exact extracted INI and HBA in the pinned image.
 
 Rationale, from the [PgBouncer config docs](https://www.pgbouncer.org/config.html):
 
@@ -1427,14 +1514,14 @@ Rationale, from the [PgBouncer config docs](https://www.pgbouncer.org/config.htm
 
 #### 3.10.3 CA granularity
 
-**One CA per app environment** (`database_clients` row; for example `storefront/production` and `storefront/preview`). Alternatives:
+**One CA per app environment and certificate generation** (`database_clients` row; for example `storefront/production` and `storefront/preview`). Alternatives:
 
-| Granularity                | Revocation                                       | Bundle size              | Verdict         |
-| -------------------------- | ------------------------------------------------ | ------------------------ | --------------- |
-| One CA for everything      | Requires reissuing **every** client              | 1                        | Rejected        |
-| CA per database            | Revoking one app hits every app on that database | Number of databases      | Rejected        |
-| **CA per app environment** | Remove one CA; other apps are untouched          | Number of clients (tens) | **Recommended** |
-| Certificate pinning        | Not supported by PgBouncer                       | n/a                      | n/a             |
+| Granularity                           | Revocation                                                                      | Bundle size              | Verdict         |
+| ------------------------------------- | ------------------------------------------------------------------------------- | ------------------------ | --------------- |
+| One CA for everything                 | Requires reissuing **every** client                                             | 1                        | Rejected        |
+| CA per database                       | Revoking one app hits every app on that database                                | Number of databases      | Rejected        |
+| **CA per app environment/generation** | Remove the compromised generation CA, drain that role; other apps keep their CA | Number of clients (tens) | **Recommended** |
+| Certificate pinning                   | Not supported by PgBouncer                                                      | n/a                      | n/a             |
 
 The certificate does **not** bind to a role (V-8: app B's certificate plus app A's password was accepted). The role is enforced by the SCRAM password.
 
@@ -1450,7 +1537,7 @@ The certificate does **not** bind to a role (V-8: app B's certificate plus app A
 
 `database.client_revoke`:
 
-1. Mark the client `revoked` and its certificates `revoked`. Regenerate `client-ca-bundle.pem` without that CA and write it atomically (`.next`, then rename).
+1. Mark the client `revoked` and all its certificates `revoked`. Regenerate `client-ca-bundle.pem` without any of that client's generation CAs and write it atomically (`.next`, then rename).
 2. Rotate the client's login-role password with the existing `rotateRolePassword` (coordinator.ts line 43), so a leaked password cannot be paired with another app's certificate.
 3. Regenerate `userlist.txt`, then `RELOAD` on the admin socket. New TLS handshakes with the removed CA now fail with `unknown ca` (V-8). PgBouncer docs: "If the contents of any of the cert or key files are changed without changing the actual setting filename … the new file contents will be used for new connections after a RELOAD. Existing connections won't be closed".
 4. **Kill live sessions.** Run `SHOW CLIENTS`, then `KILL_CLIENT <id>` for each client whose `user` is that login role. V-8 confirmed that an already-authenticated session survives the CA removal and reload, so this step is required.
@@ -1464,18 +1551,19 @@ day 0                         day 60 (T−30)                     day 90 (T)
                               |-- cert N+1 issued (pending) ----------------------- ... --> day 150
                               |   delivered (push+redeploy, or manual confirm)
                               |   alert: rollover pending            T−14 warning, T−7 critical
-                                                                     cert N expires on its own
+                                                                     cert N expires; role drained by T+5s
 ```
 
-1. **Issue the successor at T−30 days.** The daily `database.client_rollover` job issues certificate N+1 from the **same CA** with a fresh key, valid for 90 days from issue. Its `rollover_state` is `pending`, and it is marked `superseded_by` on N. The CA bundle does not change, so **PgBouncer needs no reload, and both certificates work immediately**. An owner can also trigger rollover early (`POST …/rollover`).
+1. **Issue the successor at T−30 days.** Under a per-client transaction lock, select an unsuperseded `current` certificate with no successor, issue N+1 with a fresh key **and a fresh generation CA**, and set N.superseded_by once. A uniqueness constraint prevents duplicate successors on retries. Add both CAs to the bundle and `RELOAD` PgBouncer before delivery. N+1 is `pending`, valid for 90 days from issue. `database_clients.ca_id` tracks the promoted generation; historical certificate rows retain their own CA. An owner can also trigger rollover early (`POST …/rollover`).
 2. **Deliver it.**
-   - **With the Vercel integration** (§3.10.5): `integration.vercel_push` upserts the env vars, redeploys, waits for the deployment to become ready, and marks N+1 `delivered`.
-   - **Without it:** Ark raises a **rollover-pending alert**. The UI shows a guided step: reveal the new bundle once (`secret.reveal` step-up), the exact `vercel env add …` commands, then "Redeploy and confirm". The operator's confirmation marks it `delivered`.
+   - **With the Vercel integration** (§3.10.5): `integration.vercel_push` upserts the env vars, redeploys, waits for the deployment to become ready, and records delivery of N+1.
+   - **Without it:** Ark raises a **rollover-pending alert**. The UI shows a guided step: reveal the new bundle once (`secret.reveal` step-up), the exact `vercel env add …` commands, then "Redeploy and confirm". The operator's confirmation records delivery. In the same idempotent transaction, set `delivered_at` once, mark N `superseded`, promote N+1 through `delivered` to `current`, and update the client CA pointer. The daily job can then select N+1 at day 120; `delivered` must never remain a scheduler dead end.
 3. **Escalate if not delivered.** The pending alert becomes a warning at T−14 days and critical at T−7 days, through the existing alert pipeline (`server/src/modules/alerts.ts`).
-4. **Retire the predecessor.** Certificate N is marked `superseded` when N+1 is delivered. It is **not** revoked: the CA is shared and PgBouncer has no CRL, so N simply stops working when it expires at day 90. A superseded certificate is therefore valid for at most 30 more days. That is the accepted overlap risk. If N is suspected leaked, rotate the CA instead: new CA, new certificate, swap the bundle, then remove the old CA, as in revocation step 1.
-5. **Ark cannot tell from PgBouncer which certificate a session used**, because `SHOW CLIENTS` has no certificate serial. So "delivered" means "pushed and redeployed" or "operator confirmed", never "observed in use".
+4. **Retire the predecessor and bound live access.** TLS expiry rejects new handshakes only. At N.not_after, a durable retirement task removes N's generation CA, reloads and drains **all sessions for this client's role**, including successor sessions, because PgBouncer cannot identify the certificate serial. Under a serialized pooler lock, first fence new admission in `be_pgbouncer` across all HAProxy generations; close unauthenticated PgBouncer clients that could complete a pre-retirement handshake, reload the reduced CA bundle, kill the role's clients, verify no role or pre-auth clients remain, then reopen admission. Existing sessions for other roles remain alive; new pooler connections may briefly retry. Reconnecting with N+1 succeeds, N fails. The retirement deadline is **not_after + 5 seconds**; an independent watchdog fences admission and stops PgBouncer if the drain/reload cannot meet it. No claim of a ≤90-day exposure bound is made without this enforcement. Idle timeouts and `server_lifetime` are not absolute client lifetimes.
+5. **Emergency revocation during overlap.** Remove only N's generation CA using the same admission fence and role drain; N+1 remains trusted and reconnects. If a legacy pair shares a CA, individual certificate revocation is impossible: emergency rotate to a new CA and redistribute N+1, with explicit downtime if delivery is not ready. Removing a client's access altogether removes **every** generation CA belonging to its certificate chain, not just `database_clients.ca_id`, and rotates its role password (§3.10.4 revocation).
+6. **Delivery is not observed use.** PgBouncer `SHOW CLIENTS` has no serial; `delivered_at` means a ready deployment or manual confirmation. A missing delivery does not postpone the predecessor retirement deadline. Clients must reconnect and refresh pools when their valid successor is delivered.
 
-The CA itself lives 5 years. CA rotation is a deliberate operation that uses the same two-certificate overlap, with both CAs in the bundle until the old one is removed.
+Each CA may have a 5-year cryptographic validity, but its trust in PgBouncer lasts only for that generation's certificate window. Old trust is removed at retirement or emergency revocation. The accepted overlap permits **new** connections with N until retirement; established access is bounded by the enforced five-second drain deadline.
 
 #### 3.10.5 Optional Vercel integration
 
@@ -1485,7 +1573,7 @@ The integration makes rollover fully automatic. It is **off by default**, connec
 
 - **A Vercel project-scoped access token.** Vercel added project-scoped tokens on 2026-07-30: "A project-scoped token denies any request to another project, to a user-level resource, or to a team-level resource" ([access tokens](https://vercel.com/docs/accounts/access-tokens), [changelog](https://vercel.com/changelog/project-scoped-tokens)).
   - Ark requires an expiry (`expiresAt`), with a default of 1 year, and alerts 30 days before it.
-  - When the token is connected, Ark calls the API with it and **refuses to store a token that can see any other project**. It does this by checking that listing other projects fails, and that the token's metadata names the project scope. The exact API calls for this check are designed and tested in FD-29 (**unverified**).
+  - When the token is connected, Ark calls the API with it and **refuses to store a token that can see any other project**. Use the candidate bearer token **in memory only** for `GET /v5/user/tokens/current` (the special `current` value is in Vercel's [OpenAPI specification](https://openapi.vercel.sh)), `GET /v9/projects/{selectedProjectId}?teamId={teamId}`, and negative probes `GET /v9/projects?teamId={teamId}` and `GET /v9/projects/{knownOtherProjectId}?teamId={teamId}`. Metadata must positively bind the sole project scope to the selected project/team and give an unexpired mandatory expiry; a list failure by itself is never scope proof. Require the documented project-scope denial for the negative probes, not network errors, 401, 404, 429 or 5xx. Do not log response secrets. FD-29 must validate the metadata field shape and permissions against live test tokens before shipping. If project-scoped tokens cannot read sufficient metadata, or the schema is ambiguous, **disable connection and use manual rollover**; never persist a token on inferred scope. No higher-privileged verifier token is introduced.
   - The token is stored as a sealed secret (`vercel_integrations.token_secret_id`).
 - **Optionally, a deploy hook URL**, also sealed. Deploy hooks need no token, but "treat it with the same security as you would any other token or password" ([deploy hooks](https://vercel.com/docs/deploy-hooks)).
 
@@ -1497,7 +1585,7 @@ The integration makes rollover fully automatic. It is **off by default**, connec
 2. **Redeploy**, because env changes "only apply to new deployments" ([env vars](https://vercel.com/docs/environment-variables)).
    - **Preferred:** the deploy hook. It builds the branch head as a new deployment, which picks up current env vars, but it is limited to 60 triggers per hour per project and needs a Git-connected project.
    - **Otherwise:** `POST /v13/deployments` with the last production `deploymentId` and `withLatestCommit: true`. Whether this redeploy picks up env vars changed after the original deployment is **unverified** ("All project settings and environment variables are inherited from the original unless explicitly overridden"), so FD-29 must test it before relying on it.
-3. Poll the new deployment until it is ready, with a timeout of 30 min. On success, mark the certificate `delivered`. On failure, keep it `pending` and raise the alert; the old certificate still works until T.
+3. Poll the new deployment until it is ready, with a timeout of 30 min. On success, atomically record `delivered_at`, supersede the predecessor and promote the successor to `current` (§3.10.4). On failure, keep it `pending` and raise the alert; the old certificate still works until T.
 4. Audit every call: endpoint, project, target and status. Values are never logged.
 
 **Security trade-off.** This must be shown in the UI before connecting:
@@ -1507,10 +1595,10 @@ The integration makes rollover fully automatic. It is **off by default**, connec
   - project scope only, never team or account scope;
   - a mandatory expiry;
   - opt-in per client;
-  - the token is sealed with the root key and read only by the domain worker;
+  - the token is sealed with `ARK_ROOT_KEY`; api, database-worker, domain-worker, mail-worker and backup-worker have that key and database access, so compromise of any can decrypt it. The public login origin newly exposes api; “used only by domain-worker” is an operational convention, not secret isolation;
   - every use is audited;
   - deleting the integration deletes the token.
-- **Recommended use:** preview environments, or production for owners who accept the risk. Production apps holding sensitive user data should keep the guided manual path, which is one reveal and one redeploy every 90 days.
+- **Recommended use:** preview environments, or production for owners who accept the risk. Production apps holding sensitive user data should keep the guided manual path, which is one reveal and one redeploy about every 60 days in steady state, with a 30-day delivery window.
 - **Not offered:** a team-scoped token, or a Vercel Integration/OAuth app (a larger permission surface).
 
 ### 3.11 Public port limits and allowlists (nftables)
@@ -1586,7 +1674,7 @@ Details:
 - **Syntax** follows the [nftables meters page](https://wiki.nftables.org/wiki-nftables/index.php/Meters). `ct count` sets must not have a timeout ("If you define a timeout to your set and use it with ct count, you will hit an 'Operation is not supported' error").
 - **IPv6 sources are grouped by /64.** Without that, one client could rotate through a whole /64.
 - **Defaults are generous.** Vercel egress comes from shared AWS addresses, so many function instances can share one source IP: 5432 allows 128 concurrent and 30 new per second per source. 443 also carries browsers behind carrier-grade NAT, so it allows 256 and 50/s. All values are configurable per platform. Counters feed Prometheus through the existing metrics endpoint (FD-18).
-- **`accept` in Ark's chains does not override Docker's own rules, and a `drop` in either table is final.** That is why the existing table uses its own priority -1 hooks (cidr.ts lines 125-136). Raw-port allowlists are rendered from `front_routes.source_cidrs` (and `compat_port`), and an empty list renders `0.0.0.0/0` and `::/0`.
+- **`accept` in Ark's chains does not override Docker's own rules, and a `drop` in either table is final.** That is why the existing table uses its own priority -1 hooks (cidr.ts lines 125-136). Raw-port allowlists are rendered from `front_routes.source_cidrs` (and `compat_port`), and an empty list renders empty sets (deny all); open CIDRs require the explicit `allow_internet` flag and owner step-up.
 - **`database-ingress` keeps applying the files** (`scripts/database-ingress.ts:41-46`), with its 5432 listener removed (§3.8.3). The same reconciler applies `ark_front.nft`, with the same fail-closed status file and readback.
 
 ### 3.12 Vercel-side guide
@@ -1676,7 +1764,7 @@ Ark fills this in from the platform region setting (§3.15).
 
 **Driver mode.** Vercel apps connect to the Ark database with classic negotiation (the snippets above), which HAProxy routes to PgBouncer by the `SSLRequest` bytes. `sslnegotiation: 'direct'` also works with both drivers, because PgBouncer 1.26.1 accepts direct TLS and HAProxy routes it by the DB hostname (V-13). It saves one round trip per new connection, but is optional.
 
-**Rollover every 90 days (R6).** The env var names never change: rollover replaces the values.
+**90-day certificates, rollover at T−30 days (R6).** The env var names never change: rollover replaces the values.
 
 - **With the Vercel integration** (§3.10.5), Ark pushes the new values about 30 days before expiry and redeploys. There is nothing to do.
 - **Without it**, Ark raises a rollover-pending alert, and the client page shows the exact commands:
@@ -1689,7 +1777,7 @@ vercel deploy --prod        # or redeploy from the dashboard
 # Then press "Confirm rollover" in Ark.
 ```
 
-The old certificate keeps working until its own expiry, so redeploys can happen at any time within the 30-day window. (Check the `--force` and `--sensitive` flag spellings against the current Vercel CLI when FD-22 writes the guide: **unverified**.)
+The old certificate admits new connections until expiry and its role is drained by expiry +5 s, so redeploys can happen at any time within the 30-day window. (Check the `--force` and `--sensitive` flag spellings against the current Vercel CLI when FD-22 writes the guide: **unverified**.)
 
 ### 3.13 DNS flows and provider guides
 
@@ -1711,11 +1799,11 @@ Creating a route:
 When the preflight result changes, `domain.ipv6_preflight` re-plans every domain:
 
 - **AAAA rows appear** (Cloudflare: through the reviewed diff) when the preflight passes and `aaaa_enabled` is true.
-- **AAAA rows are withdrawn**, with a warning, when the preflight fails, the address changes, or the owner turns AAAA off for that domain.
+- **AAAA withdrawal tombstones are planned** when preflight fails, the address changes, or the owner turns AAAA off. Cloudflare executes exact authorized deletes (§3.13.2), then verifies absence externally after TTL. Until deletion and lookup succeed, status is `withdrawal_pending` with an alert, not “withdrawn”. Manual DNS providers show pending operator removal with exact prior records, and remain unhealthy until lookup confirms absence.
 
 #### 3.13.2 Cloudflare (automatic)
 
-- **Dry-run diff.** Factor a `planCloudflare(zone, records)` out of `publishCloudflare` (providers.ts lines 94-131). It returns the `keep`/`update`/`create` actions from `chooseCloudflareMutation` without writing. `GET /api/front/routes/:id/dns` shows that diff. `POST /api/domains/:id/publish` gains a required `planHash` from the diff, so Ark applies only the reviewed diff. If DNS changed since review, the hash differs and the request returns 409.
+- **Dry-run diff.** Factor a `planCloudflare(zone, records)` out of `publishCloudflare` (providers.ts lines 94-131). It returns the `keep`/`update`/`create`/**`delete`** actions without writing; extend `chooseCloudflareMutation` and the publisher with explicit deletion. Store provider zone/record IDs plus type/name/content ownership evidence for every Ark-created record, and retain a tombstone when desired AAAA disappears. Deletes name an exact Ark-owned ID and expected prior value, and are included in the plan hash and audit; re-read before DELETE, reject drift with 409. Never delete unrelated, ambiguous or unowned records. `DELETE /zones/{zone_id}/dns_records/{dns_record_id}` is the Cloudflare mutation ([reference](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/delete/)). A reviewed per-domain withdrawal authorization may let failure-triggered AAAA deletes run automatically; without that prior authorization, mark removal pending and require the ordinary reviewed plan. `GET /api/front/routes/:id/dns` shows that diff. `POST /api/domains/:id/publish` gains a required `planHash` from the diff, so Ark applies only the reviewed diff. If DNS changed since review, the hash differs and the request returns 409.
 - **Records stay DNS-only.** `proxied: false` is already forced (cloudflare.ts line 15). Cloudflare: "When a record is DNS-only, Cloudflare responds with your server's actual IP address" ([proxy status](https://developers.cloudflare.com/dns/proxy-status/)). The `proxied` flag is not exposed; a future per-domain flag would need Cloudflare's IP ranges trusted at the edge and is out of scope.
 - **Token scope:** Zone / DNS / Edit and Zone / Zone / Read ([lego Cloudflare](https://go-acme.github.io/lego/dns/cloudflare/), [Cloudflare API](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/)).
 - **Ordering fix.** Today `domain.verify` checks address records **before** it enqueues `dns.publish` (coordinator.ts line 693), so a first verify on a Cloudflare domain always ends `awaiting_dns`. For routes, the order becomes publish (after diff approval), then verify. `dns.publish` enqueues `domain.verify` when it succeeds.
@@ -1730,7 +1818,7 @@ Ark shows a table of exact records plus a provider guide, then polls `domain.ver
 | A                                          | `www`           | `203.0.113.10` | 300                  |
 | AAAA (only when the IPv6 preflight passed) | `@`, `www`      | `2001:db8::10` | 300                  |
 
-If the IPv6 preflight has not passed, the AAAA rows are not shown. The UI says why: "IPv6 not verified on this server; publishing A only".
+If IPv6 preflight has not passed, new AAAA rows are not offered; existing AAAA rows are shown as **remove** instructions, not hidden. The UI says why: "IPv6 not verified on this server; publishing A only".
 
 - **Namecheap guide** ([KB 434](https://www.namecheap.com/support/knowledgebase/article.aspx/434/2237/how-do-i-set-up-host-records-for-a-domain/), [KB 319](https://www.namecheap.com/support/knowledgebase/article.aspx/319/2237/how-can-i-set-up-an-a-address-record-for-my-domain/)): Domain List → **Manage** → **Advanced DNS** → Host Records → **Add New Record** → `A Record`, Host `www` (or `@` for the apex), Value the IP, TTL Automatic. Repeat with `AAAA Record` for IPv6. This only works when the domain uses Namecheap BasicDNS, PremiumDNS or FreeDNS. If the nameservers point elsewhere, edit the records there instead. Ark does not offer Namecheap API automation: the API needs IPv4 whitelisting and account thresholds ("at least 20 domains … or at least $50 on your account balance", [API FAQ](https://www.namecheap.com/support/knowledgebase/article.aspx/9739/63/api-faq/)).
 - **Generic guide:**
@@ -1760,16 +1848,19 @@ If the IPv6 preflight has not passed, the AAAA rows are not shown. The UI says w
 3. **Every public port answers over IPv6 from outside.** An external probe connects to `[public_ipv6]` on:
    - 80: expects the challenge edge's 404 or a known redirect;
    - 443: expects a TLS handshake for a configured hostname;
-   - 5432, if any public database or Postgres route exists: expects the `SSLRequest` reply `S`;
+   - 5432 when PgBouncer is enabled: classic `SSLRequest` must reply `S`, followed by the configured TLS/client authentication;
+   - 5432 for each Postgres route: direct TLS with that route's SNI and ALPN `postgresql`, its configured certificate/auth policy and an allowed probe source. A route-only installation must reject classic SSLRequest; it can still pass this direct-TLS preflight;
    - every enabled raw-TCP and compat port: expects a TCP connect.
 
-   The probe also checks that the **source address HAProxy logs equals the probe's own address**, which proves client-address preservation end to end. The external probe is the existing off-host heartbeat runner (`ARK_OFFHOST_HEARTBEAT_URL` receiver) extended with a `preflight` endpoint, or, if none is configured, a one-time manual check. Ark prints a script for the owner to run from any IPv6-capable machine (`curl -6`, `openssl s_client -6`, `nc -6`), which posts back a signed result token.
+   The probe also checks that the **source address HAProxy logs equals the probe's own address**. Probe identities and source addresses must already satisfy route CIDR and authentication policies; do not add a policy bypass for health checks. If an authorized external probe cannot be supplied, mark that check unverified and withhold AAAA. This proves client-address preservation end to end. The external probe is the existing off-host heartbeat runner (`ARK_OFFHOST_HEARTBEAT_URL` receiver) extended with a `preflight` endpoint, or, if none is configured, a one-time manual check. Ark prints a script for the owner to run from any IPv6-capable machine (`curl -6`, `openssl s_client -6`, `nc -6`), which posts back a signed result token.
 
 4. **The result is recorded** in `platform_settings.ipv6_status` and `ipv6_evidence`, per port. `failed` lists the failing ports; `not_present` means no global IPv6 address.
 
 Ark never tests its own IPv6 reachability from inside the VPS, because hairpin connections do not prove external reachability.
 
 ### 3.14 Certificates for routes
+
+For a `database` endpoint, certificate issue/renew must durably enqueue `pgbouncer.reload` after atomic file replacement, and test the served fingerprint. Do not mark renewal serving until that reload succeeds; retries and expiry alerts cover failures. Client-certificate rollover is a separate lifecycle.
 
 - **Keep lego HTTP-01** (`shared/src/acme.ts:25-48`). It needs port 80 reachable and serves challenges from the `:80` block. Wildcards are not supported. That is fine, because each route has an explicit hostname.
 - **Mount `/var/lib/ark/certs` read-only into `edge` and `edge-l4`.** The implementation plan calls for per-service certificate volumes (`docs/implementation-plan.md` line 187). FD-02 starts with one read-only mount and leaves per-service scoping as a follow-up.
@@ -1841,7 +1932,17 @@ services:
   edge-l4:
     image: haproxy:3.2.26-alpine@sha256:1c3568e520453cc8ba98c39501febcf450429c80e6cc27ecad779961d76e597c
     network_mode: service:edge-ts # binds 443, 5432, 20000-20049 and the SNI ports
-    command: [haproxy, -W, -db, -S, /var/run/haproxy/master.sock, -f, /usr/local/etc/haproxy/haproxy.cfg]
+    command:
+      [
+        haproxy,
+        -W,
+        -db,
+        -S,
+        "/var/run/haproxy/master.sock,gid,4400,mode,660",
+        -f,
+        /usr/local/etc/haproxy/current/haproxy.cfg,
+      ]
+    group_add: ["4400"]
     volumes:
       - ../../tmp/edge-l4:/usr/local/etc/haproxy:ro # haproxy.cfg, allow/*.lst, cas/*.pem|crl, certs/*.pem
       - ark_haproxy_run:/var/run/haproxy # master + admin sockets, shared with domain-worker
@@ -1851,21 +1952,28 @@ services:
     cap_drop: [ALL] # binds 443/5432 as uid 99 with no capabilities: Docker sets ip_unprivileged_port_start=0 (V-14)
     restart: unless-stopped
 
+  # haproxy-validator and edge lease watchdog: first-party targets specified in §3.8.6/FD-25.
+  # Validator mounts generations read-only at the same absolute path and exposes only its Unix socket.
   domain-worker:
+    group_add: ["4400"]
     volumes:
-      - ../../tmp/edge-l4:/var/lib/ark/edge-l4
+      - ../../tmp/edge-l4:/usr/local/etc/haproxy
+      - ark_haproxy_validator_run:/var/run/haproxy-validator
       - ark_haproxy_run:/var/run/haproxy
       - ark_edge_ts_socket:/var/run/tailscale:ro # LocalAPI, read-only by uid (FD-06)
     environment:
-      ARK_EDGE_L4_DIR: /var/lib/ark/edge-l4
+      ARK_EDGE_L4_DIR: /usr/local/etc/haproxy
+      ARK_HAPROXY_VALIDATOR_SOCKET: /var/run/haproxy-validator/validate.sock
       ARK_HAPROXY_MASTER_SOCKET: /var/run/haproxy/master.sock
       ARK_HAPROXY_ADMIN_SOCKET: /var/run/haproxy/admin.sock
       ARK_EDGE_TS_SOCKET: /var/run/tailscale/tailscaled.sock
 
   backup-worker:
+    volumes:
+      - ark_backup_ts_socket:/var/run/backup-tailscale:ro
     environment:
-      HTTPS_PROXY: socks5://backup-ts:1055 # tailnet REST target only (FD-30); NO_PROXY covers S3 endpoints
-      NO_PROXY: ${ARK_BACKUP_S3_HOST:-}
+      ARK_BACKUP_TS_SOCKET: /var/run/backup-tailscale/tailscaled.sock
+      ARK_BACKUP_REST_PROXY: socks5://backup-ts:1055 # worker sets HTTP_PROXY only in the REST subprocess
     networks: [control, backup-egress, backup-tailnet]
 
   backup-ts: # FD-30: tag:ark-backup, userspace, SOCKS5 only
@@ -1875,9 +1983,12 @@ services:
       TS_USERSPACE: "true"
       TS_AUTHKEY: ${TS_BACKUP_AUTHKEY:-}
       TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
       TS_SOCKS5_SERVER: 0.0.0.0:1055 # reachable only on the internal backup-tailnet network
       TS_EXTRA_ARGS: "--shields-up"
-    volumes: [ark_backup_ts_state:/var/lib/tailscale]
+    volumes:
+      - ark_backup_ts_state:/var/lib/tailscale
+      - ark_backup_ts_socket:/var/run/tailscale
     networks: [backup-tailnet, backup-ts-egress]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -1899,8 +2010,10 @@ volumes:
   ark_edge_ts_state:
   ark_edge_ts_socket:
   ark_haproxy_run:
+  ark_haproxy_validator_run:
   ark_pgbouncer_socket:
   ark_backup_ts_state:
+  ark_backup_ts_socket:
 ```
 
 Notes:
@@ -1922,9 +2035,9 @@ These steps are delivered as an installer step (`scripts/install.ts`) plus `docs
    - `established,related`, `lo`, and `tailscale0` (host node);
    - ICMP and ICMPv6 (needed for PMTU and NDP);
    - UDP 41641 (host tailscaled) and 41642 (edge node);
-   - TCP 80, 443, 5432, the enabled shared SNI ports and the configured raw-TCP range. With `userland-proxy` off, these arrive through DNAT and are governed by the `forward` chain. The `input` accepts cover only any remaining host-local listeners.
+   - TCP 80, 443, 5432, enabled shared SNI ports, enabled raw/compat ports, and **25, 465, 587, 993 when mail is enabled**. Generate one permitted-public-port inventory as the union of enabled platform services, with each service owning its entries. With `userland-proxy` off, these arrive through DNAT and are governed by the `forward` chain. The `input` accepts cover only any remaining host-local listeners.
 
-   The `forward` chain drops `ct status dnat` traffic to any port outside the front set. Docker publishes ports through the nat table, so ufw's INPUT rules never see them: "packets are diverted before it reaches the INPUT and OUTPUT chains that ufw uses" ([Docker and ufw](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw)). That is why the existing allowlist hooks `forward` as well (cidr.ts lines 125-136). Every netfilter base chain on a hook sees the packet, so a `drop` in Ark's table takes effect whatever Docker's chains accept. Do not use ufw. Docker's nftables backend is experimental and has no `DOCKER-USER` chain ([Docker nftables](https://docs.docker.com/engine/network/firewall-nftables/)), so Ark stays on independent `inet` tables. Those work with both backends.
+   The `forward` chain drops `ct status dnat` traffic to any port outside that enabled-platform union. The mail service owns its port entries; HAProxy owns no mail listener. Apply the same inventory to provider firewall and host audit. Docker publishes ports through the nat table, so ufw's INPUT rules never see them: "packets are diverted before it reaches the INPUT and OUTPUT chains that ufw uses" ([Docker and ufw](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw)). That is why the existing allowlist hooks `forward` as well (cidr.ts lines 125-136). Every netfilter base chain on a hook sees the packet, so a `drop` in Ark's table takes effect whatever Docker's chains accept. Do not use ufw. Docker's nftables backend is experimental and has no `DOCKER-USER` chain ([Docker nftables](https://docs.docker.com/engine/network/firewall-nftables/)), so Ark stays on independent `inet` tables. Those work with both backends.
 
 3. **Docker daemon and native IPv6 (R9).** `/etc/docker/daemon.json` gets:
    - `"ipv6": true`, and `"ip6tables": true` (the default since Engine 27.0: "ip6tables is now enabled for Linux bridge networks by default", [Engine 27 notes](https://docs.docker.com/engine/release-notes/27/));
@@ -1947,12 +2060,18 @@ The backup worker already drives restic and pgBackRest (`shared/src/backup-plan.
 
 #### 3.18.1 What goes where
 
-| Data                                             | S3-compatible target                                                                 | Home machine over the tailnet                                                                         |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| PostgreSQL (platform and app clusters)           | pgBackRest `repo1` (S3): full and differential backups plus WAL archive, giving PITR | restic snapshot of pgBackRest's local `repo2` (posix, on the VPS), which carries full backups and WAL |
-| Mail (Stalwart snapshot), reviewed named volumes | restic S3 repository                                                                 | restic REST repository (`rest-server --append-only`)                                                  |
+**Physical backup prerequisites (FD-21).** Both Compose clusters (`postgres` platform and `app-postgres`) need a pgBackRest executor built with the pinned PostgreSQL-major-compatible tooling, available **inside each PostgreSQL container**, with read access to its actual PGDATA and local Unix socket. Use a reviewed derivative PostgreSQL image, not a backup-worker with no data access. Each cluster has its own stanza, config/credentials, explicit `--repo=2` selection for backup/check/restore, and persistent encrypted posix `repo2` volume (separate paths and cluster IDs); mount its repo2 into that cluster and read-only into a snapshot exporter. Configure `archive_mode=on`, `archive_command='pgbackrest --stanza=<cluster> archive-push %p'`, stanza-create/check and backup role access; restart for archive_mode and prove archiving before claiming PITR. The control worker invokes only fixed backup/check commands through a narrowly authenticated local executor on the internal management network; no Docker socket and no arbitrary shell. This source-side executor and new images/volumes are FD-21 scope, not assumed existing functionality.
 
-Both destinations are encrypted client-side: pgBackRest `repo1-cipher-type=aes-256-cbc`, and restic always. Repository passwords are sealed secrets, and an off-host copy is part of the recovery runbook.
+Schedule full backups weekly, differential daily and WAL-inclusive off-VPS snapshots at most every 5 minutes **independently to each destination**. Under an Ark executor lock shared by every backup, expire and archive-push writer for that stanza, create a read-only filesystem snapshot/reflink of completed repo2 metadata and backup/WAL files; release the lock before restic upload. Do not copy a repository while its `.info` files are being rewritten. Record a manifest of stanza, backup labels, WAL coverage and last recoverable timestamp per destination. Keep newly archived WAL until both destinations acknowledge coverage. If filesystem snapshots/reflinks are unavailable, pause all repository mutation under that same executor lock for a consistent staged copy (archive-push retries/queues WAL in PostgreSQL while fenced); no concurrent partial metadata copies. A missed snapshot interval alerts and bounds the off-VPS RPO to the last acknowledged WAL, not the latest local WAL. With a destination unavailable, continue the other destination and local archive, mark backups unhealthy, retry durably, monitor capacity and fail backup health before local WAL/repository disk fills. Never silently discard unexported WAL or claim a recovery point that has not been exported.
+
+Recovery uses a separate off-VPS machine with independently stored repository decryption credentials: restore a selected restic snapshot to a scratch posix pgBackRest repository, then restore the cluster and replay through the selected archived WAL point. Neither the original VPS, its root key nor a local repo is required. FD-21/FD-30 prove this after losing every VPS-local copy.
+
+| Data                                             | S3-compatible target                                                                                                            | Home machine over the tailnet                                                        |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| PostgreSQL (platform and app clusters)           | Immutable restic S3 snapshots of a completed local pgBackRest repository, including full/differential backups, metadata and WAL | Independently scheduled restic REST snapshots of the same completed local repository |
+| Mail (Stalwart snapshot), reviewed named volumes | restic S3 repository                                                                                                            | restic REST repository (`rest-server --append-only`)                                 |
+
+Both destinations are encrypted client-side by restic; the persistent local pgBackRest repository also uses `repo2-cipher-type=aes-256-cbc`. The baseline uses local posix `repo2` → immutable restic snapshots on **all** providers (including R2). A direct live pgBackRest S3 `repo1` is an optional provider-specific extension, never the R2 recipe, and cannot substitute for the required snapshots. Repository passwords are sealed secrets, and an off-host copy is part of the recovery runbook.
 
 #### 3.18.2 S3-compatible target
 
@@ -1974,28 +2093,28 @@ The region preset (§3.15) suggests the bucket region (`us-east-1` for `us-east`
 
 Per-provider recipes, which Ark shows and FD-21 verifies:
 
-| Provider      | Make history immutable                                                                                                                                                                                                                                                                             | Writer credential                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| AWS S3        | Versioning plus **Object Lock**: compliance mode, or governance mode with the writer lacking `s3:BypassGovernanceRetention`. Retention ≥ the backup retention window ([Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)).                                      | IAM: allow `PutObject`, `GetObject`, `ListBucket`; allow `DeleteObject` **only** on `<prefix>/locks/*` (restic). Deny `DeleteObjectVersion`, `PutLifecycleConfiguration`, `PutBucketVersioning`, `PutBucketObjectLockConfiguration` and `BypassGovernanceRetention`. With versioning, an overwrite or delete only adds a version or delete marker ([deleting versions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html)). |
-| Backblaze B2  | B2 keeps file versions natively; enable **Object Lock** on the bucket ([B2 Object Lock](https://www.backblaze.com/docs/cloud-storage-object-lock))                                                                                                                                                 | Application key **without `deleteFiles`**, scoped to the bucket. `writeFiles` still allows _hiding_, which is restic's lock removal on B2 ("restic's S3 backend will only hide no longer necessary files"). Hidden versions remain recoverable, and Object Lock blocks lifecycle purges ([key capabilities](https://www.backblaze.com/docs/cloud-storage-application-key-capabilities)).                                                                    |
-| Cloudflare R2 | **Bucket lock rules** on the data prefixes (`data/`, `index/`, `snapshots/`, `keys/`, `config`, and the pgBackRest path), not on `locks/`: "prevent the deletion and overwriting of objects … for a specified period" ([bucket locks](https://developers.cloudflare.com/r2/buckets/bucket-locks/)) | R2 tokens have no no-delete level ("Object Read & Write"), so the lock rules are the only control. A bucket-scoped token is still required.                                                                                                                                                                                                                                                                                                                 |
-| MinIO         | Versioning plus object locking (release-dependent: newer releases allow enabling it on existing buckets)                                                                                                                                                                                           | The same IAM-style policy as AWS.                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Provider      | Make history immutable                                                                                                                                                                                                                                                                       | Writer credential                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AWS S3        | Versioning plus **Object Lock**: compliance mode, or governance mode with the writer lacking `s3:BypassGovernanceRetention`. Retention ≥ the backup retention window ([Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)).                                | IAM: allow `PutObject`, `GetObject`, `ListBucket`; allow `DeleteObject` **only** on `<prefix>/locks/*` (restic). Deny `DeleteObjectVersion`, `PutLifecycleConfiguration`, `PutBucketVersioning`, `PutBucketObjectLockConfiguration` and `BypassGovernanceRetention`. With versioning, an overwrite or delete only adds a version or delete marker ([deleting versions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html)). |
+| Backblaze B2  | B2 keeps file versions natively; enable **Object Lock** on the bucket ([B2 Object Lock](https://www.backblaze.com/docs/cloud-storage-object-lock))                                                                                                                                           | Application key **without `deleteFiles`**, scoped to the bucket. `writeFiles` still allows _hiding_, which is restic's lock removal on B2 ("restic's S3 backend will only hide no longer necessary files"). Hidden versions remain recoverable, and Object Lock blocks lifecycle purges ([key capabilities](https://www.backblaze.com/docs/cloud-storage-application-key-capabilities)).                                                                    |
+| Cloudflare R2 | **Bucket lock rules** on the data prefixes (`data/`, `index/`, `snapshots/`, `keys/`, `config`, and `ark-canary/`), not on `locks/`: "prevent the deletion and overwriting of objects … for a specified period" ([bucket locks](https://developers.cloudflare.com/r2/buckets/bucket-locks/)) | Never put a live pgBackRest repository under an R2 non-overwrite lock: `backup.info`, `backup.info.copy` and `archive.info` are mutable. Snapshot the completed local repository with restic so metadata history is immutable too. R2 tokens have no no-delete level ("Object Read & Write"), so the lock rules are the only control. A bucket-scoped token is still required.                                                                              |
+| MinIO         | Versioning plus object locking (release-dependent: newer releases allow enabling it on existing buckets)                                                                                                                                                                                     | The same IAM-style policy as AWS.                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 **Append-only canary** (`backup.verify_target`, weekly, and when a target is saved):
 
-1. Write `<prefix>/ark-canary/<random>` (a path that the lock rules cover).
-2. Attempt to delete it, and to overwrite it.
-3. Pass only if the delete is refused, or (with versioning or locks) the original version is still retrievable afterwards.
-4. Then check that a `locks/` object can be created and deleted, so restic will work.
-5. Record the evidence in `append_only_evidence`.
+1. Write `<prefix>/ark-canary/<random>` in **each protected prefix/policy class**, recording content hash, provider object/version ID, retention mode and deadline. Verify retention covers the required recovery window; the writer cannot shorten it, change bucket lock/versioning/lifecycle policy, or bypass governance retention. A read-only independently scoped verifier may inspect policy metadata; it never supplies destructive privileges to the writer.
+2. With the **writer's deployed credentials**, attempt ordinary delete and overwrite. For a versioned store, then attempt **permanent version-specific deletion of the recorded original version** (`DeleteObjectVersion` or provider equivalent), and per-object shortening/bypass of retention on the canary. Prove bucket-level policy-changing permissions absent by independent read-only policy inspection/provider permission evaluation; **never attempt to remove or weaken a production bucket lock, lifecycle or versioning policy**. Bucket-wide mutation negative tests run only in disposable provider fixtures. All destructive attempts on a configured target address disposable canary objects only. For unversioned R2 test delete and overwrite under the actual lock and verify the writer cannot alter that lock.
+3. Pass only when permanent deletion is denied, the original hash remains retrievable, retention/lock coverage is proven, and policy-changing/bypass capabilities are refused or independently proven absent. Versioning alone is insufficient: a full-access key on a merely versioned bucket **fails**, even if ordinary delete leaves a readable old version. Unknown permissions, unsupported checks and unverifiable retention count as unhealthy, never success.
+4. Check `locks/` create/delete for restic separately, and ensure the exception cannot reach data, metadata snapshots or canary history.
+5. Record version IDs, policy evidence, denial codes, verified retention deadline and original-hash readback in `append_only_evidence`, excluding credentials. Recheck weekly and on credential/policy changes; health expires when evidence is older than 7 days or retention coverage ends.
 
 A target that fails the canary is shown as "deletable: a compromised server could erase backups", and counts as unhealthy.
 
 #### 3.18.3 Home machine over the tailnet
 
 - **Server.** On the home machine, run [`rest-server`](https://github.com/restic/rest-server) with `--append-only` (and `--private-repos`, htpasswd), listening on its tailnet address, port 8000. "The `--append-only` mode allows creation of new backups but prevents deletion and modification of existing backups." **V-18** confirmed this with rest-server 0.14.0 and restic 0.19.1: two backups succeeded and left no stale lock files, because append-only mode still allows lock removal, while `restic forget` left the snapshot count unchanged.
-- **Transport.** A dedicated **`backup-ts`** node (`tag:ark-backup`, userspace, `--shields-up`) exposes SOCKS5 on the internal `backup-tailnet` network only. The backup worker reaches the REST URL through `HTTPS_PROXY=socks5://backup-ts:1055`. The edge node is not used, so backup reach and route reach never share grants (§3.7). Whether restic honours a `socks5://` `HTTPS_PROXY` for its REST backend is **unverified**: Go's `ProxyFromEnvironment` supports the `socks5` scheme. If it does not, the fallback is to give `backup-ts` kernel mode and let the backup worker share its netns, as `edge-ts` does.
-- **Identity.** The target is pinned like a route: Tailscale address and `StableNodeID`, validated by §3.2 with `tag:ark-backup` as the source tag.
+- **Transport.** A dedicated **`backup-ts`** node (`tag:ark-backup`, userspace, `--shields-up`) exposes SOCKS5 on the internal `backup-tailnet` network only. For the documented `http://backup-home…:8000/ark` URL, the REST restic **subprocess only** receives `HTTP_PROXY=socks5://backup-ts:1055` (also `HTTPS_PROXY` when the configured REST endpoint is HTTPS). Clear inherited conflicting proxy/NO_PROXY values for that subprocess and substitute the validated pinned target IP, preserving rest-server repository/auth semantics. S3 and API/control calls run with their ordinary environment and never inherit this tailnet proxy. The edge node is not used, so backup reach and route reach never share grants (§3.7). Whether the pinned restic honours the matching-scheme `socks5://` proxy for its REST backend is **unverified**: Go's `ProxyFromEnvironment` supports the `socks5` scheme. If it does not, the fallback is to give `backup-ts` kernel mode and let the backup worker share its netns, as `edge-ts` does.
+- **Identity.** `backup.observe` reads **backup-ts's own** self/peers through `ark_backup_ts_socket` and commits a separate `source=backup` snapshot generation (§3.1). Reuse FD-06's real-UID read-only test and single-status-endpoint sidecar fallback on a backup-only internal network. Neither the edge observer nor api mounts this socket. Apply §3.2 identity validation and six-minute freshness to the backup source; absent/replaced peers or expiry suspend new transfers and terminate active REST transfers within 5 s. Check during transfers with a local watchdog; do not wait for the next scheduled backup. This may leave a failed snapshot, never a successful health record. Never give ark-edge a backup grant just to populate its netmap.
 - **ACL.** `tag:ark-backup` → `backup-home:8000` only (§3.7).
 - **Pruning** runs on the home machine itself, with a non-append-only rest-server instance or directly on the repository, never from the VPS.
 
@@ -2024,11 +2143,11 @@ New metrics on `/api/metrics/prometheus`:
 Alerts cover:
 
 - a route stuck in `awaiting_acl` or `identity_mismatch` for more than 15 min;
-- edge observation older than 15 min;
+- edge/backup observation expires at 6 min: active withdrawal/suspension plus immediate critical alert (§3.2), not a 15-minute alert-only response;
 - server certificate expiry under 14 days (the existing rule, extended to route CAs and their CRLs' `nextUpdate`);
 - **client certificate rollover pending at T−30 days, warning at T−14, critical at T−7** (R6);
 - Vercel push failed; Vercel token expiring within 30 days;
-- IPv6 preflight failed while AAAA records are published (this should not happen, because AAAA is withdrawn first, so it indicates drift);
+- IPv6 preflight failed while AAAA records are published (this should not happen, because authorized withdrawal should start immediately; pending provider/manual deletion remains an alert until externally confirmed);
 - either backup target stale, or failing the append-only canary;
 - PgBouncer `cl_waiting` sustained above 0;
 - per-source drop spikes.
@@ -2053,7 +2172,7 @@ Rows marked **(user)** were decided by the user in §0.1. The rest are design re
 | Gate check caching                                | ≤ 10 s positive cache in the API                                                                                                      | None (DB on every request); signed short-lived tokens                                                  | Bounds revocation latency.                                                                                  |
 | Access lists (user, R11)                          | Individual users only                                                                                                                 | Groups                                                                                                 | v1 simplicity.                                                                                              |
 | Route management (user, R12)                      | Owners only                                                                                                                           | Operators within domain scope                                                                          | Exposure decisions stay with the owner.                                                                     |
-| Target identity (user, R10)                       | StableID pinning plus netmap membership via read-only LocalAPI; observer-sidecar fallback                                             | Tailscale API OAuth client                                                                             | No Tailscale credential at all; the netmap doubles as an ACL check.                                         |
+| Target identity (user, R10)                       | StableID pinning plus netmap membership via read-only LocalAPI; observer-sidecar fallback                                             | Tailscale API OAuth client                                                                             | No Tailscale credential; fresh netmap checks identity, exact-port netns probe checks outbound reach.        |
 | DB client CA granularity (user, R5)               | Per app environment, with a dedicated login role per client; preview read-only                                                        | Single CA; per database                                                                                | Revoking one app environment touches nothing else.                                                          |
 | DB cert issuance                                  | Ark-generated key, revealed once or pushed to Vercel                                                                                  | CSR only                                                                                               | Vercel has nowhere to generate keys; CSR is offered as the advanced path.                                   |
 | DB cert lifetime (user, R6)                       | 90 days, successor issued at T−30, overlap, alerts                                                                                    | 180 days; 1 year                                                                                       | Shorter exposure, with no CRL; rollover automated or guided.                                                |
@@ -2135,6 +2254,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-04: Front-door data model and target validator
 
 - **Scope:**
+  - Create `private_cas` before `front_routes`; add the no-default session origin with explicit legacy backfill, explicit internet-exposure flags, and source-keyed complete snapshot generations (§3.1).
   - Migration **`0013_front_door.sql`** (§3.1) and Drizzle schema.
   - `shared/src/tailnet.ts` (`validateRouteTarget`) with unit tests.
   - Export `prefixMatch` from `cidr.ts`.
@@ -2142,6 +2262,8 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Add `requireOwner` and use it for route management.
 - **Depends on:** none.
 - **Acceptance criteria:**
+  - [ ] Execute the **literal SQL in §3.1** on both a fresh schema migrated through 0012 and an upgrade fixture through 0012; FK creation succeeds, old sessions backfill to admin, and a new session insert omitting origin fails.
+  - [ ] The target validator rejects expired/incomplete snapshots, source mismatches and peers from a previous generation.
   - [ ] `mise run test:upgrade` applies `0013` after `0012_drop_account_issuer.sql` over the representative pre-existing schema.
   - [ ] **Accepted targets:** Tailscale IPv4/IPv6 inside the ranges.
   - [ ] **Rejected targets:**
@@ -2172,12 +2294,16 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-25: HAProxy SNI router on 443 in front of Caddy
 
 - **Scope:**
+  - Add the restricted `haproxy-validator` target, immutable candidate generations, installer numeric UID/shared GID 4400 initialization, socket modes and config/certificate permissions (§3.8.6). Connect the FD-06 edge-local lease watchdog to HAProxy and add its fail-closed launch guard (§3.2).
+  - Extend **in-repo `mise run test:edge`**, not just external prototypes, to cover HAProxy → Caddy PROXY trust and strict SNI/Host handling on the exact rendered configuration.
   - Add the `edge-l4` service (HAProxy 3.2.26, digest-pinned) in the `edge-ts` netns, owning 443.
-  - Caddy HTTPS sites move to `127.0.0.1:8443` with a server-scoped `proxy_protocol` wrapper (`allow 127.0.0.1/32`, `fallback_policy reject`), `strict_sni_host on` and `protocols h1 h2`.
+  - Caddy HTTPS sites move to `127.0.0.1:8443` with a server-scoped `proxy_protocol` wrapper (`fallback_policy require`, no `allow` list; loopback bind restricts the transport), `strict_sni_host on` and `protocols h1 h2`.
   - `edge.l4_apply` renders `fe_tls443`: HTTP and login hostnames go to Caddy through `send-proxy-v2`; unknown SNI goes to Caddy; non-TLS is rejected after 5 s.
   - Master-socket reload and the admin socket, shared with the domain worker.
-- **Depends on:** FD-05, FD-24.
+- **Depends on:** FD-04, FD-05, FD-06, FD-24.
 - **Acceptance criteria:**
+  - [ ] Using the actual pinned image users, `bun` domain-worker with `group_add: [4400]`, `cap_drop: [ALL]` and no Docker access can validate a good generation, read `show stat`, reload, enumerate current/leaving workers and shut down route sessions through the shared sockets. An invalid candidate is refused before changing the serving symlink or sending reload.
+  - [ ] Headerless loopback TLS to 127.0.0.1:8443 is refused; HAProxy-emitted PROXY v2 succeeds, carries the real address, and forged PROXY from Docker peers cannot reach the listener. Both SNI/Host mismatch 421 and headerless rejection run in `test:edge`, not only V-14.
   - [ ] HTTPS to every HTTP route works through 443, and the upstream sees the real client address in `X-Forwarded-For`, not `127.0.0.1` (IPv4 now; IPv6 after FD-27).
   - [ ] A container on any Docker network cannot connect to 8443. Caddy's `:80` server does not parse PROXY headers.
   - [ ] An SNI/Host mismatch between two Ark sites returns 421.
@@ -2189,15 +2315,18 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-06: Edge observer and identity pinning (`edge.observe`)
 
 - **Scope:**
+  - Commit complete source-keyed generations, delete absent peers, set a six-minute validity deadline and require durable withdrawal/drain on identity failure. Build the independent edge-local watchdog, internal read-only lease/revocation-journal endpoint and Caddy launch guard (§3.2); verify them with the operation worker stopped. The HAProxy adapter lands in FD-25.
   - Deployment test: a non-root process reads LocalAPI `/localapi/v0/status` through the shared socket volume. Write endpoints are refused, and `connect()` through a `:ro` mount works.
-  - Implement `edge.observe`: upsert `tailnet_nodes`, re-validate routes, update statuses. Run it every 5 minutes.
+  - Implement `edge.observe`: replace complete `edge` generations, remove absent peers, re-validate routes and actively withdraw/drain invalid routes. Run it every 5 minutes.
   - `GET /api/front/tailnet` and `POST /api/front/tailnet/observe`.
   - **Only if the test shows write access:** build the `edge-observer` sidecar (bake target, distroless, single `GET /v1/peers` endpoint, bearer token) and mount the socket only there.
   - No Tailscale OAuth client (R10).
 - **Depends on:** FD-04, FD-05.
 - **Acceptance criteria:**
+  - [ ] With a route live, remove or replace the target peer; without manual apply, active Caddy and every HAProxy generation stop dialing the old address within detection +5 s. Stop observation entirely: stale listeners and sessions are withdrawn by last completion +6 min +5 s. Failure of withdrawal stops the affected proxy and alerts.
+  - [ ] Run Caddy withdrawal acceptance here; HAProxy-generation withdrawal is an FD-25/FD-14 integration gate once the adapter exists. A failed/partial observation never renews the lease or leaves absent peers in a completed generation. Start with an expired lease and verify fail-closed listeners.
   - [ ] Test evidence is attached: a status call succeeds, and a write endpoint (for example `POST /localapi/v0/prefs`) fails from the domain worker's uid. Otherwise the sidecar is built, and the worker no longer mounts the socket.
-  - [ ] Peers granted to `tag:ark-edge` appear in `tailnet_nodes`, and ungranted peers do not.
+  - [ ] In a scratch tailnet with member → ark-edge but no reverse grant, a peer may appear in status; the edge-netns probe to its ungranted port fails and the route stays `awaiting_acl`. Granting that exact port makes the probe pass.
   - [ ] Renaming a target machine flips a name-pinned route to `identity_mismatch` on the next observation, and it disappears from both rendered configs.
   - [ ] The API container has no access to the socket (compose policy test).
 
@@ -2219,6 +2348,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-08: HTTP route lifecycle (API, DNS and certificates), owner-only
 
 - **Scope:**
+  - Until FD-11 ships, reject enabling `access_mode=sso` (including the schema default) with a clear unsupported-mode error. Enabled-route updates cannot switch into an unimplemented mode.
   - `POST`, `PATCH`, `DELETE`, `enable` and `disable` for `/api/front/routes` (kind `http`), guarded by **`requireOwner`** plus step-up.
   - Endpoint and `dns_records` creation (A, plus AAAA only per §3.13).
   - Reuse `domain.verify` and `certificate.issue`; route state machine.
@@ -2228,6 +2358,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Add the new paths to both admin path allowlists.
 - **Depends on:** FD-04, FD-06.
 - **Acceptance criteria:**
+  - [ ] Deploy only through FD-09: default-sso creation stays disabled, enable is refused, and update cannot turn a public route into reachable ungated SSO.
   - [ ] An **operator** gets 403 on every route create, update and delete call. Viewers and operators can still list routes.
   - [ ] Creating a route under an unverified domain returns 422. Under a verified domain, the apex and `www` both work and produce A records (AAAA only when `ipv6_status = passed` and `aaaa_enabled`).
   - [ ] Certificates are requested only after the route's A record resolves to `public_ipv4` (stub resolver test).
@@ -2237,6 +2368,8 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-09: Edge rendering for HTTP routes (public access mode)
 
 - **Scope:**
+  - Fail closed on any unimplemented access mode: before FD-11, omit enabled SSO rows or fail the render; never silently treat them as public.
+  - Implement anchored Location authority handling for absolute/scheme-relative names, IPv4 and bracketed IPv6, preserving suffixes and rejecting unsupported malformed authorities (§3.5). Document the upstream public-URL/body/certificate audit boundary.
   - `renderCaddyfile` gains `httpRoutes`:
     - no-leak headers, WebSocket settings, body and timeout limits, HSTS;
     - error pages (`infra/platform/edge-errors/`), `Location` and `Set-Cookie` rewriting;
@@ -2245,6 +2378,8 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Input validation and an injection fuzz test.
 - **Depends on:** FD-08, FD-25.
 - **Acceptance criteria:**
+  - [ ] With an enabled `access_mode=sso` fixture before FD-11, the route is absent or rendering fails. Deployment cannot expose it without forward_auth.
+  - [ ] Redirect fixtures include `//home.tail1234.ts.net/login`, `//100.101.102.103?x=1`, bracketed compressed and expanded IPv6, explicit ports, authority-only URLs and no trailing slash. No known internal authority reaches a response or browser redirect.
   - [ ] `mise run test:edge` validates the rendered config on 2.11.9.
   - [ ] Through the SNI router:
     - no `Server` or `Via` header on success or on 502;
@@ -2253,11 +2388,13 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
     - an unreachable upstream serves the static 502, with no tailnet name in the body or headers.
   - [ ] `https://example.com/x` redirects to `https://www.example.com/x` when `redirectTo` is set.
   - [ ] A WebSocket stays connected for more than 10 minutes idle, and survives one `edge.apply`.
-  - [ ] Routes in `awaiting_acl`, `identity_mismatch` or `disabled` are absent from both rendered configs.
+  - [ ] Routes in `awaiting_acl`, `identity_mismatch`, `observation_expired` or `disabled` are absent from both rendered configs.
 
 ### FD-10: Gate login origin and session separation
 
 - **Scope:**
+  - Use no dynamic-baseURL fallback; reject unknown/malformed hosts before Better Auth. Origin marking and server-side calls must have positive provenance, with no SQL default.
+  - Configure `__Host-` names for all login auth/MFA cookies; guard enrollment-only public enable/get-totp-uri with a before hook (§3.9.1). Remove Docker-subnet XFF trust; trusted IP extraction requires edge token on exact allowed paths.
   - Better Auth 1.7.25 dynamic `baseURL` (`allowedHosts` for the admin and login hosts, `protocol: "https"`, no `trustedProxyHeaders`).
   - `session.origin` marking, with a null-context guard.
   - The `/api/*` middleware rejects `gate` sessions and users without a `platform_access` row.
@@ -2267,6 +2404,10 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Stricter rate-limit `customRules` for sign-in and two-factor.
 - **Depends on:** FD-09.
 - **Acceptance criteria:**
+  - [ ] Runtime-test Host=www.example.com against `/api/auth/sign-in/email`: refusal, no session inserted and no admin fallback. A server-side call without explicit origin fails, as does a literal insert omitting origin.
+  - [ ] An already-TOTP-enrolled admin signs in at the login origin: POST enable and get-totp-uri both return 403, existing secret/backup codes unchanged. A new gate user can complete first enrollment, and cannot repeat it after verification.
+  - [ ] From JavaScript on a sibling route, plant an attacker session cookie with Domain=example.com and Path=/gate: `/gate/authorize` must not honor it. All authentication and two-factor cookies carry enforced `__Host-` attributes.
+  - [ ] A non-edge bridge peer sends forged XFF and a forged edge token to sign-in: limiter keys on transport peer, not spoofed address. Genuine token-authenticated edge requests still use the client IP after the edge-ts namespace move.
   - [ ] An integration test proves that Better Auth 1.7.25 builds per-request base URLs for both hosts and rejects a third host.
   - [ ] Signing in on the login origin creates a session with `origin = 'gate'`, and that cookie gets 403 on every `/api/*` admin route.
   - [ ] A user with no `platform_access` row gets 403 (not viewer data) from `/api/state`.
@@ -2277,11 +2418,17 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-11: Gate handshake and SSO routes
 
 - **Scope:**
+  - Exact public callback/logout rewrites and wildcard 404, mandatory raw-URI bypass guard, browser WebSocket Origin and unsafe-HTTP CSRF contract (§3.9). Add `/api/gate/bypass-check` as an internal-only precheck.
+  - For **every** authorization revocation, atomically enqueue affected-route drains, force identical-config reloads, and enforce 305 s maximum socket lifetime from the event, with the watchdog/apply-failure response in §3.9.3.
   - `/api/gate/check`, `/gate/authorize`, `/gate/login` (a minimal server-rendered page), `/api/gate/callback`, and route and global logout.
   - The `gate_handoffs` and `gate_sessions` logic and the edge token.
   - `access_mode: sso` rendering, bypass paths, and `front_route_access` (users only) with `PUT /api/front/routes/:id/access` (owner).
 - **Depends on:** FD-10.
 - **Acceptance criteria:**
+  - [ ] Against the literal rendered Caddyfile, fake API sees `/api/gate/callback?code=…&state=…` unchanged in query and `/api/gate/logout-route` for logout; unknown `/.ark/gate/*`, including check/users, returns 404 without touching API. Wrong callback/logout methods return 405. Edge token grants no admin access.
+  - [ ] Keep a socket open separately through access removal, user deletion, session deletion/sign-out, logout-everywhere, MFA reset, route logout and mode change, with no unrelated reload. Each closes by revocation +305 s; kill the worker/reject apply to test durable retry and watchdog fail-closed behavior.
+  - [ ] A page on sibling route A cannot open an authenticated WebSocket to B (403), while B can connect to itself. Explicit approved origin exceptions work; null/missing/disallowed origins and unsafe cookie HTTP methods fail unless the documented CSRF contract is met.
+  - [ ] Bypass tests `/webhooks/..;/admin`, backslash variants, encoded traversal/slash/backslash, nested encodings and malformed encodings never reach a protected upstream path unauthenticated (400 or login).
   - [ ] An end-to-end Playwright test against a containerised edge and fake upstream covers:
     - an unauthenticated GET redirects to the login origin;
     - after password and TOTP, the browser lands on the original path with `__Host-ark_gate` set (Secure, HttpOnly, SameSite=Lax, no Domain);
@@ -2321,6 +2468,8 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-14: TLS-TCP routes by SNI, and raw-TCP routes on dedicated ports
 
 - **Scope:**
+  - Apply matched-route CIDR and conn_cur/conn_rate rules in every TLS backend before forwarding, for both passthrough and terminated modes. Admission-first serialized drain enumerates all HAProxy generations (§3.8.6).
+  - Empty CIDRs deny all; enable fails unless explicit `allow_internet` plus owner `exposure.public` confirmation is saved. `terminate` keeps its restricted-CIDR requirement.
   - Route kinds `tls` and `tcp` (owner-only API).
   - **`tls`**: an SNI entry on 443, or on an enabled shared SNI port (frontends `fe_tls<port>`), with `passthrough`, `terminate` or `terminate_mtls` (the abns loop-back pattern, route CA and CRL).
   - **`tcp`**: one frontend per port from 20000–20049, `plain` only, with its preconditions.
@@ -2330,25 +2479,31 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - UI protocol guidance (the §3.8.2 table).
 - **Depends on:** FD-06, FD-08, FD-13, FD-25.
 - **Acceptance criteria:**
+  - [ ] Run the literal §3.8.5 example for passthrough, terminate and terminate_mtls with SNI mqtt.example.com, each with full and fragmented ClientHello. Outside-CIDR sources fail; allowed sources with the required authentication succeed.
+  - [ ] Two TLS routes on 443: the eleventh connection from a source at limit 10 fails; another allowed source and the other route retain capacity. Original source remains visible after the PROXY loop.
+  - [ ] Open sessions before and after multiple reloads, then race new connections with revocation. All affected sessions close within 5 s across current/leaving workers, new admission stays closed and another route's live sessions survive.
+  - [ ] Render empty CIDRs through HAProxy and nftables: deny-all, enable refused; explicit allow-internet is the only way to render open CIDRs.
   - [ ] On a test host, a `tls` route on 443 with `terminate_mtls` accepts a valid client certificate, and rejects no certificate, a rogue CA, and a revoked serial (after a CRL update and reload).
   - [ ] A `passthrough` route presents the target's own certificate.
   - [ ] HTTP routes on the same 443 keep working.
   - [ ] Each of these holds: a source outside `source_cidrs` is refused (for a shared-port route, only that route's traffic); the 11th concurrent connection from one source is refused; `maxconn` is enforced.
   - [ ] Disabling a route closes its established sessions within 5 s, and other routes' sessions are untouched.
   - [ ] The API refuses `tcp` routes on ports outside the range, `tls` routes on raw ports, and platform or mail ports (25, 80, 443, 465, 587, 993, 2019, 3000, 5432, 41641, 41642) as dedicated ports.
-  - [ ] `plain` requires a non-empty CIDR list, or step-up with an owner confirmation.
+  - [ ] `plain` requires a non-empty CIDR list or explicit `allow_internet` with owner-confirmed protocol authentication and exposure.public step-up; an empty list alone never opens it.
 
 ### FD-26: PostgreSQL router on 5432 (PgBouncer default plus direct-TLS routes)
 
 - **Scope:**
+  - Implement one explicit **pooler-wide** CIDR policy and conflict validation; remove per-database enforcement/status claims. Classic SSLRequest cannot carry a database policy key (§3.8.3).
   - Move public 5432 to `edge-l4` (`fe_pg5432`, as in §3.8.5): `SSLRequest`, GSSENC and Cancel go to PgBouncer; direct TLS with the DB hostname or no SNI goes to PgBouncer; a `postgres` route SNI goes to that route; everything else is rejected.
   - Add the `pgbouncer-ingress` network.
   - Retire the `database-ingress` 5432 relay and the `127.0.0.1:15432` publish. Keep `database-ingress` as the nft reconciler.
-  - Move the per-database CIDR allowlist into `be_pgbouncer`.
+  - Replace the aggregate database CIDRs with the explicit pooler-wide policy in `be_pgbouncer`, with publication conflict checks.
   - Route kind `postgres`: `passthrough` for PG ≥ 17 targets; `terminate`/`terminate_mtls` with `alpn postgresql` for older targets; the opt-in compat port.
   - UI checklist for target hardening, and driver guidance.
 - **Depends on:** FD-01, FD-25. The `postgres` route kind also needs FD-14's route plumbing.
 - **Acceptance criteria:**
+  - [ ] Two managed databases request disjoint CIDRs and an unrestricted Vercel client: publication is refused until a common pooler-wide policy is explicitly reviewed. A B-source connection to database A is never reported as isolated by A's CIDRs. Test API/UI conflict status and no silently unioned allowlist; use separate listeners/private access if isolation is required.
   - [ ] The V-13 matrix is reproduced in CI (containers):
     - psql 17+ and node-postgres ≥ 8.22, classic → PgBouncer;
     - psql, node-postgres and postgres.js 4.1.1, direct → PgBouncer;
@@ -2357,7 +2512,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
     - plaintext startup and unknown SNI rejected;
     - an idle connection closed at 5 s.
   - [ ] Vercel-style classic connections keep working unchanged after the cutover, and the old 5432 listener in `database-ingress` is gone.
-  - [ ] A client outside the database's `source_cidrs` is refused by `be_pgbouncer`, while a Postgres route on the same port is unaffected.
+  - [ ] A client outside `pooler_source_cidrs` is refused by `be_pgbouncer`, while a Postgres route on the same port is unaffected. Empty policy denies all unless explicit pooler_allow_internet is authorized.
   - [ ] With no public database, `SSLRequest` connections are rejected.
   - [ ] `app-postgres` is unreachable from the `edge-ts` netns (connection test).
   - [ ] A compat port, when enabled, relays classic TLS to the target and is refused by nft for sources outside the route's CIDR list.
@@ -2378,11 +2533,15 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-16: PgBouncer mTLS and serverless settings
 
 - **Scope:**
+  - Render complete standalone-comment INI plus ordered `auth_type=hba` rules allowing the admin identity locally and rejecting it over host transports (§3.10.2).
+  - Database endpoint certificate issue/renew must enqueue admin-socket `pgbouncer.reload`; retry failures and verify serving fingerprint (§3.14).
   - `pgbouncerConfig` changes (§3.10.2): `verify-full`, the CA bundle, TLS 1.3, prepared statements, `[users]` per client login role, per-database limits, timeouts, and the admin unix socket.
   - Admin-socket `RELOAD` replaces `docker kill -s HUP`.
-  - Bundle generation from active `database_clients`.
+  - Bundle generation follows active clients' current, linked pending and retiring certificate generations; exclude revoked clients/generations and past retirement deadlines, never just the current ca_id pointer.
 - **Depends on:** FD-01, FD-13.
 - **Acceptance criteria:**
+  - [ ] Start the pinned PgBouncer image with the **exact extracted INI and HBA**; prove expected socket path, SCRAM admin login and verify-full/TLS1.3 for network clients. The same admin password plus a valid application cert fails on the public endpoint and succeeds over the shared Unix socket.
+  - [ ] Swap the database server certificate files, run renewal and confirm via openssl s_client through public 5432 that the served fingerprint changes. Simulate reload failure and verify retry/expiry alert rather than a false serving-success state.
   - [ ] The V-8 matrix is reproduced in CI: valid cert plus password is accepted; no cert, a rogue CA, a wrong password and TLS 1.2 are each rejected.
   - [ ] `max_user_client_connections` is enforced.
   - [ ] Prepared statements work in transaction mode (postgres.js default `prepare: true`).
@@ -2406,30 +2565,38 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-28: Client certificate automatic rollover
 
 - **Scope:**
-  - `database.client_rollover`, a daily job that issues the successor at T−30 days from the same CA, without a PgBouncer reload.
+  - Use a fresh CA for every generation, trust both during overlap, then remove the predecessor CA at retirement. Delivery atomically promotes successor to current with delivered_at history; per-client locking and uniqueness prevent duplicate successors.
+  - Durable retirement fencing and role-session draining by not_after +5 s, including pre-auth races, valid-successor reconnect and watchdog failure handling (§3.10.4).
+  - `database.client_rollover`, a daily job that issues the successor at T−30 days from a new generation CA and reloads the updated trust bundle.
   - `rollover_state` transitions.
   - The manual guided path (reveal, commands, confirm).
   - Alerts: rollover pending at T−30, warning at T−14, critical at T−7.
   - Early rollover endpoint.
 - **Depends on:** FD-17.
 - **Acceptance criteria:**
-  - [ ] With a clock set to day 60, the job issues exactly one successor. Both certificates connect through PgBouncer concurrently, with no reload.
+  - [ ] Run two complete cycles: day 60 issue/deliver N+1, day 120 issue/deliver N+2, continue after day 150. Only the unsuperseded current certificate schedules the next successor, retries produce none extra, delivered_at history is preserved.
+  - [ ] Keep a predecessor-authenticated session actively querying through its not_after. It closes by +5 s, as do any racing pre-auth sessions; reconnect with successor works. Expiry without drain is explicitly a failing test.
+  - [ ] During overlap, remove only N's generation CA and drain its role: N can no longer connect, N+1 reconnects, unrelated established roles survive. A legacy shared-CA pair requires emergency CA rotation/downtime and is tested as such.
+  - [ ] With a clock set to day 60, the job issues exactly one successor. Both certificates connect after the two-CA bundle reload.
   - [ ] The pending alert fires at T−30 and escalates at T−14 and T−7. Confirming delivery clears it and marks the predecessor `superseded`.
-  - [ ] At day 90 the predecessor stops working by itself, and the successor keeps working.
+  - [ ] At day 90 the old CA is removed and role sessions are drained by +5 s; the successor reconnects successfully.
   - [ ] Running the job twice in a day does not issue a second successor.
   - [ ] CA rotation (both CAs in the bundle, then removal) is covered by a test.
 
 ### FD-29: Vercel integration (optional)
 
 - **Scope:**
+  - Before persistence, perform the exact positive metadata/project and negative cross-project/list probes in §3.10.5. Keep the feature disabled until live metadata shape and denials are proven. Shared-root-key blast radius must be disclosed (§2.3).
   - The `vercel_integrations` model.
   - Connect, test and disconnect endpoints (owner, step-up).
   - Project-scoped token validation, then sealed storage.
-  - `integration.vercel_push` (domain worker, new `integration.` prefix): env upsert as `sensitive`, redeploy through the deploy hook or `/v13/deployments`, poll until ready, mark `delivered`.
+  - `integration.vercel_push` (domain worker, new `integration.` prefix): env upsert as `sensitive`, redeploy through the deploy hook or `/v13/deployments`, poll until ready, atomically record delivery and promote to `current`.
   - Token-expiry alert. The security trade-off text in the UI.
 - **Depends on:** FD-28.
 - **Acceptance criteria:**
-  - [ ] Against a mocked Vercel API, a push upserts both env vars with `type: "sensitive"` and the right target, triggers one redeploy, and marks the certificate `delivered` only after the deployment is ready.
+  - [ ] Mock and live-test project-only, team-, account-, cross-project, expired and no-expiry tokens: only the positively verified selected-project token is accepted. For every refusal assert no secret/integration row, queue job, disk/log copy or external mutation exists. Network failures/ambiguous metadata are refusal, never evidence of scope.
+  - [ ] Attach redacted real-API status/metadata-shape proof for GET /v5/user/tokens/current and the exact /v9/projects probes before enabling connect. If project token metadata is unavailable, connection remains disabled and manual rollover works.
+  - [ ] Against a mocked Vercel API, a push upserts both env vars with `type: "sensitive"` and the right target, triggers one redeploy, and records delivery and promotes the certificate to `current` only after the deployment is ready.
   - [ ] A team- or account-scoped token is refused at connect time, and so is a token without an expiry.
   - [ ] Against a real test Vercel project, it is established whether `/v13/deployments` with `deploymentId` picks up changed env vars. If not, only the deploy-hook path is enabled.
   - [ ] A failed push leaves the certificate `pending`, raises the alert, and the old certificate still works.
@@ -2448,6 +2615,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-19: DNS reviewed diff, apex/`www`, gated AAAA and provider guides
 
 - **Scope:**
+  - Persist Ark-owned provider IDs/ownership evidence, retain AAAA tombstones, hash/review delete actions and implement exact Cloudflare DELETE with drift refusal. Manual providers remain removal-pending until external absence; automatic withdrawal requires preauthorized deletion scope.
   - `planCloudflare` dry run and plan-hash-bound publish.
   - Publish-then-verify ordering for Cloudflare domains.
   - Apex and `www` support in plans and guides.
@@ -2457,21 +2625,24 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Refuse route hostnames under `ts.net` or the tailnet suffix.
 - **Depends on:** FD-08.
 - **Acceptance criteria:**
-  - [ ] The diff shows `keep`/`update`/`create` per record without writing (mocked Cloudflare). Publishing with a stale plan hash returns 409.
+  - [ ] Seed an existing Ark-owned provider AAAA, fail preflight and separately disable the domain toggle: reviewed/preauthorized DELETE is issued for its exact record ID and absence is confirmed externally after TTL; unrelated records remain. Deleted desired rows alone are a failing test. Manual removal stays pending; drift returns 409.
+  - [ ] The diff shows `keep`/`update`/`create`/`delete` per record without writing (mocked Cloudflare). Publishing with a stale plan hash returns 409.
   - [ ] Created records have `proxied: false`.
-  - [ ] With `ipv6_status ≠ passed`, no AAAA row exists for any route hostname, and the UI shows "publishing A only".
+  - [ ] With `ipv6_status ≠ passed`, no new AAAA is desired; existing provider AAAA remains as a removal tombstone/pending action until absence is verified. Only then may UI show “publishing A only”.
   - [ ] Turning a domain's toggle off withdraws its AAAA records through the diff flow.
   - [ ] A Cloudflare-proxied address, or a CAA record without `letsencrypt.org`, gives an actionable error, and no certificate is requested.
 
 ### FD-27: IPv6 preflight and Docker native IPv6
 
 - **Scope:**
+  - Probe configured 5432 protocols separately: classic SSLRequest only for enabled PgBouncer, direct TLS with route SNI and ALPN postgresql for Postgres routes, using approved source/auth credentials without bypasses.
   - Daemon settings (`ipv6`, `ip6tables`, `userland-proxy: false`, `live-restore`) via the installer, in the safe order of §3.17.
   - `enable_ipv6` on the published network.
   - `domain.ipv6_preflight`: host global address, Docker IPv6 state, and an external probe (heartbeat runner or signed manual script) over 80, 443, 5432 and every enabled raw or compat port, including the source-address check.
   - `PUT /api/domains/:id/aaaa`.
 - **Depends on:** FD-05, FD-25.
 - **Acceptance criteria:**
+  - [ ] A Postgres-route-only install passes direct-TLS preflight while refusing SSLRequest; PgBouncer-only passes classic negotiation; both together pass both probes. A probe outside CIDR or without required authentication cannot falsely pass.
   - [ ] On a dual-stack test VPS, the preflight passes only after the network IPv6 and proxy changes, and HAProxy logs show the probe's real IPv6 address.
   - [ ] On an IPv4-only VPS, the result is `not_present`, and no AAAA records are planned.
   - [ ] Closing IPv6 443 at the provider firewall makes the preflight fail, naming port 443, and AAAA records are withdrawn.
@@ -2480,11 +2651,13 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-20: VPS hardening
 
 - **Scope:**
+  - Generate the allowed public inventory as the union of enabled platform services; include mail TCP 25/465/587/993 when enabled in host nft, provider rules and audit.
   - Installer and docs: host Tailscale with `tag:ark-vps` and SSH; the `ark_host` nft baseline; unattended-upgrades checks; the reboot-required alert; and the `mise run host:audit` external probe.
   - Docker IPv6 daemon settings are in FD-27.
 - **Depends on:** FD-14, FD-25, FD-26 (for the final port list).
 - **Acceptance criteria:**
-  - [ ] On a fresh test VPS, an external scan (IPv4, and IPv6 if present) shows only 80, 443, 5432, the enabled SNI ports, the enabled raw-TCP ports and UDP 41641/41642.
+  - [ ] With mail enabled, external SMTP delivery on 25, submission on 465/587 and IMAP on 993 work, while an unexpected published port is rejected. With mail disabled those ports are outside the inventory.
+  - [ ] On a fresh test VPS, an external scan (IPv4, and IPv6 if present) matches the enabled-service inventory: 80, 443, 5432, enabled SNI/raw/compat ports, UDP 41641/41642, plus TCP 25/465/587/993 when mail is enabled.
   - [ ] Public 22 is closed, and Tailscale SSH works for the owner.
   - [ ] `host:audit` fails when an unexpected port is listening or published.
   - [ ] `unattended-upgrades --dry-run` succeeds, and the reboot-required metric is exported.
@@ -2492,14 +2665,21 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-21: S3-compatible off-VPS backups (append-only)
 
 - **Scope:**
+  - Add PostgreSQL-side executor images, stanza/data/socket access for both actual Compose clusters, archive_mode/archive_command, persistent encrypted local repo2, safe snapshot staging and independent schedules/exported-WAL manifests (§3.18.1).
+  - Use immutable restic S3 snapshots of completed local pgBackRest repositories for the baseline including R2; never lock live mutable *.info paths. Add executor/exporter permissions, credentials, failure/capacity behavior and isolated off-VPS restore tooling.
+  - Canary tests permanent version deletion and retention-policy changes/bypass with deployed writer credentials, verifies coverage of all policy classes, and treats unknown capabilities as unhealthy.
   - The `backup_targets` model for `s3`: endpoint, region (suggested from FD-03), bucket, prefix, path style.
-  - pgBackRest `repo1` (S3, encrypted, `expire-auto=n`) and a local posix `repo2`.
+  - Persistent encrypted local pgBackRest posix `repo2` per cluster (`expire-auto=n`), exported as immutable restic snapshots; direct versioned-S3 repo1 is an optional separate recipe, not R2.
   - A restic S3 repository for mail and volumes.
   - The append-only canary.
   - Provider recipes for AWS, B2, R2 and MinIO in the UI and docs.
   - A `backup-egress` network for the backup worker.
-- **Depends on:** FD-03.
+- **Depends on:** FD-03, FD-04 (backup target/snapshot model). FD-30 supplies the home transport used by the final two-destination recovery test.
 - **Acceptance criteria:**
+  - [ ] Against actual Compose clusters: create data, back up both clusters, generate more WAL, export to **each** destination, lose all VPS-local copies and restore a chosen PITR timestamp on an isolated machine from each off-VPS destination using independent recovery credentials.
+  - [ ] Run at least two successive PostgreSQL backup/WAL cycles through the real R2 lock recipe and restore both recovery points. Prove metadata snapshots preserve both *.info histories and that locks do not block later backup/index/snapshot writes.
+  - [ ] A versioning-only bucket with full-access writer fails despite retained ordinary-delete history; permanent deletion succeeds in that negative fixture. A restricted locked writer passes with permanent-version deletion and retention change/bypass refused. Unsupported policy checks and retention shorter than the recovery window are unhealthy.
+  - [ ] An unavailable repository/egress target does not silently drop WAL; other-target export continues, health fails and capacity/last-recoverable-time alerts fire.
   - [ ] A backup and a restore test complete against MinIO (path-style) and against at least one hosted provider (virtual-host style).
   - [ ] With an AWS-style no-delete policy (delete allowed only on `locks/`), `restic backup` succeeds and the canary reports "append-only: yes". With a full-access key the canary reports "deletable", and backups are marked unhealthy.
   - [ ] `pgbackrest expire` is never run from the VPS.
@@ -2507,13 +2687,17 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 ### FD-30: Home-machine backups over the tailnet
 
 - **Scope:**
+  - Observe backup-ts self/peers through a dedicated read-only socket or backup-only observer fallback; persist source=backup generations and apply identity/freshness checks throughout transfers. Never borrow edge snapshots/grants.
+  - Configure HTTP_PROXY for the exact HTTP REST subprocess only, clear inherited conflicting proxy settings, and keep S3/API traffic on its intended network.
   - The `backup-ts` node (`tag:ark-backup`, userspace, SOCKS5 on the internal network).
   - The `tailnet_rest` target, pinned like a route.
-  - restic through `HTTPS_PROXY=socks5://…`, falling back to a shared netns if restic does not honour it.
+  - restic REST subprocess through matching-scheme `HTTP_PROXY=socks5://…` for HTTP (HTTPS_PROXY for HTTPS), falling back to a shared netns if restic does not honour it.
   - The setup guide for `rest-server --append-only --private-repos` on the home machine.
   - Both targets are required for "backups healthy".
-- **Depends on:** FD-21.
+- **Depends on:** FD-21 (source-side backup layout), FD-04 (source-keyed snapshots), FD-06 (read-only observer/UID and sidecar contract).
 - **Acceptance criteria:**
+  - [ ] With disjoint edge/backup grants, pin and back up using only backup-ts's snapshot. Replace the target StableNodeID, remove it, or expire observation: new transfers fail and active REST transfers stop within the stated bound, without an edge grant/manual apply.
+  - [ ] With no direct tailnet route, use the exact documented http://backup-home…:8000/ark endpoint, prove SOCKS5 traffic traverses backup-ts, and prove S3 and API requests are not proxied. Repeat UID/write-denial checks for backup LocalAPI; api/domain worker cannot read it.
   - [ ] On a test tailnet, a backup reaches the home `rest-server` with only the `tag:ark-backup → home:8000` grant.
   - [ ] `restic forget` from the VPS cannot remove snapshots (the V-18 result reproduced).
   - [ ] With either target stale, the backup status is unhealthy.
@@ -2547,14 +2731,15 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 **Suggested order.** Two tracks can run in parallel.
 
 - **Vercel track:** FD-01 (started) → FD-13 → FD-16 → FD-17 → FD-28 → FD-29, plus FD-18 at any time.
-- **Front-door track:** FD-24 → FD-02 → FD-05 → FD-25 → (FD-04 and FD-06 alongside) → FD-07, FD-08 → FD-09 → FD-10 → FD-11, FD-12 → FD-14 → FD-26 → FD-15 → FD-19, FD-27 → FD-20.
-- **Backups:** FD-03 → FD-21 → FD-30.
+- **Front-door track:** FD-24 → FD-02 → FD-05, with FD-04 alongside → FD-06 → FD-25 → FD-07, FD-08 → FD-09 → FD-10 → FD-11, FD-12 → FD-14 → FD-26 → FD-15 → FD-19, FD-27 → FD-20.
+- **Backups:** FD-03 + FD-04 → FD-21 source wiring, FD-06 + FD-21 → FD-30 transport; final FD-21/FD-30 recovery acceptance runs after both are installed.
 - **Docs:** FD-22 closes both tracks.
 
 ```mermaid
 flowchart LR
   FD24 --> FD02 --> FD05 --> FD25
   FD05 --> FD06
+  FD06 --> FD25
   FD04 --> FD06 --> FD08
   FD04 --> FD07
   FD04 --> FD08 --> FD09
@@ -2578,6 +2763,9 @@ flowchart LR
   FD25 --> FD20
   FD26 --> FD20
   FD03 --> FD21 --> FD30
+  FD04 --> FD21
+  FD04 --> FD30
+  FD06 --> FD30
   FD11 --> FD22
   FD14 --> FD22
   FD26 --> FD22
@@ -2589,7 +2777,7 @@ flowchart LR
 
 ## 6. Remaining questions
 
-All twelve revision 1 questions are resolved (§0.1). Revision 2 raises these smaller ones. Each has a default the design already uses, so none blocks the tickets.
+All twelve revision 1 questions are resolved (§0.1). Revision 2 raises these smaller ones. Each has a default the design already uses. Explicit live-API and security acceptance gates below still block shipping the corresponding feature.
 
 | #   | Question                                                                                                                                                                                                                                                                                | Default in this design                                                              |
 | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
@@ -2603,9 +2791,13 @@ All twelve revision 1 questions are resolved (§0.1). Revision 2 raises these sm
 
 ## 7. Verification log
 
+**Revision 3 coverage status.** [`scripts/test-front-door-design.py`](../../scripts/test-front-door-design.py), invoked by `mise run test:edge`, extracts the literal SQL, Caddyfile, HAProxy config and PgBouncer INI/HBA here. It generates disposable certificates, starts pinned containers as their unmodified users, and checks fresh/upgrade SQL execution after 0012, missing-origin refusal, full/fragmented TLS CIDR denial/admission in all three modes, required PROXY headers, SNI/Host 421, exact callback/logout rewrites and query preservation, wildcard 404s, scheme-relative redirects and local-only PgBouncer admin access. It requires Python 3, OpenSSL and Docker and cleans its own containers/networks/temporary fixtures. A fake API proves proxy plumbing only; this does **not** implement or prove the future gate's authorization decisions.
+
+The historical prototypes below do not establish the other corrected security properties. FD-10 still requires runtime tests on pinned Better Auth for permitted/unknown hosts, origin provenance, MFA isolation and sibling-cookie injection. FD-29 requires mocked **and real-API** token-scope refusals before any secret persistence, with connection disabled until proof. FD-06/14/21/28/30 require the specified real-tailnet, multi-generation drain, provider-lock, retirement and isolated recovery tests. Those remain feature release gates, not passing tests claimed by this design change.
+
 These are the prototypes run for this design, outside the repository: under `/tmp/ark-fd-proto` (revision 1, V-1 to V-12) and `/tmp/ark-fd-proto2` (revision 2, V-13 to V-20). All were run on 2026-11-16 with Docker 29.9.2 (Docker Desktop, arm64 Linux VM).
 
-V-1, V-5 and V-6 ran on Caddy 2.10.2, and V-16 re-ran them on 2.11.9 with identical results. V-12 covered the revision 1 examples; V-20 covers the revision 2 examples.
+V-21 is the revision 3 in-repository example suite described above, run successfully on 2026-11-16. V-1, V-5 and V-6 ran on Caddy 2.10.2, and V-16 re-ran them on 2.11.9 with identical results. V-12 covered the revision 1 examples; V-20 covers the revision 2 examples.
 
 | ID   | What                                                                                                                                                                                                                                                                                                                          | Result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2647,14 +2839,14 @@ V-1, V-5 and V-6 ran on Caddy 2.10.2, and V-16 re-ran them on 2.11.9 with identi
   - Behaviour under load and `mworker-max-reloads`. Reload status and draining **are** now verified (V-14, V-15).
 - **Vercel:**
   - Whether `POST /v13/deployments` with `deploymentId` picks up env vars changed after the original deployment (FD-29).
-  - The exact API check that a token is project-scoped (FD-29).
+  - Live proof of the exact scope-check endpoints in §3.10.5, including metadata availability to a project token (FD-29); connection remains disabled until proven.
   - Region codes other than `iad1` (FD-03).
   - The `vercel env add --sensitive/--force` flags (FD-22).
   - Whether Vercel recommends base64 for multi-line values (we use it as our own convention).
 - **Object storage:**
   - The AWS/MinIO IAM recipe with delete allowed only on `locks/`, B2 hide-on-delete with a key lacking `deleteFiles`, and R2 bucket-lock coverage with restic's layout. All are from docs only; MinIO could not be pulled (FD-21).
 - **Restic:**
-  - SOCKS5 through `HTTPS_PROXY` for the REST backend (FD-30).
+  - SOCKS5 through matching-scheme subprocess `HTTP_PROXY`/`HTTPS_PROXY` for the REST backend (FD-30).
 - **Better Auth 1.7.25:**
   - Dynamic `baseURL` and the hook context are confirmed **in source** for the pinned 1.7.25, but not exercised at runtime (FD-10 integration test).
 - **Caddy:**

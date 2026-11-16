@@ -58,6 +58,12 @@ try {
   );
   await validate("bootstrap-edge", await Bun.file(resolve("infra/platform/Caddyfile")).text());
   await validate("tailnet-gateway", await Bun.file(resolve("infra/platform/TailnetCaddyfile")).text());
+  const design = Bun.spawn(["python3", new URL("./test-front-door-design.py", import.meta.url).pathname], {
+    cwd: resolve(import.meta.dir, ".."),
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  if ((await design.exited) !== 0) throw new Error("Front-door design example checks failed.");
   console.log("Generated and static Caddy configurations validate with deny-first route ordering.");
 } finally {
   await rm(directory, { recursive: true, force: true });
