@@ -59,6 +59,10 @@ run = "bun scripts/test-pgbouncer-public.ts"
 description = "Check the public database port nftables rules (per-source limits, /64 grouping, both hooks), their counters and alerts in a privileged container"
 run = ["bun test shared/src/db-ingress.test.ts", "bun scripts/test-db-ingress.ts"]
 
+[tasks."test:tailnet-acl"]
+description = "Validate the generated Tailscale policy snippet against a scratch tailnet (skips without ARK_TEST_TS_POLICY_API_KEY)"
+run = "bun scripts/test-tailnet-acl.ts"
+
 [tasks."test:agent"]
 description = "Run Docker agent policy tests"
 run = "go test ./..."

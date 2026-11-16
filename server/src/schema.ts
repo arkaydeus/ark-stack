@@ -811,6 +811,27 @@ export const backupTargets = pgTable(
   (table) => [check("backup_targets_kind_check", sql`${table.kind} IN ('s3', 'tailnet_rest')`)],
 );
 
+// Last generated Tailscale policy snippet per scope (0016, front door §3.7, FD-07): the diff baseline.
+export const tailnetAclSnippets = pgTable(
+  "tailnet_acl_snippets",
+  {
+    scope: text("scope").primaryKey(), // 'global' or 'route:<route id>'
+    routeId: text("route_id").references(() => frontRoutes.id, { onDelete: "cascade" }),
+    digest: text("digest").notNull(),
+    snippet: text("snippet").notNull(),
+    generatedAt: timestamp("generated_at", { withTimezone: true }).notNull().defaultNow(),
+    previousDigest: text("previous_digest"),
+    previousSnippet: text("previous_snippet"),
+    previousGeneratedAt: timestamp("previous_generated_at", { withTimezone: true }),
+  },
+  (table) => [
+    check(
+      "tailnet_acl_snippets_scope_check",
+      sql`(${table.scope} = 'global' AND ${table.routeId} IS NULL) OR (${table.routeId} IS NOT NULL AND ${table.scope} = 'route:' || ${table.routeId})`,
+    ),
+  ],
+);
+
 export const schema = {
   user,
   session,
@@ -852,4 +873,5 @@ export const schema = {
   databaseClients,
   vercelIntegrations,
   backupTargets,
+  tailnetAclSnippets,
 };

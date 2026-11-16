@@ -504,13 +504,15 @@ describe("Drizzle schema mirrors the migration", () => {
     schema.databaseClients,
     schema.vercelIntegrations,
     schema.backupTargets,
+    schema.tailnetAclSnippets,
   ];
 
   test("columns, nullability, defaults, checks, indexes and keys match a fresh migrate", async () => {
     const db = await scratch("drizzle");
     try {
       // Every migration, not just 0013: later tickets add the region columns (0014),
-      // client_certificates.cert_pem (0015) and the database ingress limits (0016), and schema.ts
+      // client_certificates.cert_pem (0015), database ingress limits and tailnet_acl_snippets
+      // (both 0016). Migrations are tracked by full filename, and schema.ts
       // mirrors the latest state.
       await apply(db, migrationFiles);
       for (const table of tables) {
