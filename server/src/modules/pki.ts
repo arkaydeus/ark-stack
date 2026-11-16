@@ -57,7 +57,10 @@ export const CLIENT_CERT_VALIDITY_DAYS = 90;
 export const DEFAULT_CRL_NEXT_UPDATE_DAYS = 14;
 export const CA_KEY_SECRET_KIND = "pki.ca_key";
 export const CLIENT_KEY_SECRET_KIND = "pki.client_key";
-const MAX_CSR_PEM_LENGTH = 16 * 1024;
+/** CSR submissions are PEM text of at most 16 KiB (FD-17 hardening). */
+export const MAX_CSR_PEM_BYTES = 16 * 1024;
+/** RSA moduli above this are refused before any signature work (bounded verification cost). */
+export const MAX_RSA_MODULUS_BITS = 8192;
 const DAY_MS = 86_400_000;
 
 /** RFC 5280 CRLReason codes Ark records. `certificateHold` is not used: revocation is final. */
@@ -75,6 +78,14 @@ export type CrlReason = keyof typeof CRL_REASONS;
 /** A request or input that the CA policy refuses. Messages never contain key material. */
 export class PkiPolicyError extends Error {
   override name = "PkiPolicyError";
+}
+
+/**
+ * A refused certificate signing request. Every CSR failure, malformed or against policy, is this
+ * one type: the parser never lets a DER, crypto or runtime error escape (FD-17 hardening).
+ */
+export class CsrError extends PkiPolicyError {
+  override name = "CsrError";
 }
 
 const CA_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9 ._/-]{0,46}[A-Za-z0-9._-])?$/;
@@ -109,8 +120,16 @@ export function assertClientKeyPolicy(key: KeyObject) {
     throw new PkiPolicyError("Client keys on this curve are not accepted; use ECDSA P-256 or P-384.");
   }
   if (key.asymmetricKeyType === "rsa") {
-    if ((details.modulusLength ?? 0) >= 3072) return;
-    throw new PkiPolicyError("RSA client keys must be at least 3072 bits; ECDSA P-256 is preferred.");
+    const bits = details.modulusLength ?? 0;
+    if (bits < 3072)
+      throw new PkiPolicyError("RSA client keys must be at least 3072 bits; ECDSA P-256 is preferred.");
+    if (bits > MAX_RSA_MODULUS_BITS)
+      throw new PkiPolicyError(`RSA client keys must be at most ${MAX_RSA_MODULUS_BITS} bits.`);
+    // A huge public exponent would make every verification slow; real keys use 65537.
+    const exponent = details.publicExponent ?? 0n;
+    if (exponent < 3n || exponent > 0xffffffffn || exponent % 2n === 0n)
+      throw new PkiPolicyError("RSA client keys must use a small odd public exponent such as 65537.");
+    return;
   }
   throw new PkiPolicyError(
     `Client keys of type ${key.asymmetricKeyType ?? "unknown"} are not accepted; use ECDSA P-256.`,
@@ -325,37 +344,101 @@ function assertRequestedExtensions(extensions: x509.ParsedExtension[]) {
   }
 }
 
+/** Named curves a CSR key may use, by OID, matching `assertClientKeyPolicy`. */
+const CSR_CURVES = new Set(["1.2.840.10045.3.1.7", "1.3.132.0.34"]);
+/** Directory string tags accepted in a CSR subject (which Ark checks but never copies). */
+const NAME_STRING_TAGS = new Set([0x0c, 0x13, 0x14, 0x16, 0x1c, 0x1e]);
+const MAX_NAME_RDNS = 16;
+const MAX_RDN_ATTRIBUTES = 8;
+const MAX_CSR_ATTRIBUTES = 4;
+
+function assertCsrName(node: x509.Node | undefined) {
+  const rdns = x509.children(x509.expectTag(node, 0x30, "a subject Name"));
+  if (rdns.length > MAX_NAME_RDNS) throw new x509.DerError("The CSR subject has too many components.");
+  for (const rdn of rdns) {
+    const attributes = x509.children(x509.expectTag(rdn, 0x31, "a RelativeDistinguishedName SET"));
+    if (!attributes.length || attributes.length > MAX_RDN_ATTRIBUTES)
+      throw new x509.DerError("Malformed RelativeDistinguishedName.");
+    for (const attribute of attributes) {
+      const parts = x509.children(x509.expectTag(attribute, 0x30, "an AttributeTypeAndValue"));
+      if (parts.length !== 2) throw new x509.DerError("Malformed AttributeTypeAndValue.");
+      x509.decodeOid(parts[0]);
+      if (!NAME_STRING_TAGS.has(parts[1]!.tag)) throw new x509.DerError("Unsupported subject string type.");
+    }
+  }
+}
+
+/** Read the SubjectPublicKeyInfo shape before handing its bytes to node:crypto. */
+function readCsrPublicKey(node: x509.Node | undefined): KeyObject {
+  const spki = x509.expectTag(node, 0x30, "a SubjectPublicKeyInfo");
+  const parts = x509.children(spki);
+  if (parts.length !== 2) throw new x509.DerError("Malformed SubjectPublicKeyInfo.");
+  const algorithm = x509.children(x509.expectTag(parts[0], 0x30, "a public key AlgorithmIdentifier"));
+  if (algorithm.length > 2) throw new x509.DerError("Malformed public key AlgorithmIdentifier.");
+  const keyOid = x509.decodeOid(algorithm[0]);
+  if (keyOid === x509.OID.ecPublicKey) {
+    if (algorithm[1]?.tag !== 0x06)
+      throw new PkiPolicyError("EC client keys must name their curve; explicit parameters are refused.");
+    if (!CSR_CURVES.has(x509.decodeOid(algorithm[1])))
+      throw new PkiPolicyError("Client keys on this curve are not accepted; use ECDSA P-256 or P-384.");
+  } else if (keyOid === x509.OID.rsaEncryption) {
+    if (algorithm[1] && !(algorithm[1].tag === 0x05 && algorithm[1].content.length === 0))
+      throw new x509.DerError("Malformed RSA key parameters.");
+  } else {
+    const known: Record<string, string> = {
+      "1.3.101.112": "ed25519",
+      "1.3.101.113": "ed448",
+      "1.2.840.10040.4.1": "dsa",
+      "1.2.840.113549.1.1.10": "rsa-pss",
+    };
+    throw new PkiPolicyError(
+      `Client keys of type ${known[keyOid] ?? keyOid} are not accepted; use ECDSA P-256.`,
+    );
+  }
+  const bits = x509.decodeBitString(parts[1], "a subjectPublicKey BIT STRING");
+  if (bits.unused !== 0) throw new x509.DerError("Malformed subjectPublicKey BIT STRING.");
+  let publicKey: KeyObject;
+  try {
+    publicKey = createPublicKey({ key: Buffer.from(spki.raw), format: "der", type: "spki" });
+  } catch {
+    throw new PkiPolicyError("The CSR public key cannot be read.");
+  }
+  if (publicKey.asymmetricKeyType !== (keyOid === x509.OID.ecPublicKey ? "ec" : "rsa"))
+    throw new PkiPolicyError("The CSR public key does not match its algorithm.");
+  assertClientKeyPolicy(publicKey);
+  // The key must round-trip to the exact submitted bytes: no alternate or trailing encodings.
+  if (!x509.spkiDer(publicKey).equals(spki.raw))
+    throw new PkiPolicyError("The CSR public key is not canonically encoded.");
+  return publicKey;
+}
+
 /**
- * Parse and check a PKCS#10 CSR: the self-signature must verify, the key must meet
- * `assertClientKeyPolicy`, and any requested extensions must stay within the client profile.
- * Requested values are checked but never copied; the issued profile is fixed. Returns the key.
+ * Parse and check a PKCS#10 CSR: one strict PEM block of at most 16 KiB, a DER structure that
+ * matches RFC 2986 exactly, a key within `assertClientKeyPolicy`, a self-signature that verifies,
+ * and requested extensions within the client profile. Requested values are checked but never
+ * copied; the issued profile is fixed. Every failure is a `CsrError`. Returns the public key.
  */
 export function validateCsr(csrPem: string): KeyObject {
-  if (typeof csrPem !== "string" || csrPem.length > MAX_CSR_PEM_LENGTH)
-    throw new PkiPolicyError("The CSR is missing or too large.");
+  if (typeof csrPem !== "string" || !csrPem) throw new CsrError("The CSR is missing.");
+  if (csrPem.length > MAX_CSR_PEM_BYTES || Buffer.byteLength(csrPem, "utf8") > MAX_CSR_PEM_BYTES)
+    throw new CsrError(`The CSR is larger than ${MAX_CSR_PEM_BYTES / 1024} KiB.`);
   try {
     const der = x509.fromPem(csrPem, ["CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST"]);
     const parts = x509.children(x509.expectTag(x509.decode(der), 0x30, "a CertificationRequest"));
     if (parts.length !== 3) throw new x509.DerError("Malformed CertificationRequest.");
     const [info, algorithm, signature] = parts as [x509.Node, x509.Node, x509.Node];
     const fields = x509.children(x509.expectTag(info, 0x30, "a CertificationRequestInfo"));
-    const version = x509.expectTag(fields[0], 0x02, "a version");
-    if (version.content.length !== 1 || version.content[0] !== 0)
+    if (fields.length < 3 || fields.length > 4)
+      throw new x509.DerError("Malformed CertificationRequestInfo.");
+    if (x509.decodeInteger(fields[0], "a CSR version", { maxBytes: 1 }) !== 0n)
       throw new PkiPolicyError("Only version 1 CSRs are accepted.");
-    x509.expectTag(fields[1], 0x30, "a subject Name");
-    const spki = x509.expectTag(fields[2], 0x30, "a SubjectPublicKeyInfo");
-    if (fields.length > 4 || (fields[3] && fields[3].tag !== 0xa0))
-      throw new x509.DerError("Malformed CSR attributes.");
-    let publicKey: KeyObject;
-    try {
-      publicKey = createPublicKey({ key: Buffer.from(spki.raw), format: "der", type: "spki" });
-    } catch {
-      throw new PkiPolicyError("The CSR public key cannot be read.");
-    }
-    assertClientKeyPolicy(publicKey);
+    assertCsrName(fields[1]);
+    if (fields[3] && fields[3].tag !== 0xa0) throw new x509.DerError("Malformed CSR attributes.");
+    const publicKey = readCsrPublicKey(fields[2]);
 
     const algorithmParts = x509.children(x509.expectTag(algorithm, 0x30, "a signature AlgorithmIdentifier"));
-    const scheme = CSR_SIGNATURES[x509.decodeOid(algorithmParts[0]!)];
+    if (algorithmParts.length > 2) throw new x509.DerError("Malformed signature AlgorithmIdentifier.");
+    const scheme = CSR_SIGNATURES[x509.decodeOid(algorithmParts[0])];
     if (!scheme || scheme.keyType !== publicKey.asymmetricKeyType)
       throw new PkiPolicyError("The CSR signature algorithm is not accepted for its key.");
     const parameters = algorithmParts[1];
@@ -364,26 +447,38 @@ export function validateCsr(csrPem: string): KeyObject {
       !(scheme.keyType === "rsa" && parameters.tag === 0x05 && parameters.content.length === 0)
     )
       throw new PkiPolicyError("The CSR signature algorithm has unexpected parameters.");
-    const signatureBits = x509.expectTag(signature, 0x03, "a signature BIT STRING").content;
-    if (signatureBits[0] !== 0) throw new x509.DerError("Malformed CSR signature.");
-    if (!verify(scheme.hash, info.raw, publicKey, signatureBits.subarray(1)))
-      throw new PkiPolicyError("The CSR signature does not verify.");
+    const signatureBits = x509.decodeBitString(signature, "a signature BIT STRING");
+    if (signatureBits.unused !== 0 || !signatureBits.bytes.length)
+      throw new x509.DerError("Malformed CSR signature.");
+    let verified = false;
+    try {
+      verified = verify(scheme.hash, info.raw, publicKey, signatureBits.bytes);
+    } catch {
+      verified = false;
+    }
+    if (!verified) throw new PkiPolicyError("The CSR signature does not verify.");
 
-    for (const attribute of fields[3] ? x509.children(fields[3]) : []) {
+    const attributes = fields[3] ? x509.children(fields[3]) : [];
+    if (attributes.length > MAX_CSR_ATTRIBUTES)
+      throw new PkiPolicyError("The CSR carries too many attributes.");
+    let extensionRequests = 0;
+    for (const attribute of attributes) {
       const [type, values, ...rest] = x509.children(x509.expectTag(attribute, 0x30, "an Attribute"));
       if (rest.length) throw new x509.DerError("Malformed CSR attribute.");
-      const id = x509.decodeOid(type!);
+      const id = x509.decodeOid(type);
       if (id !== x509.OID.extensionRequest)
         throw new PkiPolicyError(`The CSR carries attribute ${id}, which is not accepted.`);
+      if ((extensionRequests += 1) > 1) throw new PkiPolicyError("The CSR repeats its extension request.");
       const requested = x509.children(x509.expectTag(values, 0x31, "an attribute value SET"));
       if (requested.length !== 1) throw new PkiPolicyError("The CSR must carry one extension request.");
       assertRequestedExtensions(x509.parseExtensions(requested[0]!));
     }
     return publicKey;
   } catch (error) {
-    if (error instanceof PkiPolicyError) throw error;
-    if (error instanceof x509.DerError) throw new PkiPolicyError(`The CSR is malformed: ${error.message}`);
-    throw new PkiPolicyError("The CSR is malformed.");
+    if (error instanceof CsrError) throw error;
+    if (error instanceof PkiPolicyError) throw new CsrError(error.message);
+    if (error instanceof x509.DerError) throw new CsrError(`The CSR is malformed: ${error.message}`);
+    throw new CsrError("The CSR is malformed.");
   }
 }
 
