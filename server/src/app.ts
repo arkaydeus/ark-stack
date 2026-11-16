@@ -81,6 +81,7 @@ import { db, sql } from "./db.ts";
 import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
+import { frontAclSnippet } from "./modules/front-acl.ts";
 import { cancelWorkspaceQuery } from "./modules/database.ts";
 import { writeApprovedCompose } from "./modules/docker.ts";
 import { listMailQueue } from "./modules/queue.ts";
@@ -2393,6 +2394,20 @@ app.put("/api/settings/region", async (c) => {
     access.role,
   );
   return c.json(regionSummary(settings ?? null));
+});
+
+// Tailscale policy snippets (front door §3.7, FD-07). Owner-only, like route management (R12):
+// the snippet maps the tailnet machines behind every public route. Ark never writes the policy.
+app.get("/api/front/acl", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(await frontAclSnippet({ kind: "global" }));
+});
+
+app.get("/api/front/routes/:id/acl", async (c) => {
+  requireOwner(c.get("access"));
+  const snippet = await frontAclSnippet({ kind: "route", routeId: c.req.param("id") });
+  if (!snippet) throw new HTTPException(404, { message: "Route not found." });
+  return c.json(snippet);
 });
 
 app.get("/api/metrics", async (c) => {

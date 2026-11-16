@@ -9,6 +9,7 @@ import {
   LogOut,
   RefreshCw,
   Settings2,
+  ShieldCheck,
   ShipWheel,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
@@ -18,6 +19,7 @@ import { authClient } from "@/lib/auth-client";
 import type { PlatformState } from "@/lib/types";
 import { api, cn, onActionError } from "@/lib/utils";
 import { AuthScreen, MfaSetup } from "@/pages/Auth";
+import { FrontAclView } from "@/pages/FrontAcl";
 import {
   ActivityView,
   BackupsView,
@@ -42,6 +44,7 @@ const navigation = [
   { id: "activity", label: "Activity", icon: Activity },
   { id: "backups", label: "Backups", icon: Archive },
   { id: "updates", label: "Updates", icon: RefreshCw },
+  { id: "front-acl", label: "Front door ACL", icon: ShieldCheck, ownerOnly: true },
   { id: "settings", label: "Settings", icon: Settings2 },
 ] as const;
 
@@ -128,19 +131,21 @@ export function App() {
           <p className="mt-1 text-sm text-muted-foreground">Infrastructure desk</p>
         </div>
         <nav aria-label="Main navigation" className="space-y-1">
-          {navigation.map((item) => (
-            <button
-              key={item.id}
-              className={cn("nav-item", view === item.id && "active")}
-              onClick={() => {
-                setView(item.id);
-                window.location.hash = `/${item.id}`;
-              }}
-            >
-              <item.icon className="size-4" aria-hidden="true" />
-              {item.label}
-            </button>
-          ))}
+          {navigation
+            .filter((item) => !("ownerOnly" in item) || state?.user.role === "owner")
+            .map((item) => (
+              <button
+                key={item.id}
+                className={cn("nav-item", view === item.id && "active")}
+                onClick={() => {
+                  setView(item.id);
+                  window.location.hash = `/${item.id}`;
+                }}
+              >
+                <item.icon className="size-4" aria-hidden="true" />
+                {item.label}
+              </button>
+            ))}
         </nav>
         <div className="mt-auto flex items-center justify-between gap-2 rounded-xl border border-border p-3">
           <div className="min-w-0">
@@ -216,6 +221,7 @@ function ViewBody({
   if (view === "activity") return <ActivityView state={state} />;
   if (view === "backups") return <BackupsView state={state} reload={reload} />;
   if (view === "updates") return <UpdatesView state={state} reload={reload} />;
+  if (view === "front-acl") return <FrontAclView state={state} />;
   if (view === "settings") return <SettingsView state={state} reload={reload} />;
   return <Overview state={state} reload={reload} />;
 }
