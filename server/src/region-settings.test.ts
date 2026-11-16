@@ -185,9 +185,9 @@ describe("region setting API", () => {
     try {
       const sesBefore = await reconcileSes("region.example", "bounce.region.example");
 
-      const request = { region: "eu-central", vpsRegionLabel: "Hetzner fsn1" };
+      const request = { region: "eu-central", vpsRegionLabel: "  Hetzner fsn1 " };
       await stepUp(actors.owner, request);
-      const response = await putRegion(actors.owner, { ...request, vpsRegionLabel: "  Hetzner fsn1 " });
+      const response = await putRegion(actors.owner, request);
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({
         region: "eu-central",
@@ -233,5 +233,22 @@ describe("region setting API", () => {
         if (value !== undefined) process.env[key] = value;
       }
     }
+  });
+
+  test.each([
+    { request: { region: "eu-west" }, label: null },
+    { request: { region: "eu-west", vpsRegionLabel: "" }, label: null },
+    { request: { region: "eu-west", vpsRegionLabel: "   " }, label: null },
+    { request: { region: "eu-west", vpsRegionLabel: "  DO lon1  " }, label: "DO lon1" },
+  ])("binds the original request and stores the normalized label: %j", async ({ request, label }) => {
+    await stepUp(actors.owner, request);
+    const response = await putRegion(actors.owner, request);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ region: "eu-west", vpsRegionLabel: label });
+    const [row] = await sql`
+      SELECT region, vps_region_label FROM platform_settings WHERE id = 'default'
+    `;
+    expect(row).toEqual({ region: "eu-west", vps_region_label: label });
+    expect((await putRegion(actors.owner, request)).status).toBe(403);
   });
 });

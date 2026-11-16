@@ -1267,7 +1267,7 @@ function RegionSettings({ state, reload }: { state: PlatformState; reload: () =>
         const request = { region: String(form.get("region") ?? ""), vpsRegionLabel: label || null };
         await api("/api/step-up", {
           method: "POST",
-          body: JSON.stringify({ password: form.get("password"), action: "platform.update", request }),
+          body: JSON.stringify({ password: form.get("regionPassword"), action: "platform.update", request }),
         });
         const saved = await api<{ label: string; vercelRegion: string }>("/api/settings/region", {
           method: "PUT",
@@ -1300,7 +1300,7 @@ function RegionSettings({ state, reload }: { state: PlatformState; reload: () =>
       />
       <Field
         label="Current password"
-        name="password"
+        name="regionPassword"
         type="password"
         autoComplete="current-password"
         required

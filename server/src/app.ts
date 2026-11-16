@@ -2366,13 +2366,15 @@ app.put("/api/settings/region", async (c) => {
   const access = c.get("access");
   requireOwner(access);
   requireMfa(c.get("session"));
-  const input = regionSettingsInput.parse(await c.req.json());
+  const request = await c.req.json();
+  const input = regionSettingsInput.parse(request);
   // Validate before consuming the single-use grant, so a typo does not burn a password+MFA round.
+  // Bind to the original JSON, just as /api/step-up does; normalize only the stored values.
   await requirePrivileged(
     access,
     c.get("session"),
     "platform.update",
-    privilegedRequestHash("platform.update", input),
+    privilegedRequestHash("platform.update", request),
   );
   const [previous] = await db
     .select({ region: platformSettings.region, vpsRegionLabel: platformSettings.vpsRegionLabel })
