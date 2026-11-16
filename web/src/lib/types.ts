@@ -17,6 +17,21 @@ export type RegionSummary = {
   options: Array<{ region: PlatformRegion; label: string; vercelRegion: string }>;
 };
 
+/** Mirrors `FrontAclResponse` in server/src/modules/front-acl.ts (front door §3.7). */
+export type FrontAclSnippet = {
+  scope: "global" | "route";
+  routeId: string | null;
+  tailnet: string | null;
+  snippet: string;
+  digest: string;
+  generatedAt: string;
+  sshExample: string;
+  omitted: Array<{ kind: "route" | "backup"; id: string; reason: string }>;
+  previous: { digest: string; generatedAt: string | null } | null;
+  diff: Array<{ op: "same" | "add" | "remove"; line: string }> | null;
+  routes: Array<{ id: string; kind: string; hostname: string; listenPort: number; status: string }>;
+};
+
 export type PlatformState = {
   user: { id: string; name: string; email: string; role: Role; twoFactorEnabled?: boolean };
   setup: {

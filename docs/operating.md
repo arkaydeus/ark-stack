@@ -58,6 +58,25 @@ Third-party images (Caddy, Tailscale, PgBouncer, PostgreSQL, Stalwart and the `o
 4. Run the image's integration task. For Caddy, `mise run test:edge` fails unless both Compose services use exactly the tested pin. It then validates every rendered and static Caddyfile against fixture certificates and runs the edge behaviour tests in disposable containers: header stripping, `Server`/`Via` removal (including a control proving `header_down -Via` alone is insufficient), WebSockets across `/load` and 80 s of idle, and a production-like edge (explicit uid/gid 1000:1000, 0600 private keys, bootstrap Caddyfile, `edge-admin` alias) configured through the real `writeEdge`. That edge must serve each fixture certificate over TLS, skip hostnames whose certificate is not `issued`, answer ACME challenges and 308 redirects on `:80` (404 for other hosts), and serve a renewed certificate after an identical `writeEdge` reload with `Cache-Control: must-revalidate`, which a control `/load` without the header does not. The run takes about 100 s.
 5. In the PR, record the full digest, how it was resolved and verified, and the integration-task output. Roll the release out through `mise run maintain` (above).
 
+## Tailnet policy snippet
+
+Ark never holds a Tailscale key that can write the tailnet policy. The owner copies the generated snippet from **Front door ACL** in the UI (`GET /api/front/acl` for every route and tailnet backup target, `GET /api/front/routes/:id/acl` for one route; both owner-only) and merges each section into the tailnet policy file by hand. The snippet declares the four Ark tags, one host alias per target machine, one grant per target `host:port` for `tag:ark-edge`, one per tailnet backup target for `tag:ark-backup`, and a `tests` block. Its TCP and UDP deny assertions sample common ports, every configured service port, observed non-target nodes and the other Ark tags. They catch broad allow-all rules and UDP leaks on routed ports. They do not prove isolation at untested ports, other protocols or unobserved nodes. Remove or narrow broad rules and review the complete policy before pasting. Per-route tests account for all configured routes and backup targets, so they can be merged with the global policy. If a tag already appears in your `tagOwners`, keep one entry. The page also shows what changed since the last generated snippet, a Tailnet Lock explainer, and an optional Tailscale SSH policy for `tag:ark-vps` in `check` mode, which is kept out of the snippet itself.
+
+For a local check of **every TCP/UDP port** on known destinations, save a freshly generated **global** snippet as `global-snippet.hujson` and the entire proposed merged policy as `candidate-policy.hujson`, then run:
+
+```sh
+bun scripts/audit-tailnet-policy.ts global-snippet.hujson candidate-policy.hujson
+```
+
+The local audit compares all grant/ACL port-range boundaries, including port zero, against the trusted global snippet, rather than sampling ports. It catches missing grants, extra ports, UDP leaks and access to observed non-target addresses. Its model supports direct Ark tags, users, host aliases, IPs, CIDRs, `*` and common autogroups; unsupported rule selectors or conditions are refused. It does **not** model group membership, multi-tag membership, posture, `via`, application capabilities or protocols other than TCP/UDP; it cannot establish tailnet-wide isolation or replace Tailscale validation and a complete policy review. ICMP can be implicitly allowed by Tailscale when traffic is allowed between two nodes. Refresh inventory and the global snippet before each audit. No policy is uploaded or changed by this command.
+
+The snippet's syntax and tests can be checked against a real tailnet with an opt-in script. CI does not run it, because it needs credentials. Use a scratch tailnet, not production:
+
+1. In the scratch tailnet's admin console, generate an API access token (Settings → Keys). Tailscale's validate endpoint needs only the `policy_file:read` scope, so an OAuth client limited to that scope also works.
+2. Run `ARK_TEST_TS_POLICY_API_KEY=tskey-api-... mise run test:tailnet-acl`. Set `ARK_TEST_TS_TAILNET` if the token can reach more than one tailnet (the default is `-`, the token's own tailnet).
+3. The script calls only `POST /api/v2/tailnet/{tailnet}/acl/validate`, which never changes the policy. It checks that the §3.7 sample snippet validates on its own and together with the SSH example, and that adding a broad `*` grant or a legacy allow-all ACL makes the snippet's tests reject the policy. It exits 0 with a `skipped` message when the variable is unset.
+4. Revoke the token afterwards.
+
 ## Import
 
 `mise run import -- inventory.json` compares domains, databases, and services. Owners are never imported. Stop the old reconcilers before transferring a live mail domain.
