@@ -1,3 +1,4 @@
+import { routeIdentityKey } from "./edge-withdrawal.ts";
 import type { AdminMode } from "./dns-plan.ts";
 import { ValidationError } from "./errors.ts";
 import { normalizeHostname } from "./hostnames.ts";
@@ -29,10 +30,11 @@ export type EdgeAppRoute = { hostname: string; upstream?: string };
 
 /**
  * A front-door HTTP route to a tailnet backend (docs/design/front-door.md §3.2, FD-06). Only routes
- * that are enabled, `ready` and allowed by a fresh lease are passed in; the pinned IP is the only
- * part of the target ever rendered. FD-09 adds the gate, header policy and per-route options.
+ * that are enabled, `ready` and allowed by a fresh lease are passed in. The pinned IP is the only
+ * address dialed; route and stable-ID metadata authorise that exact pin. FD-09 adds the gate, header
+ * policy and per-route options.
  */
-export type EdgeTailnetRoute = { id: string; hostname: string; ip: string; port: number };
+export type EdgeTailnetRoute = { id: string; hostname: string; stableId: string; ip: string; port: number };
 
 /** Marks a tailnet route's site so the launch guard and audits can find it in the Caddyfile. */
 export const TAILNET_ROUTE_MARKER = "# ark-tailnet-route";
@@ -226,7 +228,10 @@ ${body}}
     .map((route) =>
       site(
         route.hostname,
-        `  reverse_proxy ${route.upstream}
+        `  route {
+    vars ark_tailnet_route ${routeIdentityKey(route)}
+    reverse_proxy ${route.upstream}
+  }
 `,
         `${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
 `,

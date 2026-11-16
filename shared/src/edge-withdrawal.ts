@@ -25,7 +25,7 @@ export type EdgeLeaseDocument = {
   /** The API's clock, so the watchdog can measure the remaining lease without trusting its own. */
   now: string;
   lease: { generation: string; completedAt: string; validUntil: string; valid: boolean } | null;
-  /** Allowed backends; always empty when the lease is missing or expired. */
+  /** Allowed routes; always empty when the lease is missing or expired. */
   routes: EdgePolicyRoute[];
 };
 
@@ -43,8 +43,8 @@ export type WithdrawalResult = {
 };
 
 /**
- * What every proxy adapter provides. `enforce` withdraws every tailnet backend not in `allowed`
- * and verifies the result; `stop` closes all of the proxy's listeners and sessions.
+ * What every proxy adapter provides. `enforce` withdraws tailnet handlers whose route identity
+ * key is not in `allowed` and verifies the result; `stop` closes all of the proxy's listeners and sessions.
  * FD-25 implements this for HAProxy (master CLI: disable servers, shut down sessions across every
  * worker generation, `stop` as the fallback).
  */
@@ -104,26 +104,87 @@ export function caddyTailnetBackends(config: unknown) {
   return [...found].toSorted();
 }
 
+/** Identity metadata survives Caddyfile adaptation in a native `vars` handler. */
+export function routeIdentityKey(
+  route: Pick<EdgePolicyRoute, "id" | "hostname" | "stableId" | "ip" | "port">,
+) {
+  return encodeURIComponent(
+    JSON.stringify([route.id, route.hostname, route.stableId, backendKey(route.ip, route.port)]),
+  );
+}
+
+function identityMatches(identity: string, backend: string, hosts: string[]) {
+  try {
+    const [id, hostname, stableId, target] = JSON.parse(decodeURIComponent(identity));
+    return (
+      typeof id === "string" &&
+      id.length > 0 &&
+      typeof stableId === "string" &&
+      stableId.length > 0 &&
+      hosts.length === 1 &&
+      hosts[0] === hostname &&
+      target === backend
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Replaces every `reverse_proxy` handler that dials a tailnet backend outside `allowed` with a
- * fixed 503. A handler with several upstreams is withdrawn whole when any one is not allowed.
+ * Withdraws individual handlers, even when several routes dial the same backend. Unmarked legacy
+ * handlers fail closed. Host match, stable identity, route ID and pinned backend must all agree.
  */
 export function withdrawCaddyBackends(config: unknown, allowed: ReadonlySet<string>) {
   const withdrawn = new Set<string>();
-  const rewrite = (value: Json): Json => {
-    if (Array.isArray(value)) return value.map(rewrite);
+  const activeRoutes = new Set<string>();
+  const rewrite = (value: Json, hosts: string[] = [], identity = ""): Json => {
+    if (Array.isArray(value)) {
+      let current = identity;
+      return value.map((child) => {
+        if (child && typeof child === "object" && !Array.isArray(child) && child.handler === "vars") {
+          current = typeof child.ark_tailnet_route === "string" ? child.ark_tailnet_route : "";
+        }
+        return rewrite(child, hosts, current);
+      });
+    }
     if (!value || typeof value !== "object") return value;
+    if (Array.isArray(value.match)) {
+      const matched = value.match.flatMap((match) =>
+        match && typeof match === "object" && !Array.isArray(match) && Array.isArray(match.host)
+          ? match.host.filter((host): host is string => typeof host === "string")
+          : [],
+      );
+      if (matched.length) hosts = matched;
+    }
     if (value.handler === "reverse_proxy") {
-      const denied = reverseProxyKeys(value).filter((key) => !allowed.has(key));
+      const keys = reverseProxyKeys(value);
+      const denied = keys.filter((key) => !allowed.has(identity) || !identityMatches(identity, key, hosts));
       if (denied.length) {
         for (const key of denied) withdrawn.add(key);
         return structuredClone(WITHDRAWN_HANDLER) as unknown as Json;
       }
+      if (keys.length) activeRoutes.add(identity);
     }
-    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, rewrite(child)]));
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [key, rewrite(child, hosts, identity)]),
+    );
   };
   const next = rewrite(config as Json);
-  return { config: next, withdrawn: [...withdrawn].toSorted() };
+  return { config: next, withdrawn: [...withdrawn].toSorted(), activeRoutes: [...activeRoutes].toSorted() };
+}
+
+/** Route identities currently served by Caddy (only correctly marked and host-bound handlers). */
+export function caddyTailnetRouteKeys(config: unknown) {
+  // Collect metadata, then verify it in the same traversal used for enforcement.
+  const candidates = new Set<string>();
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== "object") return;
+    if ("ark_tailnet_route" in value && typeof value.ark_tailnet_route === "string")
+      candidates.add(value.ark_tailnet_route);
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(config);
+  return withdrawCaddyBackends(config, candidates).activeRoutes;
 }
 
 type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
@@ -158,6 +219,10 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     return (await response.json()) as unknown;
   }
 
+  async activeRoutes() {
+    return caddyTailnetRouteKeys(await this.activeConfig());
+  }
+
   /** Tailnet backends Caddy dials right now. */
   async activeBackends() {
     return caddyTailnetBackends(await this.activeConfig());
@@ -187,7 +252,7 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
       });
       if (!loaded.ok)
         throw new Error(`POST /load returned ${loaded.status}: ${(await loaded.text()).slice(0, 200)}`);
-      const remaining = caddyTailnetBackends(await this.activeConfig()).filter((key) => !allowed.has(key));
+      const remaining = withdrawCaddyBackends(await this.activeConfig(), allowed).withdrawn;
       if (remaining.length) throw new Error(`still dialing ${remaining.join(", ")} after reload`);
     } catch (error) {
       return {
@@ -206,10 +271,10 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
   }
 }
 
-/** Allowed backend keys of a lease document, or none when the lease is missing or expired. */
+/** Allowed HTTP route identity keys (including the pinned backend), or none without a fresh lease. */
 export function allowedBackends(document: Pick<EdgeLeaseDocument, "lease" | "routes">) {
   if (!document.lease?.valid) return new Set<string>();
-  return new Set(document.routes.map((route) => backendKey(route.ip, route.port)));
+  return new Set(document.routes.filter((route) => route.kind === "http").map(routeIdentityKey));
 }
 
 /** Tailnet `ip:port` literals in a rendered Caddyfile (`reverse_proxy 100.x.y.z:port`, `[fd7a:…]:port`). */
@@ -233,8 +298,26 @@ export function caddyfileTailnetBackends(caddyfile: string) {
  */
 export function launchDecision(caddyfile: string, allowed: ReadonlySet<string>) {
   const backends = caddyfileTailnetBackends(caddyfile);
-  const denied = backends.filter((key) => !allowed.has(key));
-  return { open: denied.length === 0, backends, denied };
+  const denied = new Set<string>();
+  const checked = new Set<string>();
+  let hosts: string[] = [];
+  let identity = "";
+  for (const line of caddyfile.split("\n")) {
+    const site = /^([a-z0-9.-]+) \{$/.exec(line);
+    if (site) {
+      hosts = [site[1]!];
+      identity = "";
+    }
+    const metadata = /^\s*vars ark_tailnet_route (\S+)\s*$/.exec(line);
+    if (metadata) identity = metadata[1]!;
+    if (!/^\s*reverse_proxy\s/.test(line)) continue;
+    for (const key of caddyfileTailnetBackends(line)) {
+      checked.add(key);
+      if (!allowed.has(identity) || !identityMatches(identity, key, hosts)) denied.add(key);
+    }
+  }
+  for (const key of backends) if (!checked.has(key)) denied.add(key);
+  return { open: denied.size === 0, backends, denied: [...denied].toSorted() };
 }
 
 export type WatchdogEvent = {
@@ -253,6 +336,8 @@ export type WatchdogOptions = {
   now?: () => number;
   /** A policy older than this is treated as revoked (default 5 s, §3.9.3). */
   staleMs?: number;
+  /** Initial Caddy startup only; once inspected, errors fail closed immediately. */
+  startupGraceMs?: number;
 };
 
 /**
@@ -269,12 +354,18 @@ export class EdgeWatchdog {
   private lastPolicyError = "";
   /** Last unreachable message per proxy, so the log records changes rather than every second. */
   private readonly unreachable = new Map<string, string>();
+  private readonly failures = new Map<string, string>();
+  private readonly stopOutcomes = new Map<string, string>();
+  private readonly pendingEvents = new Map<string, WatchdogEvent>();
+  private readonly inspected = new Set<string>();
+  private readonly startedAt: number;
   private readonly now: () => number;
   private readonly staleMs: number;
 
   constructor(private readonly options: WatchdogOptions) {
     this.now = options.now ?? (() => performance.now());
     this.staleMs = options.staleMs ?? 5_000;
+    this.startedAt = this.now();
   }
 
   /** The backends allowed right now; empty when the lease expired or the policy is stale. */
@@ -345,6 +436,7 @@ export class EdgeWatchdog {
    * own cadence and at the lease deadline, so a slow or hanging lease read cannot delay expiry.
    */
   async enforce() {
+    await this.flushEvents();
     const allowed = this.effectiveAllowed();
     const results: WithdrawalResult[] = [];
     for (const adapter of this.options.adapters) {
@@ -363,31 +455,71 @@ export class EdgeWatchdog {
         await this.emit({
           event: "withdrawn",
           proxy: adapter.proxy,
-          detail: `withdrew ${result.withdrawn.join(", ")} in ${took} ms${this.lastPolicyError ? ` (policy unavailable: ${this.lastPolicyError})` : ""}`,
+          detail: `withdrew ${backendSummary(result.withdrawn)} in ${took} ms${this.lastPolicyError ? ` (policy unavailable: ${this.lastPolicyError})` : ""}`,
         });
       }
-      if (result.error && !result.unreachable) {
+      if (!result.unreachable) this.inspected.add(adapter.proxy);
+      if (
+        result.unreachable &&
+        !this.inspected.has(adapter.proxy) &&
+        this.now() - this.startedAt < (this.options.startupGraceMs ?? 5_000)
+      )
+        continue;
+      if (result.error) {
         // Withdrawal could not be applied: stale configuration must not keep serving.
-        await this.emit({ event: "withdrawal_failed", proxy: adapter.proxy, detail: result.error });
+        const previous = this.failures.get(adapter.proxy);
+        if (previous !== result.error) {
+          await this.emit({ event: "withdrawal_failed", proxy: adapter.proxy, detail: result.error });
+        }
+        this.failures.set(adapter.proxy, result.error);
         try {
           await adapter.stop();
-          await this.emit({
-            event: "proxy_stopped",
-            proxy: adapter.proxy,
-            detail: `stopped ${adapter.proxy} after a failed withdrawal of ${result.withdrawn.join(", ")}`,
-          });
+          if (this.stopOutcomes.get(adapter.proxy) !== "stopped")
+            await this.emit({
+              event: "proxy_stopped",
+              proxy: adapter.proxy,
+              detail: `stopped ${adapter.proxy} after a failed withdrawal of ${backendSummary(result.withdrawn)}`,
+            });
+          this.stopOutcomes.set(adapter.proxy, "stopped");
         } catch (error) {
-          await this.emit({ event: "stop_failed", proxy: adapter.proxy, detail: (error as Error).message });
+          const message = (error as Error).message;
+          if (this.stopOutcomes.get(adapter.proxy) !== message)
+            await this.emit({ event: "stop_failed", proxy: adapter.proxy, detail: message });
+          this.stopOutcomes.set(adapter.proxy, message);
         }
+      } else {
+        this.failures.delete(adapter.proxy);
+        this.stopOutcomes.delete(adapter.proxy);
       }
     }
     return results;
   }
 
   private async emit(event: WatchdogEvent) {
-    this.options.log?.(`${event.event}${event.proxy ? ` [${event.proxy}]` : ""}: ${event.detail}`);
-    await this.options
-      .report?.(event)
-      .catch((error: Error) => this.options.log?.(`report failed: ${error.message}`));
+    const bounded = { ...event, detail: event.detail.slice(0, 1000) };
+    this.options.log?.(`${bounded.event}${bounded.proxy ? ` [${bounded.proxy}]` : ""}: ${bounded.detail}`);
+    // Coalesce per proxy/event so retries remain bounded during an API outage. A successful
+    // withdrawal must still be reported after the next pass sees no remaining denied handlers.
+    this.pendingEvents.set(`${event.proxy ?? "edge"}:${event.event}`, bounded);
+    await this.flushEvents();
   }
+
+  private async flushEvents() {
+    if (!this.options.report) {
+      this.pendingEvents.clear();
+      return;
+    }
+    for (const [key, event] of this.pendingEvents) {
+      try {
+        await this.options.report(event);
+        this.pendingEvents.delete(key);
+      } catch (error) {
+        this.options.log?.(`report failed: ${(error as Error).message}`);
+      }
+    }
+  }
+}
+
+function backendSummary(backends: string[]) {
+  return `${backends.length} backend(s): ${backends.slice(0, 8).join(", ")}${backends.length > 8 ? ", …" : ""}`;
 }

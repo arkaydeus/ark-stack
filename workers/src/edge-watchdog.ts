@@ -9,8 +9,9 @@
 // with the operation workers stopped.
 //
 // `GET /v1/launch` answers `open` or `closed` for the Caddy launch guard
-// (infra/platform/edge-launch-guard.sh): `open` only when every tailnet backend in the rendered
-// Caddyfile is allowed by a valid lease. FD-25 adds the HAProxy adapter and launch guard.
+// (infra/platform/edge-launch-guard.sh): `open` only when every rendered route identity and pinned
+// backend is allowed by a valid lease. `/v1/supervise` requires recently verified enforcement.
+// FD-25 adds the HAProxy adapter and launch guard.
 import { join } from "node:path";
 
 import {
@@ -22,14 +23,14 @@ import {
   type WatchdogEvent,
 } from "@ark-stack/shared";
 
+import { watchdogConfig } from "./watchdog-config.ts";
+
 const apiUrl = (process.env.ARK_API_URL ?? "http://api:3000").replace(/\/$/, "");
 const token = process.env.ARK_EDGE_WATCHDOG_TOKEN?.trim() ?? "";
 const adminUrl = process.env.ARK_EDGE_ADMIN_URL ?? "http://edge-admin:2019";
 const caddyfile = join(process.env.ARK_EDGE_DIR ?? "/var/lib/ark/edge", "Caddyfile");
 // Never slower than once a second (§3.2); tests may run it faster.
-const intervalMs = Math.min(1_000, Math.max(100, Number(process.env.ARK_EDGE_WATCHDOG_INTERVAL_MS ?? 1_000)));
-const staleMs = Math.min(5_000, Math.max(500, Number(process.env.ARK_EDGE_WATCHDOG_STALE_MS ?? 5_000)));
-const port = Number(process.env.ARK_EDGE_WATCHDOG_PORT ?? 2021);
+const { intervalMs, staleMs, port } = watchdogConfig(process.env);
 
 const log = (line: string) => console.log(`${new Date().toISOString()} ${redactLogLine(line)}`);
 
@@ -63,6 +64,7 @@ const watchdog = new EdgeWatchdog({
 });
 
 const run = { stopped: false };
+let lastVerifiedAt = Number.NEGATIVE_INFINITY;
 let lastTick: { at: string; withdrawn: string[]; errors: string[] } | null = null;
 
 // Each pass reads the lease (waiting at most 300 ms, so a slow API never delays enforcement) and
@@ -72,12 +74,15 @@ async function loop() {
     const started = performance.now();
     try {
       const results = await watchdog.tick(300);
+      if (results.every((result) => !result.error)) lastVerifiedAt = performance.now();
+      else lastVerifiedAt = Number.NEGATIVE_INFINITY;
       lastTick = {
         at: new Date().toISOString(),
         withdrawn: results.flatMap((result) => result.withdrawn),
         errors: results.flatMap((result) => (result.error ? [`${result.proxy}: ${result.error}`] : [])),
       };
     } catch (error) {
+      lastVerifiedAt = Number.NEGATIVE_INFINITY;
       log(`enforcement failed: ${(error as Error).message}`);
     }
     const untilExpiry = watchdog.msUntilExpiry();
@@ -101,6 +106,15 @@ const server = Bun.serve({
       const decision = text === null ? { open: false } : launchDecision(text, watchdog.effectiveAllowed());
       log(`launch guard asked: ${decision.open ? "open" : "closed"}`);
       return new Response(`${decision.open ? "open" : "closed"}\n`, {
+        headers: { "cache-control": "no-store" },
+      });
+    }
+    if (pathname === "/v1/supervise") {
+      // Respond only from a recently completed, verified enforcement pass. A responsive HTTP
+      // server with a wedged loop or unreadable admin API must not keep Caddy alive.
+      const healthy = performance.now() - lastVerifiedAt <= 2_000;
+      return new Response(healthy ? "ok\n" : "closed\n", {
+        status: healthy ? 200 : 503,
         headers: { "cache-control": "no-store" },
       });
     }

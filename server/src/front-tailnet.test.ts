@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 
-import { createId, parseEnvFile, type Role } from "@ark-stack/shared";
+import { EdgeWatchdog, createId, parseEnvFile, type Role, type WatchdogEvent } from "@ark-stack/shared";
 import { makeSignature } from "better-auth/crypto";
 
 if (!process.env.DATABASE_URL && existsSync(".env")) {
@@ -158,4 +158,62 @@ describe("edge watchdog endpoints", () => {
     expect(alert).toMatchObject({ severity: "critical" });
     expect(String(alert?.title)).toMatch(/stopped caddy/);
   });
+});
+
+describe("bulk watchdog reporting through the real endpoint", () => {
+  test.each([false, true])(
+    "100 withdrawn backends are audited and reconciled (stop: %s)",
+    async (failure) => {
+      const backends = Array.from({ length: 100 }, (_, index) => `100.81.1.${index + 1}:3000`);
+      const reported: WatchdogEvent[] = [];
+      let active = true;
+      const watchdog = new EdgeWatchdog({
+        fetchLease: async () => ({ now: new Date().toISOString(), lease: null, routes: [] }),
+        adapters: [
+          {
+            proxy: "bulk-test",
+            enforce: async () => {
+              const withdrawn = active ? backends : [];
+              active = false;
+              return {
+                proxy: "bulk-test",
+                active: backends,
+                withdrawn,
+                ...(failure ? { error: "injected bulk load failure" } : {}),
+              };
+            },
+            stop: async () => undefined,
+          },
+        ],
+        report: async (event) => {
+          expect(event.detail.length).toBeLessThanOrEqual(1000);
+          const response = await internal(watchdogToken, "/api/internal/edge/watchdog-event", {
+            method: "POST",
+            body: JSON.stringify(event),
+          });
+          expect(response.status).toBe(200);
+          reported.push(event);
+        },
+      });
+      await watchdog.tick();
+      const expected: WatchdogEvent["event"][] = failure
+        ? ["withdrawal_failed", "proxy_stopped"]
+        : ["withdrawn"];
+      expect(reported.map((event) => event.event)).toEqual(expected);
+      for (const event of expected) {
+        const rows =
+          await sql`SELECT detail FROM audit_events WHERE action = ${`edge.watchdog.${event}`} AND resource_id = 'bulk-test'`;
+        expect(rows.length).toBeGreaterThanOrEqual(1);
+        if (event !== "withdrawal_failed") expect(JSON.stringify(rows)).toContain("100 backend(s)");
+      }
+      const applies = await sql`SELECT id FROM operations WHERE kind = 'edge.apply' AND status = 'queued'`;
+      expect(applies.length).toBeGreaterThanOrEqual(1);
+      operationIds.push(...applies.map((row) => String(row.id)));
+      if (failure) {
+        const [alert] =
+          await sql`SELECT severity FROM alerts WHERE dedup_key = 'edge-withdrawal' AND resolved_at IS NULL`;
+        expect(alert?.severity).toBe("critical");
+      }
+    },
+  );
 });

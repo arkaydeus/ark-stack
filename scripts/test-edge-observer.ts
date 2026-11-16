@@ -16,7 +16,9 @@
 //    - with observation stopped, the route is withdrawn by last completion + lease + 5 s (the lease is
 //      shortened to 8 s through ARK_EDGE_LEASE_VALIDITY_MS);
 //    - starting Caddy with an expired lease (or without the watchdog) serves no tailnet route;
-//    - when withdrawal cannot be applied, the watchdog stops Caddy and raises a critical alert.
+//    - hostnames sharing a backend remain independently revocable, including stale-file restarts;
+//    - stopping or freezing the watchdog while serving closes listeners and existing sessions;
+//    - when config inspection or withdrawal fails, Caddy stops and a critical alert is raised.
 // HAProxy withdrawal is an FD-25 integration gate. It needs a local PostgreSQL (DATABASE_URL), like
 // `mise run test`; it creates and drops its own database.
 import { randomBytes } from "node:crypto";
@@ -55,6 +57,7 @@ const removeSignalHandlers = runtime.installSignalHandlers();
 const docker = (...args: string[]) => runtime.docker(...args);
 const leaseMs = 8_000;
 const routeHost = "www.example.com";
+const sharedHost = "shared.example.com";
 const tailnet = ".tail9fd6.ts.net";
 // A random /24 inside 100.64.0.0/10 for the simulated tailnet peer.
 const octet = 64 + (Number.parseInt(randomBytes(1).toString("hex"), 16) % 64);
@@ -130,9 +133,9 @@ async function migrate() {
 
 type Server = typeof import("../server/src/coordinator.ts");
 let coordinator: Server;
-let sql: typeof import("../server/src/db.ts").sql;
+let sql!: typeof import("../server/src/db.ts").sql;
 let apiServer: ReturnType<typeof Bun.serve> | undefined;
-let mock: import("../server/src/mock-localapi.ts").MockLocalApi;
+let mock!: import("../server/src/mock-localapi.ts").MockLocalApi;
 
 const self = { id: "nEDGEOBS", name: "ark-edge", ips: ["100.64.0.1"], tags: ["tag:ark-edge"] };
 const home = { id: "nHOMEOBS", name: "home", ips: [peerIp] };
@@ -207,7 +210,7 @@ async function routeStatus() {
 
 // ---- Containers ----------------------------------------------------------------------------------------
 
-let stack: EdgeStack;
+let stack!: EdgeStack;
 let watchdogBundle = "";
 let writeEdgeBundle = "";
 let watchdogName = "";
@@ -220,9 +223,11 @@ async function prepareFiles() {
   await chmod(directory, 0o755);
   const script = [
     "set -e",
-    `mkdir -p /out/certs/${routeHost}`,
-    `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj "/CN=${routeHost}" -addext "subjectAltName=DNS:${routeHost}" -keyout /out/certs/${routeHost}/privkey.pem -out /out/certs/${routeHost}/fullchain.pem 2>/dev/null`,
-    `chmod 600 /out/certs/${routeHost}/privkey.pem`,
+    ...[routeHost, sharedHost].flatMap((host) => [
+      `mkdir -p /out/certs/${host}`,
+      `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj "/CN=${host}" -addext "subjectAltName=DNS:${host}" -keyout /out/certs/${host}/privkey.pem -out /out/certs/${host}/fullchain.pem 2>/dev/null`,
+      `chmod 600 /out/certs/${host}/privkey.pem`,
+    ]),
     "chown -R 1000:1000 /out/certs /out/edge",
   ].join("\n");
   await docker("run", "--rm", "--user", "0:0", "--volume", `${directory}:/out`, bunImage, "sh", "-c", script);
@@ -321,6 +326,16 @@ async function startWatchdog(adminUrl: string) {
     const logs = await runtime.dockerOutput("logs", watchdogName);
     return /edge watchdog on :2021/.test(logs.stdout) ? true : undefined;
   });
+  await waitFor("verified watchdog enforcement", async () => {
+    const status = await docker(
+      "exec",
+      watchdogName,
+      "bun",
+      "--eval",
+      'const r = await fetch("http://127.0.0.1:2021/v1/supervise"); if (!r.ok) process.exit(1); console.log("ready")',
+    );
+    return status === "ready" ? true : undefined;
+  });
 }
 
 /** `edge.apply` as the domain worker runs it: the production plan, rendered and loaded by writeEdge. */
@@ -382,15 +397,15 @@ async function activeBackends() {
 
 type Reply = { status: number; body: string };
 
-function secureGet(path = "/") {
+function secureGet(path = "/", hostname = routeHost) {
   return new Promise<Reply>((resolveReply, reject) => {
     const request = httpsRequest(
       {
         host: "127.0.0.1",
         port: ports.https,
-        servername: routeHost,
+        servername: hostname,
         path,
-        headers: { host: routeHost },
+        headers: { host: hostname },
         rejectUnauthorized: false,
         timeout: 3_000,
       },
@@ -431,20 +446,20 @@ async function refreshPorts() {
 }
 
 /** A routed request outcome: `upstream` when the tailnet peer answered through Caddy. */
-async function outcome() {
-  const reply = await secureGet().catch((error: Error) => ({ status: 0, body: error.message }));
+async function outcome(hostname = routeHost) {
+  const reply = await secureGet("/", hostname).catch((error: Error) => ({ status: 0, body: error.message }));
   if (reply.status === 200 && reply.body === "ok") return "upstream";
   if (reply.status === 503) return "withdrawn (503)";
   return `not served (${reply.status || reply.body})`;
 }
 
 /** An upgraded (WebSocket) session through the route; resolves `closed` with the time it ended. */
-async function openSession() {
+async function openSession(hostname = routeHost) {
   return new Promise<{ closed: Promise<number>; end: () => void }>((resolveOpen, reject) => {
     const connection = tlsConnect({
       host: "127.0.0.1",
       port: ports.https,
-      servername: routeHost,
+      servername: hostname,
       rejectUnauthorized: false,
       ALPNProtocols: ["http/1.1"],
     });
@@ -455,7 +470,7 @@ async function openSession() {
     const timer = setTimeout(() => reject(new Error("WebSocket upgrade timed out")), 5_000);
     connection.on("secureConnect", () =>
       connection.write(
-        `GET /ws HTTP/1.1\r\nHost: ${routeHost}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString("base64")}\r\n\r\n`,
+        `GET /ws HTTP/1.1\r\nHost: ${hostname}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString("base64")}\r\n\r\n`,
       ),
     );
     connection.on("data", (chunk) => {
@@ -718,11 +733,12 @@ async function identityWithdrawalTest(report: Report) {
 /** The owner re-confirms the original machine (FD-08 will do this with step-up); the route is live again. */
 async function restoreRoute(report: Report) {
   mock.state.peers = [home];
-  await sql`UPDATE front_routes SET status = 'awaiting_acl', target_node_stable_id = ${home.id} WHERE id = ${routeId}`;
-  const restored = await observe();
+  await sql`UPDATE front_routes SET enabled = true, status = 'awaiting_acl', target_node_stable_id = ${home.id} WHERE id = ${routeId}`;
+  await observe();
   await edgeApply();
   await waitUntilServing(report, "after re-confirmation the route serves again");
-  return restored;
+  // Start the expiry measurement after the last apply and its container startup have finished.
+  return observe();
 }
 
 async function leaseExpiryTest(report: Report) {
@@ -806,81 +822,192 @@ async function expiredStartTest(report: Report) {
   await startWatchdog("http://edge-admin:2019");
 }
 
-async function withdrawalFailureTest(report: Report) {
+async function withdrawalFailureTest(report: Report, failure: "load" | "read" = "load") {
   // A fresh lease kept fresh, Caddy restarted through the guard (now open), and the route live again.
   await restoreRoute(report);
   const stopObserving = keepObserving();
-  await docker("restart", stack.edge);
-  await refreshPorts();
-  await waitUntilServing(report, "with a valid lease the launch guard opens the full config");
-  expect(
-    report,
-    /starting from \/etc\/caddy\/ark\/Caddyfile: the watchdog confirmed a valid lease/.test(await edgeLogs()),
-    "the guard logged an open start",
-    "open",
-  );
-  // Route the watchdog through a proxy that refuses POST /load, so withdrawal cannot be applied.
-  const fault = `ark-edge-observer-fault-${suffix}`;
-  runtime.containers.push(fault);
-  await docker(
-    "run",
-    "--detach",
-    "--name",
-    fault,
-    "--network",
-    stack.networks.edgeControl,
-    "--network-alias",
-    "admin-fault",
-    "--volume",
-    `${join(fixtures, "admin-fault.ts")}:/fixture/admin-fault.ts:ro`,
-    bunImage,
-    "bun",
-    "/fixture/admin-fault.ts",
-  );
-  await startWatchdog("http://admin-fault:2019");
-  const restartsBefore = Number(await docker("inspect", "-f", "{{.RestartCount}}", stack.edge));
-  expect(
-    report,
-    (await outcome()) === "upstream",
-    "control: the route is still served through the fault-injecting watchdog",
-    "upstream",
-  );
-  await stopObserving();
-  mock.state.peers = [impostor];
-  const detection = await observe();
-  const gone = await withdrawnAt(15_000);
-  const stopped = await waitFor("Caddy to be restarted after the stop", async () => {
-    const count = Number(await docker("inspect", "-f", "{{.RestartCount}}", stack.edge));
-    return count > restartsBefore ? count : undefined;
-  });
-  const [alert] =
-    await sql`SELECT severity, title FROM alerts WHERE dedup_key = 'edge-withdrawal' AND resolved_at IS NULL`;
-  const watchdogLogs = (await runtime.dockerOutput("logs", watchdogName)).stdout;
-  await refreshPorts();
-  await waitFor("edge to come back closed", async () =>
-    (await plainGet("example.com", "/.well-known/acme-challenge/obs-token")).status === 200
-      ? true
-      : undefined,
-  );
-  const guard = (await edgeLogs()).match(/ark launch guard: [^\n]+/g)?.at(-1) ?? "";
-  report.lines.push(`      timing: route stopped serving ${gone - detection.detectedAt} ms after detection`);
-  expect(
-    report,
-    /withdrawal_failed \[caddy\]/.test(watchdogLogs) &&
-      /proxy_stopped \[caddy\]/.test(watchdogLogs) &&
-      stopped > restartsBefore,
-    "when the withdrawal cannot be applied, the watchdog stops Caddy (POST /stop)",
-    `watchdog: ${watchdogLogs.match(/withdrawal_failed[^\n]*/)?.[0]}; edge restart count ${restartsBefore} -> ${stopped}`,
-  );
-  expect(report, alert?.severity === "critical", "and raises a critical alert", String(alert?.title));
-  expect(
-    report,
-    /Caddyfile\.closed/.test(guard) &&
-      (await outcome()) !== "upstream" &&
-      gone - detection.detectedAt <= 5_000,
-    "the restarted Caddy comes back through the launch guard with the route closed",
-    `${guard}; GET ${await outcome()}`,
-  );
+  try {
+    await docker("restart", stack.edge);
+    await refreshPorts();
+    await waitUntilServing(report, "with a valid lease the launch guard opens the full config");
+    expect(
+      report,
+      /starting from \/etc\/caddy\/ark\/Caddyfile: the watchdog confirmed a valid lease/.test(
+        await edgeLogs(),
+      ),
+      "the guard logged an open start",
+      "open",
+    );
+    // Route the watchdog through a proxy that refuses POST /load, so withdrawal cannot be applied.
+    const fault = `ark-edge-observer-fault-${suffix}-${failure}`;
+    runtime.containers.push(fault);
+    await docker(
+      "run",
+      "--detach",
+      "--name",
+      fault,
+      "--network",
+      stack.networks.edgeControl,
+      "--network-alias",
+      `admin-fault-${failure}`,
+      "--env",
+      `ARK_TEST_ADMIN_FAULT=${failure}`,
+      "--volume",
+      `${join(fixtures, "admin-fault.ts")}:/fixture/admin-fault.ts:ro`,
+      bunImage,
+      "bun",
+      "/fixture/admin-fault.ts",
+    );
+    await startWatchdog(`http://admin-fault-${failure}:2019`);
+    // Replacing the watchdog can intentionally restart Caddy closed. Restore the test route only
+    // after the new enforcer has verified that state; no apply runs after injecting the fault.
+    await edgeApply();
+    await Bun.sleep(1_200); // Complete an inspection through the fault proxy before enabling read errors.
+    const restartsBefore = Number(await docker("inspect", "-f", "{{.RestartCount}}", stack.edge));
+    await waitUntilServing(report, "control: the route is still served through the fault-injecting watchdog");
+    await stopObserving();
+    await sql`DELETE FROM alerts WHERE dedup_key = 'edge-withdrawal'`;
+    const session = await openSession();
+    if (failure === "read")
+      await docker(
+        "exec",
+        fault,
+        "bun",
+        "--eval",
+        'await fetch("http://127.0.0.1:2019/fault/enable", { method: "POST" })',
+      );
+    mock.state.peers = [impostor];
+    const detection = await observe();
+    const gone = await withdrawnAt(15_000);
+    const sessionClosed = await Promise.race([session.closed, Bun.sleep(5_000).then(() => 0)]);
+    expect(
+      report,
+      sessionClosed > 0 && sessionClosed - detection.detectedAt <= 5_000,
+      "admin failure closes the existing public session within detection + 5 s",
+      String(sessionClosed),
+    );
+    const stopped = await waitFor("Caddy to be restarted after the stop", async () => {
+      const count = Number(await docker("inspect", "-f", "{{.RestartCount}}", stack.edge));
+      return count > restartsBefore ? count : undefined;
+    });
+    const [alert] =
+      await sql`SELECT severity, title FROM alerts WHERE dedup_key = 'edge-withdrawal' AND resolved_at IS NULL`;
+    const watchdogLogs = (await runtime.dockerOutput("logs", watchdogName)).stdout;
+    await startWatchdog("http://edge-admin:2019");
+    await refreshPorts();
+    await waitFor("edge to come back closed", async () =>
+      (await plainGet("example.com", "/.well-known/acme-challenge/obs-token")).status === 200
+        ? true
+        : undefined,
+    );
+    const guard = (await edgeLogs()).match(/ark launch guard: [^\n]+/g)?.at(-1) ?? "";
+    report.lines.push(
+      `      timing: route stopped serving ${gone - detection.detectedAt} ms after detection`,
+    );
+    expect(
+      report,
+      /withdrawal_failed \[caddy\]/.test(watchdogLogs) &&
+        (/proxy_stopped \[caddy\]/.test(watchdogLogs) ||
+          /watchdog enforcement unavailable/.test(await edgeLogs())) &&
+        stopped > restartsBefore,
+      "when the withdrawal cannot be applied, the watchdog stops Caddy (POST /stop)",
+      `watchdog: ${watchdogLogs.match(/withdrawal_failed[^\n]*/)?.[0]}; edge restart count ${restartsBefore} -> ${stopped}`,
+    );
+    expect(report, alert?.severity === "critical", "and raises a critical alert", String(alert?.title));
+    expect(
+      report,
+      /Caddyfile\.closed/.test(guard) &&
+        (await outcome()) !== "upstream" &&
+        gone - detection.detectedAt <= 5_000,
+      "the restarted Caddy comes back through the launch guard with the route closed",
+      `${guard}; GET ${await outcome()}`,
+    );
+  } finally {
+    await stopObserving();
+  }
+}
+
+/** Lose enforcement while a live route/session is running, without any worker or Caddy restart. */
+async function watchdogLossTest(report: Report) {
+  for (const mode of ["pause", "stop"] as const) {
+    await startWatchdog("http://edge-admin:2019");
+    await restoreRoute(report);
+    const session = await openSession();
+    const lostAt = Date.now();
+    try {
+      await docker(mode, watchdogName);
+      const gone = await withdrawnAt(5_000);
+      const closed = await Promise.race([session.closed, Bun.sleep(5_000).then(() => 0)]);
+      expect(
+        report,
+        gone - lostAt <= 5_000 && closed > 0 && closed - lostAt <= 5_000,
+        `${mode}: independent supervisor closes listener and session within 5 s`,
+        `listener +${gone - lostAt} ms, session +${closed - lostAt} ms`,
+      );
+      await Bun.sleep(1_000);
+      expect(
+        report,
+        (await outcome()) !== "upstream",
+        `${mode}: route stays closed without enforcement`,
+        await outcome(),
+      );
+    } finally {
+      session.end();
+      if (mode === "pause") await docker("unpause", watchdogName);
+    }
+  }
+  await startWatchdog("http://edge-admin:2019");
+}
+
+async function sharedBackendTest(report: Report) {
+  await restoreRoute(report);
+  await sql`INSERT INTO endpoints (id, kind, hostname) VALUES ('end_shared', 'route', ${sharedHost})`;
+  await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
+    VALUES ('crt_shared', 'end_shared', ${JSON.stringify([sharedHost])}::jsonb, 'issued', now())`;
+  await sql`INSERT INTO front_routes (id, kind, endpoint_id, listen_port, target_input, target_node_stable_id, target_ip, target_port, access_mode, status, enabled)
+    VALUES ('rt_shared', 'http', 'end_shared', 443, ${peerIp}, ${home.id}, ${peerIp}, 3000, 'public', 'ready', true)`;
+  const stopObserving = keepObserving();
+  try {
+    await edgeApply();
+    await waitFor("both shared-backend hostnames serving", async () =>
+      (await outcome()) === "upstream" && (await outcome(sharedHost)) === "upstream" ? true : undefined,
+    );
+    const session = await openSession();
+    await sql`UPDATE front_routes SET enabled = false WHERE id = ${routeId}`;
+    const revokedAt = Date.now();
+    const gone = await withdrawnAt(5_000);
+    const closed = await Promise.race([session.closed, Bun.sleep(5_000).then(() => 0)]);
+    expect(
+      report,
+      gone - revokedAt <= 5_000 && closed > 0 && closed - revokedAt <= 5_000,
+      "revoking one hostname closes its handler and session on a shared backend",
+      `withdrawn +${gone - revokedAt} ms; closed +${closed - revokedAt} ms`,
+    );
+    expect(
+      report,
+      (await outcome(sharedHost)) === "upstream",
+      "the other hostname still reaches the same backend",
+      await outcome(sharedHost),
+    );
+    await docker("restart", stack.edge);
+    await refreshPorts();
+    await waitFor("stale file refused on restart", async () =>
+      /Caddyfile.closed/.test((await edgeLogs()).match(/ark launch guard: starting[^\n]+/g)?.at(-1) ?? "")
+        ? true
+        : undefined,
+    );
+    expect(
+      report,
+      (await outcome()) !== "upstream",
+      "restart refuses the stale file containing the revoked hostname",
+      await outcome(),
+    );
+  } finally {
+    await stopObserving();
+    await sql`DELETE FROM front_routes WHERE id = 'rt_shared'`;
+    await sql`DELETE FROM certificates WHERE id = 'crt_shared'`;
+    await sql`DELETE FROM endpoints WHERE id = 'end_shared'`;
+  }
 }
 
 // ---- Runner --------------------------------------------------------------------------------------------
@@ -909,9 +1036,12 @@ try {
   const results = [
     await run("localapi read-only deployment (FD-06)", localApiTest),
     await run("identity withdrawal within detection + 5 s", identityWithdrawalTest),
+    await run("shared backend per-route withdrawal and restart", sharedBackendTest),
+    await run("watchdog loss while Caddy is serving", watchdogLossTest),
     await run("lease expiry with observation stopped", leaseExpiryTest),
     await run("start with an expired lease", expiredStartTest),
     await run("withdrawal failure stops the proxy", withdrawalFailureTest),
+    await run("unreadable admin config stops the proxy", (report) => withdrawalFailureTest(report, "read")),
   ];
   failed = results.includes(false);
   const restarts = await docker("inspect", "-f", "{{.RestartCount}}", stack.edgeTs);

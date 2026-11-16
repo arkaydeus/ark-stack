@@ -204,8 +204,20 @@ describe("edge plan", () => {
 });
 
 describe("tailnet routes (front door §3.2, FD-06)", () => {
-  const route = { id: "rt_k3x9", hostname: "www.example.com", ip: "100.101.102.103", port: 3000 };
-  const v6 = { id: "rt_v6", hostname: "v6.example.com", ip: "fd7a:115c:a1e0::103", port: 8080 };
+  const route = {
+    id: "rt_k3x9",
+    stableId: "nHOME",
+    hostname: "www.example.com",
+    ip: "100.101.102.103",
+    port: 3000,
+  };
+  const v6 = {
+    id: "rt_v6",
+    stableId: "nV6",
+    hostname: "v6.example.com",
+    ip: "fd7a:115c:a1e0::103",
+    port: 8080,
+  };
   const certificates = [certificate("www.example.com", "issued"), certificate("v6.example.com", "issued")];
 
   test("renders an allowed route with its pinned address and a marker, and redirects it on :80", () => {

@@ -3,8 +3,8 @@ import { resolve } from "node:path";
 
 import {
   allowedBackends,
+  routeIdentityKey,
   assertCidrs,
-  backendKey,
   CaddyWithdrawalAdapter,
   backupProofAllowed,
   buildProvisionPlan,
@@ -1640,7 +1640,13 @@ export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: s
     certificates: await db.select().from(certificates),
     tailnetRoutes: policy.routes
       .filter((route) => route.kind === "http")
-      .map((route) => ({ id: route.id, hostname: route.hostname, ip: route.ip, port: route.port })),
+      .map((route) => ({
+        id: route.id,
+        hostname: route.hostname,
+        stableId: route.stableId,
+        ip: route.ip,
+        port: route.port,
+      })),
   });
 }
 
@@ -1687,16 +1693,26 @@ async function observeEdge(operation: OperationRow) {
 async function reconcileServedRoutes() {
   const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
   if (!adminUrl) return { checked: false };
-  const allowed = (await edgePolicy()).routes.filter((route) => route.kind === "http");
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const plan = await edgePlan(
+    settings?.adminMode === "tailnet" ? "tailnet" : "public",
+    settings?.adminHostname,
+  );
+  const issued = new Set(
+    plan.certificates
+      .filter((certificate) => certificate.status === "issued")
+      .map((certificate) => certificate.hostname),
+  );
+  const allowed = plan.tailnetRoutes.filter((route) => issued.has(route.hostname));
   if (!allowed.length) return { checked: true, missing: [] };
   let active: string[];
   try {
-    active = await new CaddyWithdrawalAdapter(adminUrl).activeBackends();
+    active = await new CaddyWithdrawalAdapter(adminUrl).activeRoutes();
   } catch (error) {
     return { checked: false, error: (error as Error).message };
   }
   const missing = allowed
-    .filter((route) => !active.includes(backendKey(route.ip, route.port)))
+    .filter((route) => !active.includes(routeIdentityKey(route)))
     .map((route) => route.id);
   if (missing.length) await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   return { checked: true, missing };
@@ -1724,18 +1740,21 @@ async function drainEdge(operation: OperationRow) {
   const allowed = allowedBackends(await edgePolicy());
   const adapter = new CaddyWithdrawalAdapter(adminUrl);
   const result = await adapter.enforce(allowed);
-  if (result.error && !result.unreachable) {
-    await adapter.stop().catch(() => undefined);
+  if (result.error) {
+    let outcome = "Caddy was stopped";
+    try {
+      await adapter.stop();
+    } catch (error) {
+      outcome = `Caddy stop failed: ${(error as Error).message}`;
+    }
     await raiseAlert({
       severity: "critical",
-      title: `Edge route withdrawal failed; Caddy was stopped (${result.error})`,
+      title: `Edge route withdrawal failed; ${outcome} (${result.error})`,
       dedupKey: EDGE_WITHDRAWAL_ALERT,
     });
-    throw new Error(`Caddy withdrawal failed and Caddy was stopped: ${result.error}`);
+    throw new Error(`Caddy withdrawal failed; ${outcome}: ${result.error}`);
   }
   if (result.unreachable) throw new Error(result.error);
-  const remaining = result.active.filter((key) => !allowed.has(key) && !result.withdrawn.includes(key));
-  if (remaining.length) throw new Error(`Caddy still dials ${remaining.join(", ")}.`);
   await addStep(operation.id, "edge-drain", {
     reason: operation.payload.reason ?? null,
     routeIds: operation.payload.routeIds ?? [],

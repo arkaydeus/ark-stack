@@ -7,6 +7,8 @@ import {
   caddyTailnetBackends,
   caddyfileTailnetBackends,
   launchDecision,
+  routeIdentityKey,
+  renderCaddyfile,
   tailnetDialKey,
   withdrawCaddyBackends,
   type EdgeLeaseDocument,
@@ -14,6 +16,36 @@ import {
   type WatchdogEvent,
   type WithdrawalResult,
 } from "./index.ts";
+
+const routes = [
+  { id: "rt_0", kind: "http", hostname: "www.example.com", stableId: "n", ip: "100.101.102.103", port: 3000 },
+  {
+    id: "rt_1",
+    kind: "http",
+    hostname: "v6.example.com",
+    stableId: "n",
+    ip: "fd7a:115c:a1e0::103",
+    port: 8080,
+  },
+];
+const allowed = (...indices: number[]) => new Set(indices.map((index) => routeIdentityKey(routes[index]!)));
+
+const sharedBackendHandler = (route: (typeof routes)[number]) => ({
+  match: [{ host: [route.hostname] }],
+  handle: [
+    {
+      handler: "subroute",
+      routes: [
+        {
+          handle: [
+            { handler: "vars", ark_tailnet_route: routeIdentityKey(route) },
+            { handler: "reverse_proxy", upstreams: [{ dial: `${route.ip}:${route.port}` }] },
+          ],
+        },
+      ],
+    },
+  ],
+});
 
 // The shape `caddy adapt` gives a Caddyfile with one admin site and two tailnet routes.
 const config = () => ({
@@ -39,14 +71,22 @@ const config = () => ({
                 {
                   handler: "subroute",
                   routes: [
-                    { handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "100.101.102.103:3000" }] }] },
+                    {
+                      handle: [
+                        { handler: "vars", ark_tailnet_route: routeIdentityKey(routes[0]!) },
+                        { handler: "reverse_proxy", upstreams: [{ dial: "100.101.102.103:3000" }] },
+                      ],
+                    },
                   ],
                 },
               ],
             },
             {
               match: [{ host: ["v6.example.com"] }],
-              handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "[fd7a:115c:a1e0:0::103]:8080" }] }],
+              handle: [
+                { handler: "vars", ark_tailnet_route: routeIdentityKey(routes[1]!) },
+                { handler: "reverse_proxy", upstreams: [{ dial: "[fd7a:115c:a1e0:0::103]:8080" }] },
+              ],
             },
           ],
         },
@@ -65,26 +105,25 @@ describe("Caddy config inspection and withdrawal", () => {
   });
 
   test("replaces denied handlers with a fixed 503 and keeps everything else", () => {
-    const { config: next, withdrawn } = withdrawCaddyBackends(
-      config(),
-      new Set(["[fd7a:115c:a1e0::103]:8080"]),
-    );
+    const { config: next, withdrawn } = withdrawCaddyBackends(config(), allowed(1));
     expect(withdrawn).toEqual(["100.101.102.103:3000"]);
     expect(caddyTailnetBackends(next)).toEqual(["[fd7a:115c:a1e0::103]:8080"]);
     expect(JSON.stringify(next)).toContain(JSON.stringify(WITHDRAWN_HANDLER));
     expect(JSON.stringify(next)).toContain('"dial":"api:3000"');
-    expect(JSON.stringify(next)).not.toContain("100.101.102.103");
+    expect(caddyTailnetBackends(next)).not.toContain("100.101.102.103:3000");
     // Nothing to do when everything is allowed.
-    const all = new Set(["100.101.102.103:3000", "[fd7a:115c:a1e0::103]:8080"]);
+    const all = allowed(0, 1);
     expect(withdrawCaddyBackends(config(), all).withdrawn).toEqual([]);
   });
 
   test("the launch decision is open only when every rendered tailnet backend is allowed", () => {
     const caddyfile = `# ark-tailnet-route rt_a 100.101.102.103:3000
 www.example.com {
+  vars ark_tailnet_route ${routeIdentityKey(routes[0]!)}
   reverse_proxy 100.101.102.103:3000
 }
 v6.example.com {
+  vars ark_tailnet_route ${routeIdentityKey(routes[1]!)}
   reverse_proxy [fd7a:115c:a1e0::103]:8080
 }
 admin.example.com {
@@ -95,12 +134,8 @@ admin.example.com {
       "[fd7a:115c:a1e0::103]:8080",
     ]);
     expect(launchDecision(caddyfile, new Set()).open).toBe(false);
-    expect(launchDecision(caddyfile, new Set(["100.101.102.103:3000"])).denied).toEqual([
-      "[fd7a:115c:a1e0::103]:8080",
-    ]);
-    expect(
-      launchDecision(caddyfile, new Set(["100.101.102.103:3000", "[fd7a:115c:a1e0::103]:8080"])).open,
-    ).toBe(true);
+    expect(launchDecision(caddyfile, allowed(0)).denied).toEqual(["[fd7a:115c:a1e0::103]:8080"]);
+    expect(launchDecision(caddyfile, allowed(0, 1)).open).toBe(true);
     expect(launchDecision("admin.example.com {\n  reverse_proxy api:3000\n}\n", new Set()).open).toBe(true);
   });
 });
@@ -134,13 +169,13 @@ describe("CaddyWithdrawalAdapter", () => {
   test("loads the withdrawn config with must-revalidate and verifies it", async () => {
     const caddy = fakeCaddy();
     const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher);
-    const result = await adapter.enforce(new Set(["[fd7a:115c:a1e0::103]:8080"]));
+    const result = await adapter.enforce(allowed(1));
     expect(result).toMatchObject({ withdrawn: ["100.101.102.103:3000"] });
     expect(result.error).toBeUndefined();
     expect(caddyTailnetBackends(caddy.active())).toEqual(["[fd7a:115c:a1e0::103]:8080"]);
     expect(caddy.calls).toEqual(["GET /config/", "POST /load", "GET /config/"]);
     // Idempotent: a second pass changes nothing.
-    expect((await adapter.enforce(new Set(["[fd7a:115c:a1e0::103]:8080"]))).withdrawn).toEqual([]);
+    expect((await adapter.enforce(allowed(1))).withdrawn).toEqual([]);
   });
 
   test("reports a failed load so the caller stops Caddy", async () => {
@@ -160,7 +195,7 @@ describe("CaddyWithdrawalAdapter", () => {
   });
 });
 
-const lease = (now: number, validForMs: number, routes = [{ ip: "100.101.102.103", port: 3000 }]) =>
+const lease = (now: number, validForMs: number, backendRoutes = [{ ip: "100.101.102.103", port: 3000 }]) =>
   ({
     now: new Date(now).toISOString(),
     lease: {
@@ -169,10 +204,10 @@ const lease = (now: number, validForMs: number, routes = [{ ip: "100.101.102.103
       validUntil: new Date(now + validForMs).toISOString(),
       valid: validForMs > 0,
     },
-    routes: routes.map((route, index) => ({
+    routes: backendRoutes.map((route, index) => ({
+      ...routes[index]!,
       id: `rt_${index}`,
       kind: "http",
-      hostname: `h${index}.example.com`,
       stableId: "n",
       ...route,
     })),
@@ -372,5 +407,184 @@ describe("EdgeWatchdog", () => {
     });
     await watchdog.tick();
     expect(events.map((event) => event.event)).toEqual(["withdrawal_failed", "stop_failed"]);
+  });
+});
+
+describe("route identity and fail-closed regressions", () => {
+  test("revokes one hostname on a shared backend and refuses the stale launch file", async () => {
+    const keep = routes[0]!;
+    const revoke = { ...keep, id: "rt_revoked", hostname: "revoked.example.com", stableId: "old" };
+
+    const active = {
+      apps: {
+        http: { servers: { srv0: { routes: [sharedBackendHandler(keep), sharedBackendHandler(revoke)] } } },
+      },
+    };
+    const { config: next, withdrawn } = withdrawCaddyBackends(active, new Set([routeIdentityKey(keep)]));
+    expect(withdrawn).toEqual(["100.101.102.103:3000"]);
+    const serialized = JSON.stringify(next);
+    expect(serialized.match(/"handler":"reverse_proxy"/g)).toHaveLength(1);
+    expect(caddyTailnetBackends(next)).toEqual(["100.101.102.103:3000"]);
+    expect(serialized).toContain(JSON.stringify(WITHDRAWN_HANDLER));
+    const stale = renderCaddyfile({
+      adminMode: "tailnet",
+      apiUpstream: "api:3000",
+      challengeDir: "/acme",
+      certificates: [keep, revoke].map((route) => ({
+        hostname: route.hostname,
+        status: "issued",
+        fullchain: "/cert.pem",
+        privkey: "/key.pem",
+      })),
+      tailnetRoutes: [keep, revoke],
+    });
+    expect(launchDecision(stale, new Set([routeIdentityKey(keep)])).open).toBe(false);
+    expect(launchDecision(stale, new Set([routeIdentityKey(keep), routeIdentityKey(revoke)])).open).toBe(
+      true,
+    );
+    // Changing just the pin, route ID, host match or backend cannot reuse the old authorisation.
+    for (const changed of [
+      { ...keep, stableId: "replacement" },
+      { ...keep, id: "rt_new" },
+      { ...keep, hostname: "other.example.com" },
+      { ...keep, port: 4000 },
+    ]) {
+      expect(withdrawCaddyBackends(active, new Set([routeIdentityKey(changed)])).activeRoutes).toEqual([]);
+    }
+    const legacy = {
+      match: [{ host: [keep.hostname] }],
+      handle: [{ handler: "reverse_proxy", upstreams: [{ dial: "100.101.102.103:3000" }] }],
+    };
+    expect(withdrawCaddyBackends(legacy, allowed(0)).withdrawn).toHaveLength(1);
+    expect(launchDecision("www.example.com {\n reverse_proxy 100.101.102.103:3000\n}", allowed(0)).open).toBe(
+      false,
+    );
+  });
+
+  test("read failure stops and alerts even if the public proxy remains live; repeated failures are coalesced", async () => {
+    let stops = 0;
+    let reads = 0;
+    const events: WatchdogEvent[] = [];
+    const adapter = new CaddyWithdrawalAdapter("http://admin:2019", async (url) => {
+      if (url.endsWith("/config/")) {
+        reads++;
+        return new Response("admin broken, public still live", { status: 503 });
+      }
+      stops++;
+      return new Response("stop also failed", { status: 503 });
+    });
+    const watchdog = new EdgeWatchdog({
+      fetchLease: async () => lease(0, 0),
+      adapters: [adapter],
+      startupGraceMs: 0,
+      report: async (event) => {
+        events.push(event);
+      },
+    });
+    for (let i = 0; i < 4; i++) await watchdog.tick();
+    expect(reads).toBe(4);
+    expect(stops).toBe(4); // Retry the safety action; deduplicate reporting only.
+    expect(events.map((event) => event.event)).toEqual(["withdrawal_failed", "stop_failed"]);
+  });
+
+  test("startup grace is bounded, and cannot hide later inspection failures", async () => {
+    let now = 0;
+    let stops = 0;
+    const watchdog = new EdgeWatchdog({
+      now: () => now,
+      fetchLease: async () => lease(0, 0),
+      adapters: [
+        {
+          proxy: "fake",
+          enforce: async () => ({
+            proxy: "fake",
+            active: [],
+            withdrawn: [],
+            error: "read failed",
+            unreachable: true,
+          }),
+          stop: async () => {
+            stops++;
+          },
+        },
+      ],
+    });
+    await watchdog.tick();
+    expect(stops).toBe(0);
+    now = 5000;
+    await watchdog.tick();
+    expect(stops).toBe(1);
+  });
+
+  test("a persistent reload failure reports once, continues stopping and reports again after recovery", async () => {
+    let failing = true;
+    let stops = 0;
+    const events: WatchdogEvent[] = [];
+    const watchdog = new EdgeWatchdog({
+      fetchLease: async () => lease(0, 0),
+      adapters: [
+        {
+          proxy: "fake",
+          enforce: async () => ({
+            proxy: "fake",
+            active: ["x"],
+            withdrawn: failing ? ["x"] : [],
+            ...(failing ? { error: "load failed" } : {}),
+          }),
+          stop: async () => {
+            stops++;
+          },
+        },
+      ],
+      report: async (event) => {
+        events.push(event);
+      },
+    });
+    for (let i = 0; i < 5; i++) await watchdog.tick();
+    expect(stops).toBe(5);
+    expect(events.map((event) => event.event)).toEqual(["withdrawal_failed", "proxy_stopped"]);
+    failing = false;
+    await watchdog.tick();
+    failing = true;
+    await watchdog.tick();
+    expect(events.map((event) => event.event)).toEqual([
+      "withdrawal_failed",
+      "proxy_stopped",
+      "withdrawal_failed",
+      "proxy_stopped",
+    ]);
+  });
+
+  test("bulk events stay bounded and a failed delivery retries after the config has converged", async () => {
+    const backends = Array.from({ length: 100 }, (_, i) => `100.80.1.${i + 1}:3000`);
+    let active = true;
+    let attempts = 0;
+    const events: WatchdogEvent[] = [];
+    const watchdog = new EdgeWatchdog({
+      fetchLease: async () => lease(0, 0),
+      adapters: [
+        {
+          proxy: "fake",
+          enforce: async () => {
+            const withdrawn = active ? backends : [];
+            active = false;
+            return { proxy: "fake", active: [], withdrawn };
+          },
+          stop: async () => undefined,
+        },
+      ],
+      report: async (event) => {
+        attempts++;
+        if (attempts === 1) throw new Error("API offline");
+        events.push(event);
+      },
+    });
+    await watchdog.tick();
+    expect(events).toHaveLength(0);
+    await watchdog.tick();
+    expect(attempts).toBe(2);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.detail).toContain("100 backend(s)");
+    expect(events[0]!.detail.length).toBeLessThanOrEqual(1000);
   });
 });

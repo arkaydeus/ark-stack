@@ -64,6 +64,7 @@ async function addRoute(input: {
   ip: string;
   port: number;
   status: string;
+  certificate?: boolean;
 }) {
   const endpointId = createId("end");
   const routeId = `rt_${createId("x").slice(2, 18)}`;
@@ -74,6 +75,9 @@ async function addRoute(input: {
     VALUES (${routeId}, 'http', ${endpointId}, 443, ${input.target}, ${input.stableId}, ${input.ip},
       ${input.port}, 'public', ${input.status}, true)
   `;
+  if (input.certificate)
+    await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
+    VALUES (${createId("crt")}, ${endpointId}, ${JSON.stringify([`${routeId.slice(3)}.example.com`])}::jsonb, 'issued', now())`;
   endpointIds.push(endpointId);
   routeIds.push(routeId);
   return routeId;
@@ -107,6 +111,7 @@ async function rendered(now = new Date()) {
   const policy = await edgePolicy(now);
   const routes = policy.routes.map((item) => ({
     id: item.id,
+    stableId: item.stableId,
     hostname: item.hostname,
     ip: item.ip,
     port: item.port,
@@ -134,6 +139,7 @@ async function rendered(now = new Date()) {
 async function removeRoutes() {
   if (routeIds.length) await sql`DELETE FROM audit_events WHERE resource_id = ANY(${routeIds})`;
   if (routeIds.length) await sql`DELETE FROM front_routes WHERE id = ANY(${routeIds})`;
+  if (endpointIds.length) await sql`DELETE FROM certificates WHERE endpoint_id = ANY(${endpointIds})`;
   if (endpointIds.length) await sql`DELETE FROM endpoints WHERE id = ANY(${endpointIds})`;
   routeIds.length = 0;
   endpointIds.length = 0;
@@ -439,55 +445,62 @@ describe("schedule", () => {
 });
 
 describe("coordinator wiring", () => {
-  test("edge.observe runs through the coordinator and re-applies a route missing from the running Caddy", async () => {
-    const { enqueue: realEnqueue, runOperation } = await import("./coordinator.ts");
-    mock.state.reachable.add("100.101.102.103:3000");
-    const id = await addRoute({
-      target: `home${tailnet}`,
-      stableId: home.id,
-      ip: "100.101.102.103",
-      port: 3000,
-      status: "ready",
-    });
-    // A running Caddy that serves nothing from the tailnet (for example, started from the closed config).
-    const caddy = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: (request) =>
-        new URL(request.url).pathname === "/config/"
-          ? Response.json({ apps: { http: { servers: { srv0: { routes: [] } } } } })
-          : new Response("not found", { status: 404 }),
-    });
-    const previous = { socket: process.env.ARK_EDGE_TS_SOCKET, reload: process.env.ARK_EDGE_RELOAD_URL };
-    process.env.ARK_EDGE_TS_SOCKET = socket;
-    process.env.ARK_EDGE_RELOAD_URL = `http://127.0.0.1:${caddy.port}`;
-    const created: string[] = [];
-    try {
-      await sql`UPDATE operations SET status = 'cancelled' WHERE kind = 'edge.apply' AND status = 'queued'`;
-      const operation = await realEnqueue({
-        kind: "edge.observe",
-        targetIds: ["tailnet:edge"],
-        payload: { test: suffix },
+  test.each([true, false])(
+    "edge.observe reconciles only renderable routes (issued certificate: %s)",
+    async (certificate) => {
+      const { enqueue: realEnqueue, runOperation } = await import("./coordinator.ts");
+      await observe(); // Establish a current lease before adding an already-ready route.
+      mock.state.reachable.add("100.101.102.103:3000");
+      const id = await addRoute({
+        target: `home${tailnet}`,
+        stableId: home.id,
+        ip: "100.101.102.103",
+        port: 3000,
+        status: "ready",
+        certificate,
       });
-      created.push(operation.id);
-      const result = (await runOperation("edge.observe", operation)) as { reconcile: { missing: string[] } };
-      expect((await route(id)).status).toBe("ready");
-      expect(result.reconcile.missing).toEqual([id]);
-      const applies = await sql`SELECT id FROM operations WHERE kind = 'edge.apply' AND status = 'queued'`;
-      created.push(...applies.map((row) => String(row.id)));
-      expect(applies).toHaveLength(1);
-    } finally {
-      caddy.stop(true);
-      if (previous.socket === undefined) delete process.env.ARK_EDGE_TS_SOCKET;
-      else process.env.ARK_EDGE_TS_SOCKET = previous.socket;
-      if (previous.reload === undefined) delete process.env.ARK_EDGE_RELOAD_URL;
-      else process.env.ARK_EDGE_RELOAD_URL = previous.reload;
-      if (created.length) {
-        await sql`DELETE FROM operation_steps WHERE operation_id = ANY(${created})`;
-        await sql`DELETE FROM operations WHERE id = ANY(${created})`;
+      // A running Caddy that serves nothing from the tailnet (for example, started from the closed config).
+      const caddy = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: (request) =>
+          new URL(request.url).pathname === "/config/"
+            ? Response.json({ apps: { http: { servers: { srv0: { routes: [] } } } } })
+            : new Response("not found", { status: 404 }),
+      });
+      const previous = { socket: process.env.ARK_EDGE_TS_SOCKET, reload: process.env.ARK_EDGE_RELOAD_URL };
+      process.env.ARK_EDGE_TS_SOCKET = socket;
+      process.env.ARK_EDGE_RELOAD_URL = `http://127.0.0.1:${caddy.port}`;
+      const created: string[] = [];
+      try {
+        await sql`UPDATE operations SET status = 'cancelled' WHERE kind = 'edge.apply' AND status = 'queued'`;
+        const operation = await realEnqueue({
+          kind: "edge.observe",
+          targetIds: ["tailnet:edge"],
+          payload: { test: suffix },
+        });
+        created.push(operation.id);
+        const result = (await runOperation("edge.observe", operation)) as {
+          reconcile: { missing: string[] };
+        };
+        expect((await route(id)).status).toBe("ready");
+        expect(result.reconcile.missing).toEqual(certificate ? [id] : []);
+        const applies = await sql`SELECT id FROM operations WHERE kind = 'edge.apply' AND status = 'queued'`;
+        created.push(...applies.map((row) => String(row.id)));
+        expect(applies).toHaveLength(certificate ? 1 : 0);
+      } finally {
+        caddy.stop(true);
+        if (previous.socket === undefined) delete process.env.ARK_EDGE_TS_SOCKET;
+        else process.env.ARK_EDGE_TS_SOCKET = previous.socket;
+        if (previous.reload === undefined) delete process.env.ARK_EDGE_RELOAD_URL;
+        else process.env.ARK_EDGE_RELOAD_URL = previous.reload;
+        if (created.length) {
+          await sql`DELETE FROM operation_steps WHERE operation_id = ANY(${created})`;
+          await sql`DELETE FROM operations WHERE id = ANY(${created})`;
+        }
       }
-    }
-  });
+    },
+  );
 
   test("edge.observe refuses to run without the edge node's socket", async () => {
     const { enqueue: realEnqueue, runOperation } = await import("./coordinator.ts");
@@ -503,6 +516,97 @@ describe("coordinator wiring", () => {
     } finally {
       if (previous !== undefined) process.env.ARK_EDGE_TS_SOCKET = previous;
       await sql`DELETE FROM operations WHERE id = ${operation.id}`;
+    }
+  });
+});
+
+describe("lifecycle recovery", () => {
+  test.each(["awaiting_dns", "issuing_certificate"])(
+    "%s survives temporary peer loss and recovers without becoming ready",
+    async (status) => {
+      const id = await addRoute({
+        target: `home${tailnet}`,
+        stableId: home.id,
+        ip: "100.101.102.103",
+        port: 3000,
+        status,
+      });
+      mock.state.peers = [nas];
+      await observe();
+      expect((await route(id)).status).toBe(status);
+      expect((await route(id)).last_error).not.toBeNull();
+      mock.state.peers = [home, nas];
+      mock.state.reachable.add("100.101.102.103:3000");
+      await observe();
+      expect((await route(id)).status).toBe(status);
+      expect((await route(id)).last_error).toBeNull();
+      expect((await edgePolicy()).routes.map((item) => item.id)).not.toContain(id);
+    },
+  );
+  test("a healthy lifecycle observation preserves errors owned by DNS or certificate work", async () => {
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "awaiting_dns",
+    });
+    await sql`UPDATE front_routes SET last_error = 'DNS provider refused the record' WHERE id = ${id}`;
+    await observe();
+    expect((await route(id)).last_error).toBe("DNS provider refused the record");
+    expect((await route(id)).status).toBe("awaiting_dns");
+  });
+  test("a lifecycle identity mismatch is sticky", async () => {
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "issuing_certificate",
+    });
+    mock.state.peers = [{ ...home, id: "nREPLACED" }];
+    await observe();
+    expect((await route(id)).status).toBe("identity_mismatch");
+    mock.state.peers = [home, nas];
+    await observe();
+    expect((await route(id)).status).toBe("identity_mismatch");
+  });
+});
+
+describe("coordinator drain failure", () => {
+  test.each(["load", "read"])("%s failure attempts a stop and raises a critical alert", async (failure) => {
+    const { enqueue: realEnqueue, runOperation } = await import("./coordinator.ts");
+    const calls: string[] = [];
+    const caddy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        const path = new URL(request.url).pathname;
+        calls.push(`${request.method} ${path}`);
+        if (path === "/stop") return new Response("");
+        if (path === "/config/" && failure === "load")
+          return Response.json({ handler: "reverse_proxy", upstreams: [{ dial: "100.101.102.103:3000" }] });
+        return new Response("injected failure", { status: 503 });
+      },
+    });
+    const previous = process.env.ARK_EDGE_RELOAD_URL;
+    process.env.ARK_EDGE_RELOAD_URL = `http://127.0.0.1:${caddy.port}`;
+    const operation = await realEnqueue({
+      kind: "edge.drain",
+      targetIds: ["edge:drain"],
+      payload: { reason: "test" },
+    });
+    try {
+      await expect(runOperation("edge.drain", operation)).rejects.toThrow(/withdrawal failed/);
+      expect(calls).toContain("POST /stop");
+      const [alert] = await sql`SELECT severity FROM alerts WHERE dedup_key = 'edge-withdrawal'`;
+      expect(alert?.severity).toBe("critical");
+    } finally {
+      caddy.stop(true);
+      if (previous === undefined) delete process.env.ARK_EDGE_RELOAD_URL;
+      else process.env.ARK_EDGE_RELOAD_URL = previous;
+      await sql`DELETE FROM operations WHERE id = ${operation.id}`;
+      await sql`DELETE FROM alerts WHERE dedup_key = 'edge-withdrawal'`;
     }
   });
 });

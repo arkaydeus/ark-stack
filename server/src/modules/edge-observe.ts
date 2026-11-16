@@ -45,8 +45,9 @@ type Enqueue = (input: {
 
 /** Statuses `edge.observe` owns. `identity_mismatch` is sticky until the owner re-confirms (FD-08). */
 const OBSERVED_STATUSES = new Set(["awaiting_acl", "ready", "observation_expired"]);
-/** Lifecycle statuses owned by DNS and certificate work (FD-08); identity failures still override them. */
+/** Lifecycle statuses owned by DNS and certificate work (FD-08); transient failures keep the lifecycle position; identity mismatch remains sticky. */
 const LIFECYCLE_STATUSES = new Set(["awaiting_dns", "issuing_certificate"]);
+const LIFECYCLE_OBSERVATION_ERROR = "Edge observation: ";
 
 export const EDGE_OBSERVE_TARGET = "tailnet:edge";
 
@@ -293,10 +294,18 @@ async function revalidateRoutes(input: {
     let ip = route.targetIp;
     let probe: ProbeResult | undefined;
     if (!check.ok) {
-      status = check.status;
-      lastError = check.message;
+      status =
+        LIFECYCLE_STATUSES.has(route.status) && check.status !== "identity_mismatch"
+          ? route.status
+          : check.status;
+      lastError = LIFECYCLE_STATUSES.has(status)
+        ? `${LIFECYCLE_OBSERVATION_ERROR}${check.message}`
+        : check.message;
     } else {
       ip = check.ip;
+      // Only clear errors owned by this observer; DNS/certificate diagnostics belong to their worker.
+      if (LIFECYCLE_STATUSES.has(route.status) && lastError?.startsWith(LIFECYCLE_OBSERVATION_ERROR))
+        lastError = null;
       if (OBSERVED_STATUSES.has(route.status)) {
         const key = backendKey(check.ip, route.targetPort);
         if (!probes.has(key)) probes.set(key, input.api.probe(check.ip, route.targetPort));
