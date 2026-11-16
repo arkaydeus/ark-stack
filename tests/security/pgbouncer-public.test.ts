@@ -77,6 +77,9 @@ function pgbouncerPublicViolations(service: Service | undefined) {
       problems.push(`${mount} must be mounted read-only`);
     }
   }
+  if (!service.volumes?.includes("ark_pgbouncer_socket:/var/run/pgbouncer")) {
+    problems.push("the admin socket volume ark_pgbouncer_socket must be mounted at /var/run/pgbouncer");
+  }
   return problems;
 }
 
@@ -117,7 +120,11 @@ describe("pgbouncer-public compose service", () => {
       command: ["/var/lib/ark/pgbouncer/pgbouncer.ini"],
       user: "1000:1000",
       ports: ["127.0.0.1:15432:5432"],
-      volumes: ["../../tmp/pgbouncer:/var/lib/ark/pgbouncer:ro", "../../tmp/certs:/var/lib/ark/certs:ro"],
+      volumes: [
+        "../../tmp/pgbouncer:/var/lib/ark/pgbouncer:ro",
+        "../../tmp/certs:/var/lib/ark/certs:ro",
+        "ark_pgbouncer_socket:/var/run/pgbouncer",
+      ],
       cap_drop: ["ALL"],
       security_opt: ["no-new-privileges:true"],
     };
@@ -137,8 +144,20 @@ describe("pgbouncer-public compose service", () => {
       [{ security_opt: [] }, /no-new-privileges/],
       [{ ports: ["15432:5432"] }, /loopback-only/],
       [
-        { volumes: ["../../tmp/pgbouncer:/var/lib/ark/pgbouncer", "../../tmp/certs:/var/lib/ark/certs:ro"] },
+        {
+          volumes: [
+            "../../tmp/pgbouncer:/var/lib/ark/pgbouncer",
+            "../../tmp/certs:/var/lib/ark/certs:ro",
+            "ark_pgbouncer_socket:/var/run/pgbouncer",
+          ],
+        },
         /read-only/,
+      ],
+      [
+        {
+          volumes: ["../../tmp/pgbouncer:/var/lib/ark/pgbouncer:ro", "../../tmp/certs:/var/lib/ark/certs:ro"],
+        },
+        /admin socket/,
       ],
     ];
     for (const [change, expected] of cases) {
@@ -193,6 +212,51 @@ describe("pgbouncer-public compose service", () => {
           : Object.keys(service.networks ?? {});
         expect(names).not.toContain("database-loopback");
       }
+    }
+  });
+
+  test("shares the admin socket only between pgbouncer-public and database-worker", async () => {
+    const compose = Bun.YAML.parse(await Bun.file(composeFile).text()) as {
+      services: Record<string, Service>;
+      volumes: Record<string, { driver?: string; driver_opts?: Record<string, string> } | null>;
+    };
+    const users = Object.entries(compose.services)
+      .filter(([, service]) => service.volumes?.some((volume) => volume.startsWith("ark_pgbouncer_socket:")))
+      .map(([name]) => name)
+      .toSorted();
+    expect(users).toEqual(["database-worker", "pgbouncer-public"]);
+    for (const name of users) {
+      expect(compose.services[name]?.volumes).toContain("ark_pgbouncer_socket:/var/run/pgbouncer");
+    }
+    // A tmpfs owned by uid 1000 (PgBouncer and the worker), closed to every other uid.
+    const volume = compose.volumes.ark_pgbouncer_socket;
+    expect(volume?.driver_opts?.type).toBe("tmpfs");
+    expect(volume?.driver_opts?.o).toContain("uid=1000");
+    expect(volume?.driver_opts?.o).toContain("mode=0700");
+  });
+
+  test("the database worker reloads over the admin socket with no Docker CLI or socket", async () => {
+    const compose = await loadCompose();
+    const worker = compose.services["database-worker"]!;
+    const environment = worker.environment as Record<string, string>;
+    expect(environment.ARK_PGBOUNCER_RELOAD).toBe("1");
+    expect(environment.ARK_PGBOUNCER_SOCKET_DIR).toBe("/var/run/pgbouncer");
+    expect(environment.ARK_PGBOUNCER_ADMIN_PASSWORD).toMatch(/^\$\{ARK_PGBOUNCER_ADMIN_PASSWORD:\?/);
+    expect(Object.keys(environment).filter((name) => name.startsWith("DOCKER_"))).toEqual([]);
+    expect(worker.volumes?.some((volume) => volume.includes("docker.sock"))).toBe(false);
+    // The database-worker image stage installs nftables only: no Docker CLI.
+    const dockerfile = await Bun.file(join(root, "Dockerfile")).text();
+    const stage = dockerfile.slice(
+      dockerfile.indexOf("AS database-worker"),
+      dockerfile.indexOf("\nFROM ", dockerfile.indexOf("AS database-worker")),
+    );
+    expect(stage).toContain("nftables");
+    expect(stage).not.toMatch(/docker/i);
+    // The reload code path has no Docker invocation left.
+    for (const file of ["server/src/modules/pgbouncer.ts", "server/src/modules/providers.ts"]) {
+      const source = await Bun.file(join(root, file)).text();
+      expect(source).not.toMatch(/exec\(\s*"docker"/);
+      expect(source).not.toContain('"kill", "-s", "HUP"');
     }
   });
 

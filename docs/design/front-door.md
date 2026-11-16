@@ -1518,6 +1518,15 @@ Rationale, from the [PgBouncer config docs](https://www.pgbouncer.org/config.htm
 
 `pgbouncerUserlist` must not let `ark_pgbouncer_admin` collide with a Postgres role. It is excluded from `[users]` and never created in Postgres.
 
+**As built (FD-16).** `shared/src/pgbouncer.ts` renders the INI and HBA above byte for byte (a unit test compares them with this section), and `server/src/modules/pgbouncer.ts` plans, writes and reloads them. Details the section leaves open:
+
+- **Admin password.** The installer generates `ARK_PGBOUNCER_ADMIN_PASSWORD`; Compose passes it only to `database-worker`, and `userlist.txt` holds its SCRAM-SHA-256 verifier, never the plaintext.
+- **Socket volume.** `ark_pgbouncer_socket` is a named tmpfs volume owned by uid 1000 with mode 0700, because the image's own `/var/run/pgbouncer` belongs to uid 70 and PgBouncer runs as uid 1000.
+- **No admitted client.** PgBouncer is not routed (`expose` stays `0`), nothing is mapped, and `client-ca-bundle.pem` holds a freshly generated deny-all CA whose key is discarded. It is never empty or unset: without `client_tls_ca_file`, PgBouncer's TLS layer falls back to the system trust store.
+- **Bundle selection** walks each active client's certificates through `superseded_by` from its `ca_id` generation, and trusts a generation while it has an issued certificate before `not_after + 5 s` and an unrevoked, unexpired `db-client` CA. A CA linked to a revoked client is never trusted.
+- **Reload.** When no client is admitted, the worker first closes public routing and waits for the running host ingress to acknowledge closure. Files are replaced atomically, then `RELOAD` runs on the socket. Every reload discovers a pending database endpoint certificate and checks its served fingerprint, even without a certificate payload; only verified recovery clears the renewal alert and marks the certificate serving. Failures are retried (three attempts by default), then raise the critical `pgbouncer-reload` alert and fail the operation.
+- **Tests.** `scripts/test-pgbouncer-public.ts` (`mise run test:pgbouncer`) runs all of this against the pinned image.
+
 #### 3.10.3 CA granularity
 
 **One CA per app environment and certificate generation** (`database_clients` row; for example `storefront/production` and `storefront/preview`). Alternatives:

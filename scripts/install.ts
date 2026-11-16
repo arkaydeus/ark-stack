@@ -51,8 +51,6 @@ if (!existsSync(join(databaseCert, "fullchain.pem")) || !existsSync(join(databas
   ]);
   await chmod(join(databaseCert, "privkey.pem"), 0o600);
 }
-await seedPgbouncerBootstrap(join(root, "tmp", "pgbouncer"));
-await Bun.write(join(root, "tmp", "pgbouncer", "expose"), "0\n");
 if (!existsSync(join(root, "tmp", "edge", "Caddyfile"))) {
   await Bun.write(
     join(root, "tmp", "edge", "Caddyfile"),
@@ -74,6 +72,12 @@ const parsed = Object.fromEntries(
       return [line.slice(0, eq), line.slice(eq + 1)];
     }),
 );
+// The closed PgBouncer configuration admits nobody; the console administrator's SCRAM verifier
+// lets the database worker RELOAD over the shared admin socket once clients exist.
+await seedPgbouncerBootstrap(join(root, "tmp", "pgbouncer"), {
+  adminPassword: parsed.ARK_PGBOUNCER_ADMIN_PASSWORD,
+});
+await Bun.write(join(root, "tmp", "pgbouncer", "expose"), "0\n");
 await Bun.write(join(root, "tmp", "metrics.token"), `${parsed.ARK_METRICS_TOKEN}\n`);
 await chmod(join(root, "tmp", "metrics.token"), 0o600);
 
