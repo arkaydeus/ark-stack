@@ -35,6 +35,23 @@ Upload, integrity, and restore-test are three statuses. A successful upload is n
 
 `mise run maintain -- infra/platform/release.json infra/platform/docker-compose.yml` requires an Ed25519 publisher key in `ARK_RELEASE_PUBLIC_KEY`, verifies the bundle signature, exact Compose-file digest, and exact immutable image set, and journals the approval. It pulls every approved digest and executes health-waiting Compose only when `ARK_MAINTENANCE_EXECUTE=1`. Stateful images require `allowStateful` after a reviewed migration and recovery plan.
 
+## Third-party image pins
+
+Third-party images (Caddy, Tailscale, PgBouncer, PostgreSQL, Stalwart and the `oven/bun` base) are pinned as `name:version@sha256:<digest>`: the version is for readers, the digest is what Docker pulls. Dependabot (`.github/dependabot.yml`) covers only the bun workspace and GitHub Actions, so it never proposes image bumps. Bump images by hand:
+
+1. Read the upstream release notes between the pinned and the target version, and note behaviour changes that touch Ark's config.
+2. Resolve the multi-arch index digest from the registry, not from a local pull (a local `RepoDigests` entry can be a single-platform manifest):
+
+   ```sh
+   docker buildx imagetools inspect caddy:2.11.9
+   ```
+
+   Take the top-level `Digest:` of the `application/vnd.oci.image.index.v1+json` index and confirm it lists `linux/amd64` and `linux/arm64`. If a design doc or release note quotes a digest prefix, check that the resolved digest starts with it. Then confirm the pinned reference runs the expected version, for example `docker run --rm caddy:2.11.9@sha256:<digest> caddy version`.
+
+3. Replace every reference in one change. For Caddy that is `edge` and `tailnet-gateway` in `infra/platform/docker-compose.yml`, `caddyImage` in `scripts/test-edge-config.ts`, and the sample `infra/platform/release.json` (recompute its `digest` with `bundleDigest` from `@ark-stack/shared`). `rg '<old version>'` should then match only historical docs.
+4. Run the image's integration task. For Caddy, `mise run test:edge` fails unless both Compose services use exactly the tested pin. It then validates every rendered and static Caddyfile and runs the edge behaviour tests in disposable containers: header stripping, `Server`/`Via` removal (including a control proving `header_down -Via` alone is insufficient), WebSockets across `/load` and 80 s of idle, and certificate reload with `Cache-Control: must-revalidate`. The run takes about 100 s.
+5. In the PR, record the full digest, how it was resolved and verified, and the integration-task output. Roll the release out through `mise run maintain` (above).
+
 ## Import
 
 `mise run import -- inventory.json` compares domains, databases, and services. Owners are never imported. Stop the old reconcilers before transferring a live mail domain.
