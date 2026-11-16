@@ -28,4 +28,5 @@ export * from "./schemas.ts";
 export * from "./ses.ts";
 export * from "./sql-guard.ts";
 export * from "./stalwart.ts";
+export * from "./tailnet.ts";
 export * from "./update-policy.ts";

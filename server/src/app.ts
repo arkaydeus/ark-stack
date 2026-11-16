@@ -261,7 +261,8 @@ app.all("/api/auth/*", async (c) => {
 // every poll, minting a deployment revision each time. Module workers get `update.detect` only.
 const workerPrefixes: Record<string, string[]> = {
   database: ["database.", "pgbouncer."],
-  domains: ["domain.", "dns.", "certificate.", "edge.", "admin."],
+  // `integration.` (front door §3.4): the domain worker is the only worker with external egress.
+  domains: ["domain.", "dns.", "certificate.", "edge.", "admin.", "integration."],
   mail: ["mail.", "mailbox.", "ses."],
   backup: ["backup.", "update.detect", "import."],
   agent: ["service.", "update.apply"],
@@ -276,6 +277,7 @@ const workerPrefixes: Record<string, string[]> = {
     "certificate.",
     "edge.",
     "admin.",
+    "integration.",
     "backup.",
     "update.detect",
     "import.",

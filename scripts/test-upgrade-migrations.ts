@@ -35,6 +35,13 @@ const legacyAccount = {
     "0123456789abcdef0123456789abcdef:be37d324a8b88b115aa8f3e16c8ae13c575bcd3f3846e66dddfdd7559af107edac38b954feb0bd0065b0702ac6f5a958534ae850b367ec28c45fe6fce02eff7f",
 };
 const createdAt = new Date("2025-01-02T03:04:05.000Z");
+// A signed-in session from before the front door existed (0013 adds a required session.origin).
+const legacySession = {
+  id: "legacy-upgrade-session",
+  token: "legacy-upgrade-session-token",
+  user_id: legacyUser.id,
+  expires_at: new Date("2099-01-01T00:00:00.000Z"),
+};
 
 function runMigration() {
   return new Promise<void>((resolve, reject) => {
@@ -76,6 +83,12 @@ try {
       VALUES (${legacyAccount.id}, 'http://localhost:3000', ${legacyAccount.account_id},
         ${legacyAccount.provider_id}, ${legacyAccount.user_id}, ${legacyAccount.password}, ${createdAt}, ${createdAt})
     `;
+    await target`
+      INSERT INTO session (id, expires_at, token, user_id, created_at, updated_at)
+      VALUES (${legacySession.id}, ${legacySession.expires_at}, ${legacySession.token},
+        ${legacySession.user_id}, ${createdAt}, ${createdAt})
+    `;
+    await target`INSERT INTO platform_settings (id) VALUES ('default') ON CONFLICT DO NOTHING`;
   } finally {
     await target.end();
   }
@@ -126,6 +139,53 @@ try {
       "Upgrade must preserve the existing credential account and password hash.",
     );
 
+    // 0013_front_door.sql must run after 0012_drop_account_issuer.sql over the same install.
+    const applied = await verified`SELECT id FROM ark_migrations ORDER BY id`;
+    const order = applied.map((row) => row.id as string);
+    assert.ok(order.includes("0013_front_door.sql"), "The front-door migration must be applied.");
+    assert.equal(
+      order.indexOf("0013_front_door.sql"),
+      order.indexOf("0012_drop_account_issuer.sql") + 1,
+      "0013 must follow 0012 directly.",
+    );
+    const [origin] = await verified`
+      SELECT is_nullable, column_default FROM information_schema.columns
+      WHERE table_name = 'session' AND column_name = 'origin'
+    `;
+    assert.deepEqual(origin, { is_nullable: "NO", column_default: null }, "session.origin has no default.");
+    const [retainedSession] = await verified`
+      SELECT id, token, user_id, origin FROM session WHERE id = ${legacySession.id}
+    `;
+    assert.deepEqual(
+      retainedSession,
+      { id: legacySession.id, token: legacySession.token, user_id: legacySession.user_id, origin: "admin" },
+      "Existing sessions must be backfilled to origin = admin.",
+    );
+    await assert.rejects(
+      verified`
+        INSERT INTO session (id, expires_at, token, user_id)
+        VALUES ('missing-origin', now() + interval '1 day', 'missing-origin-token', ${legacyUser.id})
+      `,
+      /null value in column "origin"/,
+      "A session insert that omits origin must fail.",
+    );
+    const [frontDoorSettings] = await verified`
+      SELECT pooler_source_cidrs, pooler_allow_internet, gate_login_mode
+      FROM platform_settings WHERE id = 'default'
+    `;
+    assert.deepEqual(
+      frontDoorSettings,
+      { pooler_source_cidrs: [], pooler_allow_internet: false, gate_login_mode: "disabled" },
+      "Front-door exposure must default closed on upgrade.",
+    );
+    const frontDoorTables = await verified`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name IN ('tailnet_snapshots', 'tailnet_nodes',
+        'private_cas', 'front_routes', 'front_route_access', 'gate_handoffs', 'gate_sessions',
+        'client_certificates', 'database_clients', 'vercel_integrations', 'backup_targets')
+    `;
+    assert.equal(frontDoorTables.length, 11, "Every front-door table must exist after the upgrade.");
+
     // Import the production auth configuration only after selecting the disposable
     // database, so its singleton connection cannot touch the source database.
     const authUrl = "http://127.0.0.1:3000";
@@ -148,7 +208,9 @@ try {
       const rejected = await signIn(`${legacyPassword}-wrong`);
       assert.equal(rejected.status, 401, "An incorrect legacy password must be rejected.");
       assert.equal((await rejected.json()).code, "INVALID_EMAIL_OR_PASSWORD");
-      const sessions = await verified`SELECT id FROM session WHERE user_id = ${legacyUser.id}`;
+      const sessions = await verified`
+        SELECT id FROM session WHERE user_id = ${legacyUser.id} AND id <> ${legacySession.id}
+      `;
       assert.equal(sessions.length, 0, "A rejected password must not create a session.");
 
       const accepted = await signIn(legacyPassword);
@@ -158,14 +220,17 @@ try {
       assert.equal(signedIn.user.email, legacyUser.email);
       assert.ok(signedIn.token, "Successful sign-in must return a session token.");
       const [session] = await verified`
-        SELECT user_id FROM session WHERE token = ${signedIn.token}
+        SELECT user_id, origin FROM session WHERE token = ${signedIn.token}
       `;
       assert.equal(session?.user_id, legacyUser.id, "The token must belong to the migrated user.");
+      assert.equal(session?.origin, "admin", "A sign-in on the admin origin must record origin = admin.");
     } finally {
       await sql.end();
     }
     console.log(
-      "Legacy credential data preserved; incorrect password rejected and correct password signed in.",
+      "Legacy credential data preserved; incorrect password rejected and correct password signed in.\n" +
+        "0013_front_door.sql applied after 0012; legacy session backfilled to origin = admin; " +
+        "an insert omitting origin was refused; new sign-in recorded origin = admin.",
     );
   } finally {
     await verified.end();

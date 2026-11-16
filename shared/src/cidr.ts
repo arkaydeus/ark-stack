@@ -72,7 +72,8 @@ function ipv6Parts(part: string) {
   return part ? part.split(":") : [];
 }
 
-function prefixMatch(value: Uint8Array, network: Uint8Array, bits: number) {
+/** True when the first `bits` bits of `value` equal those of `network` (both 4- or 16-byte addresses). */
+export function prefixMatch(value: Uint8Array, network: Uint8Array, bits: number) {
   const full = Math.floor(bits / 8);
   const rem = bits % 8;
   for (let i = 0; i < full; i++) {
