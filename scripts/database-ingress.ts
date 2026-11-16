@@ -132,6 +132,11 @@ async function reconcile() {
   reconciling = true;
   try {
     const expose = await shouldExpose();
+    // Revocation must not wait for nft or the pooler's admin socket to recover.
+    if (!expose) {
+      stopListener();
+      await writeStatus({ applied: false, enforced: false, exposed: false });
+    }
     if (!existsSync(nftFile)) {
       stopListener();
       attemptedRules = null;
@@ -139,12 +144,14 @@ async function reconcile() {
       await writeStatus({ applied: true, enforced: false, exposed: false });
     } else {
       await applyNft();
-      if (expose) startListener();
+      // Re-read after nft: a revocation arriving during apply must not reopen admission.
+      const exposeNow = expose && (await shouldExpose());
+      if (exposeNow) startListener();
       else stopListener();
       // An empty allowlist installs only the per-source limits, so the table exists but no CIDR
       // allowlist is enforced. Report that honestly rather than claiming enforcement.
       const enforced = dbIngressAllowlistEnforced(appliedRules ?? "");
-      await writeStatus({ applied: true, enforced, exposed: expose && Boolean(server) });
+      await writeStatus({ applied: true, enforced, exposed: exposeNow && Boolean(server) });
       await exportCounters();
     }
   } catch (error) {
@@ -184,3 +191,13 @@ setInterval(() => {
     if (desired !== appliedRules || (await shouldExpose()) !== Boolean(server)) await reconcile();
   })().catch((error) => console.error(`database ingress refresh failed: ${String(error)}`));
 }, 1500);
+
+// File notifications may be coalesced or delayed across host filesystems. Poll only closure
+// requests (never reopen from polling) so revocation cannot retain an old public listener.
+setInterval(() => {
+  void shouldExpose()
+    .then((expose) => {
+      if (!expose && (server || !existsSync(statusFile))) void reconcile();
+    })
+    .catch((error) => console.error("public database closure poll failed", error));
+}, 250);

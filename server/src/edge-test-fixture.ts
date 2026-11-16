@@ -36,7 +36,13 @@ async function command(args: string[], env = process.env) {
 }
 
 // Resolve the actual shipped manifest with production, staging and omitted selections.
-const composeEnv = { ...process.env, ...parseEnvFile(await Bun.file(join(root, ".env.example")).text()) };
+// `docker compose config` only interpolates; the installer-generated PgBouncer admin password is
+// required by Compose but never used here, so a validation-only placeholder satisfies it.
+const composeEnv: Record<string, string | undefined> = {
+  ARK_PGBOUNCER_ADMIN_PASSWORD: "config-validation-only",
+  ...process.env,
+  ...parseEnvFile(await Bun.file(join(root, ".env.example")).text()),
+};
 async function stagingSetting(value?: string) {
   const env = { ...composeEnv };
   delete env.ARK_ACME_STAGING;

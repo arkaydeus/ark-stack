@@ -456,7 +456,11 @@ table inet ark_db_ingress {
       ]) {
         assert.ok(installed.includes(expected), `Startup must install ${expected} in the kernel.`);
       }
-      assert.equal(await ingressFile("pgbouncer/expose"), "1\n");
+      assert.equal(
+        await ingressFile("pgbouncer/expose"),
+        "0\n",
+        "Startup installs rate limits but cannot expose a database without an admitted mTLS client.",
+      );
       assert.equal(
         await ingressFile("pgbouncer/pgbouncer.ini").catch(() => "missing"),
         "missing",
