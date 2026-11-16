@@ -2196,6 +2196,8 @@ The tickets are ordered so that each one can be built, tested and merged on its 
 
 Every ticket includes the repository's standard gates: `mise run format:check`, `mise run lint`, `mise run typecheck`, `mise run test`, and `mise run test:edge` where the edge is touched.
 
+**Executable checks of this document's examples belong to the implementation tickets, not to this design change.** Every ticket that implements a literal example from this document (SQL, Caddyfile, HAProxy configuration, PgBouncer INI/HBA, nftables) must include **runtime tests of that example** in its acceptance criteria. The tests run under the repository's existing Bun/TypeScript test tasks (`mise run test` or `mise run test:edge`) and **must not add a Python dependency**. For reference, the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) extracted and exercised the revision 3 examples in pinned containers. Its cases are a starting checklist, not a passing test suite.
+
 ### FD-01: Make `pgbouncer-public` start, and upgrade PgBouncer to 1.26.1 (**started separately**)
 
 - **Status:** already in progress outside this design. Listed here for dependencies only.
@@ -2262,6 +2264,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Add `requireOwner` and use it for route management.
 - **Depends on:** none.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.1 migration SQL (fresh install and upgrade after `0012`)) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Execute the **literal SQL in §3.1** on both a fresh schema migrated through 0012 and an upgrade fixture through 0012; FK creation succeeds, old sessions backfill to admin, and a new session insert omitting origin fails.
   - [ ] The target validator rejects expired/incomplete snapshots, source mismatches and peers from a previous generation.
   - [ ] `mise run test:upgrade` applies `0013` after `0012_drop_account_issuer.sql` over the representative pre-existing schema.
@@ -2295,13 +2298,14 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
 
 - **Scope:**
   - Add the restricted `haproxy-validator` target, immutable candidate generations, installer numeric UID/shared GID 4400 initialization, socket modes and config/certificate permissions (§3.8.6). Connect the FD-06 edge-local lease watchdog to HAProxy and add its fail-closed launch guard (§3.2).
-  - Extend **in-repo `mise run test:edge`**, not just external prototypes, to cover HAProxy → Caddy PROXY trust and strict SNI/Host handling on the exact rendered configuration.
+  - Extend **in-repo `mise run test:edge`** (Bun/TypeScript, no Python dependency), not just external prototypes, to cover HAProxy → Caddy PROXY trust and strict SNI/Host handling on the exact rendered configuration.
   - Add the `edge-l4` service (HAProxy 3.2.26, digest-pinned) in the `edge-ts` netns, owning 443.
   - Caddy HTTPS sites move to `127.0.0.1:8443` with a server-scoped `proxy_protocol` wrapper (`fallback_policy require`, no `allow` list; loopback bind restricts the transport), `strict_sni_host on` and `protocols h1 h2`.
   - `edge.l4_apply` renders `fe_tls443`: HTTP and login hostnames go to Caddy through `send-proxy-v2`; unknown SNI goes to Caddy; non-TLS is rejected after 5 s.
   - Master-socket reload and the admin socket, shared with the domain worker.
 - **Depends on:** FD-04, FD-05, FD-06, FD-24.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.5 Caddyfile global block and the §3.8.5 `fe_tls443` frontend (PROXY v2 trust, strict SNI/Host)) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Using the actual pinned image users, `bun` domain-worker with `group_add: [4400]`, `cap_drop: [ALL]` and no Docker access can validate a good generation, read `show stat`, reload, enumerate current/leaving workers and shut down route sessions through the shared sockets. An invalid candidate is refused before changing the serving symlink or sending reload.
   - [ ] Headerless loopback TLS to 127.0.0.1:8443 is refused; HAProxy-emitted PROXY v2 succeeds, carries the real address, and forged PROXY from Docker peers cannot reach the listener. Both SNI/Host mismatch 421 and headerless rejection run in `test:edge`, not only V-14.
   - [ ] HTTPS to every HTTP route works through 443, and the upstream sees the real client address in `X-Forwarded-For`, not `127.0.0.1` (IPv4 now; IPv6 after FD-27).
@@ -2378,6 +2382,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Input validation and an injection fuzz test.
 - **Depends on:** FD-08, FD-25.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.5 Caddyfile site blocks (header stripping, rewrites, error pages, apex redirect)) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] With an enabled `access_mode=sso` fixture before FD-11, the route is absent or rendering fails. Deployment cannot expose it without forward_auth.
   - [ ] Redirect fixtures include `//home.tail1234.ts.net/login`, `//100.101.102.103?x=1`, bracketed compressed and expanded IPv6, explicit ports, authority-only URLs and no trailing slash. No known internal authority reaches a response or browser redirect.
   - [ ] `mise run test:edge` validates the rendered config on 2.11.9.
@@ -2404,6 +2409,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Stricter rate-limit `customRules` for sign-in and two-factor.
 - **Depends on:** FD-09.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.5 login-origin site block and its path allowlist) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Runtime-test Host=www.example.com against `/api/auth/sign-in/email`: refusal, no session inserted and no admin fallback. A server-side call without explicit origin fails, as does a literal insert omitting origin.
   - [ ] An already-TOTP-enrolled admin signs in at the login origin: POST enable and get-totp-uri both return 403, existing secret/backup codes unchanged. A new gate user can complete first enrollment, and cannot repeat it after verification.
   - [ ] From JavaScript on a sibling route, plant an attacker session cookie with Domain=example.com and Path=/gate: `/gate/authorize` must not honor it. All authentication and two-factor cookies carry enforced `__Host-` attributes.
@@ -2425,6 +2431,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - `access_mode: sso` rendering, bypass paths, and `front_route_access` (users only) with `PUT /api/front/routes/:id/access` (owner).
 - **Depends on:** FD-10.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.5 `forward_auth`, callback and logout routing) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Against the literal rendered Caddyfile, fake API sees `/api/gate/callback?code=…&state=…` unchanged in query and `/api/gate/logout-route` for logout; unknown `/.ark/gate/*`, including check/users, returns 404 without touching API. Wrong callback/logout methods return 405. Edge token grants no admin access.
   - [ ] Keep a socket open separately through access removal, user deletion, session deletion/sign-out, logout-everywhere, MFA reset, route logout and mode change, with no unrelated reload. Each closes by revocation +305 s; kill the worker/reject apply to test durable retry and watchdog fail-closed behavior.
   - [ ] A page on sibling route A cannot open an authenticated WebSocket to B (403), while B can connect to itself. Explicit approved origin exceptions work; null/missing/disallowed origins and unsafe cookie HTTP methods fail unless the documented CSRF contract is met.
@@ -2479,6 +2486,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - UI protocol guidance (the §3.8.2 table).
 - **Depends on:** FD-06, FD-08, FD-13, FD-25.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.8.5 TLS-TCP and raw-TCP frontends and backends) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Run the literal §3.8.5 example for passthrough, terminate and terminate_mtls with SNI mqtt.example.com, each with full and fragmented ClientHello. Outside-CIDR sources fail; allowed sources with the required authentication succeed.
   - [ ] Two TLS routes on 443: the eleventh connection from a source at limit 10 fails; another allowed source and the other route retain capacity. Original source remains visible after the PROXY loop.
   - [ ] Open sessions before and after multiple reloads, then race new connections with revocation. All affected sessions close within 5 s across current/leaving workers, new admission stays closed and another route's live sessions survive.
@@ -2503,6 +2511,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - UI checklist for target hardening, and driver guidance.
 - **Depends on:** FD-01, FD-25. The `postgres` route kind also needs FD-14's route plumbing.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.8.5 `fe_pg5432` frontend and its backends) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Two managed databases request disjoint CIDRs and an unrestricted Vercel client: publication is refused until a common pooler-wide policy is explicitly reviewed. A B-source connection to database A is never reported as isolated by A's CIDRs. Test API/UI conflict status and no silently unioned allowlist; use separate listeners/private access if isolation is required.
   - [ ] The V-13 matrix is reproduced in CI (containers):
     - psql 17+ and node-postgres ≥ 8.22, classic → PgBouncer;
@@ -2525,6 +2534,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Apply through the `database-ingress` reconciler, with status-file readback.
 - **Depends on:** FD-14, FD-26.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.11 `ark_front` ruleset) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Generated rulesets pass `nft -c` (CI container with `NET_ADMIN`).
   - [ ] On the test host, CIDR denial on a raw port is proven from an outside IPv4 and an outside IPv6 address.
   - [ ] A range port with no enabled route drops traffic.
@@ -2540,6 +2550,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Bundle generation follows active clients' current, linked pending and retiring certificate generations; exclude revoked clients/generations and past retirement deadlines, never just the current ca_id pointer.
 - **Depends on:** FD-01, FD-13.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.10.2 PgBouncer INI and HBA) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Start the pinned PgBouncer image with the **exact extracted INI and HBA**; prove expected socket path, SCRAM admin login and verify-full/TLS1.3 for network clients. The same admin password plus a valid application cert fails on the public endpoint and succeeds over the shared Unix socket.
   - [ ] Swap the database server certificate files, run renewal and confirm via openssl s_client through public 5432 that the served fingerprint changes. Simulate reload failure and verify retry/expiry alert rather than a false serving-success state.
   - [ ] The V-8 matrix is reproduced in CI: valid cert plus password is accepted; no cert, a rogue CA, a wrong password and TLS 1.2 are each rejected.
@@ -2609,6 +2620,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Export nft counters as metrics.
 - **Depends on:** none. The rules match TCP 5432 on both the `input` and `forward` hooks, so they work before and after FD-26.
 - **Acceptance criteria:**
+  - [ ] Runtime tests of the document example this ticket implements (the §3.11 `ark_db_ingress` ruleset) run under the existing Bun/TypeScript test tasks, with no Python dependency. See the prototype harness `scripts/test-front-door-design.py` in commit `91961c4` (removed again to keep this design PR doc-only) for reference cases.
   - [ ] Generated rules pass `nft -c`.
   - [ ] On a test host, opening more than N concurrent connections from one IP drops the excess, while another IP still connects.
 
@@ -2791,13 +2803,22 @@ All twelve revision 1 questions are resolved (§0.1). Revision 2 raises these sm
 
 ## 7. Verification log
 
-**Revision 3 coverage status.** [`scripts/test-front-door-design.py`](../../scripts/test-front-door-design.py), invoked by `mise run test:edge`, extracts the literal SQL, Caddyfile, HAProxy config and PgBouncer INI/HBA here. It generates disposable certificates, starts pinned containers as their unmodified users, and checks fresh/upgrade SQL execution after 0012, missing-origin refusal, full/fragmented TLS CIDR denial/admission in all three modes, required PROXY headers, SNI/Host 421, exact callback/logout rewrites and query preservation, wildcard 404s, scheme-relative redirects and local-only PgBouncer admin access. It requires Python 3, OpenSSL and Docker and cleans its own containers/networks/temporary fixtures. A fake API proves proxy plumbing only; this does **not** implement or prove the future gate's authorization decisions.
+**Revision 3 coverage status.** During the review, a prototype harness, `scripts/test-front-door-design.py`, was added in commit `91961c4` and wired into `mise run test:edge`. It extracted the literal SQL, Caddyfile, HAProxy config and PgBouncer INI/HBA from this document, generated disposable certificates, started pinned containers as their unmodified users, and checked:
+
+- fresh and upgrade SQL execution after 0012, and missing-origin refusal;
+- full and fragmented TLS CIDR denial and admission in all three modes;
+- required PROXY headers, and SNI/Host 421;
+- exact callback and logout rewrites with query preservation;
+- wildcard 404s and scheme-relative redirects;
+- local-only PgBouncer admin access.
+
+A fake API proved proxy plumbing only, **not** the future gate's authorization decisions. The harness passed at `91961c4` (V-21). **It has since been removed** so that this design PR changes only this document and adds no Python dependency to the repository's test tasks. Its cases now live in the acceptance criteria of FD-04, FD-09, FD-10, FD-11, FD-14, FD-15, FD-16, FD-18, FD-25 and FD-26, to be implemented with the existing Bun/TypeScript tooling (§5).
 
 The historical prototypes below do not establish the other corrected security properties. FD-10 still requires runtime tests on pinned Better Auth for permitted/unknown hosts, origin provenance, MFA isolation and sibling-cookie injection. FD-29 requires mocked **and real-API** token-scope refusals before any secret persistence, with connection disabled until proof. FD-06/14/21/28/30 require the specified real-tailnet, multi-generation drain, provider-lock, retirement and isolated recovery tests. Those remain feature release gates, not passing tests claimed by this design change.
 
 These are the prototypes run for this design, outside the repository: under `/tmp/ark-fd-proto` (revision 1, V-1 to V-12) and `/tmp/ark-fd-proto2` (revision 2, V-13 to V-20). All were run on 2026-11-16 with Docker 29.9.2 (Docker Desktop, arm64 Linux VM).
 
-V-21 is the revision 3 in-repository example suite described above, run successfully on 2026-11-16. V-1, V-5 and V-6 ran on Caddy 2.10.2, and V-16 re-ran them on 2.11.9 with identical results. V-12 covered the revision 1 examples; V-20 covers the revision 2 examples.
+V-21 is the revision 3 prototype harness described above. It ran successfully on 2026-11-16 at commit `91961c4` and is no longer in the repository. V-1, V-5 and V-6 ran on Caddy 2.10.2, and V-16 re-ran them on 2.11.9 with identical results. V-12 covered the revision 1 examples; V-20 covers the revision 2 examples.
 
 | ID   | What                                                                                                                                                                                                                                                                                                                          | Result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

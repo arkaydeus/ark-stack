@@ -31,7 +31,7 @@ Useful commands:
 | `mise run test:e2e`               | disposable real-browser signup/MFA/wizard   |
 | `mise run test:upgrade`           | representative additive schema upgrade      |
 | `mise run test:stalwart`          | disposable native Stalwart lifecycle test   |
-| `mise run test:edge`              | Caddy + front-door example runtime checks   |
+| `mise run test:edge`              | generated/static Caddy validation           |
 | `mise run recover -- status`      | local lockout / bootstrap inspection        |
 | `mise run recover:mfa -- …`       | token- and confirmation-gated MFA reset     |
 | `mise run host:install`           | build and start the complete host topology  |
