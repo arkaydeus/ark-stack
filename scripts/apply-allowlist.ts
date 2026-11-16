@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 
+import { dbIngressAllowlistEnforced } from "@ark-stack/shared";
+
 const file = process.argv[2] ?? join(process.cwd(), "tmp", "pgbouncer", "allowlist.nft");
 const dir = join(file, "..");
 const composeFile =
@@ -41,9 +43,9 @@ try {
   if (expose && process.env.ARK_PUBLIC_DB_CONTROL === "1") {
     await run("docker", ["compose", "-f", composeFile, "up", "-d", "database-ingress", "pgbouncer-public"]);
   }
-  // An empty allowlist installs an accept-only chain, so the table exists but nothing is
-  // enforced. Report that honestly rather than claiming enforcement.
-  const enforced = (await Bun.file(file).text()).includes("drop");
+  // An empty allowlist installs only the per-source limits, so the table exists but no CIDR
+  // allowlist is enforced. Report that honestly rather than claiming enforcement.
+  const enforced = dbIngressAllowlistEnforced(await Bun.file(file).text());
   await writeFile(statusFile, `applied=true\nenforced=${enforced}\nexposed=${expose}\nerror=\n`, {
     mode: 0o600,
   });

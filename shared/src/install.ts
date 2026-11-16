@@ -80,6 +80,7 @@ export function generateInstallSecrets() {
     ARK_COMPOSE_DIR: "./tmp/compose",
     ARK_MAIL_STATE_DIR: "./tmp/mail-state",
     ARK_PGBOUNCER_DIR: "./tmp/pgbouncer",
+    ARK_DB_INGRESS_METRICS_DIR: "./tmp/db-ingress",
     ARK_EDGE_DIR: "./infra/platform",
   };
 }

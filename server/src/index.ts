@@ -1,7 +1,7 @@
 import { assertNoPlaceholderSecrets } from "@ark-stack/shared";
 
 import { loadEnv } from "./env.ts";
-import { startCoordinator } from "./coordinator.ts";
+import { reconcileDatabaseIngressOnStartup, startCoordinator } from "./coordinator.ts";
 import { app } from "./app.ts";
 import { startOffhostHeartbeat } from "./modules/offhost-heartbeat.ts";
 
@@ -12,6 +12,9 @@ if (process.env.ARK_BACKUP_REQUIRED === "1" && process.env.ARK_BACKUP_EXECUTE !=
 }
 
 if (process.env.ARK_SKIP_LISTEN !== "1") {
+  // Queue on every API startup, including external-worker deployments. Fail startup if the
+  // reconciliation cannot be recorded; apply errors remain visible as failed operations.
+  await reconcileDatabaseIngressOnStartup();
   startOffhostHeartbeat();
   if (env.embeddedWorkers) {
     console.warn("ARK_EMBEDDED_WORKERS is enabled; provider adapters are running inside the API process.");

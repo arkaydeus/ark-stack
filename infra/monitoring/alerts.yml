@@ -36,3 +36,26 @@ groups:
           severity: critical
         annotations:
           summary: An Ark Stack worker heartbeat is stale
+      # Public database port per-source limits (docs/design/front-door.md §3.11, FD-18).
+      # Counters reset whenever the ruleset is reapplied; rate() handles the reset.
+      - alert: ArkDatabaseIngressDrops
+        expr: sum by (reason, family) (rate(ark_nft_drop_packets_total{table="ark_db_ingress"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: The public database port has been dropping connections for 10 minutes
+          description: >-
+            nftables table ark_db_ingress dropped {{ $value | printf "%.2f" }} packets/s for reason
+            {{ $labels.reason }} ({{ $labels.family }}). A client may be over the per-source limits
+            in platform settings, or someone is abusing the public pooler.
+      - alert: ArkDatabaseIngressCountersStale
+        expr: >-
+          ark_nft_counters_present{table="ark_db_ingress"} == 0
+          or (ark_nft_counters_present{table="ark_db_ingress"} == 1
+          and ark_nft_counters_age_seconds{table="ark_db_ingress"} > 300)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The database-ingress reconciler has stopped reporting nftables counters

@@ -109,36 +109,3 @@ export function clientAllowed(cidrs: string[], ip: string) {
   }
   return { allowed: false, reason: "source-not-allowlisted" as const };
 }
-
-export function nftAllowlist(cidrs: string[], port = 5432) {
-  const valid = cidrs.map((item) => parseCidr(item)).filter((item) => item.ok);
-  const v4 = valid.filter((item) => item.version === 4).map((item) => `    ip saddr ${item.cidr} accept`);
-  const v6 = valid.filter((item) => item.version === 6).map((item) => `    ip6 saddr ${item.cidr} accept`);
-  // An empty allowlist still emits a real table with an accept-only chain. Emitting a bare
-  // `delete table` instead would leave hosts with nothing to read back, and the reconcilers
-  // treat a missing table as a failed apply and close the listener.
-  const policy = valid.length
-    ? `# Default deny applies only to tcp/${port}.\n${[...v4, ...v6].join("\n")}\n    drop`
-    : `# Empty allowlist: any authenticated client may reach tcp/${port}.\n    accept`;
-  const [comment, ...rules] = policy.split("\n");
-  return `#!/usr/sbin/nft -f
-# Generated public database source policy.
-${comment}
-# input covers a host-namespace listener; forward covers Docker DNAT to a published port.
-table inet ark_db_ingress
-delete table inet ark_db_ingress
-table inet ark_db_ingress {
-  chain input {
-    type filter hook input priority -1; policy accept;
-    tcp dport ${port} jump ark_db_allow
-  }
-  chain forward {
-    type filter hook forward priority -1; policy accept;
-    ct status dnat tcp dport ${port} jump ark_db_allow
-  }
-  chain ark_db_allow {
-${rules.join("\n")}
-  }
-}
-`;
-}

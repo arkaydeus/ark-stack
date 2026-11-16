@@ -25,6 +25,7 @@ import {
   PGBOUNCER_SOCKET_DIR,
   planEdge,
   planHash,
+  platformDbIngressLimits,
   validateMaintenanceBundle,
   type BackupStatus,
   type DnsWrite,
@@ -1409,6 +1410,37 @@ async function reconcileSesOp(operation: OperationRow) {
   });
 }
 
+/** Reconcile persisted pre-upgrade policy through the normal, observable worker operation. */
+export async function reconcileDatabaseIngressOnStartup() {
+  const publicDatabases = await db
+    .select({ id: managedDatabases.id })
+    .from(managedDatabases)
+    .where(eq(managedDatabases.exposure, "public"));
+  if (!publicDatabases.length) return null;
+  return enqueue({
+    kind: "pgbouncer.reload",
+    targetIds: [],
+    payload: { reason: "startup-db-ingress-policy" },
+  });
+}
+
+async function applyCurrentDatabaseIngress(
+  databases: Array<typeof managedDatabases.$inferSelect>,
+  dir: string,
+  expose: boolean,
+) {
+  const publicDatabases = databases.filter((item) => item.exposure === "public");
+  const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
+  if (cidrs.length) assertCidrs(cidrs);
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const limits = platformDbIngressLimits(settings);
+  const allowlist = await applyDatabaseAllowlist(dir, cidrs, 5432, {
+    expose,
+    limits,
+  });
+  return { cidrs, limits, allowlist };
+}
+
 /** Dedup key of the alert raised when PgBouncer cannot be reloaded or serves the wrong certificate. */
 export const PGBOUNCER_RELOAD_ALERT = "pgbouncer-reload";
 
@@ -1475,6 +1507,26 @@ async function reloadPgbouncer(operation: OperationRow) {
   });
   // Revoke the route before any rendering, secret or socket error can leave old admission live.
   if (!plan.routed) await fenceDatabasePublicListener(pgbouncerDir());
+  if (operation.payload?.reason === "startup-db-ingress-policy") {
+    // An upgrade changes only the host firewall policy. Existing PgBouncer configuration,
+    // credentials and TLS files must not depend on a separate reload executor being present.
+    const { cidrs, limits, allowlist } = await applyCurrentDatabaseIngress(
+      databases,
+      pgbouncerDir(),
+      plan.routed,
+    );
+    for (const database of databases) {
+      await db
+        .update(managedDatabases)
+        .set({
+          allowlistEnforced:
+            database.exposure === "public" && Boolean(database.sourceCidrs?.length) && allowlist.enforced,
+        })
+        .where(eq(managedDatabases.id, database.id));
+    }
+    await addStep(operation.id, "db-ingress-startup", { cidrs, limits, ...allowlist });
+    return;
+  }
   const dbEndpoint = (await db.select().from(endpoints)).find((item) => item.kind === "database");
   // A payload-less reload must recover an earlier failed renewal too. The latest pending row
   // describes the files on disk; an older queued operation must not verify a superseded leaf.
@@ -1566,11 +1618,8 @@ async function reloadPgbouncer(operation: OperationRow) {
         .where(eq(endpoints.id, certificate.endpointId));
     }
   }
-  const publicDatabases = databases.filter((item) => item.exposure === "public");
-  const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
-  if (cidrs.length) assertCidrs(cidrs);
-  // With no admitted client, PgBouncer is not routed publicly at all.
-  const allowlist = await applyDatabaseAllowlist(written.dir, cidrs, 5432, { expose: plan.routed });
+  // Apply persisted rate limits while retaining the admitted-client routing decision.
+  const { cidrs, limits, allowlist } = await applyCurrentDatabaseIngress(databases, written.dir, plan.routed);
   const mapped = new Set(plan.mappings.map((item) => item.database));
   for (const database of databases) {
     const allowlistReady = !database.sourceCidrs?.length || allowlist.enforced;
@@ -1595,6 +1644,7 @@ async function reloadPgbouncer(operation: OperationRow) {
     generations: plan.generations,
     excluded: plan.excluded,
     cidrs,
+    limits,
     dir: written.dir,
     reloaded,
     attempts: reload?.attempts ?? 0,

@@ -404,3 +404,35 @@ test("a stale closed acknowledgement cannot satisfy the route fence", async () =
   await expect(fenceDatabasePublicListener(dir, 30)).rejects.toThrow(/did not acknowledge closure/);
   expect(await Bun.file(join(dir, "expose")).text()).toBe("0\n");
 });
+
+test("startup installs ingress limits without reopening a revoked client or rewriting pooler files", async () => {
+  const previousDir = process.env.ARK_PGBOUNCER_DIR;
+  const dir = join(work, "startup-revoked");
+  await mkdir(dir);
+  await Bun.write(join(dir, "expose"), "1\n");
+  await Bun.write(join(dir, PGBOUNCER_FILES.config), "existing pooler configuration\n");
+  process.env.ARK_PGBOUNCER_DIR = dir;
+  const admin = spyOn(pooler, "reloadPgbouncerAdmin").mockImplementation(async () => {
+    throw new Error("Startup policy reconciliation must not reload PgBouncer.");
+  });
+  try {
+    const operation = await enqueue({
+      kind: "pgbouncer.reload",
+      targetIds: [],
+      payload: { reason: "startup-db-ingress-policy" },
+    });
+    operationIds.push(operation.id);
+    await runOperation("pgbouncer.reload", operation);
+    expect(await Bun.file(join(dir, "expose")).text()).toBe("0\n");
+    expect(await Bun.file(join(dir, PGBOUNCER_FILES.config)).text()).toBe("existing pooler configuration\n");
+    const rules = await Bun.file(join(dir, "allowlist.nft")).text();
+    expect(rules).toContain("ct count over 128");
+    expect(rules).toContain("limit rate over 30/second burst 60 packets");
+    expect(admin).not.toHaveBeenCalled();
+    const steps = await db.select().from(operationSteps).where(eq(operationSteps.operationId, operation.id));
+    expect(steps.some((step) => step.name === "db-ingress-startup")).toBe(true);
+  } finally {
+    admin.mockRestore();
+    process.env.ARK_PGBOUNCER_DIR = previousDir;
+  }
+});

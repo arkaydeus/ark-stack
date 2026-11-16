@@ -31,7 +31,16 @@ await Bun.write(envPath, mergeInstallEnv(hasEnv ? existing : template, generated
 // `.env` holds every platform secret and `Bun.write` creates it 0644.
 await chmod(envPath, 0o600);
 const edgeAuthKey = await configureEdgeAuthKey(envPath);
-for (const path of ["certs", "acme", "backups", "restore-runs", "pgbouncer", "edge", "mail-state"]) {
+for (const path of [
+  "certs",
+  "acme",
+  "backups",
+  "restore-runs",
+  "pgbouncer",
+  "db-ingress",
+  "edge",
+  "mail-state",
+]) {
   await mkdir(join(root, "tmp", path), { recursive: true });
 }
 await mkdir(join(root, "tmp", "certs", "database"), { recursive: true });
@@ -89,7 +98,16 @@ await chmod(join(root, "tmp", "metrics.token"), 0o600);
 const containerUid = Number(process.env.ARK_CONTAINER_UID ?? "1000");
 const containerGid = Number(process.env.ARK_CONTAINER_GID ?? "1000");
 if (process.platform === "linux" && process.getuid?.() === 0) {
-  for (const path of ["certs", "acme", "backups", "restore-runs", "pgbouncer", "edge", "mail-state"]) {
+  for (const path of [
+    "certs",
+    "acme",
+    "backups",
+    "restore-runs",
+    "pgbouncer",
+    "db-ingress",
+    "edge",
+    "mail-state",
+  ]) {
     await chownRecursive(join(root, "tmp", path), containerUid, containerGid);
   }
 }

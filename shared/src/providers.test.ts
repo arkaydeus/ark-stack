@@ -5,7 +5,7 @@ import { funnelDisabled, renderCaddyfile, renderTailscaleServe } from "./edge.ts
 import { compareInventory } from "./import-inventory.ts";
 import { generateInstallSecrets, hostLossChecklist, mergeInstallEnv } from "./install.ts";
 import { pgbouncerUserlist } from "./pgbouncer.ts";
-import { nftAllowlist } from "./cidr.ts";
+import { nftAllowlist } from "./db-ingress.ts";
 import { firstComposeImage, pinComposeImage, registryManifestUrl } from "./registry.ts";
 import { deriveSesSmtpPassword, signAwsRequest } from "./ses.ts";
 import { buildStalwartPlan, jmapCall } from "./stalwart.ts";

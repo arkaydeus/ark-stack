@@ -40,7 +40,7 @@ description = "Run fresh-volume browser onboarding against a disposable local da
 run = "bun --env-file=.env scripts/test-e2e.ts"
 
 [tasks."test:upgrade"]
-description = "Apply current migrations over a representative pre-Fix-1 schema"
+description = "Verify schema upgrade and startup nft policy activation (requires Docker)"
 run = "bun --env-file=.env scripts/test-upgrade-migrations.ts"
 
 [tasks."test:stalwart"]
@@ -48,12 +48,16 @@ description = "Run native mail lifecycle checks against a disposable pinned Stal
 run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts"
 
 [tasks."test:edge"]
-description = "Check edge harness cleanup and pins, validate Caddy configurations, and test edge behaviour"
-run = ["bun test scripts/edge-test", "bun scripts/test-edge-config.ts"]
+description = "Check edge harness cleanup and pins, validate Caddy configurations, test edge behaviour, and test the public database port nftables rules"
+run = ["bun test scripts/edge-test", "bun scripts/test-edge-config.ts", "bun scripts/test-db-ingress.ts"]
 
 [tasks."test:pgbouncer"]
 description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM, admin-socket reloads and database clients (connect, read-only preview, revoke)"
 run = "bun scripts/test-pgbouncer-public.ts"
+
+[tasks."test:db-ingress"]
+description = "Check the public database port nftables rules (per-source limits, /64 grouping, both hooks), their counters and alerts in a privileged container"
+run = ["bun test shared/src/db-ingress.test.ts", "bun scripts/test-db-ingress.ts"]
 
 [tasks."test:tailnet-acl"]
 description = "Validate the generated Tailscale policy snippet against a scratch tailnet (skips without ARK_TEST_TS_POLICY_API_KEY)"

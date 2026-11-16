@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 
 import {
   assertAliasGraph,
@@ -41,6 +42,10 @@ import {
   settingsInput,
   regionSettingsInput,
   regionSummary,
+  dbIngressCounterMetrics,
+  dbIngressLimitsInput,
+  dbIngressLimitsSummary,
+  platformDbIngressLimits,
   buildDomainPlan,
   nextBackupStatus,
   redactLogLine,
@@ -99,6 +104,7 @@ import {
 import { CLIENT_KEY_SECRET_KIND, PkiPolicyError, validateCsr } from "./modules/pki.ts";
 import { cancelWorkspaceQuery } from "./modules/database.ts";
 import { writeApprovedCompose } from "./modules/docker.ts";
+import { dbIngressCountersFile } from "./modules/providers.ts";
 import { listMailQueue } from "./modules/queue.ts";
 import {
   alerts,
@@ -478,6 +484,14 @@ app.post("/api/internal/jobs/:id/complete", async (c) => {
   return c.json({ ok: true });
 });
 
+async function readDbIngressCounters() {
+  try {
+    return JSON.parse(await readFile(dbIngressCountersFile(), "utf8")) as unknown;
+  } catch {
+    return null;
+  }
+}
+
 app.get("/api/metrics/prometheus", async (c) => {
   if (!secureEqual(c.req.header("authorization") ?? "", `Bearer ${env.metricsToken}`)) {
     throw new HTTPException(401, { message: "Invalid metrics credential." });
@@ -503,6 +517,9 @@ app.get("/api/metrics/prometheus", async (c) => {
       const item = heartbeatRows.find((row) => row.identity === identity);
       return `ark_worker_heartbeat_stale{identity="${identity}"} ${!item || Date.now() - item.lastSeenAt.getTime() > 90_000 ? 1 : 0}`;
     }),
+    // nft drop counters for the public database port (front door §3.11, FD-18), written by the
+    // host-namespace database-ingress reconciler. A missing or unreadable snapshot reports 0.
+    ...dbIngressCounterMetrics(await readDbIngressCounters()),
   ];
   return c.text(`${lines.join("\n")}\n`, 200, { "content-type": "text/plain; version=0.0.4" });
 });
@@ -734,6 +751,7 @@ app.get("/api/state", async (c) => {
     },
     settings,
     region: regionSummary(settings ?? null),
+    dbIngress: dbIngressLimitsSummary(settings ?? null),
     domains: visibleDomains.map((domain) => ({
       ...redactDomain(domain, access),
       records: records.filter((record) => record.domainId === domain.id),
@@ -2563,6 +2581,56 @@ app.put("/api/settings/region", async (c) => {
     access.role,
   );
   return c.json(regionSummary(settings ?? null));
+});
+
+// Per-source limits on the public database port (front door §3.11, FD-18). Every signed-in role
+// can read them; changing them re-renders `inet ark_db_ingress` through a pgbouncer.reload.
+app.get("/api/settings/db-ingress", async (c) => {
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  return c.json(dbIngressLimitsSummary(settings ?? null));
+});
+
+app.put("/api/settings/db-ingress", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const request = await c.req.json();
+  const input = dbIngressLimitsInput.parse(request);
+  // Validate before consuming the single-use grant, so a typo does not burn a password+MFA round.
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "platform.update",
+    privilegedRequestHash("platform.update", request),
+  );
+  const [previous] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const values = {
+    dbIngressMaxConnections: input.maxConnectionsPerSource,
+    dbIngressRatePerSecond: input.newConnectionsPerSecond,
+    dbIngressRateBurst: input.newConnectionBurst,
+    updatedAt: new Date(),
+  };
+  const [settings] = await db
+    .insert(platformSettings)
+    .values({ id: "default", ...values })
+    .onConflictDoUpdate({ target: platformSettings.id, set: values })
+    .returning();
+  const operation = await enqueue({
+    kind: "pgbouncer.reload",
+    actorId: access.userId,
+    targetIds: ["platform"],
+    payload: { dbIngressLimits: input },
+  });
+  await audit(
+    access.userId,
+    "settings.db_ingress",
+    "platform",
+    "platform",
+    { ...input, previous: previous ? platformDbIngressLimits(previous) : null },
+    operation.id,
+    access.role,
+  );
+  return c.json({ ...dbIngressLimitsSummary(settings ?? null), operationId: operation.id });
 });
 
 // Tailscale policy snippets (front door §3.7, FD-07). Owner-only, like route management (R12):
