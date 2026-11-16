@@ -971,8 +971,8 @@ Notes:
 
 - **Ports move from `edge` and `database-ingress` to `edge-ts`**, because a container joined with `network_mode: service:` cannot publish ports. `database-ingress` stops listening on 5432 and remains only as the host-netns nftables reconciler (§3.8.3, §3.11). The `edge-admin` alias moves too, which keeps the existing guarantee that only `edge-control` members can reach the Caddy admin API (compose lines 299-303).
 - **UDP 41642 is published so the edge node can make direct connections.** Without it, traffic is relayed through DERP over 443 ([firewall ports](https://tailscale.com/docs/reference/faq/firewall-ports): "Direct WireGuard tunnels use UDP with a source port that defaults to 41641").
-- **Recreating `edge-ts` means recreating `edge` and `edge-l4`.** The implementation plan already calls this out for the admin pair (`docs/implementation-plan.md` line 368). The upgrade runner must handle it (**Unverified**: whether `docker compose up` recreates `network_mode: service:` dependents automatically; test in FD-05).
-- The env var names `TS_ACCEPT_DNS`, `TS_EXTRA_ARGS` and `TS_TAILSCALED_EXTRA_ARGS` are from the docker params page. `--shields-up` as a container argument is **Unverified** on v1.86.2; test it in FD-05.
+- **Recreating `edge-ts` means recreating `edge` and `edge-l4`.** The implementation plan already calls this out for the admin pair (`docs/implementation-plan.md` line 368). The upgrade runner must handle it. **Verified in FD-05** (Compose v5.6.1, `mise run test:edge`): `docker compose up` recreates `edge` when the same run recreates `edge-ts`. It does not do so when `edge-ts` alone is recreated (`up --force-recreate edge-ts`) or restarted in place (a crash or `docker restart`). In those cases `edge` stays in the dead namespace with only loopback. `mise run maintain` and the installer therefore run a rejoin step (`scripts/edge-namespace.ts`, also `mise run edge:rejoin`) that recreates the managed `edge` dependent outside its owner's live namespace. Optional admin tailnet services are excluded; a stopped edge owner produces a start-the-owner-first error.
+- The env var names `TS_ACCEPT_DNS`, `TS_EXTRA_ARGS` and `TS_TAILSCALED_EXTRA_ARGS` are from the docker params page. **Verified in FD-05** on v1.86.2: `TS_EXTRA_ARGS: "--shields-up"` and `TS_ACCEPT_DNS: "false"` reach tailscaled's prefs (`ShieldsUp: true`, `CorpDNS: false`). The image's iptables is the legacy backend, which needs `NET_RAW`. With `NET_ADMIN` alone, every netfilter call fails with "can't initialize iptables table: Permission denied", so both capabilities are kept.
 
 **Observer (R10: LocalAPI first, sidecar fallback, no OAuth)**
 
@@ -2864,7 +2864,7 @@ V-21 is the revision 3 prototype harness described above. It ran successfully on
 
 - **Tailscale:**
   - Read-only LocalAPI for the worker's uid across containers, and `connect()` through a `:ro` bind mount. Source analysis says read-only; the deployment test is FD-06.
-  - `--shields-up` via `TS_EXTRA_ARGS`, and Compose's recreation of `network_mode: service:` dependents (FD-05).
+  - ~~`--shields-up` via `TS_EXTRA_ARGS`, and Compose's recreation of `network_mode: service:` dependents (FD-05).~~ Settled in FD-05; see the §3.6 notes.
   - Whether a tag is a valid `src`/`deny` target in policy `tests` (FD-07).
   - That the SOCKS5 proxy resolves MagicDNS names: confirmed in source, not documented, and not needed.
 - **Docker IPv6 on Linux:**

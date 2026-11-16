@@ -5,6 +5,8 @@ import { spawn } from "node:child_process";
 
 import { generateInstallSecrets, mergeInstallEnv } from "@ark-stack/shared";
 
+import { rejoinNamespaceDependents } from "./edge-namespace.ts";
+import { configureEdgeAuthKey } from "./install-edge-auth.ts";
 import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 
 const root = join(import.meta.dir, "..");
@@ -28,6 +30,7 @@ const generated = generateInstallSecrets();
 await Bun.write(envPath, mergeInstallEnv(hasEnv ? existing : template, generated, { template: !hasEnv }));
 // `.env` holds every platform secret and `Bun.write` creates it 0644.
 await chmod(envPath, 0o600);
+const edgeAuthKey = await configureEdgeAuthKey(envPath);
 for (const path of [
   "certs",
   "acme",
@@ -161,10 +164,16 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "domain-worker",
     "backup-worker",
     "agent",
+    "edge-ts",
     "edge",
     "pgbouncer-public",
     "database-ingress",
   ]);
+  // A re-run that restarted edge-ts in place would otherwise leave edge in its old namespace.
+  await rejoinNamespaceDependents({
+    project: "ark-platform",
+    composeArgs: ["-f", join(root, "infra/platform/docker-compose.yml"), "-p", "ark-platform"],
+  });
   await run("docker", [
     "compose",
     "-f",
@@ -183,6 +192,14 @@ Setup token: ${parsed.ARK_SETUP_TOKEN}
 Use an SSH tunnel if this host is remote. Create the owner, enroll MFA, then run the domain wizard.
 Do not reuse this token after bootstrap closes.
 `);
+if (edgeAuthKey === "missing") {
+  console.log(`TS_EDGE_AUTHKEY is empty. That is expected once the edge node (edge-ts) has joined. If it has
+not, the edge still serves but cannot reach tailnet services: create a one-off, pre-approved key for tag:ark-edge, put it in .env as
+TS_EDGE_AUTHKEY (or re-run this installer with it in the environment), then run
+\`docker compose --env-file .env -f infra/platform/docker-compose.yml up -d edge-ts edge\` and \`mise run edge:rejoin\`.
+See docs/operating.md, "Edge Tailscale node".
+`);
+}
 
 async function chownRecursive(path: string, uid: number, gid: number) {
   await chown(path, uid, gid).catch(() => undefined);

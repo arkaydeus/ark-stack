@@ -2,7 +2,11 @@
 // fixture certificates, then runs the edge behaviour tests from docs/design/front-door.md §3.5, §3.14,
 // FD-24 and FD-02 in disposable containers: header stripping, Server/Via removal, WebSockets across
 // reloads and idle, and the production edge serving Ark-issued certificates (TLS, the :80 block, and
-// certificate reloads through the real `writeEdge`).
+// certificate reloads through the real `writeEdge`). The production edge is the shipped `edge-ts` and
+// `edge` Compose services (FD-05): `edge` runs in the kernel-mode Tailscale node's namespace, its admin
+// API is reachable only from edge-control, and a restarted or replaced `edge-ts` is recovered by the
+// same rejoin step `mise run maintain` runs. No tailnet is needed; `mise run test:edge-tailnet` covers
+// the checks that need one.
 // The bump procedure for the pinned images is in docs/operating.md ("Third-party image pins").
 import { X509Certificate, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp } from "node:fs/promises";
@@ -14,10 +18,18 @@ import { connect } from "node:tls";
 
 import { EDGE_CERT_DIR, edgeCertificatePaths, planEdge, renderCaddyfile } from "@ark-stack/shared";
 
+import { rejoinNamespaceDependents } from "./edge-namespace.ts";
 import { checkReleasePins } from "./edge-test/pins.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
+import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
 
 const caddyImage = "caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c";
+// The edge node (edge-ts) and the admin node (tailscale) share this pin.
+const tailscaleImage =
+  "tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2";
+// edge-ts never reaches Tailscale's control plane in this run: login fails fast and tailscaled keeps
+// running, which is what a node without TS_EDGE_AUTHKEY does.
+const offlineLoginServer = "--login-server=http://127.0.0.1:9";
 // Same pin as the Dockerfile runtime stage; hosts the fixture upstream and generates fixture certificates.
 const bunImage =
   "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
@@ -74,6 +86,25 @@ async function checkPins() {
       `infra/platform/docker-compose.yml must pin edge and tailnet-gateway to the tested ${caddyImage}; found ${JSON.stringify(caddyPins)}.`,
     );
   }
+  const tailscalePins = [...compose.matchAll(/^\s*image:\s*(tailscale\/tailscale:\S+)\s*$/gm)].map(
+    (match) => match[1],
+  );
+  if (tailscalePins.length !== 2 || tailscalePins.some((pin) => pin !== tailscaleImage)) {
+    throw new Error(
+      `infra/platform/docker-compose.yml must pin edge-ts and tailscale to the tested ${tailscaleImage}; found ${JSON.stringify(tailscalePins)}.`,
+    );
+  }
+  const tailscaleVersion = await docker(
+    "run",
+    "--rm",
+    "--entrypoint",
+    "tailscale",
+    tailscaleImage,
+    "version",
+  );
+  if (!tailscaleVersion.startsWith("1.86.2\n")) {
+    throw new Error(`${tailscaleImage} reports ${tailscaleVersion.split("\n")[0]}, expected 1.86.2.`);
+  }
   checkReleasePins(await Bun.file(join(root, "infra/platform/release.json")).json(), caddyImage);
   const dockerfile = await Bun.file(join(root, "Dockerfile")).text();
   if (!dockerfile.includes(bunImage)) {
@@ -84,6 +115,7 @@ async function checkPins() {
   console.log(
     `Compose and release.json pin the tested image ${caddyImage} (${version.split(" ")[0]}); release bundle digest matches.`,
   );
+  console.log(`Compose pins edge-ts and tailscale to the tested ${tailscaleImage}.`);
 }
 
 // ---- Fixture certificates -------------------------------------------------------------------------------
@@ -603,16 +635,20 @@ async function websocketIdleTest(report: Report) {
 
 // ---- Ark-issued certificates on the production edge (FD-02) ----------------------------------------------
 
-type Edge = CaddyContainer & { edgeDir: string };
+type Edge = CaddyContainer & { edgeDir: string; stack: EdgeStack; refreshPorts: () => Promise<void> };
 
-// Mirrors the Compose `edge` service: bootstrap Caddyfile, `edge-admin` alias, the writer's uid with
-// every capability dropped, ACME webroot and certificate directory mounted read-only.
+// The shipped `edge-ts` and `edge` Compose services in a disposable project (scripts/edge-test/stack.ts):
+// pinned images, kernel-mode edge-ts with its capabilities and /dev/net/tun, `edge` in its namespace
+// as uid/gid 1000 with every capability dropped, the bootstrap Caddyfile, the edge-admin alias, and the
+// ACME webroot and certificate directory mounted read-only. Only host paths and ports differ.
 async function startProductionEdge(): Promise<Edge> {
   const acme = join(directory, "acme");
   const edgeDir = join(directory, "edge");
   await mkdir(join(acme, ".well-known", "acme-challenge"), { recursive: true });
   await mkdir(edgeDir);
   await Bun.write(join(acme, ".well-known", "acme-challenge", "fixture-token"), "fixture-token.key-auth");
+  // As the installer does: tmp/edge/Caddyfile starts as the bootstrap config, and writeEdge replaces it.
+  await Bun.write(join(edgeDir, "Caddyfile"), await Bun.file(join(root, "infra/platform/Caddyfile")).text());
   // The worker writes this directory as uid 1000 in production too.
   await docker(
     "run",
@@ -623,48 +659,41 @@ async function startProductionEdge(): Promise<Edge> {
     `${edgeDir}:/edge`,
     bunImage,
     "chown",
+    "-R",
     "1000:1000",
     "/edge",
   );
-  const name = `ark-edge-production-${suffix}`;
-  containers.push(name);
-  await docker(
-    "run",
-    "--detach",
-    "--name",
-    name,
-    "--network",
-    network,
-    "--network-alias",
-    "edge-admin",
-    "--user",
-    productionUser,
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges:true",
-    "--publish",
-    "127.0.0.1::80",
-    "--publish",
-    "127.0.0.1::443",
-    "--volume",
-    `${join(root, "infra/platform/Caddyfile")}:/etc/caddy/Caddyfile:ro`,
-    "--volume",
-    `${acme}:/var/lib/ark/acme:ro`,
-    "--volume",
-    `${fixtureCerts.served}:${EDGE_CERT_DIR}:ro`,
-    caddyImage,
-  );
-  const ports = new Map([
-    [80, await publishedPort(name, 80)],
-    [443, await publishedPort(name, 443)],
-  ]);
+  const stack = await startEdgeStack({
+    runtime,
+    project: `ark-edge-${suffix}`,
+    directory,
+    acmeDir: acme,
+    certDir: fixtureCerts.served,
+    caddyfile: join(edgeDir, "Caddyfile"),
+    ports: ["127.0.0.1::80", "127.0.0.1::443", "127.0.0.1::41642/udp"],
+    edgeTsEnvironment: { TS_EXTRA_ARGS: `--shields-up ${offlineLoginServer}` },
+  });
+  // The production admin site proxies to api:3000 on the admin network.
+  await docker("network", "connect", "--alias", "api", stack.networks.admin, `ark-edge-upstream-${suffix}`);
+  const ports = new Map<number, number>();
+  const refreshPorts = async () => {
+    ports.set(80, await stack.hostPort(80));
+    ports.set(443, await stack.hostPort(443));
+  };
+  await refreshPorts();
   const port = (inner: number) => {
     const outer = ports.get(inner);
-    if (outer === undefined) throw new Error(`${name} does not publish ${inner}`);
+    if (outer === undefined) throw new Error(`${stack.edgeTs} does not publish ${inner}`);
     return outer;
   };
-  return { name, port, url: (inner, scheme = "http") => `${scheme}://127.0.0.1:${port(inner)}`, edgeDir };
+  return {
+    name: stack.edge,
+    port,
+    url: (inner, scheme = "http") => `${scheme}://127.0.0.1:${port(inner)}`,
+    edgeDir,
+    stack,
+    refreshPorts,
+  };
 }
 
 // Bundles scripts/edge-test/write-edge.ts, including the production writeEdge and its dependencies,
@@ -684,14 +713,14 @@ function bundleWriteEdge() {
   return writeEdgeBundle;
 }
 
-// Runs the bundled write-edge.ts beside the edge, as the domain worker would.
+// Runs the bundled write-edge.ts on edge-control, as the domain worker does, so it reaches edge-admin:2019.
 async function edgeApply(edge: Edge, mode: "write" | "load-without-revalidate", input?: unknown) {
   const bundle = await bundleWriteEdge();
   return docker(
     "run",
     "--rm",
     "--network",
-    network,
+    edge.stack.networks.edgeControl,
     "--user",
     productionUser,
     "--env",
@@ -940,6 +969,313 @@ async function certificateReloadTest(report: Report) {
   );
 }
 
+// ---- edge-ts namespace (FD-05) ---------------------------------------------------------------------------
+
+type Inspected = {
+  Id: string;
+  Config: { User: string; Env: string[] };
+  HostConfig: {
+    NetworkMode: string;
+    CapAdd: string[] | null;
+    CapDrop: string[] | null;
+    Devices: Array<{ PathOnHost: string; PathInContainer: string }> | null;
+    SecurityOpt: string[] | null;
+    PortBindings: Record<string, unknown> | null;
+  };
+  NetworkSettings: { Networks: Record<string, { IPAddress: string }> };
+};
+
+async function inspect(container: string) {
+  return (JSON.parse(await docker("inspect", container)) as Inspected[])[0]!;
+}
+
+function interfaces(procNetDev: string) {
+  return procNetDev
+    .split("\n")
+    .slice(2)
+    .map((line) => line.split(":")[0]!.trim())
+    .filter(Boolean)
+    .toSorted();
+}
+
+function tailscale(container: string, ...args: string[]) {
+  return docker("exec", container, "tailscale", "--socket=/var/run/tailscale/tailscaled.sock", ...args);
+}
+
+async function namespaceTest(report: Report) {
+  const edge = await productionEdgeFixture();
+  const { stack } = edge;
+  const [owner, caddy] = [await inspect(stack.edgeTs), await inspect(stack.edge)];
+  const env = Object.fromEntries(owner.Config.Env.map((entry) => entry.split(/=(.*)/s).slice(0, 2)));
+  const caps = (owner.HostConfig.CapAdd ?? []).map((cap) => cap.replace(/^CAP_/, "")).toSorted();
+  expect(
+    report,
+    JSON.stringify(caps) === '["NET_ADMIN","NET_RAW"]' &&
+      JSON.stringify(owner.HostConfig.CapDrop) === '["ALL"]' &&
+      (owner.HostConfig.Devices ?? []).some((device) => device.PathInContainer === "/dev/net/tun") &&
+      (owner.HostConfig.SecurityOpt ?? []).includes("no-new-privileges:true"),
+    "edge-ts: kernel-mode capabilities only (cap_drop ALL + NET_ADMIN, NET_RAW), /dev/net/tun, no-new-privileges",
+    `CapAdd ${JSON.stringify(caps)}, CapDrop ${JSON.stringify(owner.HostConfig.CapDrop)}, devices ${JSON.stringify(owner.HostConfig.Devices?.map((device) => device.PathInContainer))}`,
+  );
+  expect(
+    report,
+    env.TS_USERSPACE === "false" &&
+      env.TS_ACCEPT_DNS === "false" &&
+      env.TS_TAILSCALED_EXTRA_ARGS === "--port=41642",
+    "edge-ts: TS_USERSPACE=false, TS_ACCEPT_DNS=false, tailscaled on --port=41642",
+    `TS_USERSPACE=${env.TS_USERSPACE} TS_ACCEPT_DNS=${env.TS_ACCEPT_DNS} TS_TAILSCALED_EXTRA_ARGS=${env.TS_TAILSCALED_EXTRA_ARGS}`,
+  );
+  expect(
+    report,
+    caddy.HostConfig.NetworkMode === `container:${owner.Id}` &&
+      Object.keys(caddy.HostConfig.PortBindings ?? {}).length === 0 &&
+      Object.keys(caddy.NetworkSettings.Networks ?? {}).length === 0 &&
+      (caddy.HostConfig.CapAdd ?? []).length === 0 &&
+      JSON.stringify(caddy.HostConfig.CapDrop) === '["ALL"]' &&
+      caddy.Config.User === "1000:1000",
+    "edge: in edge-ts's namespace with no ports or networks of its own, uid 1000, no capabilities",
+    `NetworkMode ${caddy.HostConfig.NetworkMode.slice(0, 22)}…, ports ${JSON.stringify(Object.keys(caddy.HostConfig.PortBindings ?? {}))}, CapAdd ${JSON.stringify(caddy.HostConfig.CapAdd)}`,
+  );
+  const [ownerLinks, caddyLinks] = [
+    interfaces(await docker("exec", stack.edgeTs, "cat", "/proc/net/dev")),
+    interfaces(await docker("exec", stack.edge, "cat", "/proc/net/dev")),
+  ];
+  expect(
+    report,
+    caddyLinks.includes("tailscale0") && JSON.stringify(ownerLinks) === JSON.stringify(caddyLinks),
+    "kernel mode: tailscale0 exists in the namespace Caddy runs in",
+    `edge sees ${caddyLinks.filter((name) => /^(eth|tailscale)/.test(name)).join(", ")}`,
+  );
+  const prefs = JSON.parse(await tailscale(stack.edgeTs, "debug", "prefs")) as Record<string, unknown>;
+  expect(
+    report,
+    prefs.ShieldsUp === true && prefs.CorpDNS === false,
+    "--shields-up through TS_EXTRA_ARGS and TS_ACCEPT_DNS=false reach tailscaled's prefs on v1.86.2",
+    `ShieldsUp ${prefs.ShieldsUp}, CorpDNS ${prefs.CorpDNS}`,
+  );
+  const udp = await docker("exec", stack.edgeTs, "ss", "-lunp");
+  const published = await stack.hostPort(41642, "udp");
+  expect(
+    report,
+    /:41642\s.*tailscaled/.test(udp) && published > 0,
+    "tailscaled listens on UDP 41642 and edge-ts publishes it",
+    `${udp
+      .split("\n")
+      .find((line) => line.includes(":41642"))
+      ?.replace(/\s+/g, " ")}; published on 127.0.0.1:${published}/udp`,
+  );
+  // tailscaled clears and installs its netfilter rules with the image's iptables (legacy backend),
+  // which needs CAP_NET_RAW in addition to CAP_NET_ADMIN.
+  const tailscaledLog = async (container: string) => {
+    const output = await runtime.dockerOutput("logs", container);
+    return output.stdout + output.stderr;
+  };
+  const logs = await waitFor(`${stack.edgeTs} tailscaled startup`, async () => {
+    const text = await tailscaledLog(stack.edgeTs);
+    return /Switching ipn state|Received error/.test(text) ? text : undefined;
+  });
+  const denied = /can't initialize ip6?tables table/.test(logs);
+  const iptables = await docker("exec", stack.edgeTs, "iptables", "-S").then(
+    (rules) => `ok (${rules.split("\n").length} rules)`,
+    (error: Error) => `failed: ${error.message.split("\n")[0]}`,
+  );
+  expect(
+    report,
+    !denied && iptables.startsWith("ok"),
+    "edge-ts can run iptables, and tailscaled logs no netfilter permission error",
+    `iptables -S ${iptables}; permission errors in log: ${denied}`,
+  );
+  const control = `ark-edge-ts-control-${suffix}`;
+  containers.push(control);
+  await docker(
+    "run",
+    "--detach",
+    "--name",
+    control,
+    "--cap-drop",
+    "ALL",
+    "--cap-add",
+    "NET_ADMIN",
+    "--device",
+    "/dev/net/tun:/dev/net/tun",
+    "--env",
+    "TS_USERSPACE=false",
+    "--env",
+    "TS_STATE_DIR=/tmp/tailscale",
+    "--env",
+    `TS_EXTRA_ARGS=${offlineLoginServer}`,
+    tailscaleImage,
+  );
+  const withoutRaw = await waitFor(`${control} iptables error`, async () => {
+    const match = (await tailscaledLog(control)).match(/can't initialize iptables table `\w+': [^\n(]+/);
+    return match?.[0];
+  });
+  expect(
+    report,
+    withoutRaw.includes("Permission denied"),
+    "control: with NET_ADMIN alone, tailscaled's iptables calls fail, so NET_RAW is required",
+    withoutRaw.trim(),
+  );
+}
+
+// Probes Caddy's admin API from a disposable container on the given network.
+async function adminProbe(networkName: string, aliases: string[], targets: string[]) {
+  const script = `
+    const results = {};
+    for (const target of process.argv.slice(1)) {
+      try {
+        const response = await fetch(target + "/config/", { signal: AbortSignal.timeout(3000) });
+        results[target] = "HTTP " + response.status;
+      } catch (error) {
+        results[target] = "unreachable (" + (error.name === "TimeoutError" ? "timed out" : error.code ?? error.name) + ")";
+      }
+    }
+    console.log(JSON.stringify(results));
+  `;
+  const output = await docker(
+    "run",
+    "--rm",
+    "--network",
+    networkName,
+    ...aliases.flatMap((alias) => ["--network-alias", alias]),
+    bunImage,
+    "bun",
+    "--eval",
+    script,
+    ...targets,
+  );
+  return JSON.parse(output.split("\n").at(-1)!) as Record<string, string>;
+}
+
+async function adminIsolationTest(report: Report) {
+  const edge = await productionEdgeFixture();
+  const { stack } = edge;
+  const networks = (await inspect(stack.edgeTs)).NetworkSettings.Networks;
+  const controlIp = networks[stack.networks.edgeControl]?.IPAddress;
+  const adminIp = networks[stack.networks.admin]?.IPAddress;
+  if (!controlIp || !adminIp) throw new Error(`edge-ts is not on both networks: ${JSON.stringify(networks)}`);
+
+  const worker = await adminProbe(stack.networks.edgeControl, [], ["http://edge-admin:2019"]);
+  expect(
+    report,
+    worker["http://edge-admin:2019"] === "HTTP 200",
+    "a domain-worker stand-in on edge-control reaches edge-admin:2019",
+    JSON.stringify(worker),
+  );
+  const targets = ["http://edge-admin:2019", `http://${controlIp}:2019`, `http://${adminIp}:2019`];
+  const api = await adminProbe(stack.networks.admin, ["api"], targets);
+  expect(
+    report,
+    targets.every((target) => api[target]?.startsWith("unreachable")),
+    "a container on admin as `api` cannot reach the admin API by alias, edge-control address or admin address",
+    targets.map((target) => `${target.replace("http://", "")} -> ${api[target]}`).join("; "),
+  );
+}
+
+async function servingOutcome(edge: Edge) {
+  await edge.refreshPorts();
+  const challenge = await plainGet(edge, "example.com", "/.well-known/acme-challenge/fixture-token").catch(
+    (error: Error) => ({ status: 0, body: error.message, headers: {} }) as Reply,
+  );
+  const redirect = await plainGet(edge, "www.example.com", "/path").catch(
+    (error: Error) => ({ status: 0, body: error.message, headers: {} }) as Reply,
+  );
+  return {
+    serving:
+      challenge.status === 200 && challenge.body === "fixture-token.key-auth" && redirect.status === 308,
+    observed: `challenge ${challenge.status || challenge.body}, redirect ${redirect.status || redirect.body}`,
+  };
+}
+
+async function waitUntilServing(edge: Edge) {
+  return waitFor(`${edge.name} to serve`, async () => {
+    const outcome = await servingOutcome(edge);
+    return outcome.serving ? outcome : undefined;
+  });
+}
+
+async function strandedOutcome(edge: Edge) {
+  // Give the published port a moment to point at the new namespace.
+  await Bun.sleep(1_000);
+  return servingOutcome(edge);
+}
+
+async function recreationTest(report: Report) {
+  const edge = await productionEdgeFixture();
+  const { stack } = edge;
+  const log = (line: string) => report.lines.push(`      ${line}`);
+  const rejoin = () =>
+    rejoinNamespaceDependents({ project: stack.project, composeArgs: stack.composeArgs, log });
+
+  // 1. The maintain path: `docker compose up` after edge-ts's definition changed.
+  const before = await inspect(stack.edge);
+  const changed = join(directory, "edge-ts-generation.yml");
+  await Bun.write(changed, 'services:\n  edge-ts:\n    environment:\n      ARK_TEST_GENERATION: "2"\n');
+  await docker(
+    "compose",
+    ...stack.composeArgs,
+    "-f",
+    changed,
+    "up",
+    "--detach",
+    "--no-deps",
+    "--wait",
+    "--wait-timeout",
+    "120",
+    "edge-ts",
+    "edge",
+  );
+  const [owner, caddy] = [await inspect(stack.edgeTs), await inspect(stack.edge)];
+  const composed = await waitUntilServing(edge);
+  expect(
+    report,
+    caddy.Id !== before.Id &&
+      caddy.HostConfig.NetworkMode === `container:${owner.Id}` &&
+      (await rejoin()).length === 0,
+    "compose up recreates edge with a changed edge-ts and joins the new namespace; rejoin finds nothing to do",
+    `edge ${before.Id.slice(0, 12)} -> ${caddy.Id.slice(0, 12)} in container:${owner.Id.slice(0, 12)}; ${composed.observed}`,
+  );
+
+  // 2. edge-ts restarted in place (a tailscaled crash, `docker restart`): Compose does not notice.
+  await docker("restart", stack.edgeTs);
+  const restarted = await strandedOutcome(edge);
+  expect(
+    report,
+    !restarted.serving,
+    "control: after edge-ts restarts in place, edge is stranded in the old namespace",
+    restarted.observed,
+  );
+  const fixedRestart = await rejoin();
+  const afterRestart = await waitUntilServing(edge);
+  expect(
+    report,
+    fixedRestart.length === 1 && fixedRestart[0]?.reason === "owner-restarted",
+    "rejoin (run by mise run maintain and mise run edge:rejoin) recreates edge and it serves :80 again",
+    `${JSON.stringify(fixedRestart)}; ${afterRestart.observed}`,
+  );
+
+  // 3. edge-ts replaced on its own (`up --force-recreate edge-ts`).
+  await stack.compose("up", "--detach", "--no-deps", "--force-recreate", "--wait", "edge-ts");
+  const replaced = await strandedOutcome(edge);
+  expect(
+    report,
+    !replaced.serving,
+    "control: after edge-ts alone is recreated, edge is stranded",
+    replaced.observed,
+  );
+  const fixedReplace = await rejoin();
+  const afterReplace = await waitUntilServing(edge);
+  const worker = await adminProbe(stack.networks.edgeControl, [], ["http://edge-admin:2019"]);
+  expect(
+    report,
+    fixedReplace.length === 1 &&
+      fixedReplace[0]?.reason === "owner-replaced" &&
+      worker["http://edge-admin:2019"] === "HTTP 200",
+    "rejoin recreates edge in the new edge-ts: :80 and edge-admin:2019 work again with the written config",
+    `${JSON.stringify(fixedReplace)}; ${afterReplace.observed}; edge-admin ${worker["http://edge-admin:2019"]}`,
+  );
+}
+
 // ---- Runner ----------------------------------------------------------------------------------------------
 
 async function run(name: string, test: (report: Report) => Promise<unknown>) {
@@ -973,11 +1309,15 @@ try {
     run("header stripping", async (report) => headerBehaviour(await headerFixture(), report)),
     run("server and via removal", async (report) => viaBehaviour(await headerFixture(), report)),
     run("websocket across reload", websocketReloadTests),
-    // The reload test swaps certificate files, so it runs after the read-only TLS and :80 tests.
+    // The reload test swaps certificate files, so it runs after the read-only TLS and :80 tests. The
+    // recreation test restarts and replaces edge-ts, so it runs last.
     (async () => [
       await run("ark certificates: tls", tlsTest),
       await run("ark certificates: http redirect", redirectTest),
+      await run("edge-ts namespace", namespaceTest),
+      await run("edge admin API isolation", adminIsolationTest),
       await run("ark certificates: reload through writeEdge", certificateReloadTest),
+      await run("edge-ts recreation", recreationTest),
     ])(),
   ]);
   failed = results.flat().includes(false);

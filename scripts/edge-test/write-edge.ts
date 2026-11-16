@@ -1,7 +1,7 @@
 // Test-only entry point for `mise run test:edge`. The harness bundles it with Bun.build and runs it
-// in the pinned Bun container on the disposable edge-test network, next to a Caddy container with
-// the `edge-admin` alias, so the apply goes through the production `writeEdge` as the domain worker
-// does:
+// in the pinned Bun container on the edge-control network of the disposable edge-ts/edge Compose
+// project, where edge-ts carries the `edge-admin` alias for the Caddy in its namespace, so the apply
+// goes through the production `writeEdge` as the domain worker does:
 // render -> write ARK_EDGE_DIR/Caddyfile -> POST /adapt -> POST /load with must-revalidate.
 // Caddy's admin API only accepts Host `edge-admin:2019`, which is why this cannot run on the host.
 //

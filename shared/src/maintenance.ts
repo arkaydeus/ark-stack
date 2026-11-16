@@ -106,3 +106,49 @@ export function maintenanceArgv(project: string, file: string) {
     "120",
   ];
 }
+
+/** One container of a Compose project, as `docker inspect` reports it. */
+export type NamespaceContainer = {
+  service: string;
+  id: string;
+  /** `HostConfig.NetworkMode`; `container:<id>` for a `network_mode: service:` dependent. */
+  networkMode: string;
+  running: boolean;
+  /** `State.StartedAt`, an RFC 3339 timestamp. */
+  startedAt: string;
+};
+
+export type StaleNamespaceDependent = {
+  service: string;
+  parent?: string;
+  reason: "owner-replaced" | "owner-restarted" | "owner-stopped" | "not-running";
+};
+
+/**
+ * Finds `network_mode: service:` dependents that are no longer in their owner's live namespace.
+ *
+ * A dependent joins the namespace of one container instance. If the owner is recreated (new id)
+ * or restarted after the dependent started, the dependent keeps running in the old namespace with
+ * only loopback, so the edge silently stops serving. Compose recreates dependents only when it
+ * recreates the owner itself; a crash restart or `docker restart` is not detected
+ * (docs/design/front-door.md §3.6).
+ */
+export function staleNamespaceDependents(containers: NamespaceContainer[]): StaleNamespaceDependent[] {
+  const byId = new Map(containers.map((container) => [container.id, container]));
+  const stale: StaleNamespaceDependent[] = [];
+  for (const container of containers) {
+    if (!container.networkMode.startsWith("container:")) continue;
+    const ownerId = container.networkMode.slice("container:".length);
+    const owner = byId.get(ownerId);
+    if (!owner) {
+      stale.push({ service: container.service, reason: "owner-replaced" });
+    } else if (!owner.running) {
+      stale.push({ service: container.service, parent: owner.service, reason: "owner-stopped" });
+    } else if (!container.running) {
+      stale.push({ service: container.service, parent: owner.service, reason: "not-running" });
+    } else if (Date.parse(owner.startedAt) > Date.parse(container.startedAt)) {
+      stale.push({ service: container.service, parent: owner.service, reason: "owner-restarted" });
+    }
+  }
+  return stale;
+}

@@ -325,21 +325,40 @@ services:
     restart: unless-stopped
     pids_limit: 64
 
-  edge:
-    image: caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
-    # Ark writes the Caddyfile and every certificate key as uid 1000 with mode 0600 (the installer
-    # chowns tmp/edge and tmp/certs to it). As root with every capability dropped, Caddy could not
-    # read them and would exit at startup. The image's /data/caddy and /config/caddy are 1777.
-    user: "1000:1000"
-    ports: ["80:80", "443:443"]
+  # The public edge's own Tailscale node (tag:ark-edge), separate from the admin `tailscale` node
+  # below. It owns the network namespace that `edge` joins, so it publishes the edge's ports and
+  # carries the `edge-admin` alias (docs/design/front-door.md §3.6, §3.16). Kernel mode puts
+  # `tailscale0` in this namespace, so the proxies dial tailnet addresses natively.
+  edge-ts:
+    image: tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2
+    hostname: ark-edge
+    environment:
+      TS_USERSPACE: "false"
+      # A one-off, pre-approved key for tag:ark-edge (docs/operating.md, "Edge Tailscale node").
+      # Without it the node waits for login and the edge still serves.
+      TS_AUTHKEY: ${TS_EDGE_AUTHKEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      # Keep Docker's resolver so `api` and `edge-admin` resolve; MagicDNS is never needed here.
+      TS_ACCEPT_DNS: "false"
+      # No inbound tailnet connections to the edge node, whatever the tailnet policy allows.
+      TS_EXTRA_ARGS: "--shields-up"
+      # The host tailscaled keeps the default 41641.
+      TS_TAILSCALED_EXTRA_ARGS: "--port=41642"
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    cap_drop: [ALL]
+    # NET_ADMIN creates tailscale0, routes and rules. NET_RAW is needed by the image's iptables
+    # (legacy backend), which tailscaled runs for its netfilter rules; without it every call fails
+    # with "can't initialize iptables table: Permission denied" (checked by `mise run test:edge`).
+    # Capabilities are per process: Caddy in this namespace still runs with none.
+    cap_add: [NET_ADMIN, NET_RAW]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - "80:80" # Caddy: ACME HTTP-01 and HTTPS redirects
+      - "443:443" # Caddy HTTPS
+      - "41642:41642/udp" # direct WireGuard paths for the edge node
     volumes:
-      - ../../tmp/acme:/var/lib/ark/acme:ro
-      # Ark-issued lego certificates, loaded per site with `tls` (docs/design/front-door.md §3.14).
-      - ../../tmp/certs:/var/lib/ark/certs:ro
-      - ../../tmp/edge/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ark_edge_data:/data
-    depends_on: [api]
-    restart: unless-stopped
+      - ark_edge_ts_state:/var/lib/tailscale
     networks:
       admin: {}
       # Caddy binds its admin API to this alias, so the unauthenticated config endpoint is only
@@ -347,6 +366,26 @@ services:
       # process and the tailnet containers — can rewrite public routing.
       edge-control:
         aliases: [edge-admin]
+    restart: unless-stopped
+
+  edge:
+    image: caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
+    # Ark writes the Caddyfile and every certificate key as uid 1000 with mode 0600 (the installer
+    # chowns tmp/edge and tmp/certs to it). As root with every capability dropped, Caddy could not
+    # read them and would exit at startup. The image's /data/caddy and /config/caddy are 1777.
+    user: "1000:1000"
+    # Ports, networks and the edge-admin alias belong to edge-ts. A restarted or recreated edge-ts
+    # leaves this container in a dead namespace until it is recreated: `mise run maintain` and
+    # `mise run edge:rejoin` do that (docs/operating.md, "Edge Tailscale node").
+    network_mode: service:edge-ts
+    volumes:
+      - ../../tmp/acme:/var/lib/ark/acme:ro
+      # Ark-issued lego certificates, loaded per site with `tls` (docs/design/front-door.md §3.14).
+      - ../../tmp/certs:/var/lib/ark/certs:ro
+      - ../../tmp/edge/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ark_edge_data:/data
+    depends_on: [edge-ts, api]
+    restart: unless-stopped
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
 
@@ -382,6 +421,7 @@ volumes:
   ark_app_pg:
   ark_agent_state:
   ark_edge_data:
+  ark_edge_ts_state:
   ark_tailscale_state:
   # PgBouncer's admin console socket directory. A tmpfs owned by uid 1000 (PgBouncer and the
   # database worker), mode 0700, mounted only into pgbouncer-public and database-worker.
