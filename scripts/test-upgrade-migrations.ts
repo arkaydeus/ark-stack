@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
@@ -34,6 +35,137 @@ const legacyAccount = {
   password:
     "0123456789abcdef0123456789abcdef:be37d324a8b88b115aa8f3e16c8ae13c575bcd3f3846e66dddfdd7559af107edac38b954feb0bd0065b0702ac6f5a958534ae850b367ec28c45fe6fce02eff7f",
 };
+const policyState = await mkdtemp(join(tmpdir(), "ark-ingress-upgrade-"));
+const ingressContainer = `ark-upgrade-ingress-${databaseName}`;
+const ingressVolume = `${ingressContainer}-state`;
+const ingressImage = "ark-db-ingress-test:local";
+
+async function docker(args: string[], stdin?: string) {
+  const child = Bun.spawn(["docker", ...args], {
+    stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (code !== 0) throw new Error(`upgrade docker ${args[0]} failed: ${(stderr || stdout).slice(-2000)}`);
+  return args[0] === "logs" ? stdout + stderr : stdout;
+}
+
+async function startIngress() {
+  // Same pinned Bun base and packages as scripts/test-db-ingress.ts; Docker shares the
+  // build cache. A separate netns keeps this upgrade from touching the host firewall.
+  await docker(
+    ["build", "--quiet", "-t", ingressImage, "-"],
+    `FROM oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends nftables iproute2 \
+  && rm -rf /var/lib/apt/lists/*
+`,
+  );
+  const workerEntry = join(policyState, "startup-worker.ts");
+  await writeFile(
+    workerEntry,
+    `import { processQueued } from ${JSON.stringify(join(root, "server/src/coordinator.ts"))};
+import { sql } from ${JSON.stringify(join(root, "server/src/db.ts"))};
+try { await processQueued(1, "pgbouncer."); } finally { await sql.end(); }
+`,
+  );
+  const bundleDir = join(policyState, "bundle");
+  // Build separately so entries from different filesystem roots keep flat output names.
+  for (const entry of [join(root, "scripts", "database-ingress.ts"), workerEntry]) {
+    const bundle = await Bun.build({ entrypoints: [entry], outdir: bundleDir, target: "bun" });
+    if (!bundle.success) throw new Error(`Cannot bundle upgrade runtime: ${bundle.logs.join(" ")}`);
+  }
+  await writeFile(join(policyState, "pgbouncer", "expose"), "0\n");
+  // Both processes use the installer's Linux ownership. Avoid macOS bind-mount inode
+  // replacement semantics when the worker atomically publishes its next policy.
+  await docker(["volume", "create", ingressVolume]);
+  await docker([
+    "run",
+    "--rm",
+    "-v",
+    `${policyState}:/fixtures:ro`,
+    "-v",
+    `${ingressVolume}:/state`,
+    ingressImage,
+    "sh",
+    "-ec",
+    "cp -R /fixtures/pgbouncer /state/; chown -R 1000:1000 /state; chmod 700 /state/pgbouncer; chmod 600 /state/pgbouncer/*",
+  ]);
+  await docker([
+    "run",
+    "--detach",
+    "--name",
+    ingressContainer,
+    "--add-host",
+    "host.docker.internal:host-gateway",
+    "--user",
+    "0:0",
+    "--cap-drop",
+    "ALL",
+    "--cap-add",
+    "NET_ADMIN",
+    "--cap-add",
+    "DAC_OVERRIDE",
+    "--security-opt",
+    "no-new-privileges:true",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,noexec,nosuid,nodev,size=64m",
+    "-v",
+    `${ingressVolume}:/state`,
+    "-v",
+    `${bundleDir}:/bundle:ro`,
+    "-e",
+    "ARK_PGBOUNCER_DIR=/state/pgbouncer",
+    "-e",
+    "ARK_DB_INGRESS_METRICS_DIR=/state/metrics",
+    "-e",
+    "ARK_EMBEDDED_WORKERS=0",
+    "-e",
+    "ARK_RUNTIME_ROLE=worker",
+    "-e",
+    "NODE_ENV=production",
+    ingressImage,
+    "bun",
+    "/bundle/database-ingress.js",
+  ]);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const status = await ingressFile("pgbouncer/allowlist.status").catch(() => "");
+    if (status.includes("applied=true\n")) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const status = await ingressFile("pgbouncer/allowlist.status").catch(() => "missing status");
+  const logs = await docker(["logs", ingressContainer]).catch((error) => String(error));
+  throw new Error(`Upgrade ingress reconciler did not load the legacy policy: ${status} ${logs}`);
+}
+
+function ingressFile(file: string) {
+  return docker(["exec", ingressContainer, "cat", `/state/${file}`]);
+}
+
+async function runIngressWorker(fail = false) {
+  const workerUrl = new URL(databaseUrl);
+  workerUrl.hostname = "host.docker.internal";
+  await docker([
+    "exec",
+    "--user",
+    "1000:1000",
+    "-e",
+    `DATABASE_URL=${workerUrl}`,
+    "-e",
+    `ARK_ROOT_KEY=${process.env.ARK_ROOT_KEY}`,
+    ...(fail ? ["-e", "ARK_ALLOWLIST_HELPER=/state/apply-helper"] : []),
+    ingressContainer,
+    "bun",
+    "/bundle/startup-worker.js",
+  ]);
+}
+
 const createdAt = new Date("2025-01-02T03:04:05.000Z");
 // A signed-in session from before the front door existed (0013 adds a required session.origin).
 const legacySession = {
@@ -88,6 +220,26 @@ try {
       VALUES (${legacySession.id}, ${legacySession.expires_at}, ${legacySession.token},
         ${legacySession.user_id}, ${createdAt}, ${createdAt})
     `;
+    await target`INSERT INTO database_clusters (id, name) VALUES ('legacy-cluster', 'legacy')`;
+    await target`INSERT INTO managed_databases (id, cluster_id, name, exposure)
+      VALUES ('legacy-public-db', 'legacy-cluster', 'legacy_public', 'public')`;
+    await mkdir(join(policyState, "pgbouncer"));
+    await writeFile(
+      join(policyState, "pgbouncer", "allowlist.nft"),
+      `table inet ark_db_ingress
+delete table inet ark_db_ingress
+table inet ark_db_ingress {
+  chain input {
+    type filter hook input priority -1; policy accept;
+    tcp dport 5432 accept
+  }
+  chain forward {
+    type filter hook forward priority -1; policy accept;
+    ct status dnat tcp dport 5432 accept
+  }
+}
+`,
+    );
     await target`INSERT INTO platform_settings (id) VALUES ('default') ON CONFLICT DO NOTHING`;
   } finally {
     await target.end();
@@ -197,7 +349,7 @@ try {
       /platform_settings_region_check/,
       "Only the shared/src/region.ts presets may be stored.",
     );
-    // 0016_db_ingress_limits.sql (FD-18) gives an upgraded install the §3.11 per-source limits.
+    // 0016 stores the defaults; the startup reconciliation below upgrades the persisted policy.
     const [ingressLimits] = await verified`
       SELECT db_ingress_max_connections, db_ingress_rate_per_second, db_ingress_rate_burst
       FROM platform_settings WHERE id = 'default'
@@ -228,8 +380,105 @@ try {
       BETTER_AUTH_URL: authUrl,
       BETTER_AUTH_TRUSTED_ORIGINS: authUrl,
     });
+    // Start the actual API with external workers, as on a host upgrade. It must queue a
+    // reload without any owner action. The worker path below executes that same operation.
+    Object.assign(process.env, {
+      ARK_PGBOUNCER_DIR: join(policyState, "pgbouncer"),
+      ARK_EMBEDDED_WORKERS: "0",
+      ARK_LISTEN_PORT: "0",
+      NODE_ENV: "production",
+    });
+    await startIngress();
+    assert.ok(
+      !(await docker(["exec", ingressContainer, "nft", "list", "table", "inet", "ark_db_ingress"])).includes(
+        "ark_db_limits",
+      ),
+      "The pre-upgrade kernel table must lack FD-18 limits.",
+    );
+    delete process.env.ARK_ALLOWLIST_HELPER;
+    delete process.env.ARK_APPLY_NFT;
+    const api = spawn("bun", ["server/src/index.ts"], { cwd: root, env: process.env, stdio: "inherit" });
+    try {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const [queued] = await verified`SELECT id FROM operations WHERE kind = 'pgbouncer.reload'
+          AND payload->>'reason' = 'startup-db-ingress-policy'`;
+        if (queued) break;
+        if (api.exitCode !== null || attempt === 99)
+          throw new Error("API startup did not enqueue policy reconciliation.");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    } finally {
+      api.kill("SIGTERM");
+      await new Promise((resolve) => api.once("exit", resolve));
+    }
     const { sql } = await import("../server/src/db.ts");
     try {
+      const { reconcileDatabaseIngressOnStartup } = await import("../server/src/coordinator.ts");
+      const first = await reconcileDatabaseIngressOnStartup();
+      const repeated = await reconcileDatabaseIngressOnStartup();
+      assert.equal(
+        first?.id,
+        repeated?.id,
+        "Repeated startup reconciliation must reuse the in-flight operation.",
+      );
+      // Execute as the external worker: it waits for the real host reconciler's exact
+      // policy acknowledgement, with no privileged helper in the worker process.
+      await runIngressWorker();
+      const [appliedPolicy] = await verified`SELECT status, error FROM operations WHERE id = ${first!.id}`;
+      if (appliedPolicy?.status !== "succeeded") {
+        const status = await ingressFile("pgbouncer/allowlist.status").catch(() => "missing status");
+        const logs = await docker(["logs", ingressContainer]);
+        throw new Error(`Startup policy operation failed: ${appliedPolicy?.error}\n${status}\n${logs}`);
+      }
+      const upgradedPolicy = await ingressFile("pgbouncer/allowlist.nft");
+      assert.ok(upgradedPolicy.includes("chain ark_db_limits"));
+      assert.ok(upgradedPolicy.includes("ct count over 128"));
+      assert.ok(upgradedPolicy.includes("limit rate over 30/second burst 60 packets"));
+      assert.ok(upgradedPolicy.includes("counter drop_conn4"));
+      assert.ok(!upgradedPolicy.includes("delete table"));
+      const installed = await docker([
+        "exec",
+        ingressContainer,
+        "nft",
+        "list",
+        "table",
+        "inet",
+        "ark_db_ingress",
+      ]);
+      for (const expected of [
+        "ark_db_limits",
+        "ct count over 128",
+        "limit rate over 30/second burst 60 packets",
+        "drop_conn4",
+        "drop_conn6",
+        "drop_rate4",
+        "drop_rate6",
+      ]) {
+        assert.ok(installed.includes(expected), `Startup must install ${expected} in the kernel.`);
+      }
+      assert.equal(await ingressFile("pgbouncer/expose"), "1\n");
+      assert.equal(
+        await ingressFile("pgbouncer/pgbouncer.ini").catch(() => "missing"),
+        "missing",
+        "Startup must reconcile the policy without rewriting PgBouncer config.",
+      );
+      // An apply failure on the next startup is observable as a failed operation.
+      await docker([
+        "exec",
+        ingressContainer,
+        "sh",
+        "-ec",
+        "printf '#!/bin/sh\necho simulated-apply-failure >&2\nexit 1\n' > /state/apply-helper; chmod 755 /state/apply-helper",
+      ]);
+      const retry = await reconcileDatabaseIngressOnStartup();
+      await runIngressWorker(true);
+      const [failure] = await verified`SELECT status, error FROM operations WHERE id = ${retry!.id}`;
+      assert.equal(failure?.status, "failed");
+      assert.match(failure!.error, /simulated-apply-failure/);
+      delete process.env.ARK_ALLOWLIST_HELPER;
+      console.log(
+        "Startup upgraded the legacy public database policy without user action; duplicate startup was idempotent; apply failure was surfaced.",
+      );
       const { auth } = await import("../server/src/auth.ts");
       const signIn = (password: string) =>
         auth.handler(
@@ -275,4 +524,7 @@ try {
   const exists = await admin`SELECT 1 FROM pg_database WHERE datname = ${databaseName}`;
   if (exists.length) await admin.unsafe(`DROP DATABASE "${databaseName}"`);
   await admin.end();
+  await docker(["rm", "--force", ingressContainer]).catch(() => undefined);
+  await docker(["volume", "rm", "--force", ingressVolume]).catch(() => undefined);
+  await rm(policyState, { recursive: true, force: true });
 }

@@ -141,6 +141,7 @@ export function nftAllowlist(
   cidrs: string[],
   port = 5432,
   limits: DbIngressLimits = DB_INGRESS_LIMIT_DEFAULTS,
+  previousRules = "",
 ) {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error(`Invalid database port ${port}.`);
   const parsed = dbIngressLimitsInput.safeParse(limits);
@@ -154,6 +155,36 @@ export function nftAllowlist(
     newConnectionsPerSecond: rate,
     newConnectionBurst: burst,
   } = parsed.data;
+  // Stateful expressions are copied into each dynamic element when it is first created.
+  // Replacing a rule cannot change an existing element's cap or token bucket. Use a set
+  // generation per configured value. Retain older conncount sets and deny their sources
+  // until they drain (the kernel garbage-collects empty conncount elements). This keeps
+  // idle established connections accounted for without terminating them on a cap change.
+  const connectionSets = new Set(
+    [...previousRules.matchAll(/^  set (conn[46](?:_[0-9]+)?) \{/gm)].map((match) => match[1]!),
+  );
+  const conn4 = `conn4_${conn}`;
+  const conn6 = `conn6_${conn}`;
+  connectionSets.add(conn4);
+  connectionSets.add(conn6);
+  const setDeclarations = [...connectionSets]
+    .flatMap((name) => {
+      const type = name.startsWith("conn4") ? "ipv4_addr" : "ipv6_addr";
+      return [name, name.replace("conn", "active")].map(
+        (set) => `  set ${set} { type ${type}; size 65535; flags dynamic; }`,
+      );
+    })
+    .join("\n");
+  const drainingRules = [...connectionSets]
+    .filter((name) => name !== conn4 && name !== conn6)
+    .map((name) =>
+      name.startsWith("conn4")
+        ? `    ct state new ip saddr @${name.replace("conn", "active")} counter name "drop_conn4" drop`
+        : `    ct state new ip6 saddr and ${V6_PREFIX_MASK} @${name.replace("conn", "active")} counter name "drop_conn6" drop`,
+    )
+    .join("\n");
+  const rate4 = `rate4_${rate}_${burst}`;
+  const rate6 = `rate6_${rate}_${burst}`;
   const valid = cidrs.map((item) => parseCidr(item)).filter((item) => item.ok);
   const v4 = valid.filter((item) => item.version === 4).map((item) => `    ip saddr ${item.cidr} return`);
   const v6 = valid.filter((item) => item.version === 6).map((item) => `    ip6 saddr ${item.cidr} return`);
@@ -184,13 +215,21 @@ ${enforced ? DB_INGRESS_ENFORCED_MARKER : OPEN_MARKER}
 # Per-source limits on tcp/${port}: ${conn} concurrent, ${rate}/second (burst ${burst}) new connections. IPv6 sources are grouped by /64.
 # input covers a host-namespace listener; forward covers Docker DNAT to a published port.
 table inet ${DB_INGRESS_TABLE}
-delete table inet ${DB_INGRESS_TABLE}
+# Declare objects without deleting live conncount state or named counters. Flushing only
+# chains removes old jumps/rules (including a legacy allowlist) in this same transaction.
+add chain inet ${DB_INGRESS_TABLE} input { type filter hook input priority -1; policy accept; }
+add chain inet ${DB_INGRESS_TABLE} forward { type filter hook forward priority -1; policy accept; }
+add chain inet ${DB_INGRESS_TABLE} ${DB_INGRESS_ALLOW_CHAIN}
+add chain inet ${DB_INGRESS_TABLE} ${DB_INGRESS_LIMITS_CHAIN}
+flush chain inet ${DB_INGRESS_TABLE} input
+flush chain inet ${DB_INGRESS_TABLE} forward
+flush chain inet ${DB_INGRESS_TABLE} ${DB_INGRESS_ALLOW_CHAIN}
+flush chain inet ${DB_INGRESS_TABLE} ${DB_INGRESS_LIMITS_CHAIN}
 table inet ${DB_INGRESS_TABLE} {
 ${counters}
-  set conn4 { type ipv4_addr; size 65535; flags dynamic; }
-  set conn6 { type ipv6_addr; size 65535; flags dynamic; }
-  set rate4 { type ipv4_addr; size 65535; flags dynamic; timeout 2m; }
-  set rate6 { type ipv6_addr; size 65535; flags dynamic; timeout 2m; }
+${setDeclarations}
+  set ${rate4} { type ipv4_addr; size 65535; flags dynamic; timeout 2m; }
+  set ${rate6} { type ipv6_addr; size 65535; flags dynamic; timeout 2m; }
   chain input {
     type filter hook input priority -1; policy accept;
 ${jumps(`tcp dport ${port}`)}
@@ -200,10 +239,14 @@ ${jumps(`tcp dport ${port}`)}
 ${jumps(`ct status dnat tcp dport ${port}`)}
   }
 ${allowChain}  chain ${DB_INGRESS_LIMITS_CHAIN} {
-    ct state new add @conn4 { ip saddr ct count over ${conn} } counter name "drop_conn4" drop
-    ct state new add @conn6 { ip6 saddr and ${V6_PREFIX_MASK} ct count over ${conn} } counter name "drop_conn6" drop
-    ct state new update @rate4 { ip saddr limit rate over ${rate}/second burst ${burst} packets } counter name "drop_rate4" drop
-    ct state new update @rate6 { ip6 saddr and ${V6_PREFIX_MASK} limit rate over ${rate}/second burst ${burst} packets } counter name "drop_rate6" drop
+${drainingRules ? `${drainingRules}\n` : ""}    # Presence trackers use count over 0: a set lookup evaluates its element expression,
+    # so looking up the capped conn sets would only match sources already over the OLD cap.
+    ct state new add @active4_${conn} { ip saddr ct count over 0 }
+    ct state new add @active6_${conn} { ip6 saddr and ${V6_PREFIX_MASK} ct count over 0 }
+    ct state new add @${conn4} { ip saddr ct count over ${conn} } counter name "drop_conn4" drop
+    ct state new add @${conn6} { ip6 saddr and ${V6_PREFIX_MASK} ct count over ${conn} } counter name "drop_conn6" drop
+    ct state new update @${rate4} { ip saddr limit rate over ${rate}/second burst ${burst} packets } counter name "drop_rate4" drop
+    ct state new update @${rate6} { ip6 saddr and ${V6_PREFIX_MASK} limit rate over ${rate}/second burst ${burst} packets } counter name "drop_rate6" drop
   }
 }
 `;

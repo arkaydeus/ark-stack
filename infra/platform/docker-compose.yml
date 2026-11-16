@@ -297,9 +297,12 @@ services:
       target: database-ingress
     command: [bun, run, --cwd, scripts, database-ingress.ts]
     network_mode: host
+    # nft needs NET_ADMIN as root across exec. DAC_OVERRIDE permits this writer to read
+    # the 0600 policy and write snapshots in the installer-owned (1000:1000) directories.
+    # The API still sees only the dedicated read-only metrics mount.
     user: "0:0"
     cap_drop: [ALL]
-    cap_add: [NET_ADMIN]
+    cap_add: [NET_ADMIN, DAC_OVERRIDE]
     environment:
       ARK_PGBOUNCER_DIR: /var/lib/ark/pgbouncer
       ARK_PGBOUNCER_LOOPBACK_PORT: "15432"

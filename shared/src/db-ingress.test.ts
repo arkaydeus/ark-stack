@@ -48,12 +48,15 @@ describe("rendered ark_db_ingress ruleset", () => {
     }
   });
 
-  test("at the defaults, every set and limit rule of the §3.11 example is rendered verbatim", () => {
+  test("at the defaults, the §3.11 example is rendered with generation-qualified set names", () => {
     const rendered = nftAllowlist([]);
     for (const line of designRules()) {
       if (line.startsWith("table ") || line === "}") continue;
-      // §3.11 uses anonymous counters; Ark names them so they can be exported as metrics.
-      const named = line.replace(/ counter drop$/, "");
+      // Ark names counters for metrics and qualifies dynamic sets by the configured limits.
+      const named = line
+        .replace(/ counter drop$/, "")
+        .replace(/\bconn([46])\b/g, "conn$1_128")
+        .replace(/\brate([46])\b/g, "rate$1_30_60");
       expect(rendered).toContain(named);
     }
     expect(DB_INGRESS_LIMIT_DEFAULTS).toEqual({
@@ -65,17 +68,52 @@ describe("rendered ark_db_ingress ruleset", () => {
 
   test("groups IPv6 sources by /64 for both limits and IPv4 per address", () => {
     const limits = chain(nftAllowlist([]), "ark_db_limits");
-    expect(limits).toContain("add @conn4 { ip saddr ct count over 128 }");
-    expect(limits).toContain("add @conn6 { ip6 saddr and ffff:ffff:ffff:ffff:: ct count over 128 }");
-    expect(limits).toContain("update @rate4 { ip saddr limit rate over 30/second burst 60 packets }");
+    expect(limits).toContain("add @conn4_128 { ip saddr ct count over 128 }");
+    expect(limits).toContain("add @conn6_128 { ip6 saddr and ffff:ffff:ffff:ffff:: ct count over 128 }");
+    expect(limits).toContain("update @rate4_30_60 { ip saddr limit rate over 30/second burst 60 packets }");
     expect(limits).toContain(
-      "update @rate6 { ip6 saddr and ffff:ffff:ffff:ffff:: limit rate over 30/second burst 60 packets }",
+      "update @rate6_30_60 { ip6 saddr and ffff:ffff:ffff:ffff:: limit rate over 30/second burst 60 packets }",
     );
     // ct count sets must not carry a timeout (nftables meters page); rate sets expire.
-    expect(nftAllowlist([])).toContain("set conn6 { type ipv6_addr; size 65535; flags dynamic; }");
+    expect(nftAllowlist([])).toContain("set conn6_128 { type ipv6_addr; size 65535; flags dynamic; }");
     expect(nftAllowlist([])).toContain(
-      "set rate6 { type ipv6_addr; size 65535; flags dynamic; timeout 2m; }",
+      "set rate6_30_60 { type ipv6_addr; size 65535; flags dynamic; timeout 2m; }",
     );
+  });
+
+  test("reapplies retain state and cap changes guard previous source generations until drained", () => {
+    const original = nftAllowlist([], 5432, {
+      maxConnectionsPerSource: 5,
+      newConnectionsPerSecond: 2,
+      newConnectionBurst: 5,
+    });
+    expect(
+      nftAllowlist(
+        [],
+        5432,
+        { maxConnectionsPerSource: 5, newConnectionsPerSecond: 2, newConnectionBurst: 5 },
+        original,
+      ),
+    ).toBe(original);
+    const lower = nftAllowlist(
+      [],
+      5432,
+      { maxConnectionsPerSource: 4, newConnectionsPerSecond: 3, newConnectionBurst: 6 },
+      original,
+    );
+    expect(lower).not.toContain("delete table");
+    expect(lower).not.toContain("flush set");
+    expect(lower).toContain("flush chain inet ark_db_ingress ark_db_limits");
+    expect(lower).toContain('ct state new ip saddr @active4_5 counter name "drop_conn4" drop');
+    expect(lower).toContain(
+      'ct state new ip6 saddr and ffff:ffff:ffff:ffff:: @active6_5 counter name "drop_conn6" drop',
+    );
+    expect(lower).toContain("add @conn4_4 { ip saddr ct count over 4 }");
+    expect(lower).toContain("update @rate4_3_6 { ip saddr limit rate over 3/second burst 6 packets }");
+    const legacy = original.replaceAll("conn4_5", "conn4").replaceAll("conn6_5", "conn6");
+    const upgraded = nftAllowlist([], 5432, DB_INGRESS_LIMIT_DEFAULTS, legacy);
+    expect(upgraded).toContain('ip saddr @active4 counter name "drop_conn4" drop');
+    expect(upgraded).toContain("set conn6 { type ipv6_addr; size 65535; flags dynamic; }");
   });
 
   test("renders the configured limits and every drop with a named counter", () => {

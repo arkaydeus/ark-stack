@@ -106,8 +106,8 @@ describe("CIDR parsing and the generated nft policy", () => {
   test("an empty allowlist still installs a readable table", () => {
     const open = nftAllowlist([]);
     expect(open).toContain("table inet ark_db_ingress {");
-    // Only the per-source limits drop; there is no allowlist chain.
-    expect(open).not.toContain("ark_db_allow");
+    // Only the per-source limits drop; neither hook jumps to an allowlist chain.
+    expect(open).not.toContain("jump ark_db_allow");
     expect(dbIngressAllowlistEnforced(open)).toBe(false);
     const enforced = nftAllowlist(["10.0.0.0/8"]);
     expect(enforced).toContain("ip saddr 10.0.0.0/8 return");

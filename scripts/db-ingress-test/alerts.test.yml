@@ -46,3 +46,46 @@ tests:
               table: ark_db_ingress
             exp_annotations:
               summary: The database-ingress reconciler has stopped reporting nftables counters
+
+  # Never written, unreadable and corrupt snapshots all export present=0. Allow five
+  # minutes for startup/configuration, then fire even when the age series is absent.
+  - interval: 1m
+    input_series:
+      - series: 'ark_nft_counters_present{table="ark_db_ingress"}'
+        values: "0x15"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ArkDatabaseIngressCountersStale
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ArkDatabaseIngressCountersStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              table: ark_db_ingress
+            exp_annotations:
+              summary: The database-ingress reconciler has stopped reporting nftables counters
+
+  # A formerly valid snapshot disappears; the API keeps serving healthy scrapes, but
+  # presence drops to zero and age is omitted. Recovery clears the alert.
+  - interval: 1m
+    input_series:
+      - series: 'ark_nft_counters_present{table="ark_db_ingress"}'
+        values: "1x5 0x10 1x5"
+      - series: 'ark_nft_counters_age_seconds{table="ark_db_ingress"}'
+        values: "15x5 stale _ _ _ _ _ _ _ _ _ _ 15x5"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ArkDatabaseIngressCountersStale
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: ArkDatabaseIngressCountersStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              table: ark_db_ingress
+            exp_annotations:
+              summary: The database-ingress reconciler has stopped reporting nftables counters
+      - eval_time: 18m
+        alertname: ArkDatabaseIngressCountersStale
+        exp_alerts: []

@@ -45,6 +45,7 @@ const TEST_BURST = 5;
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-db-ingress-${suffix}-`));
 const containers: string[] = [];
+const stateVolume = `ark-db-ingress-state-${suffix}`;
 let failures = 0;
 
 async function docker(args: string[], options: { stdin?: string; allowFailure?: boolean } = {}) {
@@ -66,6 +67,7 @@ async function docker(args: string[], options: { stdin?: string; allowFailure?: 
 
 async function cleanup() {
   if (containers.length) await docker(["rm", "--force", ...containers], { allowFailure: true });
+  await docker(["volume", "rm", "--force", stateVolume], { allowFailure: true });
   await rm(directory, { recursive: true, force: true });
 }
 
@@ -95,9 +97,22 @@ try {
   const rules = join(directory, "rules");
   await mkdir(rules, { recursive: true });
   const files: Record<string, string> = {
+    "legacy.nft": `table inet ark_db_ingress
+delete table inet ark_db_ingress
+table inet ark_db_ingress {
+  chain input { type filter hook input priority -1; policy accept; tcp dport 5432 accept; }
+  chain forward { type filter hook forward priority -1; policy accept; ct status dnat tcp dport 5432 accept; }
+}
+`,
     "defaults.nft": nftAllowlist([], 5432),
     "defaults-allowlist.nft": nftAllowlist(["198.51.100.0/24", "2001:db8:100::/48"], 5432),
     "conn.nft": nftAllowlist([], 5432, limits(TEST_CONN, 1000, 1000)),
+    "conn-lower.nft": nftAllowlist(
+      [],
+      5432,
+      limits(TEST_CONN - 1, 1000, 1000),
+      nftAllowlist([], 5432, limits(TEST_CONN, 1000, 1000)),
+    ),
     "rate.nft": nftAllowlist([], 5432, limits(1000, TEST_RATE, TEST_BURST)),
     "allowlist.nft": nftAllowlist(["10.10.0.3/32", "2001:db8:10:2::/64"], 5432, limits(1000, 1000, 1000)),
   };
@@ -198,6 +213,22 @@ RUN apt-get update \\
     target: "bun",
   });
   if (!built.success) throw new Error(`bundling database-ingress.ts failed: ${built.logs.join("\n")}`);
+  // Use a Linux volume so Docker Desktop cannot mask DAC ownership semantics on a macOS
+  // bind mount. This is the installer's 1000:1000 ownership, 0700 PgBouncer state and 0755
+  // metrics directory, including 0600 policy files.
+  await docker(["volume", "create", stateVolume]);
+  await docker([
+    "run",
+    "--rm",
+    "-v",
+    `${state}:/fixtures:ro`,
+    "-v",
+    `${stateVolume}:/state`,
+    testImage,
+    "sh",
+    "-ec",
+    "cp -R /fixtures/. /state/; chown -R 1000:1000 /state; chmod 700 /state/pgbouncer; chmod 600 /state/pgbouncer/*; chmod 755 /state/metrics",
+  ]);
   const reconcilerName = `ark-db-ingress-reconciler-${suffix}`;
   containers.push(reconcilerName);
   const reconciler = await docker(
@@ -205,7 +236,19 @@ RUN apt-get update \\
       "run",
       "--name",
       reconcilerName,
-      "--privileged",
+      "--user",
+      "0:0",
+      "--cap-drop",
+      "ALL",
+      "--cap-add",
+      "NET_ADMIN",
+      "--cap-add",
+      "DAC_OVERRIDE",
+      "--security-opt",
+      "no-new-privileges:true",
+      "--read-only",
+      "--tmpfs",
+      "/tmp:rw,noexec,nosuid,nodev,size=64m",
       "--network",
       "none",
       "-e",
@@ -217,13 +260,63 @@ RUN apt-get update \\
       "-v",
       `${bundle}:/bundle:ro`,
       "-v",
-      `${state}:/state`,
+      `${stateVolume}:/state`,
       testImage,
       "sh",
       "-c",
-      "timeout 4 bun /bundle/database-ingress.js; cat /state/pgbouncer/allowlist.status; echo '---'; cat /state/metrics/counters.json",
+      `set -e
+bun /bundle/database-ingress.js &
+pid=$!
+trap 'kill "$pid" 2>/dev/null || true' EXIT
+for i in $(seq 1 40); do test -s /state/metrics/counters.json && break; sleep 0.1; done
+nft -a list table inet ark_db_ingress > /tmp/before
+printf credentials > /state/pgbouncer/userlist.txt
+touch /state/pgbouncer/expose
+# An identical policy write also leaves handles/state intact.
+touch /state/pgbouncer/allowlist.nft
+sleep 1
+nft -a list table inet ark_db_ingress > /tmp/after
+cmp /tmp/before /tmp/after
+cat /state/pgbouncer/allowlist.status
+echo '---'
+cat /state/metrics/counters.json`,
     ],
     { allowFailure: true },
+  );
+  check(
+    reconciler.status === 0,
+    "production UID/capabilities write snapshots and skip unchanged policies",
+    reconciler.stderr || `exit ${reconciler.status}`,
+  );
+  // The API has the same UID and no capabilities, and only a read-only snapshot mount.
+  const reader = await docker(
+    [
+      "run",
+      "--rm",
+      "--user",
+      "1000:1000",
+      "--cap-drop",
+      "ALL",
+      "--read-only",
+      "-v",
+      `${stateVolume}:/state:ro`,
+      testImage,
+      "cat",
+      "/state/metrics/counters.json",
+    ],
+    { allowFailure: true },
+  );
+  check(
+    reader.status === 0,
+    "API UID reads freshly exported counters on a read-only mount",
+    reader.stderr || "readable",
+  );
+  check(
+    dbIngressCounterMetrics(JSON.parse(reader.stdout || "null")).includes(
+      'ark_nft_counters_present{table="ark_db_ingress"} 1',
+    ),
+    "API formatter reports counters present from the reader's snapshot",
+    reader.stdout.slice(0, 100),
   );
   const [statusText = "", countersText = ""] = reconciler.stdout.split("---\n");
   console.log(statusText.trimEnd().replace(/^/gm, "  "));

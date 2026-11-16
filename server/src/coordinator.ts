@@ -55,6 +55,7 @@ import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
 import {
   applyDatabaseAllowlist,
+  pgbouncerDir,
   applyStalwartDevice,
   publishCloudflare,
   reconcileSes,
@@ -1344,8 +1345,54 @@ async function reconcileSesOp(operation: OperationRow) {
   });
 }
 
+/** Reconcile persisted pre-upgrade policy through the normal, observable worker operation. */
+export async function reconcileDatabaseIngressOnStartup() {
+  const publicDatabases = await db
+    .select({ id: managedDatabases.id })
+    .from(managedDatabases)
+    .where(eq(managedDatabases.exposure, "public"));
+  if (!publicDatabases.length) return null;
+  return enqueue({
+    kind: "pgbouncer.reload",
+    targetIds: [],
+    payload: { reason: "startup-db-ingress-policy" },
+  });
+}
+
+async function applyCurrentDatabaseIngress(
+  databases: Array<typeof managedDatabases.$inferSelect>,
+  dir: string,
+) {
+  const publicDatabases = databases.filter((item) => item.exposure === "public");
+  const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
+  if (cidrs.length) assertCidrs(cidrs);
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const limits = platformDbIngressLimits(settings);
+  const allowlist = await applyDatabaseAllowlist(dir, cidrs, 5432, {
+    expose: publicDatabases.length > 0,
+    limits,
+  });
+  return { cidrs, limits, allowlist };
+}
+
 async function reloadPgbouncer(operation: OperationRow) {
   const databases = await db.select().from(managedDatabases);
+  if (operation.payload?.reason === "startup-db-ingress-policy") {
+    // An upgrade changes only the host firewall policy. Existing PgBouncer configuration,
+    // credentials and TLS files must not depend on a separate reload executor being present.
+    const { cidrs, limits, allowlist } = await applyCurrentDatabaseIngress(databases, pgbouncerDir());
+    for (const database of databases) {
+      await db
+        .update(managedDatabases)
+        .set({
+          allowlistEnforced:
+            database.exposure === "public" && Boolean(database.sourceCidrs?.length) && allowlist.enforced,
+        })
+        .where(eq(managedDatabases.id, database.id));
+    }
+    await addStep(operation.id, "db-ingress-startup", { cidrs, limits, ...allowlist });
+    return;
+  }
   const roles = await db.select().from(databaseRoles);
   const users: Array<{ name: string; password: string }> = [];
   for (const role of roles.filter((item) => item.kind === "runtime" && item.secretId)) {
@@ -1367,16 +1414,7 @@ async function reloadPgbouncer(operation: OperationRow) {
       ? `${process.env.ARK_CERT_DIR ?? "/var/lib/ark/certs"}/${dbEndpoint.hostname}`
       : undefined,
   });
-  const publicDatabases = databases.filter((item) => item.exposure === "public");
-  const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
-  if (cidrs.length) assertCidrs(cidrs);
-  // Per-source limits on the public port are platform settings (front door §3.11, FD-18).
-  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
-  const limits = platformDbIngressLimits(settings);
-  const allowlist = await applyDatabaseAllowlist(written.dir, cidrs, 5432, {
-    expose: publicDatabases.length > 0,
-    limits,
-  });
+  const { cidrs, limits, allowlist } = await applyCurrentDatabaseIngress(databases, written.dir);
   for (const database of databases) {
     const allowlistReady = !database.sourceCidrs?.length || allowlist.enforced;
     await db

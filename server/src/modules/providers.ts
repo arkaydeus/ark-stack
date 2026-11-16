@@ -1,4 +1,4 @@
-import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -14,6 +14,8 @@ import {
   funnelDisabled,
   jmapCall,
   nftAllowlist,
+  dbIngressAllowlistEnforced,
+  sha256Hex,
   pgbouncerConfig,
   pgbouncerUserlist,
   parseBearerChallenge,
@@ -440,31 +442,54 @@ export async function applyDatabaseAllowlist(
   port = 5432,
   options: { expose?: boolean; limits?: DbIngressLimits } = {},
 ) {
-  const rules = nftAllowlist(cidrs, port, options.limits);
   const file = join(dir, "allowlist.nft");
+  const previousRules = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const rules = nftAllowlist(cidrs, port, options.limits, previousRules);
   const expose = Boolean(options.expose);
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  await writeFile(file, rules, { mode: 0o600 });
+  // Publish complete policies atomically: the host watcher must never load a partial write.
+  const temporary = `${file}.${crypto.randomUUID()}.tmp`;
+  await writeFile(temporary, rules, { mode: 0o600 });
+  await rename(temporary, file);
   await writeFile(join(dir, "expose"), expose ? "1\n" : "0\n", { mode: 0o600 });
   const requireApply = process.env.ARK_APPLY_NFT === "1" || process.env.ARK_EMBEDDED_WORKERS === "0";
   const helper = process.env.ARK_ALLOWLIST_HELPER;
   try {
     if (helper) {
       await exec(helper, [file], { timeout: 20_000 });
-      return { file, applied: true, enforced: cidrs.length > 0, exposed: expose };
+      return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules), exposed: expose };
     }
-    // An empty allowlist is applied like any other policy: the generated file installs an
-    // accept-only chain. Deleting the table instead would leave the host reconcilers with
-    // nothing to read back, and they treat a missing table as a failed apply.
+    // An empty allowlist installs per-source limits without CIDR allowlist jumps. The
+    // reconcilers read the table back and treat a missing table as a failed apply.
     if (process.env.ARK_APPLY_NFT === "0") {
       await controlPublicDatabaseListener({ expose: false });
       if (requireApply) throw new Error("Database CIDR allowlist cannot be applied because ARK_APPLY_NFT=0.");
       return { file, applied: false, enforced: false, exposed: false, reason: "disabled" };
     }
+    // External workers have no host NET_ADMIN. The host reconciler acknowledges the exact
+    // policy bytes and exposure; an older success must never satisfy a new reload/upgrade.
+    if (process.env.ARK_EMBEDDED_WORKERS === "0") {
+      const expectedHash = sha256Hex(rules);
+      let lastStatus = "No acknowledgement from database-ingress.";
+      for (let attempt = 0; attempt < 150; attempt++) {
+        const status = await readFile(join(dir, "allowlist.status"), "utf8").catch(() => "");
+        if (status.includes(`policy_hash=${expectedHash}\n`)) {
+          if (status.includes("applied=true\n") && status.includes(`exposed=${expose}\n`)) {
+            return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules), exposed: expose };
+          }
+          lastStatus = status.split("error=")[1]?.trim() || "Requested policy is not ready.";
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      throw new Error(`database-ingress did not acknowledge the requested policy: ${lastStatus}`);
+    }
     await exec("nft", ["-f", file], { timeout: 10_000 });
     await exec("nft", ["list", "table", "inet", "ark_db_ingress"], { timeout: 10_000 });
     await controlPublicDatabaseListener({ expose });
-    return { file, applied: true, enforced: cidrs.length > 0, exposed: expose };
+    return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules), exposed: expose };
   } catch (error) {
     await writeFile(join(dir, "expose"), "0\n", { mode: 0o600 }).catch(() => undefined);
     await controlPublicDatabaseListener({ expose: false }).catch(() => undefined);

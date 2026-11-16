@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { watch } from "node:fs";
 import { createServer, connect } from "node:net";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-import { DB_INGRESS_TABLE, dbIngressAllowlistEnforced, parseNftCounters } from "@ark-stack/shared";
+import { DB_INGRESS_TABLE, dbIngressAllowlistEnforced, parseNftCounters, sha256Hex } from "@ark-stack/shared";
 
 const dir = process.env.ARK_PGBOUNCER_DIR ?? join(process.cwd(), "tmp", "pgbouncer");
 const nftFile = join(dir, "allowlist.nft");
@@ -23,15 +23,19 @@ const counterIntervalMs = Number(process.env.ARK_DB_INGRESS_COUNTER_INTERVAL_MS 
 let server: ReturnType<typeof createServer> | null = null;
 let reconciling = false;
 let dirty = false;
+let appliedRules: string | null = null;
+let attemptedRules: string | null = null;
 
-function run(command: string, args: string[]) {
+function run(command: string, args: string[], input?: string) {
   return new Promise<string>((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+    child.on("error", reject);
+    if (input !== undefined) child.stdin?.end(input);
     let output = "";
-    child.stdout.on("data", (chunk) => {
+    child.stdout!.on("data", (chunk) => {
       output += String(chunk);
     });
-    child.stderr.on("data", (chunk) => {
+    child.stderr!.on("data", (chunk) => {
       output += String(chunk);
     });
     child.on("exit", (code) => {
@@ -43,14 +47,19 @@ function run(command: string, args: string[]) {
 
 async function shouldExpose() {
   if (!existsSync(exposeFile)) return false;
-  return (await Bun.file(exposeFile).text()).trim() === "1";
+  return (await readFile(exposeFile, "utf8")).trim() === "1";
 }
 
 async function applyNft() {
   if (!existsSync(nftFile)) throw new Error(`Allowlist file not found: ${nftFile}`);
-  await run("nft", ["-f", nftFile]);
+  const rules = await readFile(nftFile, "utf8");
+  attemptedRules = rules;
+  if (rules === appliedRules) return;
+  // Apply the same bytes we hash, even if a newer policy is atomically published mid-pass.
+  await run("nft", ["-f", "-"], rules);
   const listed = await run("nft", ["list", "table", "inet", DB_INGRESS_TABLE]);
   if (!listed.includes("ark_db")) throw new Error("nft readback did not show ark_db_ingress");
+  appliedRules = rules;
 }
 
 async function exportCounters() {
@@ -101,11 +110,15 @@ function startListener() {
 }
 
 async function writeStatus(input: { applied: boolean; enforced: boolean; exposed: boolean; error?: string }) {
+  // Status contains no credentials. Publish a complete, worker-readable acknowledgement
+  // even when upgrading an older root-owned 0600 status file.
+  const temporary = `${statusFile}.${crypto.randomUUID()}.tmp`;
   await writeFile(
-    statusFile,
-    `applied=${input.applied}\nenforced=${input.enforced}\nexposed=${input.exposed}\nerror=${input.error ?? ""}\n`,
-    { mode: 0o600 },
+    temporary,
+    `applied=${input.applied}\nenforced=${input.enforced}\nexposed=${input.exposed}\npolicy_hash=${attemptedRules === null ? "" : sha256Hex(attemptedRules)}\nerror=${input.error ?? ""}\n`,
+    { mode: 0o644 },
   );
+  await rename(temporary, statusFile);
 }
 
 async function reconcile() {
@@ -117,21 +130,23 @@ async function reconcile() {
     return;
   }
   reconciling = true;
-  const expose = await shouldExpose();
   try {
+    const expose = await shouldExpose();
     if (!existsSync(nftFile)) {
       stopListener();
+      attemptedRules = null;
+      appliedRules = null;
       await writeStatus({ applied: true, enforced: false, exposed: false });
-      return;
+    } else {
+      await applyNft();
+      if (expose) startListener();
+      else stopListener();
+      // An empty allowlist installs only the per-source limits, so the table exists but no CIDR
+      // allowlist is enforced. Report that honestly rather than claiming enforcement.
+      const enforced = dbIngressAllowlistEnforced(appliedRules ?? "");
+      await writeStatus({ applied: true, enforced, exposed: expose && Boolean(server) });
+      await exportCounters();
     }
-    await applyNft();
-    if (expose) startListener();
-    else stopListener();
-    // An empty allowlist installs only the per-source limits, so the table exists but no CIDR
-    // allowlist is enforced. Report that honestly rather than claiming enforcement.
-    const enforced = dbIngressAllowlistEnforced(await Bun.file(nftFile).text());
-    await writeStatus({ applied: true, enforced, exposed: expose && Boolean(server) });
-    await exportCounters();
   } catch (error) {
     stopListener();
     await writeStatus({
@@ -151,11 +166,21 @@ async function reconcile() {
 
 await mkdir(dir, { recursive: true, mode: 0o700 });
 await mkdir(metricsDir, { recursive: true, mode: 0o755 });
-await reconcile();
-setInterval(() => void exportCounters(), counterIntervalMs);
 watch(dir, (_event, filename) => {
-  // `writeStatus` writes into the directory being watched; reacting to it would make every
-  // reconcile trigger another one.
-  if (filename && filename.toString() === "allowlist.status") return;
+  // Config, credentials and our own status writes do not change firewall policy. A null
+  // filename is an unspecified event, so reconcile conservatively (the content check is cheap).
+  if (filename && !["allowlist.nft", "expose"].includes(filename.toString())) return;
   void reconcile();
 });
+
+await reconcile();
+setInterval(() => void exportCounters(), counterIntervalMs);
+
+// Bind-mount notifications can be coalesced or lost during an upgrade. Poll only the two
+// desired inputs as a fallback; unchanged files do not run nft or rewrite status/snapshots.
+setInterval(() => {
+  void (async () => {
+    const desired = existsSync(nftFile) ? await readFile(nftFile, "utf8") : null;
+    if (desired !== appliedRules || (await shouldExpose()) !== Boolean(server)) await reconcile();
+  })().catch((error) => console.error(`database ingress refresh failed: ${String(error)}`));
+}, 1500);

@@ -29,7 +29,7 @@ Useful commands:
 | `mise run test:agent`             | Go agent policy tests                       |
 | `mise run test:agent-integration` | disposable effective Docker/ledger test     |
 | `mise run test:e2e`               | disposable real-browser signup/MFA/wizard   |
-| `mise run test:upgrade`           | representative additive schema upgrade      |
+| `mise run test:upgrade`           | schema and host nft policy upgrade (Docker) |
 | `mise run test:stalwart`          | disposable native Stalwart lifecycle test   |
 | `mise run test:edge`              | Caddy validation, edge and harness tests    |
 | `mise run test:pgbouncer`         | disposable public PgBouncer TLS/SCRAM test  |

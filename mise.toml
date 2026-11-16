@@ -40,7 +40,7 @@ description = "Run fresh-volume browser onboarding against a disposable local da
 run = "bun --env-file=.env scripts/test-e2e.ts"
 
 [tasks."test:upgrade"]
-description = "Apply current migrations over a representative pre-Fix-1 schema"
+description = "Verify schema upgrade and startup nft policy activation (requires Docker)"
 run = "bun --env-file=.env scripts/test-upgrade-migrations.ts"
 
 [tasks."test:stalwart"]

@@ -33,7 +33,7 @@ function runServer(banner: string) {
 
 type OpenCommand = { op: "open"; src: string; dst: string; count: number; timeoutMs: number; hold: boolean };
 type ProbeCommand = { op: "probe"; src: string; dst: string; timeoutMs: number };
-type Command = OpenCommand | ProbeCommand | { op: "closeAll" };
+type Command = OpenCommand | ProbeCommand | { op: "closeAll" } | { op: "closeOne"; src: string };
 
 function open(command: { src: string; dst: string; timeoutMs: number }) {
   return new Promise<Socket | null>((resolve) => {
@@ -83,6 +83,10 @@ function runClient() {
       });
       socket.end();
       console.log(JSON.stringify({ banner }));
+    } else if (command.op === "closeOne") {
+      const index = held.findIndex((socket) => socket.localAddress === command.src);
+      if (index >= 0) held.splice(index, 1)[0]!.destroy();
+      console.log(JSON.stringify({ closed: index >= 0 }));
     } else {
       for (const socket of held.splice(0)) socket.destroy();
       console.log(JSON.stringify({ closed: true }));
@@ -130,7 +134,8 @@ function topology() {
   host("-6", "addr", "add", "fd00:20::1/64", "dev", "h-be", "nodad");
   host("link", "set", "h-be", "up");
   const cl = (...args: string[]) => inNs("cl", "ip", ...args);
-  for (const address of ["10.10.0.2/24", "10.10.0.3/24"]) cl("addr", "add", address, "dev", "c-cl");
+  for (const address of ["10.10.0.2/24", "10.10.0.3/24", "10.10.0.4/24"])
+    cl("addr", "add", address, "dev", "c-cl");
   for (const address of ["2001:db8:10:1::2/64", "2001:db8:10:1::3/64", "2001:db8:10:2::2/64"]) {
     cl("-6", "addr", "add", address, "dev", "c-cl", "nodad");
   }
@@ -189,6 +194,10 @@ class Client {
     return this.send<{ banner: string | null }>({ op: "probe", src, dst, timeoutMs: 2000 });
   }
 
+  closeOne(src: string) {
+    return this.send<{ closed: boolean }>({ op: "closeOne", src });
+  }
+
   closeAll() {
     return this.send<{ closed: boolean }>({ op: "closeAll" });
   }
@@ -238,7 +247,8 @@ const C6_OTHER_64 = "2001:db8:10:2::2";
 async function reset(client: Client, file: string) {
   await client.closeAll();
   await Bun.sleep(300);
-  // `nft -f` deletes and recreates the table, so every per-source set and counter starts empty.
+  // Isolate independent scenarios explicitly. Production reapplies never delete the table.
+  sh("nft", "delete", "table", "inet", "ark_db_ingress");
   apply(file);
 }
 
@@ -281,6 +291,30 @@ async function concurrentCase(client: Client, hook: "input" | "forward", limit: 
     `ok=${other.ok} failed=${other.failed}`,
   );
 
+  // Hold the sockets across ordinary reloads and limit changes. In particular, lowering
+  // below the old cap must still reject new sessions while another source has capacity.
+  for (const file of ["conn.nft", "conn-lower.nft"]) {
+    if (file === "conn-lower.nft") {
+      await client.closeOne(A4);
+      await client.closeOne(A6);
+      await Bun.sleep(500);
+    }
+    apply(file);
+    for (const [source, destination] of [
+      [A4, V4_DST],
+      [A6_SAME_64, V6_DST],
+    ]) {
+      const extra = await client.open(source!, destination!, limit, { timeoutMs: 700 });
+      check(extra.ok === 0, `${hook}: ${source} stays capped after ${file}`, `ok=${extra.ok}`);
+    }
+    const independent = await client.open(file === "conn-lower.nft" ? "10.10.0.4" : B4, V4_DST, 1);
+    check(
+      independent.ok === 1,
+      `${hook}: another source still connects after ${file}`,
+      `ok=${independent.ok}`,
+    );
+  }
+
   const { json, values } = counters();
   check(
     (values.drop_conn4 ?? 0) >= 3,
@@ -298,6 +332,13 @@ async function concurrentCase(client: Client, hook: "input" | "forward", limit: 
     `drop_rate4=${values.drop_rate4} drop_rate6=${values.drop_rate6}`,
   );
   console.log(`@@counters ${hook}-concurrent ${json.trim()}`);
+  await client.closeAll();
+  // Retired conncount elements are garbage-collected when the old sessions drain.
+  await Bun.sleep(3000);
+  const resumed = await client.open(A4, V4_DST, limit - 1);
+  check(resumed.ok === limit - 1, `${hook}: a drained source uses the lower cap`, `ok=${resumed.ok}`);
+  const capped = await client.open(A4, V4_DST, 1, { timeoutMs: 700 });
+  check(capped.ok === 0, `${hook}: lower cap is enforced after draining`, `ok=${capped.ok}`);
   await client.closeAll();
 }
 
@@ -399,8 +440,19 @@ async function main() {
   await startServer(null, "input");
   await startServer("be", "forward");
   const client = new Client();
+  apply("legacy.nft");
+  check(
+    !sh("nft", "list", "table", "inet", "ark_db_ingress").includes("ark_db_limits"),
+    "legacy fixture has no per-source limits",
+    "pre-FD-18 policy",
+  );
   apply("defaults.nft");
   const listed = sh("nft", "list", "table", "inet", "ark_db_ingress");
+  check(
+    listed.includes("ark_db_limits") && listed.includes("drop_conn4") && listed.includes("drop_rate6"),
+    "legacy table upgrades to both limits and named counters",
+    "FD-18 policy loaded",
+  );
   console.log("\nLoaded ruleset (defaults), as the kernel reports it:");
   console.log(listed.trimEnd());
 

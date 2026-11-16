@@ -50,7 +50,10 @@ groups:
             {{ $labels.reason }} ({{ $labels.family }}). A client may be over the per-source limits
             in platform settings, or someone is abusing the public pooler.
       - alert: ArkDatabaseIngressCountersStale
-        expr: ark_nft_counters_present{table="ark_db_ingress"} == 1 and ark_nft_counters_age_seconds{table="ark_db_ingress"} > 300
+        expr: >-
+          ark_nft_counters_present{table="ark_db_ingress"} == 0
+          or (ark_nft_counters_present{table="ark_db_ingress"} == 1
+          and ark_nft_counters_age_seconds{table="ark_db_ingress"} > 300)
         for: 5m
         labels:
           severity: warning
