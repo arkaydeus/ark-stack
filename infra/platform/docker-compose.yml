@@ -250,8 +250,24 @@ services:
     pids_limit: 128
 
   pgbouncer-public:
-    image: edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e
+    # PgBouncer 1.26.1 (multi-arch index digest). Releases before 1.25.2 are affected by
+    # CVE-2026-6664, an unauthenticated crash on a malformed SCRAM packet.
+    image: edoburu/pgbouncer:v1.26.1-p0@sha256:488422e38cff912895d0d65d8963fcd306e6ac589a724398b6eb8e294e94d624
+    # Run PgBouncer directly on Ark's generated config. The image's /entrypoint.sh builds a
+    # config from DB_HOST/DATABASE_URL env vars and exits when they are unset.
+    entrypoint: [/usr/bin/pgbouncer]
     command: [/var/lib/ark/pgbouncer/pgbouncer.ini]
+    # Ark writes the config, userlist and TLS key as uid 1000 with mode 0600 (the installer
+    # chowns tmp/pgbouncer and tmp/certs to it). With every capability dropped, the image's
+    # default postgres user (uid 70) could not read them.
+    user: "1000:1000"
+    # TCP-only probe: a pg_isready login attempt would log a failed "no such user" login on
+    # every interval and pollute failed-login monitoring.
+    healthcheck:
+      test: [CMD, nc, -z, -w, "3", 127.0.0.1, "5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     # Loopback only. The host-namespace ingress binds 5432 after nftables is installed.
     ports: ["127.0.0.1:15432:5432"]
     volumes:

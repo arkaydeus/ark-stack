@@ -1,0 +1,154 @@
+import { describe, expect, test } from "bun:test";
+import { readdir } from "node:fs/promises";
+import { join, relative } from "node:path";
+
+const root = join(import.meta.dir, "..", "..");
+const composeFile = join(root, "infra", "platform", "docker-compose.yml");
+// CVE-2026-6664 (unauthenticated crash via a malformed SCRAM packet) is fixed in 1.25.2.
+const minimumVersion = [1, 25, 2] as const;
+const pinnedImage = /^(?<repo>[a-z0-9./_-]+\/pgbouncer):(?<tag>[^@\s]+)@sha256:[a-f0-9]{64}$/;
+// Image references only: `../../tmp/pgbouncer:/var/...` bind mounts have no `\w` tag.
+const pgbouncerReference =
+  /(?<![\w./-])[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9._-]+)*\/pgbouncer:\w[\w.-]*(?:@sha256:[a-f0-9]+)?/g;
+
+type Service = {
+  image?: string;
+  entrypoint?: string | string[];
+  command?: string | string[];
+  environment?: Record<string, string> | string[];
+  user?: string;
+  ports?: string[];
+  volumes?: string[];
+  cap_drop?: string[];
+  security_opt?: string[];
+};
+
+function pgbouncerVersion(tag: string) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-p\d+)?$/.exec(tag);
+  return match ? ([Number(match[1]), Number(match[2]), Number(match[3])] as const) : undefined;
+}
+
+function atLeast(version: readonly number[], minimum: readonly number[]) {
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (version[index]! !== minimum[index]!) return version[index]! > minimum[index]!;
+  }
+  return true;
+}
+
+/** Returns every way `pgbouncer-public` departs from the hardened, directly-launched shape. */
+function pgbouncerPublicViolations(service: Service | undefined) {
+  if (!service) return ["pgbouncer-public service is missing"];
+  const problems: string[] = [];
+  const pin = pinnedImage.exec(service.image ?? "");
+  if (!pin) {
+    problems.push(`image must be <repo>/pgbouncer:<version>@sha256:<digest>, got ${service.image}`);
+  } else {
+    const version = pgbouncerVersion(pin.groups!.tag!);
+    if (!version) problems.push(`image tag ${pin.groups!.tag} is not a readable PgBouncer version`);
+    else if (!atLeast(version, minimumVersion)) {
+      problems.push(`PgBouncer ${version.join(".")} is older than ${minimumVersion.join(".")}`);
+    }
+  }
+  const entrypoint = typeof service.entrypoint === "string" ? [service.entrypoint] : service.entrypoint;
+  if (!entrypoint?.length || !/(^|\/)pgbouncer$/.test(entrypoint[0]!)) {
+    problems.push("entrypoint must run the pgbouncer binary directly, not the image's entrypoint script");
+  }
+  const command = typeof service.command === "string" ? [service.command] : (service.command ?? []);
+  if (![...(entrypoint ?? []), ...command].includes("/var/lib/ark/pgbouncer/pgbouncer.ini")) {
+    problems.push("pgbouncer must be launched with /var/lib/ark/pgbouncer/pgbouncer.ini");
+  }
+  const environment = Array.isArray(service.environment)
+    ? service.environment.map((item) => item.split("=")[0]!)
+    : Object.keys(service.environment ?? {});
+  const generated = environment.filter((name) => /^(DB_|DATABASE_URL$|AUTH_|POOL_MODE$|LISTEN_)/.test(name));
+  if (generated.length) problems.push(`env-driven config generation variables set: ${generated.join(", ")}`);
+  if (service.user !== "1000:1000") problems.push("user must be 1000:1000 to read Ark's 0600 config files");
+  if (!service.cap_drop?.includes("ALL")) problems.push("cap_drop must include ALL");
+  if (!service.security_opt?.includes("no-new-privileges:true")) {
+    problems.push("security_opt must include no-new-privileges:true");
+  }
+  if (JSON.stringify(service.ports) !== JSON.stringify(["127.0.0.1:15432:5432"])) {
+    problems.push(`ports must stay loopback-only 127.0.0.1:15432:5432, got ${JSON.stringify(service.ports)}`);
+  }
+  for (const mount of ["/var/lib/ark/pgbouncer", "/var/lib/ark/certs"]) {
+    if (!service.volumes?.some((volume) => volume.endsWith(`:${mount}:ro`))) {
+      problems.push(`${mount} must be mounted read-only`);
+    }
+  }
+  return problems;
+}
+
+async function loadCompose() {
+  return Bun.YAML.parse(await Bun.file(composeFile).text()) as { services: Record<string, Service> };
+}
+
+async function* files(directory: string): AsyncGenerator<string> {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== "node_modules") yield* files(path);
+    } else yield path;
+  }
+}
+
+describe("pgbouncer-public compose service", () => {
+  test("runs a patched PgBouncer directly on Ark's generated config", async () => {
+    const compose = await loadCompose();
+    expect(pgbouncerPublicViolations(compose.services["pgbouncer-public"])).toEqual([]);
+  });
+
+  test("rejects the image entrypoint, missing pins and vulnerable versions", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    const good: Service = {
+      image: `edoburu/pgbouncer:v1.25.2-p0@${digest}`,
+      entrypoint: ["/usr/bin/pgbouncer"],
+      command: ["/var/lib/ark/pgbouncer/pgbouncer.ini"],
+      user: "1000:1000",
+      ports: ["127.0.0.1:15432:5432"],
+      volumes: ["../../tmp/pgbouncer:/var/lib/ark/pgbouncer:ro", "../../tmp/certs:/var/lib/ark/certs:ro"],
+      cap_drop: ["ALL"],
+      security_opt: ["no-new-privileges:true"],
+    };
+    expect(pgbouncerPublicViolations(good)).toEqual([]);
+    const cases: Array<[Partial<Service>, RegExp]> = [
+      [{ entrypoint: undefined }, /entrypoint/],
+      [{ entrypoint: ["/entrypoint.sh"] }, /entrypoint/],
+      [{ image: `edoburu/pgbouncer:v1.9.0@${digest}` }, /1\.9\.0 is older/],
+      [{ image: `edoburu/pgbouncer:v1.25.1-p0@${digest}` }, /1\.25\.1 is older/],
+      [{ image: "edoburu/pgbouncer:v1.26.1-p0" }, /sha256/],
+      [{ image: `edoburu/pgbouncer@${digest}` }, /sha256/],
+      [{ image: `edoburu/pgbouncer:latest@${digest}` }, /readable PgBouncer version/],
+      [{ command: ["/etc/pgbouncer/pgbouncer.ini"] }, /pgbouncer\.ini/],
+      [{ environment: { DB_HOST: "app-postgres" } }, /DB_HOST/],
+      [{ user: undefined }, /1000:1000/],
+      [{ cap_drop: [] }, /cap_drop/],
+      [{ security_opt: [] }, /no-new-privileges/],
+      [{ ports: ["15432:5432"] }, /loopback-only/],
+      [
+        { volumes: ["../../tmp/pgbouncer:/var/lib/ark/pgbouncer", "../../tmp/certs:/var/lib/ark/certs:ro"] },
+        /read-only/,
+      ],
+    ];
+    for (const [change, expected] of cases) {
+      const problems = pgbouncerPublicViolations({ ...good, ...change });
+      expect(problems.some((problem) => expected.test(problem))).toBe(true);
+    }
+  });
+
+  test("no deployable file references a PgBouncer image older than 1.25.2", async () => {
+    const offenders: string[] = [];
+    for (const directory of ["infra", "scripts", ".github"]) {
+      for await (const path of files(join(root, directory))) {
+        if (!/\.(ya?ml|json|ts|hcl|sh|toml)$|Dockerfile$/.test(path)) continue;
+        const text = await Bun.file(path).text();
+        for (const reference of text.match(pgbouncerReference) ?? []) {
+          const tag = reference.split("@")[0]!.split(":").at(-1)!;
+          const version = pgbouncerVersion(tag);
+          if (!version || !atLeast(version, minimumVersion))
+            offenders.push(`${relative(root, path)}: ${reference}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});
