@@ -8,6 +8,7 @@ This checklist records code-backed boundaries, not deployment acceptance. A box 
 - [x] TypeScript and Go Compose policies default-deny fields and reject external/named platform resources, local-driver bind options, privileged mode, sockets, host namespaces, includes, interpolation, aliases and floating tags.
 - [x] Public PgBouncer omits `_owner`, `_migration`, `_backup`, and `_monitor` roles.
 - [x] `pgbouncer-public` runs digest-pinned PgBouncer 1.26.1 (at least 1.25.2, which fixes CVE-2026-6664) directly on the generated `pgbouncer.ini`, with no env-driven config generation, all capabilities dropped and read-only mounts.
+- [x] The installer seeds PgBouncer with no mappings or admitted users, requiring TLS and SCRAM; the disposable CI smoke test rejects bootstrap console access and verifies authenticated TLS through the host loopback port.
 - [x] Tailscale Funnel stays disabled; mode change rewrites edge config and revokes sessions.
 - [x] Internal worker routes authenticate bearer identities and reject job kinds outside each typed allowlist.
 - [x] Public and tailnet Caddy routes preserve deny-before-fallback ordering for internal and unknown API paths.

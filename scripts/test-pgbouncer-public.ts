@@ -1,5 +1,5 @@
 // Starts the real `app-postgres` and `pgbouncer-public` Compose services in a disposable
-// project, feeds PgBouncer a config produced by Ark's generator, and connects over TLS with
+// project, checks the installer bootstrap before admitting a database, and connects over TLS with
 // SCRAM as a runtime role. The Compose file's relative bind mounts (`../../tmp/...`) are
 // redirected into a temporary directory with `--project-directory`, so the repository's own
 // `tmp/` state is never touched.
@@ -9,6 +9,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { pgbouncerConfig, pgbouncerUserlist } from "@ark-stack/shared";
+
+import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 
 const root = resolve(import.meta.dir, "..");
 const composeFile = join(root, "infra", "platform", "docker-compose.yml");
@@ -63,9 +65,19 @@ delete env.COMPOSE_PROJECT_NAME;
 let pgbouncerImage = "";
 let clientImage = "";
 const compose = ["docker", "compose", "-f", composeFile, "--project-directory", projectDir, "-p", project];
+// Default to the real ingress target. A shared developer host can request an ephemeral
+// loopback port with ARK_PGBOUNCER_SMOKE_PORT=0, without changing production Compose.
+const requestedPort = process.env.ARK_PGBOUNCER_SMOKE_PORT ?? "15432";
+if (!/^\d+$/.test(requestedPort) || Number(requestedPort) > 65535) {
+  throw new Error("ARK_PGBOUNCER_SMOKE_PORT must be 0 (ephemeral) or a port from 1 to 65535.");
+}
+let loopbackPort = requestedPort;
 
-async function run(command: string[], options: { allowFailure?: boolean } = {}) {
-  const child = Bun.spawn(command, { env, stdout: "pipe", stderr: "pipe" });
+async function run(
+  command: string[],
+  options: { allowFailure?: boolean; env?: Record<string, string> } = {},
+) {
+  const child = Bun.spawn(command, { env: { ...env, ...options.env }, stdout: "pipe", stderr: "pipe" });
   const [status, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -150,8 +162,65 @@ async function psql(
   );
 }
 
+async function chownState(owner: string) {
+  await run([
+    "docker",
+    "run",
+    "--rm",
+    "--user",
+    "0:0",
+    "--entrypoint",
+    "chown",
+    "--volume",
+    `${join(work, "tmp")}:/smoke`,
+    pgbouncerImage,
+    "-R",
+    owner,
+    "/smoke",
+  ]);
+}
+
+async function checkLoopbackPublication(bouncer: string) {
+  const published = await run(["docker", "port", bouncer, "5432/tcp"]);
+  const binding = /^127\.0\.0\.1:(\d+)$/.exec(published.stdout);
+  if (!binding || (requestedPort !== "0" && binding[1] !== requestedPort)) {
+    throw new Error(`Expected loopback-only publication, got: ${published.stdout}`);
+  }
+  loopbackPort = binding[1]!;
+}
+
+async function loopbackPsql(
+  role: string,
+  password: string,
+  sslmode: string,
+  dbname: string,
+  sql: string,
+  allowFailure = false,
+) {
+  const client = Bun.which("psql");
+  if (!client) throw new Error("The loopback smoke test requires a host psql client (postgresql-client).");
+  return run(
+    [
+      client,
+      `host=127.0.0.1 port=${loopbackPort} dbname=${dbname} user=${role} sslmode=${sslmode} sslrootcert=${caFile} connect_timeout=10`,
+      "--no-psqlrc",
+      "--set",
+      "ON_ERROR_STOP=1",
+      "--command",
+      sql,
+    ],
+    { allowFailure, env: { PGPASSWORD: password } },
+  );
+}
+
 try {
   await mkdir(projectDir, { recursive: true });
+  if (requestedPort !== "15432") {
+    const override = join(work, "smoke-ports.yml");
+    const binding = `127.0.0.1:${requestedPort === "0" ? "" : requestedPort}:5432`;
+    await Bun.write(override, `services:\n  pgbouncer-public:\n    ports: !override ["${binding}"]\n`);
+    compose.push("-f", override);
+  }
   await mkdir(pgbouncerDir, { recursive: true });
   await mkdir(certDir, { recursive: true });
 
@@ -185,8 +254,7 @@ try {
     { name: ownerRole, password: ownerPassword },
   ]);
   if (userlist.includes(ownerRole)) throw new Error("Userlist admitted a privileged _owner role.");
-  await Bun.write(join(pgbouncerDir, "pgbouncer.ini"), config);
-  await Bun.write(join(pgbouncerDir, "userlist.txt"), userlist);
+  await seedPgbouncerBootstrap(pgbouncerDir);
   for (const file of [
     join(pgbouncerDir, "pgbouncer.ini"),
     join(pgbouncerDir, "userlist.txt"),
@@ -206,21 +274,7 @@ try {
   // Match production ownership: the installer chowns these trees to uid 1000 and Ark writes
   // the files with mode 0600. PgBouncer runs with every capability dropped, so this proves
   // the service user can read them without CAP_DAC_OVERRIDE.
-  await run([
-    "docker",
-    "run",
-    "--rm",
-    "--user",
-    "0:0",
-    "--entrypoint",
-    "chown",
-    "--volume",
-    `${join(work, "tmp")}:/smoke`,
-    pgbouncerImage,
-    "-R",
-    arkUid,
-    "/smoke",
-  ]);
+  await chownState(arkUid);
 
   log("Starting app-postgres…");
   await run([...compose, "up", "--detach", "--wait", "--wait-timeout", "120", "app-postgres"]);
@@ -277,6 +331,55 @@ try {
   if (!banner?.includes("PgBouncer 1.26.1")) throw new Error(`Unexpected PgBouncer banner: ${banner}`);
   log(`log: ${banner.trim()}`);
 
+  // Assert the real host relay target, not just service-network connectivity.
+  await checkLoopbackPublication(bouncer);
+  for (const sslmode of ["disable", "verify-full"]) {
+    const rejected = await loopbackPsql(
+      runtimeRole,
+      runtimePassword,
+      sslmode,
+      "pgbouncer",
+      "SHOW CONFIG",
+      true,
+    );
+    const expected = sslmode === "disable" ? /SSL required/ : /authentication failed/;
+    if (rejected.status === 0 || !expected.test(rejected.stderr)) {
+      throw new Error(
+        `Bootstrap console rejection (${sslmode}) failed: ${rejected.stderr || rejected.stdout}`,
+      );
+    }
+    log(`bootstrap console rejected (${sslmode}): ${rejected.stderr.split("\n").at(-1)}`);
+  }
+  const bootstrapDatabase = await loopbackPsql(
+    runtimeRole,
+    runtimePassword,
+    "verify-full",
+    database,
+    "SELECT 1",
+    true,
+  );
+  if (bootstrapDatabase.status === 0 || !/authentication failed/.test(bootstrapDatabase.stderr)) {
+    throw new Error(`Bootstrap admitted a database client: ${bootstrapDatabase.stderr}`);
+  }
+
+  // Install the normal worker-generated config after exercising the installer seed.
+  await run([...compose, "stop", "pgbouncer-public"]);
+  await chownState(`${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`);
+  await Bun.write(join(pgbouncerDir, "pgbouncer.ini"), config);
+  await Bun.write(join(pgbouncerDir, "userlist.txt"), userlist);
+  await chownState(arkUid);
+  await run([...compose, "up", "--detach", "--wait", "--wait-timeout", "120", "pgbouncer-public"]);
+  // Docker can assign a different ephemeral host port when restarting the container.
+  await checkLoopbackPublication(bouncer);
+  const loopback = await loopbackPsql(
+    runtimeRole,
+    runtimePassword,
+    "verify-full",
+    database,
+    "SELECT current_user, current_database()",
+  );
+  log(`host loopback 127.0.0.1:${loopbackPort} over verify-full TLS + SCRAM:\n${loopback.stdout}`);
+
   const network = `${project}_database-management`;
   const connected = await psql(
     network,
@@ -306,15 +409,6 @@ try {
   if (!health.startsWith("healthy restarts=0")) throw new Error(`pgbouncer-public degraded: ${health}`);
   log(`pgbouncer-public after checks: ${health}`);
 
-  // The Compose file binds 127.0.0.1:15432 for database-ingress. Report whether Docker
-  // actually published it; a container attached only to an `internal: true` network gets no
-  // published ports.
-  const published = await run(["docker", "port", bouncer, "5432/tcp"], { allowFailure: true });
-  log(
-    published.status === 0 && published.stdout
-      ? `loopback publish: ${published.stdout}`
-      : "loopback publish: NOT bound (pgbouncer-public is only on the internal database-management network)",
-  );
   log("pgbouncer-public smoke test passed.");
 } catch (error) {
   const bouncer = await run([...compose, "logs", "--no-color", "pgbouncer-public"], {

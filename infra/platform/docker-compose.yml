@@ -276,7 +276,9 @@ services:
     depends_on:
       app-postgres: { condition: service_healthy }
     restart: unless-stopped
-    networks: [database-management]
+    # A non-internal bridge is required for Docker to publish the host loopback port.
+    # Backends remain exclusively on the isolated database-management bridge.
+    networks: [database-management, database-loopback]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
 
@@ -359,6 +361,7 @@ networks:
   admin: {}
   edge-control: { internal: true }
   database-management: { internal: true }
+  database-loopback: {}
   mail-management:
     external: true
     name: ark_mail_management

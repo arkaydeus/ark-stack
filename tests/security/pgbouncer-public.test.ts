@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readdir } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const root = join(import.meta.dir, "..", "..");
 const composeFile = join(root, "infra", "platform", "docker-compose.yml");
@@ -21,6 +22,7 @@ type Service = {
   volumes?: string[];
   cap_drop?: string[];
   security_opt?: string[];
+  networks?: string[] | Record<string, unknown>;
 };
 
 function pgbouncerVersion(tag: string) {
@@ -82,13 +84,22 @@ async function loadCompose() {
   return Bun.YAML.parse(await Bun.file(composeFile).text()) as { services: Record<string, Service> };
 }
 
-async function* files(directory: string): AsyncGenerator<string> {
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) {
-      if (entry.name !== "node_modules") yield* files(path);
-    } else yield path;
+// Git enumerates repository files regardless of directory or extension, without scanning
+// ignored build output, dependencies or local review artifacts.
+async function staleImages(repository: string) {
+  const listed = Bun.spawnSync(["git", "ls-files", "-z"], { cwd: repository });
+  if (listed.exitCode !== 0) throw new Error(listed.stderr.toString());
+  const offenders: string[] = [];
+  for (const name of listed.stdout.toString().split("\0").filter(Boolean)) {
+    const text = await Bun.file(join(repository, name)).text();
+    if (text.includes("\0")) continue;
+    for (const reference of text.match(pgbouncerReference) ?? []) {
+      const tag = reference.split("@")[0]!.split(":").at(-1)!;
+      const version = pgbouncerVersion(tag);
+      if (!version || !atLeast(version, minimumVersion)) offenders.push(`${name}: ${reference}`);
+    }
   }
+  return offenders;
 }
 
 describe("pgbouncer-public compose service", () => {
@@ -98,9 +109,10 @@ describe("pgbouncer-public compose service", () => {
   });
 
   test("rejects the image entrypoint, missing pins and vulnerable versions", () => {
+    const repository = "edoburu/pgbouncer";
     const digest = `sha256:${"a".repeat(64)}`;
     const good: Service = {
-      image: `edoburu/pgbouncer:v1.25.2-p0@${digest}`,
+      image: `${repository}:v1.25.2-p0@${digest}`,
       entrypoint: ["/usr/bin/pgbouncer"],
       command: ["/var/lib/ark/pgbouncer/pgbouncer.ini"],
       user: "1000:1000",
@@ -113,11 +125,11 @@ describe("pgbouncer-public compose service", () => {
     const cases: Array<[Partial<Service>, RegExp]> = [
       [{ entrypoint: undefined }, /entrypoint/],
       [{ entrypoint: ["/entrypoint.sh"] }, /entrypoint/],
-      [{ image: `edoburu/pgbouncer:v1.9.0@${digest}` }, /1\.9\.0 is older/],
-      [{ image: `edoburu/pgbouncer:v1.25.1-p0@${digest}` }, /1\.25\.1 is older/],
+      [{ image: `${repository}:v1.9.0@${digest}` }, /1\.9\.0 is older/],
+      [{ image: `${repository}:v1.25.1-p0@${digest}` }, /1\.25\.1 is older/],
       [{ image: "edoburu/pgbouncer:v1.26.1-p0" }, /sha256/],
       [{ image: `edoburu/pgbouncer@${digest}` }, /sha256/],
-      [{ image: `edoburu/pgbouncer:latest@${digest}` }, /readable PgBouncer version/],
+      [{ image: `${repository}:latest@${digest}` }, /readable PgBouncer version/],
       [{ command: ["/etc/pgbouncer/pgbouncer.ini"] }, /pgbouncer\.ini/],
       [{ environment: { DB_HOST: "app-postgres" } }, /DB_HOST/],
       [{ user: undefined }, /1000:1000/],
@@ -135,20 +147,61 @@ describe("pgbouncer-public compose service", () => {
     }
   });
 
-  test("no deployable file references a PgBouncer image older than 1.25.2", async () => {
-    const offenders: string[] = [];
-    for (const directory of ["infra", "scripts", ".github"]) {
-      for await (const path of files(join(root, directory))) {
-        if (!/\.(ya?ml|json|ts|hcl|sh|toml)$|Dockerfile$/.test(path)) continue;
-        const text = await Bun.file(path).text();
-        for (const reference of text.match(pgbouncerReference) ?? []) {
-          const tag = reference.split("@")[0]!.split(":").at(-1)!;
-          const version = pgbouncerVersion(tag);
-          if (!version || !atLeast(version, minimumVersion))
-            offenders.push(`${relative(root, path)}: ${reference}`);
-        }
+  test("no repository file references a PgBouncer image older than 1.25.2", async () => {
+    expect(await staleImages(root)).toEqual([]);
+  });
+
+  test("finds stale images in root files and directories outside infra, scripts and CI", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ark-image-scan-"));
+    try {
+      const repository = "edoburu/pgbouncer";
+      const oldImage = `${repository}:v${[1, 24, 1].join(".")}-p1`;
+      await mkdir(join(directory, "deploy"));
+      await Bun.write(join(directory, "Dockerfile"), `FROM ${oldImage}\n`);
+      await Bun.write(join(directory, "deploy", "pooler.conf"), `image: ${oldImage}\n`);
+      for (const args of [
+        ["init", "--quiet"],
+        ["add", "."],
+      ]) {
+        const command = Bun.spawnSync(["git", ...args], { cwd: directory });
+        expect(command.exitCode).toBe(0);
+      }
+      expect(await staleImages(directory)).toEqual([
+        `Dockerfile: ${oldImage}`,
+        `deploy/pooler.conf: ${oldImage}`,
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps backend networking internal and publishes through a dedicated bridge", async () => {
+    const compose = Bun.YAML.parse(await Bun.file(composeFile).text()) as {
+      services: Record<string, Service>;
+      networks: Record<string, { internal?: boolean }>;
+    };
+    expect(compose.networks["database-management"]?.internal).toBe(true);
+    expect(compose.networks["database-loopback"]?.internal).not.toBe(true);
+    expect(compose.services["pgbouncer-public"]?.networks).toEqual([
+      "database-management",
+      "database-loopback",
+    ]);
+    for (const [name, service] of Object.entries(compose.services)) {
+      if (name !== "pgbouncer-public") {
+        const names = Array.isArray(service.networks)
+          ? service.networks
+          : Object.keys(service.networks ?? {});
+        expect(names).not.toContain("database-loopback");
       }
     }
-    expect(offenders).toEqual([]);
+  });
+
+  test("CI runs the disposable bootstrap and TLS/SCRAM smoke test", async () => {
+    const workflow = Bun.YAML.parse(await Bun.file(join(root, ".github/workflows/ci.yml")).text()) as {
+      jobs: { verify: { steps: Array<{ run?: string }> } };
+    };
+    expect(
+      workflow.jobs.verify.steps.some((step) => step.run === "bun scripts/test-pgbouncer-public.ts"),
+    ).toBe(true);
   });
 });
