@@ -33,7 +33,7 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/edge-namespace.test.ts"
 
 [tasks."test:e2e"]
 description = "Run fresh-volume browser onboarding against a disposable local database"
@@ -178,3 +178,11 @@ run = "docker compose -f infra/monitoring/docker-compose.yml up -d"
 description = "Validate and optionally apply a platform maintenance bundle"
 raw_args = true
 run = "bun --env-file=.env scripts/maintain.ts"
+
+[tasks."edge:rejoin"]
+description = "Recreate edge (and later edge-l4) if edge-ts was restarted or replaced under it"
+run = "bun --env-file=.env scripts/edge-namespace.ts"
+
+[tasks."test:edge-tailnet"]
+description = "Opt-in: join edge-ts to a real test tailnet and check tags, grants, shields-up and UDP 41642 (skips without ARK_TEST_TS_EDGE_AUTHKEY)"
+run = "bun scripts/test-edge-tailnet.ts"

@@ -4,6 +4,8 @@ import { spawn } from "node:child_process";
 
 import { bundleDigest, maintenanceArgv, verifyMaintenanceRelease } from "@ark-stack/shared";
 
+import { rejoinNamespaceDependents } from "./edge-namespace.ts";
+
 const token = process.env.ARK_MAINTENANCE_TOKEN ?? "";
 if (!token) {
   console.error("ARK_MAINTENANCE_TOKEN is required for the platform maintenance runner.");
@@ -20,7 +22,8 @@ if (!publicKey) {
 const bundle = JSON.parse(await Bun.file(file).text());
 const composeSource = await Bun.file(compose).text();
 const validated = verifyMaintenanceRelease(bundle, composeSource, publicKey.replaceAll("\\n", "\n"));
-const argv = maintenanceArgv("ark-platform", compose);
+const project = "ark-platform";
+const argv = maintenanceArgv(project, compose);
 const journal = join(process.env.ARK_MAINTENANCE_JOURNAL ?? "tmp/maintenance.jsonl");
 
 await appendFile(
@@ -46,3 +49,7 @@ await new Promise<void>((resolve, reject) => {
   const child = spawn(argv[0], argv.slice(1), { stdio: "inherit" });
   child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`maintain exited ${code}`))));
 });
+
+// Compose recreates `edge` when it recreates `edge-ts`, but not when `edge-ts` was restarted in place
+// (a crash or `docker restart`). Either way `edge` must end up in the live edge-ts namespace.
+await rejoinNamespaceDependents({ project, composeArgs: ["-f", compose, "-p", project] });
