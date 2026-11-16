@@ -9,6 +9,8 @@ import {
   cloudflareRecordBody,
   compareInventory,
   digestFromHeaders,
+  EDGE_CERT_DIR,
+  edgeCertificatePaths,
   funnelDisabled,
   jmapCall,
   nftAllowlist,
@@ -22,6 +24,7 @@ import {
   signAwsRequest,
   stalwartRef,
   type DnsWrite,
+  type EdgeAppRoute,
   type ExternalInventory,
 } from "@ark-stack/shared";
 
@@ -511,10 +514,37 @@ export async function writePgbouncer(input: {
   return { dir, reloaded };
 }
 
+/**
+ * Applies a Caddyfile through Caddy's admin API: `/adapt` first, so a rejected candidate never
+ * reaches `/load`, then `/load` of the adapted JSON with `Cache-Control: must-revalidate`. Without
+ * that header Caddy skips a `/load` whose config is unchanged, so renewed certificate files at the
+ * same paths would never be re-read (docs/design/front-door.md §3.14).
+ */
+export async function loadCaddyfile(adminUrl: string, caddyfile: string) {
+  const base = adminUrl.replace(/\/$/, "");
+  const adapted = await fetch(`${base}/adapt`, {
+    method: "POST",
+    headers: { "content-type": "text/caddyfile" },
+    body: caddyfile,
+  });
+  if (!adapted.ok) throw new Error(`Caddy rejected candidate configuration: ${adapted.status}`);
+  // /adapt answers `{ result, warnings }`; only `result` is a Caddy config that /load accepts.
+  const { result } = (await adapted.json()) as { result?: unknown };
+  if (!result || typeof result !== "object") throw new Error("Caddy /adapt returned no configuration.");
+  const loaded = await fetch(`${base}/load`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "cache-control": "must-revalidate" },
+    body: JSON.stringify(result),
+  });
+  if (!loaded.ok) throw new Error(`Caddy reload failed: ${loaded.status}`);
+}
+
 export async function writeEdge(input: {
   adminMode: "public" | "tailnet";
   adminHostname?: string;
-  appRoutes?: Array<{ hostname: string; upstream: string }>;
+  /** The current certificate status per hostname; only `issued` hostnames are served. */
+  certificates?: Array<{ hostname: string; status: string }>;
+  appRoutes?: EdgeAppRoute[];
 }) {
   const dir = process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform");
   await mkdir(dir, { recursive: true });
@@ -523,6 +553,11 @@ export async function writeEdge(input: {
     adminHostname: input.adminHostname,
     challengeDir: process.env.ARK_ACME_WEBROOT ?? join(dir, "acme"),
     apiUpstream: process.env.ARK_API_UPSTREAM ?? "api:3000",
+    // Paths inside the edge container, which mounts the certificate directory read-only.
+    certificates: (input.certificates ?? []).map((item) => ({
+      ...item,
+      ...edgeCertificatePaths(item.hostname, EDGE_CERT_DIR),
+    })),
     appRoutes: input.appRoutes,
   });
   const serve = renderTailscaleServe();
@@ -536,19 +571,7 @@ export async function writeEdge(input: {
   const reloadUrl = process.env.ARK_EDGE_RELOAD_URL;
   let applied = false;
   if (reloadUrl) {
-    const adapted = await fetch(`${reloadUrl.replace(/\/$/, "")}/adapt`, {
-      method: "POST",
-      headers: { "content-type": "text/caddyfile" },
-      body: caddy,
-    });
-    if (!adapted.ok) throw new Error(`Caddy rejected candidate configuration: ${adapted.status}`);
-    const config = await adapted.text();
-    const loaded = await fetch(`${reloadUrl.replace(/\/$/, "")}/load`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: config,
-    });
-    if (!loaded.ok) throw new Error(`Caddy reload failed: ${loaded.status}`);
+    await loadCaddyfile(reloadUrl, caddy);
     applied = true;
   } else if (process.env.NODE_ENV === "production") {
     throw new Error("ARK_EDGE_RELOAD_URL is required to apply gateway changes in production.");
