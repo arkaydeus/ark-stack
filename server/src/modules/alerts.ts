@@ -80,7 +80,9 @@ export async function evaluateAlerts() {
   // Renewal inserts a new row per endpoint and keeps the old ones, so only the newest
   // certificate for each endpoint describes what is actually served. Alerting on superseded
   // rows would make the alert permanent from the first renewal onwards.
-  const certs = await db.select().from(certificates);
+  // A renewal still `awaiting_reload` (database endpoint, §3.14) is not served yet, so the
+  // previous certificate's expiry keeps alerting until PgBouncer confirms the new one.
+  const certs = (await db.select().from(certificates)).filter((cert) => cert.status !== "awaiting_reload");
   const current = new Map<string, (typeof certs)[number]>();
   for (const cert of certs) {
     const held = current.get(cert.endpointId);

@@ -1,20 +1,38 @@
-// Starts the real `app-postgres` and `pgbouncer-public` Compose services in a disposable
-// project, checks the installer bootstrap before admitting a database, and connects over TLS with
-// SCRAM as a runtime role. The Compose file's relative bind mounts (`../../tmp/...`) are
-// redirected into a temporary directory with `--project-directory`, so the repository's own
-// `tmp/` state is never touched.
-import { randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+// Starts the real `app-postgres` and `pgbouncer-public` Compose services in a disposable project
+// and tests the FD-16 public PgBouncer (docs/design/front-door.md §3.10.2, §3.14, §7 V-8):
+//
+// - the installer's closed bootstrap (no client admitted: deny-all CA bundle, nothing mapped);
+// - the exact INI, HBA, userlist and CA bundle the database worker renders (planPgbouncer), loaded
+//   with RELOAD over the admin unix socket by a database-worker stand-in container;
+// - the V-8 mTLS matrix, the admin identity's transport restriction, max_user_client_connections,
+//   postgres.js prepared statements in transaction mode, and a server certificate swap whose new
+//   fingerprint is verified through the published port with `openssl s_client`;
+// - a simulated reload failure that retries and never reports success.
+//
+// The Compose file's relative bind mounts (`../../tmp/...`) are redirected into a temporary
+// directory with `--project-directory`, so the repository's own `tmp/` state is never touched.
+import { generateKeyPairSync, randomBytes } from "node:crypto";
+import { chmod, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { pgbouncerConfig, pgbouncerUserlist } from "@ark-stack/shared";
+import { PGBOUNCER_FILES, pgbouncerHba, renderClientCaBundle } from "@ark-stack/shared";
+import postgres from "postgres";
 
+import { planPgbouncer, renderPgbouncerFiles, writePgbouncerFiles } from "../server/src/modules/pgbouncer.ts";
 import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
+
+// The FD-13 CA module issues the client certificates. Its pure functions need no database, but
+// the module opens a lazy pool at import; give it an address it never connects to.
+process.env.DATABASE_URL ??= "postgres://unused:unused@127.0.0.1:9/unused";
+const pki = await import("../server/src/modules/pki.ts");
 
 const root = resolve(import.meta.dir, "..");
 const composeFile = join(root, "infra", "platform", "docker-compose.yml");
-const template = join(root, "infra", "database", "pgbouncer.ini");
+const templates = {
+  ini: join(root, "infra", "database", "pgbouncer.ini"),
+  hba: join(root, "infra", "database", "pg_hba.conf"),
+};
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const project = `ark-pgbouncer-smoke-${suffix}`;
 const work = await mkdtemp(join(tmpdir(), `ark-pgbouncer-${suffix}-`));
@@ -22,16 +40,23 @@ const work = await mkdtemp(join(tmpdir(), `ark-pgbouncer-${suffix}-`));
 const projectDir = join(work, "infra", "platform");
 const pgbouncerDir = join(work, "tmp", "pgbouncer");
 const certDir = join(work, "tmp", "certs", "database");
-const caFile = join(work, "client-ca.pem");
+const clientDir = join(work, "client");
+const probeDir = join(work, "probe");
+const serverCa = join(clientDir, "server-ca.pem");
 // Ark's containers and the installer's chown use uid/gid 1000 (scripts/install.ts).
 const arkUid = "1000:1000";
+const hostUid = `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`;
 const database = "ark_smoke";
-const runtimeRole = "ark_smoke_runtime";
+const appRole = "ark_smoke_shop_production";
+const limitedRole = "ark_smoke_shop_preview";
 const ownerRole = "ark_smoke_owner";
 const secret = () => randomBytes(18).toString("base64url");
-const runtimePassword = secret();
+const appPassword = secret();
+const limitedPassword = secret();
 const ownerPassword = secret();
 const adminPassword = secret();
+const clusterPassword = secret();
+const limitedClientConnections = 2;
 
 const env: Record<string, string> = { ...(process.env as Record<string, string>) };
 // The Compose file interpolates every service, so each installer-generated value needs a
@@ -58,13 +83,17 @@ for (const name of [
 ]) {
   env[name] = `smoke-${secret()}`;
 }
-env.ARK_APP_DB_PASSWORD = adminPassword;
+env.ARK_APP_DB_PASSWORD = clusterPassword;
+env.ARK_PGBOUNCER_ADMIN_PASSWORD = adminPassword;
 delete env.COMPOSE_FILE;
 delete env.COMPOSE_PROJECT_NAME;
 
 let pgbouncerImage = "";
 let clientImage = "";
+let bunImage = "";
 const compose = ["docker", "compose", "-f", composeFile, "--project-directory", projectDir, "-p", project];
+const socketVolume = `${project}_ark_pgbouncer_socket`;
+const network = `${project}_database-management`;
 // Default to the real ingress target. A shared developer host can request an ephemeral
 // loopback port with ARK_PGBOUNCER_SMOKE_PORT=0, without changing production Compose.
 const requestedPort = process.env.ARK_PGBOUNCER_SMOKE_PORT ?? "15432";
@@ -72,12 +101,18 @@ if (!/^\d+$/.test(requestedPort) || Number(requestedPort) > 65535) {
   throw new Error("ARK_PGBOUNCER_SMOKE_PORT must be 0 (ephemeral) or a port from 1 to 65535.");
 }
 let loopbackPort = requestedPort;
+const results: Array<[string, string]> = [];
 
 async function run(
   command: string[],
-  options: { allowFailure?: boolean; env?: Record<string, string> } = {},
+  options: { allowFailure?: boolean; env?: Record<string, string>; stdin?: string } = {},
 ) {
-  const child = Bun.spawn(command, { env: { ...env, ...options.env }, stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(command, {
+    env: { ...env, ...options.env },
+    stdin: options.stdin === undefined ? "ignore" : Buffer.from(options.stdin),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const [status, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -91,6 +126,16 @@ async function run(
 
 function log(line: string) {
   console.log(line);
+}
+
+function lastLine(text: string) {
+  return text.split("\n").findLast((line) => line.length > 0) ?? "";
+}
+
+/** Record one acceptance check for the summary table printed at the end. */
+function record(check: string, outcome: string) {
+  results.push([check, outcome]);
+  log(`✓ ${check}: ${outcome}`);
 }
 
 async function service(name: string) {
@@ -116,50 +161,15 @@ function settings(text: string) {
   );
 }
 
-// Every setting in the checked-in template must survive into the generated config, so the
-// smoke test exercises the same listener, auth, TLS and pooling settings production uses.
+// Every [pgbouncer] setting in the checked-in template must survive into the generated config,
+// so the smoke test exercises the same listener, auth, TLS and pooling settings production uses.
 function assertTemplateCoverage(generated: string, source: string) {
-  const expected = settings(source);
   const actual = settings(generated);
-  for (const [key, value] of expected) {
+  for (const [key, value] of settings(source)) {
     if (actual.get(key) !== value) {
       throw new Error(`Generated pgbouncer.ini drifts from the template: ${key} = ${actual.get(key)}`);
     }
   }
-}
-
-async function psql(
-  network: string,
-  role: string,
-  password: string,
-  sslmode: string,
-  sql: string,
-  allowFailure = false,
-) {
-  return run(
-    [
-      "docker",
-      "run",
-      "--rm",
-      "--network",
-      network,
-      "--volume",
-      `${caFile}:/smoke/ca.pem:ro`,
-      "--env",
-      `PGPASSWORD=${password}`,
-      "--env",
-      "PGCONNECT_TIMEOUT=10",
-      clientImage,
-      "psql",
-      `host=pgbouncer-public port=5432 dbname=${database} user=${role} sslmode=${sslmode} sslrootcert=/smoke/ca.pem`,
-      "--no-psqlrc",
-      "--set",
-      "ON_ERROR_STOP=1",
-      "--command",
-      sql,
-    ],
-    { allowFailure },
-  );
 }
 
 async function chownState(owner: string) {
@@ -180,6 +190,16 @@ async function chownState(owner: string) {
   ]);
 }
 
+/** Write files as the host user, then hand the tree back to uid 1000 as the installer does. */
+async function asHost<T>(action: () => Promise<T>) {
+  await chownState(hostUid);
+  try {
+    return await action();
+  } finally {
+    await chownState(arkUid);
+  }
+}
+
 async function checkLoopbackPublication(bouncer: string) {
   const published = await run(["docker", "port", bouncer, "5432/tcp"]);
   const binding = /^127\.0\.0\.1:(\d+)$/.exec(published.stdout);
@@ -189,28 +209,187 @@ async function checkLoopbackPublication(bouncer: string) {
   loopbackPort = binding[1]!;
 }
 
-async function loopbackPsql(
-  role: string,
-  password: string,
-  sslmode: string,
-  dbname: string,
-  sql: string,
-  allowFailure = false,
-) {
+type Credentials = { cert: string; key: string };
+
+/** psql from the host through the published loopback port, verifying the server certificate. */
+async function hostPsql(input: {
+  role: string;
+  password: string;
+  dbname?: string;
+  sql: string;
+  client?: Credentials;
+  sslmode?: string;
+  extra?: string;
+}) {
   const client = Bun.which("psql");
   if (!client) throw new Error("The loopback smoke test requires a host psql client (postgresql-client).");
+  const certificate = input.client ? ` sslcert=${input.client.cert} sslkey=${input.client.key}` : "";
   return run(
     [
       client,
-      `host=127.0.0.1 port=${loopbackPort} dbname=${dbname} user=${role} sslmode=${sslmode} sslrootcert=${caFile} connect_timeout=10`,
+      `host=127.0.0.1 port=${loopbackPort} dbname=${input.dbname ?? database} user=${input.role} sslmode=${input.sslmode ?? "verify-full"} sslrootcert=${serverCa} connect_timeout=10${certificate}${input.extra ? ` ${input.extra}` : ""}`,
       "--no-psqlrc",
+      "--tuples-only",
       "--set",
       "ON_ERROR_STOP=1",
       "--command",
+      input.sql,
+    ],
+    {
+      allowFailure: true,
+      env: { PGPASSWORD: input.password, PGSSLCERT: "/nonexistent", PGSSLKEY: "/nonexistent" },
+    },
+  );
+}
+
+/** psql inside a container that shares only the admin socket volume, as uid 1000. */
+async function socketPsql(role: string, password: string, dbname: string, sql: string) {
+  return run(
+    [
+      "docker",
+      "run",
+      "--rm",
+      "--user",
+      arkUid,
+      "--network",
+      "none",
+      "--volume",
+      `${socketVolume}:/var/run/pgbouncer`,
+      "--env",
+      `PGPASSWORD=${password}`,
+      "--entrypoint",
+      "psql",
+      pgbouncerImage,
+      `host=/var/run/pgbouncer port=5432 dbname=${dbname} user=${role} connect_timeout=10`,
+      "--no-psqlrc",
+      "--tuples-only",
+      "--command",
       sql,
     ],
-    { allowFailure, env: { PGPASSWORD: password } },
+    { allowFailure: true },
   );
+}
+
+/** The database-worker stand-in (scripts/pgbouncer-worker-probe.ts), bundled and containerised. */
+async function probe(args: string[], extraEnv: Record<string, string> = {}) {
+  const command = [
+    "docker",
+    "run",
+    "--rm",
+    "--user",
+    arkUid,
+    "--read-only",
+    "--cap-drop",
+    "ALL",
+    "--network",
+    network,
+    "--volume",
+    `${socketVolume}:/var/run/pgbouncer`,
+    "--volume",
+    `${probeDir}:/probe:ro`,
+    "--env",
+    "ARK_PGBOUNCER_ADMIN_PASSWORD",
+    ...Object.keys(extraEnv).flatMap((name) => ["--env", name]),
+    bunImage,
+    "bun",
+    "/probe/pgbouncer-worker-probe.js",
+    ...args,
+  ];
+  const result = await run(command, { allowFailure: true, env: extraEnv });
+  const line = result.stdout.split("\n").findLast((item) => item.startsWith("{"));
+  if (!line) throw new Error(`Probe printed no result:\n${result.stderr || result.stdout}`);
+  return { status: result.status, ...(JSON.parse(line) as Record<string, unknown>) } as {
+    status: number;
+    ok: boolean;
+    attempts?: number;
+    fingerprint?: string;
+    failures?: string[];
+    error?: string;
+    rows?: Array<Record<string, unknown>>;
+    environment: { dockerCli: string | null; dockerSocket: boolean; uid: number };
+  };
+}
+
+/** The leaf fingerprint served on the published port, read with `openssl s_client`. */
+async function opensslFingerprint() {
+  const handshake = await run(
+    [
+      "openssl",
+      "s_client",
+      "-starttls",
+      "postgres",
+      "-connect",
+      `127.0.0.1:${loopbackPort}`,
+      "-tls1_3",
+      "-showcerts",
+    ],
+    { allowFailure: true, stdin: "" },
+  );
+  const leaf = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(handshake.stdout)?.[0];
+  if (!leaf) throw new Error(`openssl s_client returned no certificate:\n${handshake.stderr}`);
+  const digest = await run(["openssl", "x509", "-noout", "-fingerprint", "-sha256"], { stdin: `${leaf}\n` });
+  return digest.stdout.split("=")[1]!.replace(/:/g, "").toLowerCase();
+}
+
+async function fileFingerprint(path: string) {
+  const digest = await run(["openssl", "x509", "-in", path, "-noout", "-fingerprint", "-sha256"]);
+  return digest.stdout.split("=")[1]!.replace(/:/g, "").toLowerCase();
+}
+
+/** A self-signed server certificate for the Compose service name and the loopback address. */
+async function serverCertificate(directory: string) {
+  await run([
+    "openssl",
+    "req",
+    "-x509",
+    "-newkey",
+    "ec",
+    "-pkeyopt",
+    "ec_paramgen_curve:P-256",
+    "-sha256",
+    "-nodes",
+    "-days",
+    "2",
+    "-subj",
+    "/CN=pgbouncer-public",
+    "-addext",
+    "subjectAltName=DNS:pgbouncer-public,DNS:localhost,IP:127.0.0.1",
+    "-keyout",
+    join(directory, "privkey.pem"),
+    "-out",
+    join(directory, "fullchain.pem"),
+  ]);
+}
+
+/** A client certificate issued by the FD-13 CA module; the test key lives in the work dir. */
+async function issueClient(ca: ReturnType<typeof pki.createCaMaterial>, cn: string, name: string) {
+  const pair = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const issued = pki.signClientCertificate({
+    ca: { certPem: ca.certPem, privateKey: ca.privateKey },
+    subjectCn: cn,
+    publicKey: pair.publicKey,
+  });
+  const cert = join(clientDir, `${name}.crt`);
+  const key = join(clientDir, `${name}.key`);
+  await Bun.write(cert, issued.certPem);
+  await Bun.write(key, pair.privateKey.export({ type: "pkcs8", format: "pem" }) as string);
+  await chmod(key, 0o600);
+  return {
+    cert,
+    key,
+    certPem: issued.certPem,
+    keyPem: pair.privateKey.export({ type: "pkcs8", format: "pem" }) as string,
+    notAfter: issued.notAfter,
+  };
+}
+
+function expectRejected(result: { status: number; stderr: string }, pattern: RegExp, check: string) {
+  if (result.status === 0 || !pattern.test(result.stderr)) {
+    throw new Error(
+      `${check}: expected rejection matching ${pattern}, got (${result.status}) ${result.stderr}`,
+    );
+  }
+  record(check, `rejected — ${lastLine(result.stderr)}`);
 }
 
 try {
@@ -223,57 +402,59 @@ try {
   }
   await mkdir(pgbouncerDir, { recursive: true });
   await mkdir(certDir, { recursive: true });
+  await mkdir(clientDir, { recursive: true });
+  await mkdir(probeDir, { recursive: true });
 
-  // Self-signed server certificate whose SAN matches the Compose service name, so the client
-  // can use sslmode=verify-full.
-  await run([
-    "openssl",
-    "req",
-    "-x509",
-    "-newkey",
-    "rsa:2048",
-    "-sha256",
-    "-nodes",
-    "-days",
-    "2",
-    "-subj",
-    "/CN=pgbouncer-public",
-    "-addext",
-    "subjectAltName=DNS:pgbouncer-public,DNS:localhost,IP:127.0.0.1",
-    "-keyout",
-    join(certDir, "privkey.pem"),
-    "-out",
-    join(certDir, "fullchain.pem"),
-  ]);
-  await Bun.write(caFile, await Bun.file(join(certDir, "fullchain.pem")).text());
+  await serverCertificate(certDir);
+  await Bun.write(serverCa, await Bun.file(join(certDir, "fullchain.pem")).text());
 
-  const config = pgbouncerConfig({ mappings: [{ database, host: "app-postgres" }] });
-  assertTemplateCoverage(config, await Bun.file(template).text());
-  const userlist = pgbouncerUserlist([
-    { name: runtimeRole, password: runtimePassword },
-    { name: ownerRole, password: ownerPassword },
-  ]);
-  if (userlist.includes(ownerRole)) throw new Error("Userlist admitted a privileged _owner role.");
-  await seedPgbouncerBootstrap(pgbouncerDir);
-  for (const file of [
-    join(pgbouncerDir, "pgbouncer.ini"),
-    join(pgbouncerDir, "userlist.txt"),
-    join(certDir, "privkey.pem"),
-  ]) {
-    await chmod(file, 0o600);
-  }
+  // Two client generations admitted (two CAs in one bundle, as in V-8) and one rogue CA.
+  const caShop = pki.createCaMaterial({
+    id: "pca_smoke_shop",
+    purpose: "db-client",
+    name: "smoke/production",
+  });
+  const caPreview = pki.createCaMaterial({
+    id: "pca_smoke_preview",
+    purpose: "db-client",
+    name: "smoke/preview",
+  });
+  const caRogue = pki.createCaMaterial({ id: "pca_smoke_rogue", purpose: "db-client", name: "rogue" });
+  const shop = await issueClient(caShop, appRole, "shop");
+  const preview = await issueClient(caPreview, limitedRole, "preview");
+  const rogue = await issueClient(caRogue, appRole, "rogue");
+
+  const built = await Bun.build({
+    entrypoints: [join(import.meta.dir, "pgbouncer-worker-probe.ts")],
+    target: "bun",
+    outdir: probeDir,
+  });
+  if (!built.success) throw new Error(`Could not bundle the worker probe:\n${built.logs.join("\n")}`);
+
+  // The installer's closed bootstrap: no mapping, no client, and a deny-all CA bundle.
+  await seedPgbouncerBootstrap(pgbouncerDir, { adminPassword });
+  const bootstrapBundle = await Bun.file(join(pgbouncerDir, PGBOUNCER_FILES.caBundle)).text();
+  await chmod(join(certDir, "privkey.pem"), 0o600);
 
   const resolved = JSON.parse((await run([...compose, "config", "--format", "json"])).stdout) as {
-    services: Record<string, { image: string }>;
+    services: Record<string, { image: string; volumes?: Array<{ source?: string; target: string }> }>;
   };
   const appImage = resolved.services["app-postgres"]!.image;
   pgbouncerImage = resolved.services["pgbouncer-public"]!.image;
-  // psql from the app-postgres image acts as the client.
   clientImage = appImage;
-  log(`pgbouncer-public image: ${pgbouncerImage}`);
+  const runtimeBase = /^FROM (oven\/bun:[^\s]+@sha256:[a-f0-9]{64}) AS runtime$/m.exec(
+    await Bun.file(join(root, "Dockerfile")).text(),
+  );
+  if (!runtimeBase) throw new Error("Could not read the pinned Bun runtime image from the Dockerfile.");
+  bunImage = runtimeBase[1]!;
+  for (const name of ["pgbouncer-public", "database-worker"]) {
+    const mount = resolved.services[name]!.volumes?.find((item) => item.target === "/var/run/pgbouncer");
+    if (mount?.source !== "ark_pgbouncer_socket")
+      throw new Error(`${name} does not mount the admin socket volume.`);
+  }
+  log(`pgbouncer-public image: ${pgbouncerImage}\nworker stand-in image: ${bunImage}`);
   // Match production ownership: the installer chowns these trees to uid 1000 and Ark writes
-  // the files with mode 0600. PgBouncer runs with every capability dropped, so this proves
-  // the service user can read them without CAP_DAC_OVERRIDE.
+  // the files with mode 0600. PgBouncer runs with every capability dropped.
   await chownState(arkUid);
 
   log("Starting app-postgres…");
@@ -291,7 +472,9 @@ try {
     "--set",
     "ON_ERROR_STOP=1",
     "--command",
-    `CREATE ROLE ${runtimeRole} LOGIN PASSWORD '${runtimePassword}'`,
+    `CREATE ROLE ${appRole} LOGIN PASSWORD '${appPassword}'`,
+    "--command",
+    `CREATE ROLE ${limitedRole} LOGIN PASSWORD '${limitedPassword}'`,
     "--command",
     `CREATE ROLE ${ownerRole} LOGIN PASSWORD '${ownerPassword}'`,
     "--command",
@@ -299,7 +482,7 @@ try {
     "--command",
     `REVOKE ALL ON DATABASE ${database} FROM PUBLIC`,
     "--command",
-    `GRANT CONNECT ON DATABASE ${database} TO ${runtimeRole}`,
+    `GRANT CONNECT ON DATABASE ${database} TO ${appRole}, ${limitedRole}`,
   ]);
   const verifier = await run([
     "docker",
@@ -313,10 +496,10 @@ try {
     "--tuples-only",
     "--no-align",
     "--command",
-    `SELECT left(rolpassword, 14) FROM pg_authid WHERE rolname = '${runtimeRole}'`,
+    `SELECT left(rolpassword, 14) FROM pg_authid WHERE rolname = '${appRole}'`,
   ]);
-  if (verifier.stdout !== "SCRAM-SHA-256$") throw new Error(`Runtime role is not SCRAM: ${verifier.stdout}`);
-  log(`app-postgres (${appImage}) ready; ${runtimeRole} stores a SCRAM-SHA-256 verifier.`);
+  if (verifier.stdout !== "SCRAM-SHA-256$") throw new Error(`Client role is not SCRAM: ${verifier.stdout}`);
+  log(`app-postgres (${clientImage}) ready; ${appRole} stores a SCRAM-SHA-256 verifier.`);
 
   log("Starting pgbouncer-public…");
   await run([...compose, "up", "--detach", "--wait", "--wait-timeout", "120", "pgbouncer-public"]);
@@ -331,116 +514,403 @@ try {
   if (!banner?.includes("PgBouncer 1.26.1")) throw new Error(`Unexpected PgBouncer banner: ${banner}`);
   log(`log: ${banner.trim()}`);
 
-  // Assert the real host relay target, not just service-network connectivity.
+  const socket = await run([
+    "docker",
+    "exec",
+    bouncer,
+    "stat",
+    "-c",
+    "%F %u:%g %a",
+    "/var/run/pgbouncer/.s.PGSQL.5432",
+  ]);
+  if (!socket.stdout.startsWith("socket ")) throw new Error(`Admin socket missing: ${socket.stdout}`);
+  const socketDirMode = await run([
+    "docker",
+    "exec",
+    bouncer,
+    "stat",
+    "-c",
+    "%u:%g %a",
+    "/var/run/pgbouncer",
+  ]);
+  record(
+    "admin socket at /var/run/pgbouncer/.s.PGSQL.5432",
+    `${socket.stdout} (dir ${socketDirMode.stdout})`,
+  );
+
+  // ---- Closed bootstrap: nobody admitted, nothing routed, no empty bundle --------------------
   await checkLoopbackPublication(bouncer);
-  for (const sslmode of ["disable", "verify-full"]) {
-    const rejected = await loopbackPsql(
-      runtimeRole,
-      runtimePassword,
-      sslmode,
-      "pgbouncer",
-      "SHOW CONFIG",
-      true,
+  if ((bootstrapBundle.match(/BEGIN CERTIFICATE/g) ?? []).length !== 1) {
+    throw new Error("The bootstrap CA bundle must hold exactly the deny-all CA.");
+  }
+  expectRejected(
+    await hostPsql({ role: appRole, password: appPassword, sql: "SELECT 1", client: shop }),
+    /unknown ca/,
+    "zero clients: a valid Ark client certificate is not accepted (deny-all bundle)",
+  );
+  expectRejected(
+    await hostPsql({ role: appRole, password: appPassword, sql: "SELECT 1", sslmode: "disable" }),
+    /SSL required/,
+    "zero clients: plaintext",
+  );
+
+  // ---- Admit two clients through the worker's renderer, then RELOAD over the socket ----------
+  const now = new Date();
+  const plan = planPgbouncer({
+    databases: [{ id: "mdb_smoke", name: database, exposure: "public" }],
+    clients: [
+      {
+        id: "dbc_shop",
+        databaseId: "mdb_smoke",
+        environment: "production",
+        status: "active",
+        caId: "pca_smoke_shop",
+        role: { name: appRole, connectionLimit: 20, password: appPassword },
+      },
+      {
+        id: "dbc_preview",
+        databaseId: "mdb_smoke",
+        environment: "preview",
+        status: "active",
+        caId: "pca_smoke_preview",
+        role: { name: limitedRole, connectionLimit: 5, password: limitedPassword },
+      },
+    ],
+    certificates: [
+      {
+        id: "ccert_shop",
+        caId: "pca_smoke_shop",
+        status: "issued",
+        rolloverState: "current",
+        supersededBy: null,
+        notAfter: shop.notAfter,
+      },
+      {
+        id: "ccert_preview",
+        caId: "pca_smoke_preview",
+        status: "issued",
+        rolloverState: "current",
+        supersededBy: null,
+        notAfter: preview.notAfter,
+      },
+    ],
+    cas: [caShop, caPreview].map((item, index) => ({
+      id: index === 0 ? "pca_smoke_shop" : "pca_smoke_preview",
+      purpose: "db-client",
+      status: "active",
+      certPem: item.certPem,
+      notAfter: item.notAfter,
+    })),
+    now,
+    host: "app-postgres",
+    settings: { previewMaxUserClientConnections: limitedClientConnections },
+  });
+  if (!plan.routed || plan.generations.length !== 2) throw new Error("The plan did not admit both clients.");
+  if (plan.caBundle !== renderClientCaBundle([{ certPem: caPreview.certPem }, { certPem: caShop.certPem }])) {
+    throw new Error("The rendered CA bundle is not exactly the two admitted generations.");
+  }
+  const files = renderPgbouncerFiles({ plan, adminPassword, certificateDir: "/var/lib/ark/certs/database" });
+  assertTemplateCoverage(files[PGBOUNCER_FILES.config]!, await Bun.file(templates.ini).text());
+  if (
+    files[PGBOUNCER_FILES.hba] !== (await Bun.file(templates.hba).text()) ||
+    files[PGBOUNCER_FILES.hba] !== pgbouncerHba()
+  ) {
+    throw new Error("Rendered pg_hba.conf drifts from the template.");
+  }
+  if (files[PGBOUNCER_FILES.userlist]!.includes(adminPassword))
+    throw new Error("The admin password reached the userlist.");
+  await asHost(() => writePgbouncerFiles(pgbouncerDir, files));
+  const reload = await probe(["reload"]);
+  if (!reload.ok) throw new Error(`RELOAD over the admin socket failed: ${reload.error}`);
+  if (reload.environment.dockerCli || reload.environment.dockerSocket) {
+    throw new Error("The worker stand-in can reach Docker; the reload path must not need it.");
+  }
+  record(
+    "RELOAD via the admin socket (worker stand-in, no Docker CLI or socket)",
+    `ok in ${reload.attempts} attempt(s); docker CLI=${reload.environment.dockerCli ?? "absent"}, docker.sock=${reload.environment.dockerSocket ? "present" : "absent"}, uid=${reload.environment.uid}`,
+  );
+  const config = await probe(["show", "SHOW CONFIG"]);
+  const live = new Map((config.rows ?? []).map((row) => [String(row.key), String(row.value)]));
+  for (const [key, value] of [
+    ["auth_type", "hba"],
+    ["client_tls_sslmode", "verify-full"],
+    ["client_tls_protocols", "tlsv1.3"],
+    ["max_prepared_statements", "200"],
+    ["pool_mode", "transaction"],
+    ["admin_users", "ark_pgbouncer_admin"],
+  ] as const) {
+    if (live.get(key) !== value) throw new Error(`Live ${key} is ${live.get(key)}, expected ${value}`);
+  }
+  record(
+    "live SHOW CONFIG after RELOAD",
+    "auth_type=hba, verify-full, tlsv1.3, max_prepared_statements=200, transaction",
+  );
+
+  // ---- V-8 matrix --------------------------------------------------------------------------
+  const accepted = await hostPsql({
+    role: appRole,
+    password: appPassword,
+    client: shop,
+    sql: "SELECT current_user || ' @ ' || current_database()",
+  });
+  if (accepted.status !== 0) throw new Error(`Valid certificate + password was rejected: ${accepted.stderr}`);
+  const conninfo = await hostPsql({ role: appRole, password: appPassword, client: shop, sql: "\\conninfo" });
+  // psql 17 prints "SSL connection (protocol: TLSv1.3, …)"; psql 18 prints a table row "SSL Protocol | TLSv1.3".
+  const protocol = /SSL connection \(protocol: (TLSv[\d.]+)|SSL Protocol\s*\|\s*(TLSv[\d.]+)/.exec(
+    conninfo.stdout,
+  );
+  if ((protocol?.[1] ?? protocol?.[2]) !== "TLSv1.3") {
+    throw new Error(`Client connection was not TLS 1.3: ${conninfo.stdout}`);
+  }
+  record(
+    "V-8 valid certificate + correct password",
+    `accepted — ${accepted.stdout.trim()}; client TLS ${protocol?.[1] ?? protocol?.[2]}`,
+  );
+  expectRejected(
+    await hostPsql({ role: appRole, password: appPassword, sql: "SELECT 1" }),
+    /certificate required/,
+    "V-8 no client certificate",
+  );
+  expectRejected(
+    await hostPsql({ role: appRole, password: appPassword, client: rogue, sql: "SELECT 1" }),
+    /unknown ca/,
+    "V-8 certificate from a rogue CA",
+  );
+  expectRejected(
+    await hostPsql({ role: appRole, password: `${appPassword}x`, client: shop, sql: "SELECT 1" }),
+    /SASL authentication failed|password authentication failed/,
+    "V-8 wrong password",
+  );
+  expectRejected(
+    await hostPsql({
+      role: appRole,
+      password: appPassword,
+      client: shop,
+      sql: "SELECT 1",
+      extra: "ssl_max_protocol_version=TLSv1.2",
+    }),
+    /protocol version|unsupported protocol|no protocols available|wrong version/i,
+    "V-8 TLS 1.2 (psql)",
+  );
+  const tls12 = await run(
+    ["openssl", "s_client", "-starttls", "postgres", "-connect", `127.0.0.1:${loopbackPort}`, "-tls1_2"],
+    { allowFailure: true, stdin: "" },
+  );
+  if (tls12.status === 0 && /Protocol\s*:\s*TLSv1\.2/.test(tls12.stdout))
+    throw new Error("TLS 1.2 handshake succeeded.");
+  record(
+    "V-8 TLS 1.2 (openssl s_client -tls1_2)",
+    `refused — ${lastLine(tls12.stderr) || lastLine(tls12.stdout)}`,
+  );
+  const crossed = await hostPsql({
+    role: appRole,
+    password: appPassword,
+    client: preview,
+    sql: "SELECT current_user",
+  });
+  if (crossed.status !== 0) throw new Error(`Cross-client certificate check changed: ${crossed.stderr}`);
+  record(
+    "V-8 note: another client's certificate + this role's password",
+    "accepted (the certificate does not bind the role; SCRAM does — §3.10.3)",
+  );
+  expectRejected(
+    await hostPsql({ role: appRole, password: appPassword, sql: "SELECT 1", sslmode: "disable" }),
+    /SSL required/,
+    "plaintext client",
+  );
+  expectRejected(
+    await hostPsql({ role: ownerRole, password: ownerPassword, client: shop, sql: "SELECT 1" }),
+    /SASL authentication failed|password authentication failed|no such user|not allowed/,
+    "_owner role (not in the userlist)",
+  );
+
+  // ---- Admin identity: local socket only -------------------------------------------------------
+  const adminTcp = await hostPsql({
+    role: "ark_pgbouncer_admin",
+    password: adminPassword,
+    client: shop,
+    dbname: "pgbouncer",
+    sql: "SHOW VERSION",
+  });
+  if (adminTcp.status === 0)
+    throw new Error("The administrator was admitted over TCP with a valid application certificate.");
+  record(
+    "admin password + valid application certificate on the public endpoint",
+    `rejected — ${lastLine(adminTcp.stderr)}`,
+  );
+  const adminSocket = await socketPsql("ark_pgbouncer_admin", adminPassword, "pgbouncer", "SHOW VERSION");
+  if (adminSocket.status !== 0 || !adminSocket.stdout.includes("PgBouncer 1.26.1")) {
+    throw new Error(`SCRAM admin login over the unix socket failed: ${adminSocket.stderr}`);
+  }
+  record(
+    "same admin password over the shared unix socket (SCRAM)",
+    `accepted — ${adminSocket.stdout.trim()}`,
+  );
+  const appSocket = await socketPsql(appRole, appPassword, database, "SELECT 1");
+  if (appSocket.status === 0) throw new Error("An application role was admitted over the unix socket.");
+  record("application role over the unix socket", `rejected — ${lastLine(appSocket.stderr)}`);
+
+  // ---- max_user_client_connections -------------------------------------------------------------
+  const connect = async (
+    credentials: { certPem: string; keyPem: string },
+    role: string,
+    password: string,
+    max = 1,
+  ) =>
+    postgres({
+      host: "127.0.0.1",
+      port: Number(loopbackPort),
+      database,
+      username: role,
+      password,
+      max,
+      connect_timeout: 10,
+      idle_timeout: 0,
+      onnotice: () => undefined,
+      ssl: {
+        ca: await Bun.file(serverCa).text(),
+        cert: credentials.certPem,
+        key: credentials.keyPem,
+        servername: "localhost",
+        minVersion: "TLSv1.3",
+      },
+    });
+  const held: Array<{ sql: Awaited<ReturnType<typeof connect>>; reserved: { release: () => void } }> = [];
+  try {
+    for (let index = 0; index < limitedClientConnections; index++) {
+      const sql = await connect(preview, limitedRole, limitedPassword);
+      const reserved = await sql.reserve();
+      await reserved`SELECT 1`;
+      held.push({ sql, reserved });
+    }
+    const extra = await connect(preview, limitedRole, limitedPassword);
+    const overflow = await extra`SELECT 1`.then(
+      () => null,
+      (error: Error) => error,
     );
-    const expected = sslmode === "disable" ? /SSL required/ : /authentication failed/;
-    if (rejected.status === 0 || !expected.test(rejected.stderr)) {
+    await extra.end({ timeout: 2 });
+    if (!overflow || !/max_user_client_connections/.test(overflow.message)) {
       throw new Error(
-        `Bootstrap console rejection (${sslmode}) failed: ${rejected.stderr || rejected.stdout}`,
+        `Connection ${limitedClientConnections + 1} for ${limitedRole} was not refused: ${overflow?.message}`,
       );
     }
-    log(`bootstrap console rejected (${sslmode}): ${rejected.stderr.split("\n").at(-1)}`);
-  }
-  const bootstrapDatabase = await loopbackPsql(
-    runtimeRole,
-    runtimePassword,
-    "verify-full",
-    database,
-    "SELECT 1",
-    true,
-  );
-  if (bootstrapDatabase.status === 0 || !/authentication failed/.test(bootstrapDatabase.stderr)) {
-    throw new Error(`Bootstrap admitted a database client: ${bootstrapDatabase.stderr}`);
+    const other = await connect(shop, appRole, appPassword);
+    await other`SELECT 1`;
+    await other.end({ timeout: 2 });
+    record(
+      `max_user_client_connections=${limitedClientConnections} for ${limitedRole}`,
+      `connection ${limitedClientConnections + 1} refused — ${overflow.message}; ${appRole} unaffected`,
+    );
+  } finally {
+    for (const item of held) {
+      item.reserved.release();
+      await item.sql.end({ timeout: 2 });
+    }
   }
 
-  // Install the normal worker-generated config after exercising the installer seed.
-  await run([...compose, "stop", "pgbouncer-public"]);
-  await chownState(`${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`);
-  await Bun.write(join(pgbouncerDir, "pgbouncer.ini"), config);
-  await Bun.write(join(pgbouncerDir, "userlist.txt"), userlist);
-  await chownState(arkUid);
-  await run([...compose, "up", "--detach", "--wait", "--wait-timeout", "120", "pgbouncer-public"]);
-  // Docker can assign a different ephemeral host port when restarting the container.
-  await checkLoopbackPublication(bouncer);
-  const loopback = await loopbackPsql(
-    runtimeRole,
-    runtimePassword,
-    "verify-full",
-    database,
-    "SELECT current_user, current_database()",
-  );
-  log(`host loopback 127.0.0.1:${loopbackPort} over verify-full TLS + SCRAM:\n${loopback.stdout}`);
-
-  const network = `${project}_database-management`;
-  const connected = await psql(
-    network,
-    runtimeRole,
-    runtimePassword,
-    "verify-full",
-    "SELECT current_user, current_database(), split_part(version(), ' ', 2) AS server_version",
-  );
-  log(`runtime role over TLS (verify-full) + SCRAM:\n${connected.stdout}`);
-  const tls = await psql(network, runtimeRole, runtimePassword, "verify-full", "\\conninfo");
-  if (!/SSL connection \(protocol: TLSv1\.[23]/.test(tls.stdout)) {
-    throw new Error(`Client connection was not TLS: ${tls.stdout}`);
+  // ---- Prepared statements in transaction mode (postgres.js default prepare: true) ------------
+  const pooled = await connect(shop, appRole, appPassword, 4);
+  const second = await connect(preview, limitedRole, limitedPassword, 1);
+  try {
+    const statements = await Promise.all(
+      Array.from({ length: 60 }, (_, index) =>
+        index % 3 === 0
+          ? pooled`SELECT ${index}::int + 1 AS value`.then((rows) => Number(rows[0]!.value) === index + 1)
+          : index % 3 === 1
+            ? pooled`SELECT ${String(index)}::text || 'x' AS value`.then(
+                (rows) => rows[0]!.value === `${index}x`,
+              )
+            : second`SELECT ${index}::bigint * 2 AS value`.then(
+                (rows) => Number(rows[0]!.value) === index * 2,
+              ),
+      ),
+    );
+    if (!statements.every(Boolean)) throw new Error("A prepared statement returned a wrong value.");
+    const inTransaction = await pooled.begin(async (tx) => {
+      const first = await tx`SELECT ${1}::int AS value`;
+      const again = await tx`SELECT ${2}::int AS value`;
+      return Number(first[0]!.value) + Number(again[0]!.value);
+    });
+    if (inTransaction !== 3) throw new Error("Prepared statements inside a transaction failed.");
+    record(
+      "postgres.js prepare: true in transaction mode",
+      "60 concurrent named prepared statements on 2 clients and a transaction succeeded",
+    );
+  } finally {
+    await pooled.end({ timeout: 2 });
+    await second.end({ timeout: 2 });
   }
-  log(tls.stdout);
 
-  const plaintext = await psql(network, runtimeRole, runtimePassword, "disable", "SELECT 1", true);
-  if (plaintext.status === 0) throw new Error("PgBouncer accepted a plaintext client.");
-  log(`plaintext client rejected: ${plaintext.stderr.split("\n").at(-1)}`);
-  const wrong = await psql(network, runtimeRole, `${runtimePassword}x`, "verify-full", "SELECT 1", true);
-  if (wrong.status === 0) throw new Error("PgBouncer accepted a wrong password.");
-  log(`wrong password rejected: ${wrong.stderr.split("\n").at(-1)}`);
-  const owner = await psql(network, ownerRole, ownerPassword, "verify-full", "SELECT 1", true);
-  if (owner.status === 0) throw new Error("PgBouncer admitted an _owner role.");
-  log(`_owner role rejected: ${owner.stderr.split("\n").at(-1)}`);
+  // ---- Server certificate swap: renewal reload verifies the served fingerprint ----------------
+  const before = await opensslFingerprint();
+  if (before !== (await fileFingerprint(serverCa)))
+    throw new Error("openssl saw an unexpected initial certificate.");
+  const renewed = join(work, "renewed");
+  await mkdir(renewed, { recursive: true });
+  await serverCertificate(renewed);
+  const expected = await fileFingerprint(join(renewed, "fullchain.pem"));
+  await asHost(async () => {
+    // Atomic replacement, as certificate issuance does (`.next`, then rename).
+    for (const name of ["privkey.pem", "fullchain.pem"]) {
+      await Bun.write(join(certDir, `${name}.next`), await Bun.file(join(renewed, name)).text());
+      await chmod(join(certDir, `${name}.next`), 0o600);
+      await rename(join(certDir, `${name}.next`), join(certDir, name));
+    }
+  });
+  const stillOld = await opensslFingerprint();
+  if (stillOld !== before) throw new Error("PgBouncer served the new certificate before RELOAD.");
+  const renewal = await probe(["reload", expected]);
+  if (!renewal.ok || renewal.fingerprint !== expected)
+    throw new Error(`Renewal reload failed: ${renewal.error}`);
+  const after = await opensslFingerprint();
+  if (after !== expected || after === before) throw new Error(`openssl sees ${after}, expected ${expected}`);
+  record(
+    "certificate swap + renewal reload (openssl s_client on the published port)",
+    `before ${before.slice(0, 16)}…, after files swapped (no reload) ${stillOld.slice(0, 16)}…, after RELOAD ${after.slice(0, 16)}… (worker verified in ${renewal.attempts} attempt(s))`,
+  );
+  await Bun.write(serverCa, await Bun.file(join(renewed, "fullchain.pem")).text());
+
+  // ---- Simulated reload failures: retries, then failure, never success ------------------------
+  const noSocket = await probe(["reload", expected], {
+    ARK_PGBOUNCER_SOCKET_DIR: "/tmp/no-admin-socket",
+    ARK_PGBOUNCER_RELOAD_RETRY_MS: "100",
+  });
+  if (noSocket.ok || noSocket.status === 0 || noSocket.attempts !== 3 || noSocket.failures?.length !== 3) {
+    throw new Error(`An unreachable admin socket did not fail after 3 attempts: ${JSON.stringify(noSocket)}`);
+  }
+  record(
+    "simulated reload failure (no admin socket)",
+    `failed after ${noSocket.attempts} attempts, no success state — ${noSocket.failures.at(-1)}`,
+  );
+  const stale = await probe(["reload", before], { ARK_PGBOUNCER_RELOAD_RETRY_MS: "100" });
+  if (stale.ok || stale.attempts !== 3)
+    throw new Error(`A stale served certificate was accepted: ${JSON.stringify(stale)}`);
+  record(
+    "simulated stale certificate (served fingerprint ≠ renewed)",
+    `failed after ${stale.attempts} attempts — ${stale.failures?.at(-1)}`,
+  );
 
   const health = await inspect(bouncer, "{{.State.Health.Status}} restarts={{.RestartCount}}");
   if (!health.startsWith("healthy restarts=0")) throw new Error(`pgbouncer-public degraded: ${health}`);
-  log(`pgbouncer-public after checks: ${health}`);
+  record("pgbouncer-public after all checks", health);
 
-  log("pgbouncer-public smoke test passed.");
+  log("\n---- rendered pgbouncer.ini ----\n" + files[PGBOUNCER_FILES.config]);
+  log("---- rendered pg_hba.conf ----\n" + files[PGBOUNCER_FILES.hba]);
+  log(
+    "---- rendered userlist.txt (redacted) ----\n" +
+      files[PGBOUNCER_FILES.userlist]!.replace(/^("[^"]+") "[^"]*"$/gm, '$1 "<redacted>"') +
+      "\n",
+  );
+  log("---- results ----");
+  for (const [check, outcome] of results) log(`| ${check} | ${outcome} |`);
+  log("\npgbouncer-public smoke test passed.");
 } catch (error) {
-  const bouncer = await run([...compose, "logs", "--no-color", "pgbouncer-public"], {
-    allowFailure: true,
-  });
+  const bouncer = await run([...compose, "logs", "--no-color", "pgbouncer-public"], { allowFailure: true });
   console.error(bouncer.stdout || bouncer.stderr);
   throw error;
 } finally {
-  await run([...compose, "down", "--volumes", "--remove-orphans", "--timeout", "5"], {
-    allowFailure: true,
-  });
+  await run([...compose, "down", "--volumes", "--remove-orphans", "--timeout", "5"], { allowFailure: true });
   // Files are owned by uid 1000 now; hand them back so the runner can delete them.
-  if (pgbouncerImage) {
-    const owner = `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`;
-    await run(
-      [
-        "docker",
-        "run",
-        "--rm",
-        "--user",
-        "0:0",
-        "--entrypoint",
-        "chown",
-        "--volume",
-        `${join(work, "tmp")}:/smoke`,
-        pgbouncerImage,
-        "-R",
-        owner,
-        "/smoke",
-      ],
-      { allowFailure: true },
-    );
-  }
+  if (pgbouncerImage) await chownState(hostUid).catch(() => undefined);
   await rm(work, { recursive: true, force: true });
 }

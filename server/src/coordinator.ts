@@ -20,6 +20,8 @@ import {
   observedDnsValue,
   parseImageRef,
   pinComposeImage,
+  PGBOUNCER_PORT,
+  PGBOUNCER_SOCKET_DIR,
   planHash,
   validateMaintenanceBundle,
   type BackupStatus,
@@ -29,11 +31,11 @@ import {
   type OperationKind,
   type OperationState,
 } from "@ark-stack/shared";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 
 import { db, sql } from "./db.ts";
 import { loadEnv } from "./env.ts";
-import { evaluateAlerts } from "./modules/alerts.ts";
+import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
 import {
@@ -49,6 +51,15 @@ import {
   serviceAction,
   writeApprovedCompose,
 } from "./modules/docker.ts";
+import {
+  PgbouncerReloadError,
+  planPgbouncer,
+  reloadAndVerify,
+  reloadPgbouncerAdmin,
+  renderPgbouncerFiles,
+  servedCertificateFingerprint,
+  writePgbouncerFiles,
+} from "./modules/pgbouncer.ts";
 import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
 import {
@@ -58,13 +69,16 @@ import {
   reconcileSes,
   resolveImageDigest,
   scanImport,
+  pgbouncerDir,
   writeEdge,
-  writePgbouncer,
 } from "./modules/providers.ts";
 import {
+  alerts,
   aliases,
   backups,
   certificates,
+  clientCertificates,
+  databaseClients,
   databaseClusters,
   databaseRoles,
   deploymentRevisions,
@@ -79,6 +93,7 @@ import {
   operations,
   platformSettings,
   platformAccess,
+  privateCas,
   projects,
   secrets,
   services,
@@ -706,22 +721,39 @@ async function issueCertificate(operation: OperationRow) {
   if (!issued.fingerprint || !issued.expiresAt) {
     throw new Error("Certificate metadata is missing; refusing to store invented expiry or fingerprint.");
   }
+  const certificateId = createId("crt");
+  const publiclyTrusted = issued.issuer === "letsencrypt";
+  // A database endpoint certificate is served by PgBouncer, which only picks up the renewed
+  // files after a RELOAD. It is not marked as serving until the reload operation has confirmed
+  // the new fingerprint on the public listener (§3.14).
+  const servedByPgbouncer = endpoint.kind === "database";
   await db.insert(certificates).values({
-    id: createId("crt"),
+    id: certificateId,
     endpointId,
     names: [endpoint.hostname],
     issuer: issued.issuer,
     fingerprint: issued.fingerprint,
     expiresAt: issued.expiresAt,
-    status: issued.issuer === "letsencrypt" ? "issued" : "untrusted",
-    lastDeployedAt: new Date(),
+    status: servedByPgbouncer ? "awaiting_reload" : publiclyTrusted ? "issued" : "untrusted",
+    lastDeployedAt: servedByPgbouncer ? null : new Date(),
   });
-  const publiclyTrusted = issued.issuer === "letsencrypt";
-  await db
-    .update(endpoints)
-    .set({ status: publiclyTrusted ? "testing" : "certificate_untrusted" })
-    .where(eq(endpoints.id, endpointId));
-  await addStep(operation.id, "certificate-issued", { issuer: issued.issuer, path: issued.certPath });
+  if (servedByPgbouncer) {
+    await enqueue({
+      kind: "pgbouncer.reload",
+      targetIds: [endpointId],
+      payload: { certificateId, expectFingerprint: issued.fingerprint },
+    });
+  } else {
+    await db
+      .update(endpoints)
+      .set({ status: publiclyTrusted ? "testing" : "certificate_untrusted" })
+      .where(eq(endpoints.id, endpointId));
+  }
+  await addStep(operation.id, "certificate-issued", {
+    issuer: issued.issuer,
+    path: issued.certPath,
+    awaitingReload: servedByPgbouncer,
+  });
   // Applying the edge config is a platform-wide consequence of issuing a certificate, not an
   // action the actor requested. Carrying their id over would fail the owner-only platform check
   // for an operator who is allowed to verify their own domain.
@@ -1341,35 +1373,153 @@ async function reconcileSesOp(operation: OperationRow) {
   });
 }
 
+/** Dedup key of the alert raised when PgBouncer cannot be reloaded or serves the wrong certificate. */
+export const PGBOUNCER_RELOAD_ALERT = "pgbouncer-reload";
+
+function pgbouncerReloadRequired() {
+  return process.env.ARK_PGBOUNCER_RELOAD === "1" || process.env.NODE_ENV === "production";
+}
+
+/**
+ * Regenerate the public PgBouncer configuration from active database clients (§3.10.2-§3.10.4),
+ * write it atomically, and RELOAD through the admin console on the shared unix socket. For a
+ * database endpoint certificate change (§3.14) the served fingerprint must match before the
+ * certificate is marked as serving; failures are retried, then alerted and the operation fails.
+ */
 async function reloadPgbouncer(operation: OperationRow) {
+  const now = new Date();
   const databases = await db.select().from(managedDatabases);
   const roles = await db.select().from(databaseRoles);
-  const users: Array<{ name: string; password: string }> = [];
-  for (const role of roles.filter((item) => item.kind === "runtime" && item.secretId)) {
-    const [secret] = await db
-      .select()
-      .from(secrets)
-      .where(eq(secrets.id, role.secretId ?? ""));
-    if (!secret) continue;
-    users.push({ name: role.name, password: decryptSecret(env.rootKey, secret) });
+  const clientRows = await db.select().from(databaseClients);
+  const certificateRows = await db
+    .select({
+      id: clientCertificates.id,
+      caId: clientCertificates.caId,
+      status: clientCertificates.status,
+      rolloverState: clientCertificates.rolloverState,
+      supersededBy: clientCertificates.supersededBy,
+      notAfter: clientCertificates.notAfter,
+    })
+    .from(clientCertificates);
+  const caRows = await db
+    .select({
+      id: privateCas.id,
+      purpose: privateCas.purpose,
+      status: privateCas.status,
+      certPem: privateCas.certPem,
+      notAfter: privateCas.notAfter,
+    })
+    .from(privateCas);
+  const publicIds = new Set(databases.filter((item) => item.exposure === "public").map((item) => item.id));
+  const clients = [];
+  for (const client of clientRows) {
+    const role = roles.find((item) => item.id === client.roleId);
+    let password: string | null = null;
+    if (client.status === "active" && publicIds.has(client.databaseId) && role?.secretId) {
+      const [secret] = await db.select().from(secrets).where(eq(secrets.id, role.secretId));
+      if (secret) password = decryptSecret(env.rootKey, secret);
+    }
+    clients.push({
+      id: client.id,
+      databaseId: client.databaseId,
+      environment: client.environment,
+      status: client.status,
+      caId: client.caId,
+      role: { name: role?.name ?? "", connectionLimit: role?.connectionLimit ?? 0, password },
+    });
   }
-  const mappings = databases
-    .filter((item) => item.exposure === "public")
-    .map((item) => ({ database: item.name, host: process.env.ARK_APP_PG_HOST ?? "app-postgres" }));
+  const plan = planPgbouncer({
+    databases,
+    // Revoked clients always take part, so their CAs are excluded even if the role row is gone.
+    clients: clients.filter((item) => item.status !== "active" || item.role.name),
+    certificates: certificateRows,
+    cas: caRows,
+    now,
+    host: process.env.ARK_APP_PG_HOST ?? "app-postgres",
+  });
   const dbEndpoint = (await db.select().from(endpoints)).find((item) => item.kind === "database");
-  const written = await writePgbouncer({
-    mappings,
-    users,
+  const required = pgbouncerReloadRequired();
+  const adminPassword = process.env.ARK_PGBOUNCER_ADMIN_PASSWORD ?? "";
+  if (required && !adminPassword) {
+    throw new Error("ARK_PGBOUNCER_ADMIN_PASSWORD is required to reload PgBouncer over its admin socket.");
+  }
+  const files = renderPgbouncerFiles({
+    plan,
+    adminPassword: adminPassword || undefined,
     certificateDir: dbEndpoint
       ? `${process.env.ARK_CERT_DIR ?? "/var/lib/ark/certs"}/${dbEndpoint.hostname}`
       : undefined,
   });
+  const written = await writePgbouncerFiles(pgbouncerDir(), files);
+
+  const certificateId =
+    typeof operation.payload.certificateId === "string" ? operation.payload.certificateId : "";
+  const expectedFingerprint =
+    typeof operation.payload.expectFingerprint === "string" ? operation.payload.expectFingerprint : undefined;
+  let reload: Awaited<ReturnType<typeof reloadAndVerify>> | null = null;
+  if (required) {
+    const socket = {
+      socketDir: process.env.ARK_PGBOUNCER_SOCKET_DIR ?? PGBOUNCER_SOCKET_DIR,
+      password: adminPassword,
+    };
+    try {
+      reload = await reloadAndVerify({
+        reload: () => reloadPgbouncerAdmin(socket),
+        expectedFingerprint,
+        servedFingerprint: () =>
+          servedCertificateFingerprint({
+            host: process.env.ARK_PGBOUNCER_TLS_HOST ?? "pgbouncer-public",
+            port: Number(process.env.ARK_PGBOUNCER_TLS_PORT ?? PGBOUNCER_PORT),
+            servername: dbEndpoint?.hostname,
+          }),
+        attempts: Number(process.env.ARK_PGBOUNCER_RELOAD_ATTEMPTS ?? 3),
+        delayMs: Number(process.env.ARK_PGBOUNCER_RELOAD_RETRY_MS ?? 2_000),
+      });
+    } catch (error) {
+      const failures = error instanceof PgbouncerReloadError ? error.failures : [];
+      await addStep(operation.id, "pgbouncer-reload-failed", {
+        certificateId: certificateId || undefined,
+        expectedFingerprint,
+        failures,
+      });
+      await raiseAlert({
+        severity: "critical",
+        title: expectedFingerprint
+          ? "PgBouncer reload failed: the renewed database certificate is not being served"
+          : "PgBouncer reload failed: the public database configuration was not applied",
+        dedupKey: PGBOUNCER_RELOAD_ALERT,
+      });
+      throw error;
+    }
+    await db
+      .update(alerts)
+      .set({ resolvedAt: new Date() })
+      .where(and(eq(alerts.dedupKey, PGBOUNCER_RELOAD_ALERT), isNull(alerts.resolvedAt)));
+  } else if (expectedFingerprint) {
+    // Development without an admin socket: never claim the renewed certificate is serving.
+    await addStep(operation.id, "pgbouncer-reload-skipped", { certificateId, reason: "no admin socket" });
+  }
+  const reloaded = reload !== null;
+  if (certificateId && reloaded) {
+    const [certificate] = await db.select().from(certificates).where(eq(certificates.id, certificateId));
+    if (certificate) {
+      const trusted = certificate.issuer === "letsencrypt";
+      await db
+        .update(certificates)
+        .set({ status: trusted ? "issued" : "untrusted", lastDeployedAt: new Date() })
+        .where(eq(certificates.id, certificateId));
+      await db
+        .update(endpoints)
+        .set({ status: trusted ? "testing" : "certificate_untrusted" })
+        .where(eq(endpoints.id, certificate.endpointId));
+    }
+  }
   const publicDatabases = databases.filter((item) => item.exposure === "public");
   const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
   if (cidrs.length) assertCidrs(cidrs);
-  const allowlist = await applyDatabaseAllowlist(written.dir, cidrs, 5432, {
-    expose: publicDatabases.length > 0,
-  });
+  // With no admitted client, PgBouncer is not routed publicly at all.
+  const allowlist = await applyDatabaseAllowlist(written.dir, cidrs, 5432, { expose: plan.routed });
+  const mapped = new Set(plan.mappings.map((item) => item.database));
   for (const database of databases) {
     const allowlistReady = !database.sourceCidrs?.length || allowlist.enforced;
     await db
@@ -1378,7 +1528,7 @@ async function reloadPgbouncer(operation: OperationRow) {
         allowlistEnforced:
           database.exposure === "public" && Boolean(database.sourceCidrs?.length) && allowlist.enforced,
         status:
-          database.exposure === "public" && written.reloaded && allowlistReady
+          database.exposure === "public" && reloaded && allowlistReady && mapped.has(database.name)
             ? "ready"
             : database.exposure === "public"
               ? "awaiting_configuration"
@@ -1387,10 +1537,16 @@ async function reloadPgbouncer(operation: OperationRow) {
       .where(eq(managedDatabases.id, database.id));
   }
   await addStep(operation.id, "pgbouncer-reload", {
-    mappings: mappings.length,
-    users: users.length,
+    routed: plan.routed,
+    mappings: plan.mappings.length,
+    users: plan.users.length,
+    generations: plan.generations,
+    excluded: plan.excluded,
     cidrs,
-    ...written,
+    dir: written.dir,
+    reloaded,
+    attempts: reload?.attempts ?? 0,
+    servedFingerprint: reload?.fingerprint,
     ...allowlist,
   });
 }

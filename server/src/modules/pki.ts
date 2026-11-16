@@ -556,8 +556,8 @@ export async function listPrivateCas(filter: { purpose?: CaPurpose; status?: CaS
 }
 
 /**
- * Retire (no new issuance) or revoke a CA. Revocation is final. Removing the CA from consumers
- * (PgBouncer bundle, HAProxy) is FD-16/FD-28's job.
+ * Retire (no new issuance) or revoke a CA. Revocation is final. The PgBouncer client CA bundle
+ * (FD-16) drops a revoked CA on its next `pgbouncer.reload`; HAProxy consumers are FD-14/FD-28's.
  */
 export async function setPrivateCaStatus(id: string, status: Exclude<CaStatus, "active">) {
   return db.transaction(async (tx) => {

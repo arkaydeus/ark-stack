@@ -52,7 +52,7 @@ description = "Check edge harness cleanup and pins, validate Caddy configuration
 run = ["bun test scripts/edge-test", "bun scripts/test-edge-config.ts"]
 
 [tasks."test:pgbouncer"]
-description = "Start app-postgres and pgbouncer-public from the platform Compose file and connect over TLS with SCRAM"
+description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM and admin-socket reloads"
 run = "bun scripts/test-pgbouncer-public.ts"
 
 [tasks."test:agent"]
