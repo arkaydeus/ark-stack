@@ -16,7 +16,13 @@ export class EdgeTestRuntime {
   ) {}
 
   private async execute(args: string[]) {
-    const child = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+    // The live-tailnet runner sets TS_EDGE_AUTHKEY after startup. Pass the current environment,
+    // rather than Bun.spawn's launch-time default, so Compose receives the accepted key.
+    const child = Bun.spawn(["docker", ...args], {
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     const [status, stdout, stderr] = await Promise.all([
       child.exited,
       new Response(child.stdout).text(),

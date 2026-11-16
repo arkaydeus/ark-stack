@@ -33,7 +33,7 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/edge-namespace.test.ts"
 
 [tasks."test:e2e"]
 description = "Run fresh-volume browser onboarding against a disposable local database"

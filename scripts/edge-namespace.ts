@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { type NamespaceContainer, staleNamespaceDependents } from "@ark-stack/shared";
 
 async function capture(args: string[]) {
-  const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(args, { env: process.env, stdout: "pipe", stderr: "pipe" });
   const [status, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -53,18 +53,22 @@ export type RejoinOptions = {
   project: string;
   /** Global `docker compose` arguments that select the project, such as `-f <file> -p <project>`. */
   composeArgs: string[];
+  /** Dependents managed by this repair; optional admin-profile services are never selected by default. */
+  services?: readonly string[];
   log?: (line: string) => void;
 };
 
-/**
- * Recreates every dependent whose namespace owner was restarted or replaced. The owners themselves
- * must already be running (`docker compose up` starts them); nothing else in the project is touched.
- */
-export async function rejoinNamespaceDependents({ project, composeArgs, log = console.log }: RejoinOptions) {
-  const containers = await projectContainers(project);
-  const stale = staleNamespaceDependents(containers);
+/** Recreates stale edge dependents only; their namespace owners must already be running. */
+export async function rejoinNamespaceDependents(
+  { project, composeArgs, services = ["edge"], log = console.log }: RejoinOptions,
+  io = { projectContainers, recreate: recreateDependents },
+) {
+  const containers = await io.projectContainers(project);
+  const selected = (snapshot: NamespaceContainer[]) =>
+    staleNamespaceDependents(snapshot).filter((dependent) => services.includes(dependent.service));
+  const stale = selected(containers);
   if (!stale.length) {
-    log(`${project}: every network_mode: service: dependent is in its owner's live namespace.`);
+    log(`${project}: every managed network_mode: service: dependent is in its owner's live namespace.`);
     return stale;
   }
   for (const dependent of stale) {
@@ -76,7 +80,18 @@ export async function rejoinNamespaceDependents({ project, composeArgs, log = co
     }
     log(`${project}: recreating ${dependent.service} (${dependent.reason.replaceAll("-", " ")}).`);
   }
-  const services = [...new Set(stale.map((dependent) => dependent.service))];
+  const staleServices = [...new Set(stale.map((dependent) => dependent.service))];
+  await io.recreate(composeArgs, staleServices);
+  const remaining = selected(await io.projectContainers(project));
+  if (remaining.length) {
+    throw new Error(
+      `Still outside their owner's namespace: ${remaining.map((item) => item.service).join(", ")}.`,
+    );
+  }
+  return stale;
+}
+
+async function recreateDependents(composeArgs: string[], services: string[]) {
   const child = Bun.spawn(
     [
       "docker",
@@ -94,18 +109,11 @@ export async function rejoinNamespaceDependents({ project, composeArgs, log = co
       "120",
       ...services,
     ],
-    { stdout: "inherit", stderr: "inherit" },
+    { env: process.env, stdout: "inherit", stderr: "inherit" },
   );
   const status = await child.exited;
   if (status !== 0)
     throw new Error(`Recreating ${services.join(", ")} failed (docker compose exited ${status}).`);
-  const remaining = staleNamespaceDependents(await projectContainers(project));
-  if (remaining.length) {
-    throw new Error(
-      `Still outside their owner's namespace: ${remaining.map((item) => item.service).join(", ")}.`,
-    );
-  }
-  return stale;
 }
 
 if (import.meta.main) {

@@ -121,7 +121,7 @@ export type NamespaceContainer = {
 export type StaleNamespaceDependent = {
   service: string;
   parent?: string;
-  reason: "owner-replaced" | "owner-restarted" | "not-running";
+  reason: "owner-replaced" | "owner-restarted" | "owner-stopped" | "not-running";
 };
 
 /**
@@ -142,6 +142,8 @@ export function staleNamespaceDependents(containers: NamespaceContainer[]): Stal
     const owner = byId.get(ownerId);
     if (!owner) {
       stale.push({ service: container.service, reason: "owner-replaced" });
+    } else if (!owner.running) {
+      stale.push({ service: container.service, parent: owner.service, reason: "owner-stopped" });
     } else if (!container.running) {
       stale.push({ service: container.service, parent: owner.service, reason: "not-running" });
     } else if (Date.parse(owner.startedAt) > Date.parse(container.startedAt)) {

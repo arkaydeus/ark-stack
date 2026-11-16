@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import {
   applyEdgeAuthKey,
+  assertNoPlaceholderSecrets,
   generateInstallSecrets,
   installEnvKeys,
   isPlaceholderValue,
@@ -104,5 +105,23 @@ describe("edge node auth key", () => {
     ]) {
       expect(() => applyEdgeAuthKey("TS_EDGE_AUTHKEY=\n", bad)).toThrow(/Tailscale auth key/);
     }
+  });
+});
+
+describe("startup gate token guard", () => {
+  test("rejects a supplied public gate token and accepts the generated token", () => {
+    const env = generateInstallSecrets();
+    expect(() => assertNoPlaceholderSecrets(env)).not.toThrow();
+    for (const value of ["dev-edge-gate-token", "", "change-me-now"]) {
+      expect(() => assertNoPlaceholderSecrets({ ...env, ARK_EDGE_GATE_TOKEN: value })).toThrow(
+        /ARK_EDGE_GATE_TOKEN/,
+      );
+    }
+  });
+
+  test("allows older API deployments that do not consume the gate token yet", () => {
+    const env: Record<string, string> = generateInstallSecrets();
+    delete env.ARK_EDGE_GATE_TOKEN;
+    expect(() => assertNoPlaceholderSecrets(env)).not.toThrow();
   });
 });

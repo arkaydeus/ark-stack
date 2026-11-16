@@ -20,6 +20,7 @@ import { join, resolve } from "node:path";
 
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { startEdgeStack } from "./edge-test/stack.ts";
+import { verifyShieldsUp } from "./edge-test/shields-up.ts";
 
 const edgeKey = process.env.ARK_TEST_TS_EDGE_AUTHKEY?.trim() ?? "";
 if (!edgeKey) {
@@ -217,39 +218,33 @@ try {
 
     const local = await tcp(stack.edgeTs, edgeIp, 80);
     check(local === "connected", "control: Caddy listens on the edge node's tailnet address", local);
-    const visible = await waitFor(
-      "the peer to see the edge node",
-      async () => {
-        const status = JSON.parse(await tailscale(peer, "status", "--json")) as Status;
-        return Object.values(status.Peer ?? {}).some((node) => node.TailscaleIPs?.includes(edgeIp))
-          ? true
-          : undefined;
-      },
-      30_000,
-    ).catch(() => false);
-    const inbound = await tcp(peer, edgeIp, 80);
+    await verifyShieldsUp({
+      setShieldsUp: (enabled) => tailscale(stack.edgeTs, "set", `--shields-up=${enabled}`),
+      connect: () => tcp(peer, edgeIp, 80),
+      waitUntilConnected: () =>
+        waitFor(
+          "the peer to connect to edge TCP 80 with shields-up disabled; grant the peer tag:ark-edge:80",
+          async () => ((await tcp(peer, edgeIp, 80)) === "connected" ? true : undefined),
+          30_000,
+        ),
+    });
     check(
-      inbound === "no connection",
-      "with --shields-up, a tailnet peer cannot connect to the edge node",
-      `peer -> ${edgeIp}:80 ${inbound}; edge in the peer's netmap: ${visible}`,
+      true,
+      "peer connects with shields-up disabled and is refused after shields-up is restored",
+      `peer -> ${edgeIp}:80 positive and negative controls passed`,
     );
-    if (!visible) {
-      warn(
-        "the policy does not let the test peer reach tag:ark-edge, so the inbound check does not isolate --shields-up",
-        "grant the peer tag:ark-edge:80 as in docs/operating.md",
-      );
-    } else {
-      const ping = await tailscale(peer, "ping", "-c", "30", "--until-direct", edgeIp).catch(
-        (error: Error) => error.message,
-      );
-      const direct = /via (?!DERP)[^\s]+:\d+/.test(ping);
-      const last = ping.trim().split("\n").findLast(Boolean) ?? ping;
-      if (direct) check(true, "a direct WireGuard path to the edge node is reported", last);
-      else if (requireDirect) check(false, "a direct WireGuard path to the edge node is reported", last);
-      else warn("only a DERP path was found; the network may not allow a direct one", last);
-    }
+    const ping = await tailscale(peer, "ping", "-c", "30", "--until-direct", edgeIp).catch(
+      (error: Error) => error.message,
+    );
+    const direct = /via (?!DERP)[^\s]+:\d+/.test(ping);
+    const last = ping.trim().split("\n").findLast(Boolean) ?? ping;
+    if (direct) check(true, "a direct WireGuard path to the edge node is reported", last);
+    else if (requireDirect) check(false, "a direct WireGuard path to the edge node is reported", last);
+    else warn("only a DERP path was found; the network may not allow a direct one", last);
   }
-  console.log(`\nAll tailnet checks passed${warnings.length ? ` with ${warnings.length} warning(s)` : ""}.`);
+  console.log(
+    `\n${peerKey ? "All tailnet checks passed" : "Partial tailnet checks passed; peer-dependent checks UNVERIFIED"}${warnings.length ? ` with ${warnings.length} warning(s)` : ""}.`,
+  );
 } catch (error) {
   failed = true;
   console.error(`\n${(error as Error).message}`);

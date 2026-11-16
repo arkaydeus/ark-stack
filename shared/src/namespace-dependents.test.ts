@@ -49,6 +49,12 @@ describe("network_mode: service: dependents", () => {
     ]);
   });
 
+  test("a stopped owner is unhealthy even while its dependent runs", () => {
+    expect(staleNamespaceDependents([{ ...owner, running: false }, edge])).toEqual([
+      { service: "edge", parent: "edge-ts", reason: "owner-stopped" },
+    ]);
+  });
+
   test("only container: network modes are considered", () => {
     expect(
       staleNamespaceDependents([

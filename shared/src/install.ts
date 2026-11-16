@@ -14,6 +14,7 @@ export const installEnvKeys = [
   "ARK_MFA_RECOVERY_TOKEN",
   "ARK_METRICS_TOKEN",
   "ARK_OFFHOST_HEARTBEAT_TOKEN",
+  "ARK_EDGE_GATE_TOKEN",
   "ARK_CONTROL_DB_PASSWORD",
   "ARK_APP_DB_PASSWORD",
   "ARK_API_DB_PASSWORD",
@@ -159,6 +160,9 @@ export function applyEdgeAuthKey(env: string, supplied?: string): EdgeAuthKeyRes
 
 export function assertNoPlaceholderSecrets(env: Record<string, string | undefined> = process.env) {
   for (const key of installEnvKeys) {
+    // FD-11 will pass the gate token into the API. Older deployments do not consume it yet;
+    // refuse a published value when supplied without requiring it in those deployments.
+    if (key === "ARK_EDGE_GATE_TOKEN" && env[key] === undefined) continue;
     const value = env[key] ?? "";
     if (!value || isPlaceholderValue(key, value)) {
       throw new Error(

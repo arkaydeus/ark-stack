@@ -3,9 +3,10 @@ import { chmod, chown, mkdir, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-import { applyEdgeAuthKey, generateInstallSecrets, mergeInstallEnv } from "@ark-stack/shared";
+import { generateInstallSecrets, mergeInstallEnv } from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
+import { configureEdgeAuthKey } from "./install-edge-auth.ts";
 import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 
 const root = join(import.meta.dir, "..");
@@ -29,7 +30,7 @@ const generated = generateInstallSecrets();
 await Bun.write(envPath, mergeInstallEnv(hasEnv ? existing : template, generated, { template: !hasEnv }));
 // `.env` holds every platform secret and `Bun.write` creates it 0644.
 await chmod(envPath, 0o600);
-const edgeAuthKey = await configureEdgeAuthKey();
+const edgeAuthKey = await configureEdgeAuthKey(envPath);
 for (const path of ["certs", "acme", "backups", "restore-runs", "pgbouncer", "edge", "mail-state"]) {
   await mkdir(join(root, "tmp", path), { recursive: true });
 }
@@ -176,61 +177,6 @@ TS_EDGE_AUTHKEY (or re-run this installer with it in the environment), then run
 \`docker compose --env-file .env -f infra/platform/docker-compose.yml up -d edge-ts edge\` and \`mise run edge:rejoin\`.
 See docs/operating.md, "Edge Tailscale node".
 `);
-}
-
-// TS_EDGE_AUTHKEY: an existing .env value always wins. Otherwise take it from the environment or,
-// on a terminal, from a prompt that does not echo. The key is never printed.
-async function configureEdgeAuthKey() {
-  const current = await Bun.file(envPath).text();
-  const probe = applyEdgeAuthKey(current);
-  if (probe.status === "kept") {
-    console.log("TS_EDGE_AUTHKEY is already set in .env; keeping it.");
-    return probe.status;
-  }
-  const supplied =
-    process.env.TS_EDGE_AUTHKEY?.trim() ||
-    (process.stdin.isTTY && process.env.ARK_INSTALL_NONINTERACTIVE !== "1"
-      ? await promptHidden("Tailscale auth key for the edge node (tag:ark-edge); Enter to skip (or if it has already joined): ")
-      : "");
-  const result = applyEdgeAuthKey(current, supplied);
-  if (result.status === "set") {
-    await Bun.write(envPath, result.env);
-    await chmod(envPath, 0o600);
-    // Compose interpolates from this process's environment.
-    process.env.TS_EDGE_AUTHKEY = supplied;
-    console.log("TS_EDGE_AUTHKEY written to .env.");
-  }
-  return result.status;
-}
-
-function promptHidden(question: string) {
-  return new Promise<string>((resolve) => {
-    const stdin = process.stdin;
-    let value = "";
-    process.stdout.write(question);
-    stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding("utf8");
-    const finish = () => {
-      stdin.setRawMode(false);
-      stdin.pause();
-      stdin.off("data", onData);
-      process.stdout.write("\n");
-      resolve(value.trim());
-    };
-    const onData = (chunk: string) => {
-      for (const character of chunk) {
-        if (character === "\r" || character === "\n") return finish();
-        if (character === "\u0003") {
-          stdin.setRawMode(false);
-          process.exit(130);
-        }
-        if (character === "\u007f" || character === "\b") value = value.slice(0, -1);
-        else value += character;
-      }
-    };
-    stdin.on("data", onData);
-  });
 }
 
 async function chownRecursive(path: string, uid: number, gid: number) {
