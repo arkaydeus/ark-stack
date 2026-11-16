@@ -32,6 +32,8 @@ import {
   mailboxInput,
   aliasInput,
   databaseInput,
+  databaseClientInput,
+  defaultClientRoleKind,
   projectInput,
   serviceInput,
   sqlInput,
@@ -82,6 +84,18 @@ import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
 import { frontAclSnippet } from "./modules/front-acl.ts";
+import {
+  CLIENT_PASSWORD_SECRET_KIND,
+  DatabaseClientError,
+  databaseClientContext,
+  databaseClientVercelGuide,
+  getDatabaseClient,
+  listDatabaseClients,
+  planDatabaseClient,
+  requestRevocation,
+  revealDatabaseClient,
+} from "./modules/db-clients.ts";
+import { CLIENT_KEY_SECRET_KIND, PkiPolicyError, validateCsr } from "./modules/pki.ts";
 import { cancelWorkspaceQuery } from "./modules/database.ts";
 import { writeApprovedCompose } from "./modules/docker.ts";
 import { listMailQueue } from "./modules/queue.ts";
@@ -149,6 +163,9 @@ app.onError((error, c) => {
   // Input validators in shared/ reject with plain Errors. They describe a caller mistake, not a
   // server fault, so they belong in the response rather than only in the log.
   if (error instanceof ValidationError) return c.json({ error: error.message }, 422);
+  if (error instanceof DatabaseClientError) return c.json({ error: error.message }, error.status);
+  // CSR and CA policy refusals (CsrError included) describe the submitted input; no key material.
+  if (error instanceof PkiPolicyError) return c.json({ error: error.message }, 422);
   console.error(error instanceof Error ? error.message : error);
   return c.json({ error: "The request could not be completed." }, 500);
 });
@@ -600,6 +617,17 @@ async function requireTargetScope(access: Access, targetId: string, mode: "view"
 
 async function requireSecretScope(access: Access, secret: typeof secrets.$inferSelect) {
   assertSecretRevealable(secret);
+  // Database client keys and passwords are owner-only and leave only through the client's own
+  // one-time reveal (FD-17), never through the generic endpoint operators can reach.
+  if (
+    secret.kind === CLIENT_PASSWORD_SECRET_KIND ||
+    secret.kind.startsWith(`${CLIENT_PASSWORD_SECRET_KIND}.`) ||
+    (secret.kind === CLIENT_KEY_SECRET_KIND && secret.purpose === "db-client")
+  ) {
+    throw new HTTPException(403, {
+      message: "Database client credentials are revealed only through the client's one-time reveal.",
+    });
+  }
   if (!secret.resourceId || !secret.resourceType) {
     throw new HTTPException(403, { message: "This legacy secret has no verified resource owner." });
   }
@@ -1718,6 +1746,162 @@ app.get("/api/databases/:id/admission", async (c) => {
     .where(eq(managedDatabases.id, c.req.param("id")));
   if (!database) throw new HTTPException(404, { message: "Database not found." });
   return c.json(clientAllowed(database.sourceCidrs ?? [], String(c.req.query("ip") ?? "")));
+});
+
+// ---- Database clients (front door §3.10.3, §3.12, FD-17) ----------------------------------------
+// Owner-only (R12-style exposure decision). Issue and revoke need MFA plus a single-use
+// `credential.rotate` grant bound to the request; the one-time reveal needs `secret.reveal`.
+
+const CLIENT_ISSUE_WINDOW_MS = 10 * 60 * 1000;
+const CLIENT_ISSUE_MAX = 10;
+const clientIssueAttempts = new Map<string, number[]>();
+
+/** CSR submission rate limit: 10 issue requests per owner per 10 minutes, counted before parsing. */
+function assertClientIssueRate(userId: string) {
+  const now = Date.now();
+  const recent = (clientIssueAttempts.get(userId) ?? []).filter((at) => now - at < CLIENT_ISSUE_WINDOW_MS);
+  if (recent.length >= CLIENT_ISSUE_MAX) {
+    clientIssueAttempts.set(userId, recent);
+    throw new HTTPException(429, {
+      message: "Too many database client requests. Wait a few minutes before submitting another.",
+    });
+  }
+  recent.push(now);
+  clientIssueAttempts.set(userId, recent);
+}
+
+app.get("/api/databases/:id/clients", async (c) => {
+  requireOwner(c.get("access"));
+  await databaseClientContext(c.req.param("id"));
+  return c.json({ clients: await listDatabaseClients(c.req.param("id")) });
+});
+
+app.post("/api/databases/:id/clients", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  assertClientIssueRate(access.userId);
+  const databaseId = c.req.param("id");
+  const request = (await c.req.json()) as Record<string, unknown>;
+  const input = databaseClientInput.parse(request);
+  const { role } = await planDatabaseClient({ databaseId, ...input });
+  // Parse the CSR here as well as in the worker, so a refused request never reaches the queue.
+  if (input.csrPem !== undefined) validateCsr(input.csrPem);
+  const roleKind = input.roleKind ?? defaultClientRoleKind(input.environment);
+  // Validate before consuming the single-use grant; bind it to the database and the exact body.
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", { databaseId, ...request }),
+  );
+  const clientId = createId("dbc");
+  const operation = await enqueue({
+    kind: "database.client_issue",
+    actorId: access.userId,
+    targetIds: [databaseId],
+    payload: {
+      clientId,
+      name: input.name,
+      environment: input.environment,
+      roleKind,
+      ...(input.csrPem === undefined ? {} : { csrPem: input.csrPem }),
+    },
+  });
+  await audit(
+    access.userId,
+    "database.client_issue",
+    "database",
+    databaseId,
+    {
+      clientId,
+      name: input.name,
+      environment: input.environment,
+      roleKind,
+      loginRole: role,
+      keySource: input.csrPem === undefined ? "generated" : "csr",
+    },
+    operation.id,
+    access.role,
+  );
+  return c.json(
+    { clientId, operationId: operation.id, role, roleKind, readOnly: roleKind === "readonly" },
+    202,
+  );
+});
+
+app.post("/api/databases/:id/clients/:clientId/reveal", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const databaseId = c.req.param("id");
+  const clientId = c.req.param("clientId");
+  const client = await getDatabaseClient(databaseId, clientId);
+  if (!client)
+    throw new HTTPException(404, {
+      message: "Database client not found. If it was just requested, wait for issuance to finish.",
+    });
+  if (client.status !== "active" || client.revokedAt)
+    throw new HTTPException(409, { message: "This client was revoked; its credentials cannot be revealed." });
+  if (client.revealedAt)
+    throw new HTTPException(409, {
+      message:
+        "This client's credentials were already revealed. Revoke it and issue a new client to obtain new ones.",
+    });
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { databaseId, clientId }),
+  );
+  const bundle = await revealDatabaseClient({
+    databaseId,
+    clientId,
+    actorId: access.userId,
+    actorRole: access.role,
+  });
+  c.header("cache-control", "no-store");
+  return c.json(bundle);
+});
+
+app.post("/api/databases/:id/clients/:clientId/revoke", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const databaseId = c.req.param("id");
+  const clientId = c.req.param("clientId");
+  const client = await getDatabaseClient(databaseId, clientId);
+  if (!client) throw new HTTPException(404, { message: "Database client not found." });
+  if (client.status !== "active")
+    throw new HTTPException(409, { message: "This client is already revoked." });
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", { databaseId, clientId }),
+  );
+  await requestRevocation({ databaseId, clientId, actorId: access.userId });
+  const operation = await enqueue({
+    kind: "database.client_revoke",
+    actorId: access.userId,
+    targetIds: [databaseId, clientId],
+    payload: { clientId },
+  });
+  await audit(
+    access.userId,
+    "database.client_revoke",
+    "database",
+    databaseId,
+    { clientId, name: client.name, environment: client.environment },
+    operation.id,
+    access.role,
+  );
+  return c.json({ clientId, operationId: operation.id }, 202);
+});
+
+app.get("/api/databases/:id/clients/:clientId/vercel", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(await databaseClientVercelGuide(c.req.param("id"), c.req.param("clientId")));
 });
 
 app.get("/api/mail/queue", async (c) => {

@@ -54,7 +54,15 @@ import {
   writeApprovedCompose,
 } from "./modules/docker.ts";
 import {
+  auditIssued,
+  auditRevoked,
+  issueDatabaseClient,
+  issueEvidence,
+  revokeDatabaseClient,
+} from "./modules/db-clients.ts";
+import {
   PgbouncerReloadError,
+  killRoleClients,
   planPgbouncer,
   reloadAndVerify,
   reloadPgbouncerAdmin,
@@ -495,6 +503,8 @@ export async function runOperation(kind: OperationKind, operation: OperationRow)
   if (kind === "update.detect") return detectUpdates(operation);
   if (kind === "import.scan") return scanImportOp(operation);
   if (kind === "database.rotate") return rotateDatabase(operation);
+  if (kind === "database.client_issue") return issueDatabaseClientOp(operation);
+  if (kind === "database.client_revoke") return revokeDatabaseClientOp(operation);
   if (kind === "service.adopt") return adoptService(operation);
   if (kind === "mail.queue_retry" || kind === "mail.queue_delete") return queueMail(operation);
   if (kind === "mailbox.device") return reconcileMailboxDevice(operation);
@@ -1569,6 +1579,81 @@ async function reloadPgbouncer(operation: OperationRow) {
     servedFingerprint: reload?.fingerprint,
     ...allowlist,
   });
+}
+
+function pgbouncerSocket() {
+  return {
+    socketDir: process.env.ARK_PGBOUNCER_SOCKET_DIR ?? PGBOUNCER_SOCKET_DIR,
+    password: process.env.ARK_PGBOUNCER_ADMIN_PASSWORD ?? "",
+  };
+}
+
+/**
+ * `database.client_issue` (FD-17): CA generation, 90-day certificate, login role and sealed
+ * password, then an inline PgBouncer reload so the role and its CA are admitted when this
+ * operation succeeds. Evidence and audit carry no key, password or PEM material.
+ */
+async function issueDatabaseClientOp(operation: OperationRow) {
+  const payload = operation.payload as Record<string, unknown>;
+  const roleKind =
+    payload.roleKind === "runtime" ? "runtime" : payload.roleKind === "readonly" ? "readonly" : null;
+  if (!roleKind) throw new Error("database.client_issue needs a role kind.");
+  const result = await issueDatabaseClient({
+    clientId: String(payload.clientId ?? ""),
+    databaseId: operation.targetIds[0] ?? "",
+    name: String(payload.name ?? ""),
+    environment: String(payload.environment ?? ""),
+    roleKind,
+    csrPem: typeof payload.csrPem === "string" ? payload.csrPem : undefined,
+    actorId: operation.actorId,
+  });
+  await addStep(operation.id, "database-client-issued", issueEvidence(result));
+  await auditIssued(result, { actorId: operation.actorId, operationId: operation.id });
+  await reloadPgbouncer(operation);
+}
+
+/** Dedup key of the alert raised when a revoked client's PgBouncer sessions cannot be killed. */
+export const PGBOUNCER_REVOKE_ALERT = "pgbouncer-revoke";
+
+/**
+ * `database.client_revoke` (FD-17, §3.10.4): revoke the client, its certificates and CA
+ * generations and rotate its role password (revokeDatabaseClient), then reload PgBouncer with
+ * the reduced CA bundle and userlist, then KILL_CLIENT every live session of that role. Other
+ * clients' sessions and credentials are untouched.
+ */
+async function revokeDatabaseClientOp(operation: OperationRow) {
+  const databaseId = operation.targetIds[0] ?? "";
+  const result = await revokeDatabaseClient({
+    databaseId,
+    clientId: String((operation.payload as Record<string, unknown>).clientId ?? ""),
+    actorId: operation.actorId,
+  });
+  await addStep(operation.id, "database-client-revoked", result);
+  await reloadPgbouncer(operation);
+  let killed: number | null = null;
+  if (pgbouncerReloadRequired()) {
+    try {
+      const kill = await killRoleClients(result.role, pgbouncerSocket());
+      killed = kill.killed;
+      await addStep(operation.id, "pgbouncer-kill-client", { role: result.role, ...kill });
+    } catch (error) {
+      await raiseAlert({
+        severity: "critical",
+        title: `Revoked database client ${result.role} may still have live PgBouncer sessions`,
+        dedupKey: PGBOUNCER_REVOKE_ALERT,
+      });
+      throw error;
+    }
+  } else {
+    await addStep(operation.id, "pgbouncer-kill-client-skipped", {
+      role: result.role,
+      reason: "no admin socket",
+    });
+  }
+  await auditRevoked(
+    { ...result, killed },
+    { databaseId, actorId: operation.actorId, operationId: operation.id },
+  );
 }
 
 // The edge serves only hostnames whose current certificate is `issued`. Public `http` endpoints

@@ -737,10 +737,18 @@ export const databaseClients = pgTable(
       .references(() => privateCas.id),
     status: text("status").$type<"active" | "revoked">().notNull().default("active"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    // 0018 (FD-17): issuance source, the one-time reveal gate and revocation history.
+    keySource: text("key_source").$type<"generated" | "csr">().notNull().default("generated"),
+    createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
+    revealedAt: timestamp("revealed_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    revokedBy: text("revoked_by").references(() => user.id, { onDelete: "set null" }),
   },
   (table) => [
     check("database_clients_role_kind_check", sql`${table.roleKind} IN ('runtime', 'readonly')`),
     check("database_clients_status_check", sql`${table.status} IN ('active', 'revoked')`),
+    check("database_clients_key_source_check", sql`${table.keySource} IN ('generated', 'csr')`),
+    uniqueIndex("database_clients_role_id_key").on(table.roleId),
     unique("database_clients_database_id_name_environment_key").on(
       table.databaseId,
       table.name,
