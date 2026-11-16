@@ -36,7 +36,6 @@ const REGION_LINES = [
 
 const migrationFiles = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).toSorted();
 const through = (last: string) => migrationFiles.filter((file) => file.slice(0, 4) <= last);
-const latest = migrationFiles.at(-1)!.slice(0, 4);
 
 const url = process.env.DATABASE_URL;
 if (!url) throw new Error("DATABASE_URL is required for the front-door migration tests.");
@@ -464,8 +463,9 @@ describe("Drizzle schema mirrors the migration", () => {
   test("columns, nullability, defaults, checks, indexes and keys match a fresh migrate", async () => {
     const db = await scratch("drizzle");
     try {
-      // Every shipped migration, so later columns (0014 region) are mirrored too.
-      await apply(db, through(latest));
+      // Every migration, not just 0013: later tickets add the region columns (0014)
+      // and client_certificates.cert_pem (0015), and schema.ts mirrors the latest state.
+      await apply(db, migrationFiles);
       for (const table of tables) {
         const config = getTableConfig(table);
         const columns = await db`

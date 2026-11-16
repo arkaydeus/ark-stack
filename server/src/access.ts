@@ -18,6 +18,18 @@ export type SessionValue = {
   session: { id: string; createdAt: Date; updatedAt?: Date };
 };
 
+/**
+ * Root and provider credentials, including private CA keys (`pki.ca_key`, front door §3.10.1),
+ * are never returned by the generic one-time reveal endpoint.
+ */
+export function assertSecretRevealable(secret: { sensitivity: string }) {
+  if (secret.sensitivity === "root" || secret.sensitivity === "provider") {
+    throw new HTTPException(403, {
+      message: "Root and provider credentials cannot be revealed through the generic endpoint.",
+    });
+  }
+}
+
 export function requireOperator(access: Access) {
   if (access.role !== "owner" && access.role !== "operator") {
     throw new HTTPException(403, { message: "Operator access is required." });

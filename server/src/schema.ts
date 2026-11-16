@@ -692,6 +692,8 @@ export const clientCertificates = pgTable(
     fingerprintSha256: text("fingerprint_sha256").notNull(),
     notBefore: timestamp("not_before", { withTimezone: true }).notNull(),
     notAfter: timestamp("not_after", { withTimezone: true }).notNull(), // not_before + 90 days (R6)
+    // 0015: the issued certificate (public). Written by modules/pki.ts; nullable for hand-made rows.
+    certPem: text("cert_pem"),
     keySecretId: text("key_secret_id").references(() => secrets.id),
     status: text("status").$type<"issued" | "revoked" | "expired">().notNull().default("issued"),
     rolloverState: text("rollover_state")

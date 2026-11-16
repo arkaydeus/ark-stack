@@ -57,6 +57,7 @@ import { z } from "zod";
 
 import { auth } from "./auth.ts";
 import {
+  assertSecretRevealable,
   grantAccess,
   redactDomain,
   requireDatabaseAccess,
@@ -597,11 +598,7 @@ async function requireTargetScope(access: Access, targetId: string, mode: "view"
 }
 
 async function requireSecretScope(access: Access, secret: typeof secrets.$inferSelect) {
-  if (secret.sensitivity === "root" || secret.sensitivity === "provider") {
-    throw new HTTPException(403, {
-      message: "Root and provider credentials cannot be revealed through the generic endpoint.",
-    });
-  }
+  assertSecretRevealable(secret);
   if (!secret.resourceId || !secret.resourceType) {
     throw new HTTPException(403, { message: "This legacy secret has no verified resource owner." });
   }

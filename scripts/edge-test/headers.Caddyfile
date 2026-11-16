@@ -1,7 +1,7 @@
 # Test-only Caddyfile for `mise run test:edge` (header stripping and Via/Server removal).
 # The snippets reproduce `ark_route_base` and `ark_upstream` from docs/design/front-door.md §3.5.
 # Sites are plain HTTP on separate ports so the host test client can reach each one directly;
-# TLS behaviour is covered by certificate.Caddyfile.
+# TLS behaviour is covered by the production-edge tests, which load Ark-style fixture certificates.
 {
 	admin off
 	auto_https off
