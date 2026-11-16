@@ -1,4 +1,18 @@
-import { boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+  type AnyPgColumn,
+  boolean,
+  check,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  unique,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
 
 export const user = pgTable("user", {
   id: text("id").primaryKey(),
@@ -25,8 +39,13 @@ export const session = pgTable(
     userId: text("user_id")
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }),
+    // No SQL default (0013): every insert names the origin. Set by the Better Auth session hook.
+    origin: text("origin").$type<"admin" | "gate">().notNull(),
   },
-  (table) => [index("session_user_id_idx").on(table.userId)],
+  (table) => [
+    index("session_user_id_idx").on(table.userId),
+    check("session_origin_check", sql`${table.origin} IN ('admin', 'gate')`),
+  ],
 );
 
 export const account = pgTable(
@@ -93,20 +112,45 @@ export const platformAccess = pgTable("platform_access", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const platformSettings = pgTable("platform_settings", {
-  id: text("id").primaryKey().default("default"),
-  adminMode: text("admin_mode").notNull().default("public"),
-  timezone: text("timezone").notNull().default("Europe/London"),
-  baseDomain: text("base_domain"),
-  adminHostname: text("admin_hostname"),
-  authOrigin: text("auth_origin"),
-  publicIpv4: text("public_ipv4"),
-  dnsProvider: text("dns_provider").notNull().default("manual"),
-  defaultQuotaGb: integer("default_quota_gb").notNull().default(10),
-  allowExternalForwarding: boolean("allow_external_forwarding").notNull().default(false),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const platformSettings = pgTable(
+  "platform_settings",
+  {
+    id: text("id").primaryKey().default("default"),
+    adminMode: text("admin_mode").notNull().default("public"),
+    timezone: text("timezone").notNull().default("Europe/London"),
+    baseDomain: text("base_domain"),
+    adminHostname: text("admin_hostname"),
+    authOrigin: text("auth_origin"),
+    publicIpv4: text("public_ipv4"),
+    dnsProvider: text("dns_provider").notNull().default("manual"),
+    defaultQuotaGb: integer("default_quota_gb").notNull().default(10),
+    allowExternalForwarding: boolean("allow_external_forwarding").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    // Front door (0013). Empty allowlists deny; internet exposure needs the explicit flag.
+    publicIpv6: text("public_ipv6"),
+    poolerSourceCidrs: jsonb("pooler_source_cidrs").$type<string[]>().notNull().default([]),
+    poolerAllowInternet: boolean("pooler_allow_internet").notNull().default(false),
+    ipv6Status: text("ipv6_status")
+      .$type<"unchecked" | "passed" | "failed" | "not_present">()
+      .notNull()
+      .default("unchecked"),
+    ipv6CheckedAt: timestamp("ipv6_checked_at", { withTimezone: true }),
+    ipv6Evidence: jsonb("ipv6_evidence").$type<Record<string, unknown>>(),
+    gateLoginMode: text("gate_login_mode").$type<"disabled" | "public">().notNull().default("disabled"),
+    gateLoginHostname: text("gate_login_hostname"),
+    sniExtraPorts: jsonb("sni_extra_ports").$type<number[]>().notNull().default([]),
+    tcpPortRangeStart: integer("tcp_port_range_start").notNull().default(20000),
+    tcpPortRangeEnd: integer("tcp_port_range_end").notNull().default(20049),
+  },
+  (table) => [
+    check(
+      "platform_settings_ipv6_status_check",
+      sql`${table.ipv6Status} IN ('unchecked', 'passed', 'failed', 'not_present')`,
+    ),
+    check("platform_settings_gate_login_mode_check", sql`${table.gateLoginMode} IN ('disabled', 'public')`),
+  ],
+);
 
 export const projects = pgTable("projects", {
   id: text("id").primaryKey(),
@@ -126,6 +170,8 @@ export const domainClaims = pgTable("domain_claims", {
   lastError: text("last_error"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  // Per-domain AAAA switch (R9). Effective AAAA = aaaaEnabled AND ipv6Status = 'passed'.
+  aaaaEnabled: boolean("aaaa_enabled").notNull().default(true),
 });
 
 export const dnsRecords = pgTable(
@@ -438,6 +484,309 @@ export const auditEvents = pgTable("audit_events", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+// ---- Front door (0013_front_door.sql, docs/design/front-door.md §3.1) ----
+
+// Complete snapshots are independent for edge and backup observation sources.
+export const tailnetSnapshots = pgTable(
+  "tailnet_snapshots",
+  {
+    source: text("source").$type<"edge" | "backup">().primaryKey(),
+    generation: text("generation").notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }).notNull(),
+    validUntil: timestamp("valid_until", { withTimezone: true }).notNull(), // completed_at + 6 minutes
+  },
+  (table) => [check("tailnet_snapshots_source_check", sql`${table.source} IN ('edge', 'backup')`)],
+);
+
+export const tailnetNodes = pgTable(
+  "tailnet_nodes",
+  {
+    source: text("source")
+      .$type<"edge" | "backup">()
+      .notNull()
+      .references(() => tailnetSnapshots.source),
+    generation: text("generation").notNull(),
+    stableId: text("stable_id").notNull(), // tailcfg.StableNodeID
+    dnsName: text("dns_name").notNull(), // MagicDNS FQDN, e.g. home.tail1234.ts.net
+    hostName: text("host_name").notNull(),
+    ipv4: text("ipv4"),
+    ipv6: text("ipv6"),
+    tags: jsonb("tags").$type<string[]>().notNull().default([]),
+    isSelf: boolean("is_self").notNull().default(false),
+    online: boolean("online"),
+    observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [primaryKey({ name: "tailnet_nodes_pkey", columns: [table.source, table.stableId] })],
+);
+
+// Private CAs precede front_routes, which references them.
+export const privateCas = pgTable(
+  "private_cas",
+  {
+    id: text("id").primaryKey(),
+    purpose: text("purpose").$type<"db-client" | "tcp-client" | "http-client">().notNull(),
+    name: text("name").notNull(),
+    certPem: text("cert_pem").notNull(),
+    keySecretId: text("key_secret_id")
+      .notNull()
+      .references(() => secrets.id),
+    crlPem: text("crl_pem"),
+    crlNextUpdate: timestamp("crl_next_update", { withTimezone: true }),
+    notAfter: timestamp("not_after", { withTimezone: true }).notNull(),
+    status: text("status").$type<"active" | "retired" | "revoked">().notNull().default("active"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("private_cas_purpose_check", sql`${table.purpose} IN ('db-client', 'tcp-client', 'http-client')`),
+    check("private_cas_status_check", sql`${table.status} IN ('active', 'retired', 'revoked')`),
+  ],
+);
+
+export const frontRouteKinds = ["http", "tls", "postgres", "tcp"] as const;
+export const frontRouteStatuses = [
+  "draft",
+  "awaiting_acl",
+  "awaiting_dns",
+  "issuing_certificate",
+  "ready",
+  "identity_mismatch",
+  "observation_expired",
+  "disabled",
+  "error",
+] as const;
+
+// One row per public route. A hostname has at most one route per listener (443, each shared SNI
+// port, 5432), so an HTTP and a TLS-TCP route cannot share 443; raw-TCP ports are unique globally.
+export const frontRoutes = pgTable(
+  "front_routes",
+  {
+    id: text("id").primaryKey(),
+    kind: text("kind").$type<(typeof frontRouteKinds)[number]>().notNull(),
+    endpointId: text("endpoint_id")
+      .notNull()
+      .references(() => endpoints.id, { onDelete: "restrict" }),
+    listenPort: integer("listen_port").notNull(),
+    compatPort: integer("compat_port"),
+    targetInput: text("target_input").notNull(),
+    targetNodeStableId: text("target_node_stable_id").notNull(),
+    targetIp: text("target_ip").notNull(),
+    targetPort: integer("target_port").notNull(),
+    accessMode: text("access_mode").$type<"public" | "sso">().notNull().default("sso"),
+    bypassPaths: jsonb("bypass_paths").$type<string[]>().notNull().default([]),
+    httpOptions: jsonb("http_options").$type<Record<string, unknown>>().notNull().default({}),
+    tlsMode: text("tls_mode").$type<"passthrough" | "terminate" | "terminate_mtls" | "plain">(),
+    tcpOptions: jsonb("tcp_options").$type<Record<string, unknown>>().notNull().default({}),
+    sourceCidrs: jsonb("source_cidrs").$type<string[]>().notNull().default([]), // empty = deny all
+    allowInternet: boolean("allow_internet").notNull().default(false),
+    clientCaId: text("client_ca_id").references(() => privateCas.id),
+    rateLimit: jsonb("rate_limit").$type<Record<string, unknown>>(), // reserved; not rendered in v1
+    enabled: boolean("enabled").notNull().default(false),
+    status: text("status").$type<(typeof frontRouteStatuses)[number]>().notNull().default("draft"),
+    lastError: text("last_error"),
+    createdBy: text("created_by").references(() => user.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("front_routes_kind_check", sql`${table.kind} IN ('http', 'tls', 'postgres', 'tcp')`),
+    check("front_routes_target_port_check", sql`${table.targetPort} BETWEEN 1 AND 65535`),
+    check("front_routes_access_mode_check", sql`${table.accessMode} IN ('public', 'sso')`),
+    check(
+      "front_routes_tls_mode_check",
+      sql`${table.tlsMode} IN ('passthrough', 'terminate', 'terminate_mtls', 'plain')`,
+    ),
+    uniqueIndex("front_routes_endpoint_listener")
+      .on(table.endpointId, table.listenPort)
+      .where(sql`kind <> 'tcp'`),
+    uniqueIndex("front_routes_dedicated_port")
+      .on(table.listenPort)
+      .where(sql`kind = 'tcp'`),
+    uniqueIndex("front_routes_compat_port")
+      .on(table.compatPort)
+      .where(sql`compat_port IS NOT NULL`),
+  ],
+);
+
+// Individual users only (R11); no groups in v1.
+export const frontRouteAccess = pgTable(
+  "front_route_access",
+  {
+    routeId: text("route_id")
+      .notNull()
+      .references(() => frontRoutes.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    grantedBy: text("granted_by").references(() => user.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [primaryKey({ name: "front_route_access_pkey", columns: [table.routeId, table.userId] })],
+);
+
+export const gateHandoffs = pgTable("gate_handoffs", {
+  id: text("id").primaryKey(),
+  codeHash: text("code_hash").notNull().unique("gate_handoffs_code_hash_key"), // sha256 of a 32-byte code
+  routeId: text("route_id")
+    .notNull()
+    .references(() => frontRoutes.id, { onDelete: "cascade" }),
+  userId: text("user_id")
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  authSessionId: text("auth_session_id")
+    .notNull()
+    .references(() => session.id, { onDelete: "cascade" }),
+  stateHash: text("state_hash").notNull(),
+  returnPath: text("return_path").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(), // now() + 60s
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const gateSessions = pgTable(
+  "gate_sessions",
+  {
+    id: text("id").primaryKey(),
+    tokenHash: text("token_hash").notNull().unique("gate_sessions_token_hash_key"),
+    routeId: text("route_id")
+      .notNull()
+      .references(() => frontRoutes.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    authSessionId: text("auth_session_id")
+      .notNull()
+      .references(() => session.id, { onDelete: "cascade" }),
+    ipAddress: text("ip_address"),
+    userAgent: text("user_agent"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [index("gate_sessions_user_idx").on(table.userId)],
+);
+
+export const clientCertificates = pgTable(
+  "client_certificates",
+  {
+    id: text("id").primaryKey(),
+    caId: text("ca_id")
+      .notNull()
+      .references(() => privateCas.id, { onDelete: "cascade" }),
+    subjectCn: text("subject_cn").notNull(),
+    serial: text("serial").notNull(),
+    fingerprintSha256: text("fingerprint_sha256").notNull(),
+    notBefore: timestamp("not_before", { withTimezone: true }).notNull(),
+    notAfter: timestamp("not_after", { withTimezone: true }).notNull(), // not_before + 90 days (R6)
+    keySecretId: text("key_secret_id").references(() => secrets.id),
+    status: text("status").$type<"issued" | "revoked" | "expired">().notNull().default("issued"),
+    rolloverState: text("rollover_state")
+      .$type<"current" | "pending" | "delivered" | "superseded">()
+      .notNull()
+      .default("current"),
+    supersededBy: text("superseded_by").references((): AnyPgColumn => clientCertificates.id),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    revokedReason: text("revoked_reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("client_certificates_status_check", sql`${table.status} IN ('issued', 'revoked', 'expired')`),
+    check(
+      "client_certificates_rollover_state_check",
+      sql`${table.rolloverState} IN ('current', 'pending', 'delivered', 'superseded')`,
+    ),
+    unique("client_certificates_ca_id_serial_key").on(table.caId, table.serial),
+    uniqueIndex("client_certificates_successor_unique")
+      .on(table.supersededBy)
+      .where(sql`superseded_by IS NOT NULL`),
+  ],
+);
+
+export const databaseClients = pgTable(
+  "database_clients",
+  {
+    id: text("id").primaryKey(),
+    databaseId: text("database_id")
+      .notNull()
+      .references(() => managedDatabases.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    environment: text("environment").notNull(),
+    roleKind: text("role_kind").$type<"runtime" | "readonly">().notNull(),
+    roleId: text("role_id")
+      .notNull()
+      .references(() => databaseRoles.id),
+    caId: text("ca_id")
+      .notNull()
+      .references(() => privateCas.id),
+    status: text("status").$type<"active" | "revoked">().notNull().default("active"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("database_clients_role_kind_check", sql`${table.roleKind} IN ('runtime', 'readonly')`),
+    check("database_clients_status_check", sql`${table.status} IN ('active', 'revoked')`),
+    unique("database_clients_database_id_name_environment_key").on(
+      table.databaseId,
+      table.name,
+      table.environment,
+    ),
+  ],
+);
+
+// Optional Vercel integration (R6), one per database client.
+export const vercelIntegrations = pgTable(
+  "vercel_integrations",
+  {
+    id: text("id").primaryKey(),
+    databaseClientId: text("database_client_id")
+      .notNull()
+      .unique("vercel_integrations_database_client_id_key")
+      .references(() => databaseClients.id, { onDelete: "cascade" }),
+    vercelProjectId: text("vercel_project_id").notNull(),
+    vercelTeamId: text("vercel_team_id"),
+    tokenSecretId: text("token_secret_id")
+      .notNull()
+      .references(() => secrets.id),
+    tokenExpiresAt: timestamp("token_expires_at", { withTimezone: true }),
+    deployHookSecretId: text("deploy_hook_secret_id").references(() => secrets.id),
+    envTarget: text("env_target").$type<"production" | "preview">().notNull(),
+    gitBranch: text("git_branch"),
+    lastPushAt: timestamp("last_push_at", { withTimezone: true }),
+    lastPushStatus: text("last_push_status"),
+    lastDeploymentId: text("last_deployment_id"),
+    createdBy: text("created_by").references(() => user.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("vercel_integrations_env_target_check", sql`${table.envTarget} IN ('production', 'preview')`),
+  ],
+);
+
+// Off-VPS backup destinations (R8): both kinds are required for "backups healthy".
+export const backupTargets = pgTable(
+  "backup_targets",
+  {
+    id: text("id").primaryKey(),
+    kind: text("kind").$type<"s3" | "tailnet_rest">().notNull(),
+    name: text("name").notNull(),
+    endpoint: text("endpoint"),
+    region: text("region"),
+    bucket: text("bucket"),
+    prefix: text("prefix").notNull().default("ark"),
+    pathStyle: boolean("path_style").notNull().default(false),
+    restUrl: text("rest_url"),
+    targetNodeStableId: text("target_node_stable_id"), // tailnet_rest: pinned like routes (§3.2)
+    credentialSecretId: text("credential_secret_id")
+      .notNull()
+      .references(() => secrets.id),
+    appendOnlyVerified: boolean("append_only_verified").notNull().default(false),
+    appendOnlyEvidence: jsonb("append_only_evidence").$type<Record<string, unknown>>(),
+    lastSuccessAt: timestamp("last_success_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [check("backup_targets_kind_check", sql`${table.kind} IN ('s3', 'tailnet_rest')`)],
+);
+
 export const schema = {
   user,
   session,
@@ -468,4 +817,15 @@ export const schema = {
   alerts,
   updateCandidates,
   auditEvents,
+  tailnetSnapshots,
+  tailnetNodes,
+  privateCas,
+  frontRoutes,
+  frontRouteAccess,
+  gateHandoffs,
+  gateSessions,
+  clientCertificates,
+  databaseClients,
+  vercelIntegrations,
+  backupTargets,
 };

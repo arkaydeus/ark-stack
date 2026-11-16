@@ -24,6 +24,16 @@ export function requireOperator(access: Access) {
   }
 }
 
+/**
+ * Owner-only gate for exposure decisions such as front-door route management (R12, front door
+ * §3.3). Operators and viewers get 403. Pair it with `requireMfa` and step-up like other mutations.
+ */
+export function requireOwner(access: Access) {
+  if (access.role !== "owner") {
+    throw new HTTPException(403, { message: "Owner access is required." });
+  }
+}
+
 export function requireMfa(session: SessionValue) {
   if (
     !hasMfaAssurance({
