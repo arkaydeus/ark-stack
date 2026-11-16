@@ -65,20 +65,24 @@ const watchdog = new EdgeWatchdog({
 const run = { stopped: false };
 let lastTick: { at: string; withdrawn: string[]; errors: string[] } | null = null;
 
+// Each pass reads the lease (waiting at most 300 ms, so a slow API never delays enforcement) and
+// enforces it. Passes run every interval and also exactly when the current lease runs out.
 async function loop() {
   while (!run.stopped) {
     const started = performance.now();
     try {
-      const results = await watchdog.tick();
+      const results = await watchdog.tick(300);
       lastTick = {
         at: new Date().toISOString(),
         withdrawn: results.flatMap((result) => result.withdrawn),
         errors: results.flatMap((result) => (result.error ? [`${result.proxy}: ${result.error}`] : [])),
       };
     } catch (error) {
-      log(`tick failed: ${(error as Error).message}`);
+      log(`enforcement failed: ${(error as Error).message}`);
     }
-    await Bun.sleep(Math.max(0, intervalMs - (performance.now() - started)));
+    const untilExpiry = watchdog.msUntilExpiry();
+    const wait = Math.max(0, intervalMs - (performance.now() - started));
+    await Bun.sleep(untilExpiry === null ? wait : Math.min(wait, untilExpiry + 1));
   }
 }
 

@@ -1630,7 +1630,7 @@ async function reloadPgbouncer(operation: OperationRow) {
 // The edge serves only hostnames whose current certificate is `issued`. Public `http` endpoints
 // have no upstream yet, so they are rendered as unrouted (a fixed 503 naming no internal host).
 // Tailnet HTTP routes are rendered only while the lease allows them (front door §3.2, FD-06).
-async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
+export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
   const policy = await edgePolicy();
   return planEdge({
     adminMode,

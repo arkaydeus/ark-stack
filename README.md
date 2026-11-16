@@ -31,7 +31,7 @@ Useful commands:
 | `mise run test:e2e`               | disposable real-browser signup/MFA/wizard   |
 | `mise run test:upgrade`           | schema and host nft policy upgrade (Docker) |
 | `mise run test:stalwart`          | disposable native Stalwart lifecycle test   |
-| `mise run test:edge`              | Caddy validation, edge and harness tests    |
+| `mise run test:edge`              | Caddy, edge, observer and harness tests     |
 | `mise run test:edge-tailnet`      | opt-in edge node checks on a real tailnet   |
 | `mise run edge:rejoin`            | put `edge` back in a restarted `edge-ts`    |
 | `mise run test:pgbouncer`         | disposable public PgBouncer mTLS/SCRAM test |

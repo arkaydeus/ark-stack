@@ -276,6 +276,70 @@ describe("EdgeWatchdog", () => {
     expect(caddyTailnetBackends(h.caddy.active())).toEqual([]);
   });
 
+  test("a route made live after the last policy read is not withdrawn on that stale policy", async () => {
+    const h = harness();
+    const base = Date.parse("2026-11-16T12:00:00Z");
+    // The cached policy predates the route; edge.apply then loads it, and the API now allows it.
+    h.setLease(lease(base, 6_000, []));
+    await h.watchdog.refresh();
+    h.setLease(
+      lease(base, 6_000, [
+        { ip: "100.101.102.103", port: 3000 },
+        { ip: "fd7a:115c:a1e0::103", port: 8080 },
+      ]),
+    );
+    await h.watchdog.tick(300);
+    expect(caddyTailnetBackends(h.caddy.active())).toEqual([
+      "100.101.102.103:3000",
+      "[fd7a:115c:a1e0::103]:8080",
+    ]);
+    expect(h.events).toEqual([]);
+  });
+
+  test("a hanging lease read does not delay enforcement past the refresh wait", async () => {
+    let clock = 0;
+    const caddy = fakeCaddy();
+    let calls = 0;
+    const watchdog = new EdgeWatchdog({
+      fetchLease: () => {
+        calls++;
+        return calls === 1
+          ? Promise.resolve(lease(Date.parse("2026-11-16T12:00:00Z"), 1_000))
+          : new Promise<never>(() => undefined);
+      },
+      adapters: [new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher)],
+      now: () => clock,
+    });
+    await watchdog.tick(20);
+    expect(caddyTailnetBackends(caddy.active())).toEqual(["100.101.102.103:3000"]);
+    clock += 1_000;
+    const started = performance.now();
+    await watchdog.tick(20);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(caddyTailnetBackends(caddy.active())).toEqual([]);
+  });
+
+  test("an older lease answer arriving late does not replace a newer one", async () => {
+    let clock = 0;
+    const base = Date.parse("2026-11-16T12:00:00Z");
+    const pending: { release?: (value: EdgeLeaseDocument) => void } = {};
+    const answers: Array<() => Promise<EdgeLeaseDocument>> = [
+      () => new Promise<EdgeLeaseDocument>((resolve) => (pending.release = resolve)),
+      async () => lease(base, 0),
+    ];
+    const watchdog = new EdgeWatchdog({
+      fetchLease: () => answers.shift()!(),
+      adapters: [],
+      now: () => clock,
+    });
+    const slow = watchdog.refresh();
+    clock += 10;
+    await watchdog.refresh();
+    pending.release?.(lease(base, 60_000));
+    await slow;
+    expect(watchdog.effectiveAllowed().size).toBe(0);
+  });
+
   test("a failed withdrawal stops the proxy and raises events", async () => {
     const h = harness({ failLoad: true });
     await h.watchdog.tick();

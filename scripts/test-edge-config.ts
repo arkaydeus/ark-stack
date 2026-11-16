@@ -669,7 +669,7 @@ async function startProductionEdge(): Promise<Edge> {
     directory,
     acmeDir: acme,
     certDir: fixtureCerts.served,
-    caddyfile: join(edgeDir, "Caddyfile"),
+    edgeDir,
     ports: ["127.0.0.1::80", "127.0.0.1::443", "127.0.0.1::41642/udp"],
     edgeTsEnvironment: { TS_EXTRA_ARGS: `--shields-up ${offlineLoginServer}` },
   });

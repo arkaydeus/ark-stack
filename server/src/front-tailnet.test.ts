@@ -136,7 +136,7 @@ describe("edge watchdog endpoints", () => {
     expect([heartbeat.status, jobs.status]).toEqual([403, 403]);
   });
 
-  test("a failed withdrawal raises a critical alert; a successful one is only audited", async () => {
+  test("a failed withdrawal raises a critical alert; a successful one is audited and re-rendered", async () => {
     const withdrawn = await internal(watchdogToken, "/api/internal/edge/watchdog-event", {
       method: "POST",
       body: JSON.stringify({ event: "withdrawn", proxy: "caddy", detail: "withdrew 100.101.102.103:3000" }),
@@ -145,6 +145,10 @@ describe("edge watchdog endpoints", () => {
     expect(
       await sql`SELECT 1 FROM alerts WHERE dedup_key = 'edge-withdrawal' AND resolved_at IS NULL`,
     ).toHaveLength(0);
+    // The rendered files are brought back in line with the policy by a durable edge.apply.
+    const applies = await sql`SELECT id FROM operations WHERE kind = 'edge.apply' AND status = 'queued'`;
+    expect(applies.length).toBeGreaterThanOrEqual(1);
+    operationIds.push(...applies.map((row) => String(row.id)));
     const stopped = await internal(watchdogToken, "/api/internal/edge/watchdog-event", {
       method: "POST",
       body: JSON.stringify({ event: "proxy_stopped", proxy: "caddy", detail: "stopped caddy" }),

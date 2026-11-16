@@ -262,6 +262,8 @@ export class EdgeWatchdog {
   /** When the last policy was read (local clock), or null before the first successful read. */
   private fetchedAt: number | null = null;
   private lastPolicyError = "";
+  /** Last unreachable message per proxy, so the log records changes rather than every second. */
+  private readonly unreachable = new Map<string, string>();
   private readonly now: () => number;
   private readonly staleMs: number;
 
@@ -293,6 +295,8 @@ export class EdgeWatchdog {
     const started = this.now();
     try {
       const document = await this.options.fetchLease();
+      // A slow answer must not replace a newer one that arrived first.
+      if (this.fetchedAt !== null && started < this.fetchedAt) return;
       const apiNow = Date.parse(document.now);
       const validUntil = document.lease ? Date.parse(document.lease.validUntil) : Number.NaN;
       this.allowed = allowedBackends(document);
@@ -311,18 +315,50 @@ export class EdgeWatchdog {
     }
   }
 
-  async tick() {
-    await this.refresh();
+  /** Milliseconds until the current lease runs out on the local clock, or null without one. */
+  msUntilExpiry(at = this.now()) {
+    return this.leaseValid(at) ? Math.max(0, this.deadline - at) : null;
+  }
+
+  /**
+   * One pass: refresh the policy, waiting at most `refreshWaitMs`, then enforce. Reading the policy
+   * after the config it is compared with means a route that edge.apply has just made live is not
+   * withdrawn on a policy that predates it; bounding the wait means a slow API never delays expiry.
+   */
+  async tick(refreshWaitMs = Number.POSITIVE_INFINITY) {
+    const refreshed = this.refresh();
+    if (Number.isFinite(refreshWaitMs)) {
+      await Promise.race([refreshed, new Promise((resolve) => setTimeout(resolve, refreshWaitMs))]);
+    } else {
+      await refreshed;
+    }
+    return this.enforce();
+  }
+
+  /**
+   * Enforces the policy as it stands now, without waiting for the API. The worker runs this on its
+   * own cadence and at the lease deadline, so a slow or hanging lease read cannot delay expiry.
+   */
+  async enforce() {
     const allowed = this.effectiveAllowed();
     const results: WithdrawalResult[] = [];
     for (const adapter of this.options.adapters) {
+      const started = this.now();
       const result = await adapter.enforce(allowed);
+      const took = Math.round(this.now() - started);
       results.push(result);
+      const unreachable = result.unreachable ? (result.error ?? "unreachable") : "";
+      if (unreachable !== (this.unreachable.get(adapter.proxy) ?? "")) {
+        this.options.log?.(
+          unreachable ? `${adapter.proxy}: ${unreachable}` : `${adapter.proxy}: reachable again`,
+        );
+        this.unreachable.set(adapter.proxy, unreachable);
+      }
       if (result.withdrawn.length && !result.error) {
         await this.emit({
           event: "withdrawn",
           proxy: adapter.proxy,
-          detail: `withdrew ${result.withdrawn.join(", ")}${this.lastPolicyError ? ` (policy unavailable: ${this.lastPolicyError})` : ""}`,
+          detail: `withdrew ${result.withdrawn.join(", ")} in ${took} ms${this.lastPolicyError ? ` (policy unavailable: ${this.lastPolicyError})` : ""}`,
         });
       }
       if (result.error && !result.unreachable) {

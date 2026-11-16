@@ -354,6 +354,10 @@ app.post("/api/internal/edge/watchdog-event", async (c) => {
     .parse(await c.req.json());
   const detail = String(redactLogLine(body.detail)).slice(0, 500);
   await audit(undefined, `edge.watchdog.${body.event}`, "edge", body.proxy ?? "edge", { detail });
+  // Re-render from the current policy, so the files on disk (and the launch guard) agree with what
+  // the watchdog left serving, and a route withdrawn on a momentarily stale policy comes back.
+  // edge.apply only ever renders what the policy allows; a queued one is reused.
+  await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   if (body.event !== "withdrawn") {
     await raiseAlert({
       severity: "critical",

@@ -65,8 +65,13 @@ describe("edge-ts", () => {
     expect(edgeTs.cap_add?.toSorted()).toEqual(["NET_ADMIN", "NET_RAW"]);
     expect(edgeTs.devices).toEqual(["/dev/net/tun:/dev/net/tun"]);
     expect(edgeTs.security_opt).toContain("no-new-privileges:true");
-    expect(edgeTs.volumes).toEqual(["ark_edge_ts_state:/var/lib/tailscale"]);
+    // The LocalAPI socket volume is shared read-only with domain-worker only (FD-06).
+    expect(edgeTs.volumes).toEqual([
+      "ark_edge_ts_state:/var/lib/tailscale",
+      "ark_edge_ts_socket:/var/run/tailscale",
+    ]);
     expect(compose.volumes).toHaveProperty("ark_edge_ts_state");
+    expect(compose.volumes).toHaveProperty("ark_edge_ts_socket");
   });
 
   test("publishes the edge's ports and carries the edge-admin alias", () => {
@@ -100,7 +105,9 @@ describe("edge in the edge-ts namespace", () => {
       .filter(([, service]) => networkNames(service).includes("edge-control"))
       .map(([name]) => name)
       .toSorted();
-    expect(members).toEqual(["domain-worker", "edge-ts"]);
+    // edge-watchdog withdraws tailnet routes through the admin API (FD-06); it holds no database
+    // credential, root key or socket.
+    expect(members).toEqual(["domain-worker", "edge-ts", "edge-watchdog"]);
   });
 });
 
