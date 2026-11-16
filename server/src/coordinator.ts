@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import {
   allowedBackends,
   assertCidrs,
+  backendKey,
   CaddyWithdrawalAdapter,
   backupProofAllowed,
   buildProvisionPlan,
@@ -1673,8 +1674,32 @@ async function observeEdge(operation: OperationRow) {
     enqueue,
     operationId: operation.id,
   });
-  await addStep(operation.id, "edge-observe", result);
-  return result;
+  const reconcile = await reconcileServedRoutes();
+  await addStep(operation.id, "edge-observe", { ...result, reconcile });
+  return { ...result, reconcile };
+}
+
+/**
+ * Re-applies the edge when an allowed HTTP route is missing from the running Caddy, for example
+ * after Caddy started from the closed config during a restart, or after a withdrawal on a policy
+ * that has since been renewed. Only ever adds what the policy allows, through edge.apply.
+ */
+async function reconcileServedRoutes() {
+  const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
+  if (!adminUrl) return { checked: false };
+  const allowed = (await edgePolicy()).routes.filter((route) => route.kind === "http");
+  if (!allowed.length) return { checked: true, missing: [] };
+  let active: string[];
+  try {
+    active = await new CaddyWithdrawalAdapter(adminUrl).activeBackends();
+  } catch (error) {
+    return { checked: false, error: (error as Error).message };
+  }
+  const missing = allowed
+    .filter((route) => !active.includes(backendKey(route.ip, route.port)))
+    .map((route) => route.id);
+  if (missing.length) await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
+  return { checked: true, missing };
 }
 
 export const EDGE_WITHDRAWAL_ALERT = "edge-withdrawal";

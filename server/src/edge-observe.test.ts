@@ -437,3 +437,72 @@ describe("schedule", () => {
     expect(intervals).toEqual([5 * 60_000]);
   });
 });
+
+describe("coordinator wiring", () => {
+  test("edge.observe runs through the coordinator and re-applies a route missing from the running Caddy", async () => {
+    const { enqueue: realEnqueue, runOperation } = await import("./coordinator.ts");
+    mock.state.reachable.add("100.101.102.103:3000");
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "ready",
+    });
+    // A running Caddy that serves nothing from the tailnet (for example, started from the closed config).
+    const caddy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (request) =>
+        new URL(request.url).pathname === "/config/"
+          ? Response.json({ apps: { http: { servers: { srv0: { routes: [] } } } } })
+          : new Response("not found", { status: 404 }),
+    });
+    const previous = { socket: process.env.ARK_EDGE_TS_SOCKET, reload: process.env.ARK_EDGE_RELOAD_URL };
+    process.env.ARK_EDGE_TS_SOCKET = socket;
+    process.env.ARK_EDGE_RELOAD_URL = `http://127.0.0.1:${caddy.port}`;
+    const created: string[] = [];
+    try {
+      await sql`UPDATE operations SET status = 'cancelled' WHERE kind = 'edge.apply' AND status = 'queued'`;
+      const operation = await realEnqueue({
+        kind: "edge.observe",
+        targetIds: ["tailnet:edge"],
+        payload: { test: suffix },
+      });
+      created.push(operation.id);
+      const result = (await runOperation("edge.observe", operation)) as { reconcile: { missing: string[] } };
+      expect((await route(id)).status).toBe("ready");
+      expect(result.reconcile.missing).toEqual([id]);
+      const applies = await sql`SELECT id FROM operations WHERE kind = 'edge.apply' AND status = 'queued'`;
+      created.push(...applies.map((row) => String(row.id)));
+      expect(applies).toHaveLength(1);
+    } finally {
+      caddy.stop(true);
+      if (previous.socket === undefined) delete process.env.ARK_EDGE_TS_SOCKET;
+      else process.env.ARK_EDGE_TS_SOCKET = previous.socket;
+      if (previous.reload === undefined) delete process.env.ARK_EDGE_RELOAD_URL;
+      else process.env.ARK_EDGE_RELOAD_URL = previous.reload;
+      if (created.length) {
+        await sql`DELETE FROM operation_steps WHERE operation_id = ANY(${created})`;
+        await sql`DELETE FROM operations WHERE id = ANY(${created})`;
+      }
+    }
+  });
+
+  test("edge.observe refuses to run without the edge node's socket", async () => {
+    const { enqueue: realEnqueue, runOperation } = await import("./coordinator.ts");
+    const previous = process.env.ARK_EDGE_TS_SOCKET;
+    delete process.env.ARK_EDGE_TS_SOCKET;
+    const operation = await realEnqueue({
+      kind: "edge.observe",
+      targetIds: ["tailnet:edge"],
+      payload: { test: `${suffix}-nosocket` },
+    });
+    try {
+      await expect(runOperation("edge.observe", operation)).rejects.toThrow(/ARK_EDGE_TS_SOCKET is not set/);
+    } finally {
+      if (previous !== undefined) process.env.ARK_EDGE_TS_SOCKET = previous;
+      await sql`DELETE FROM operations WHERE id = ${operation.id}`;
+    }
+  });
+});

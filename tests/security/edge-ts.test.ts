@@ -89,7 +89,7 @@ describe("edge in the edge-ts namespace", () => {
     expect(edge.cap_drop).toEqual(["ALL"]);
     expect(edge.cap_add).toBeUndefined();
     expect(edge.user).toBe("1000:1000");
-    expect(edge.depends_on).toEqual(["edge-ts", "api"]);
+    expect(edge.depends_on).toEqual(["edge-ts", "api", "edge-watchdog"]);
   });
 
   test("only edge-ts publishes 80/443 and only it answers to edge-admin", () => {

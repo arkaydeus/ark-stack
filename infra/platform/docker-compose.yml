@@ -405,7 +405,8 @@ services:
       - ../../tmp/edge:/etc/caddy/ark:ro
       - ./edge-launch-guard.sh:/usr/local/bin/ark-edge-launch-guard:ro
       - ark_edge_data:/data
-    depends_on: [edge-ts, api]
+    # Start order only: without the watchdog the guard starts closed rather than not at all.
+    depends_on: [edge-ts, api, edge-watchdog]
     restart: unless-stopped
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]

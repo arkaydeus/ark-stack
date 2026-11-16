@@ -158,6 +158,11 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     return (await response.json()) as unknown;
   }
 
+  /** Tailnet backends Caddy dials right now. */
+  async activeBackends() {
+    return caddyTailnetBackends(await this.activeConfig());
+  }
+
   async enforce(allowed: ReadonlySet<string>): Promise<WithdrawalResult> {
     let config: unknown;
     try {
