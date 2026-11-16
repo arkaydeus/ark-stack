@@ -60,6 +60,15 @@ try {
     `;
     if (!migration.length || !stateful.length)
       throw new Error("Representative upgrade did not reach the current schema.");
+    const accountIssuer = await verified`
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'account' AND column_name = 'issuer'
+    `;
+    const accountIssuerIndex = await verified`
+      SELECT 1 FROM pg_indexes WHERE indexname = 'account_issuer_account_id_idx'
+    `;
+    if (accountIssuer.length || accountIssuerIndex.length)
+      throw new Error("Upgrade left the legacy Better Auth account.issuer column or index behind.");
   } finally {
     await verified.end();
   }
