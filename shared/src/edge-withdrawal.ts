@@ -253,6 +253,21 @@ function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object")
     return `{${Object.entries(value)
+      // Caddy's HTTP adapter appends its default Caddyfile hide even if already explicit.
+      // File-server hides are an unordered set; duplicate entries change no serving behaviour.
+      .map(
+        ([key, child]) =>
+          [
+            key,
+            key === "hide" &&
+            "handler" in value &&
+            value.handler === "file_server" &&
+            Array.isArray(child) &&
+            child.every((item) => typeof item === "string")
+              ? [...new Set(child)].toSorted()
+              : child,
+          ] as const,
+      )
       .toSorted(([a], [b]) => a.localeCompare(b))
       .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`)
       .join(",")}}`;

@@ -302,6 +302,31 @@ describe("withdrawal with stream_close_delay (FD-09)", () => {
     expect(JSON.stringify(caddy.active())).toContain(JSON.stringify(WITHDRAWN_HANDLER));
   });
 
+  test("CLI and HTTP adaptation may differ only by duplicate file-server hides", async () => {
+    const diskClosed = {
+      ...closed,
+      files: { handler: "file_server", hide: ["/etc/caddy/ark/Caddyfile.closed", "./Caddyfile"] },
+    };
+    const caddy = fakeCaddy({ initial: diskClosed });
+    const files = async () => ({ full: JSON.stringify(full()), closed: JSON.stringify(diskClosed) });
+    const fetcher = async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/adapt") && init?.body === JSON.stringify(diskClosed)) {
+        return Response.json({
+          result: {
+            ...diskClosed,
+            files: { ...diskClosed.files, hide: [...diskClosed.files.hide, "./Caddyfile"] },
+          },
+        });
+      }
+      return caddy.fetcher(url, init);
+    };
+    const result = await new CaddyWithdrawalAdapter("http://edge-admin:2019", fetcher, 3000, {
+      configFiles: files,
+    }).enforce(allowed(1));
+    expect(result.error).toBeUndefined();
+    expect(caddyTailnetBackends(caddy.active())).toEqual(["[fd7a:115c:a1e0::103]:8080"]);
+  });
+
   test("a newer zero-tailnet apply cannot resurrect public admin or superseded route settings", async () => {
     const caddy = fakeCaddy({ initial: full() });
     const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3000, {
