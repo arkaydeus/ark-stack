@@ -1,6 +1,7 @@
-// Off-VPS backup targets (docs/design/front-door.md §3.18, FD-21). Owner-only: configure the
-// S3-compatible destination from a provider recipe, see append-only status, recovery points and
-// health, and run the append-only canary. Credentials are write-only.
+// Off-VPS backup targets (docs/design/front-door.md §3.18, FD-21, FD-30). Owner-only: configure the
+// S3-compatible destination from a provider recipe and the home machine's rest-server over the
+// tailnet, see append-only status, recovery points and health, and run the append-only canary.
+// Credentials are write-only.
 import { useCallback, useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -24,8 +25,11 @@ type Recipe = {
 };
 type Target = {
   id: string;
+  kind: "s3" | "tailnet_rest";
   name: string;
-  provider: Provider;
+  provider: Provider | "rest_server";
+  restUrl: string | null;
+  pinned: { stableId: string | null; ip: string | null } | null;
   endpoint: string | null;
   region: string | null;
   bucket: string | null;
@@ -51,10 +55,12 @@ type Health = {
     sources: Array<{ source: string; lastRecoverableAt: string | null; lastAttemptFailed: boolean }>;
   }>;
 };
+type TailnetRecipe = { label: string; urlExample: string; server: string[]; notes: string[] };
 type TargetsResponse = {
   targets: Target[];
   health: Health;
   recipes: Record<Provider, Recipe>;
+  tailnetRecipe: TailnetRecipe;
   regionHint: string;
   writerPolicy: Record<string, unknown>;
   bucketProtectionPolicy: Record<string, unknown>;
@@ -74,6 +80,9 @@ export function BackupTargetsPanel() {
   const [editing, setEditing] = useState<Target | null>(null);
   const [generated, setGenerated] = useState("");
   const [message, setMessage] = useState("");
+  const [editingHome, setEditingHome] = useState<Target | null>(null);
+  const [homeGenerated, setHomeGenerated] = useState("");
+  const [homeMessage, setHomeMessage] = useState("");
   const load = useCallback(async () => {
     try {
       setData(await api<TargetsResponse>("/api/backups/targets"));
@@ -88,6 +97,41 @@ export function BackupTargetsPanel() {
   if (!data) return null;
   const recipe = data.recipes[provider];
   const health = (id: string) => data.health.targets.find((item) => item.id === id);
+
+  async function saveHome(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    setHomeMessage("");
+    const text = (name: string) => String(form.get(name) ?? "").trim();
+    const request: Record<string, unknown> = {
+      ...(editingHome ? { id: editingHome.id } : {}),
+      name: text("name"),
+      restUrl: text("restUrl"),
+      recoveryWindowDays: Number(text("recoveryWindowDays") || "30"),
+      password: String(form.get("restPassword") ?? "") || undefined,
+      repositoryPassword: text("repositoryPassword") || undefined,
+    };
+    for (const key of Object.keys(request)) if (request[key] === undefined) delete request[key];
+    try {
+      await api("/api/step-up", {
+        method: "POST",
+        body: JSON.stringify({
+          password: form.get("password"),
+          action: "credential.rotate",
+          request: { backupTarget: "tailnet_rest", ...request },
+        }),
+      });
+      await api("/api/backups/targets/tailnet_rest", { method: "PUT", body: JSON.stringify(request) });
+      formElement.reset();
+      setEditingHome(null);
+      setHomeGenerated("");
+      setHomeMessage("Saved and pinned. The append-only check is running; refresh in a minute.");
+      await load();
+    } catch (cause) {
+      setHomeMessage(cause instanceof Error ? cause.message : "Could not save the home target.");
+    }
+  }
 
   async function save(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -158,15 +202,20 @@ export function BackupTargetsPanel() {
       {data.targets.map((target) => {
         const status = health(target.id);
         const appendOnly = status?.appendOnly;
+        const home = target.kind === "tailnet_rest";
         return (
           <Card key={target.id}>
             <CardHeader>
               <CardTitle>
-                {target.name} · {data.recipes[target.provider]?.label ?? target.provider}
+                {target.name} ·{" "}
+                {home
+                  ? data.tailnetRecipe.label
+                  : (data.recipes[target.provider as Provider]?.label ?? target.provider)}
               </CardTitle>
               <CardDescription className="mono">
-                {target.endpoint} / {target.bucket} / {target.prefix} (
-                {target.pathStyle ? "path-style" : "virtual-host"}, {target.region})
+                {home
+                  ? `${target.restUrl} → pinned ${target.pinned?.stableId ?? "?"} (${target.pinned?.ip ?? "?"}) via backup-ts`
+                  : `${target.endpoint} / ${target.bucket} / ${target.prefix} (${target.pathStyle ? "path-style" : "virtual-host"}, ${target.region})`}
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-2 text-sm">
@@ -186,13 +235,21 @@ export function BackupTargetsPanel() {
                   {status?.healthy ? "healthy" : "unhealthy"}
                 </Badge>
               </div>
-              <p className="text-muted-foreground">
-                Checked {target.appendOnlyCheckedAt ? formatDate(target.appendOnlyCheckedAt) : "never"};
-                retention verified until{" "}
-                {target.retentionUntil ? formatDate(target.retentionUntil) : "unknown"} (window{" "}
-                {target.recoveryWindowDays} days). Last success{" "}
-                {target.lastSuccessAt ? formatDate(target.lastSuccessAt) : "never"}.
-              </p>
+              {home ? (
+                <p className="text-muted-foreground">
+                  Checked {target.appendOnlyCheckedAt ? formatDate(target.appendOnlyCheckedAt) : "never"};
+                  rest-server --append-only refuses deletes, and pruning runs on the home machine. Last
+                  success {target.lastSuccessAt ? formatDate(target.lastSuccessAt) : "never"}.
+                </p>
+              ) : (
+                <p className="text-muted-foreground">
+                  Checked {target.appendOnlyCheckedAt ? formatDate(target.appendOnlyCheckedAt) : "never"};
+                  retention verified until{" "}
+                  {target.retentionUntil ? formatDate(target.retentionUntil) : "unknown"} (window{" "}
+                  {target.recoveryWindowDays} days). Last success{" "}
+                  {target.lastSuccessAt ? formatDate(target.lastSuccessAt) : "never"}.
+                </p>
+              )}
               {status?.sources.map((source) => (
                 <p key={source.source}>
                   <span className="mono">{source.source}</span>: last recoverable{" "}
@@ -206,22 +263,28 @@ export function BackupTargetsPanel() {
                   {finding.kind}: {finding.message}
                 </p>
               ))}
-              <details>
-                <summary className="cursor-pointer text-xs">Writer policy (AWS IAM / MinIO)</summary>
-                <pre className="mono overflow-x-auto text-xs">
-                  {JSON.stringify(data.writerPolicy[target.id], null, 2)}
-                </pre>
-              </details>
-              <details>
-                <summary className="cursor-pointer text-xs">Bucket protection policy (AWS / MinIO)</summary>
-                <p className="text-xs text-muted-foreground">
-                  Attach this separate bucket policy to protect the exact repository config. Keep permission
-                  to replace it off this server.
-                </p>
-                <pre className="mono overflow-x-auto text-xs">
-                  {JSON.stringify(data.bucketProtectionPolicy[target.id], null, 2)}
-                </pre>
-              </details>
+              {!home && (
+                <>
+                  <details>
+                    <summary className="cursor-pointer text-xs">Writer policy (AWS IAM / MinIO)</summary>
+                    <pre className="mono overflow-x-auto text-xs">
+                      {JSON.stringify(data.writerPolicy[target.id], null, 2)}
+                    </pre>
+                  </details>
+                  <details>
+                    <summary className="cursor-pointer text-xs">
+                      Bucket protection policy (AWS / MinIO)
+                    </summary>
+                    <p className="text-xs text-muted-foreground">
+                      Attach this separate bucket policy to protect the exact repository config. Keep
+                      permission to replace it off this server.
+                    </p>
+                    <pre className="mono overflow-x-auto text-xs">
+                      {JSON.stringify(data.bucketProtectionPolicy[target.id], null, 2)}
+                    </pre>
+                  </details>
+                </>
+              )}
               <div className="flex gap-2">
                 <Button
                   size="sm"
@@ -236,8 +299,12 @@ export function BackupTargetsPanel() {
                   size="sm"
                   variant="ghost"
                   onClick={() => {
+                    if (home) {
+                      setEditingHome(target);
+                      return;
+                    }
                     setEditing(target);
-                    setProvider(target.provider);
+                    setProvider(target.provider as Provider);
                   }}
                 >
                   Edit
@@ -384,6 +451,96 @@ export function BackupTargetsPanel() {
               <Button>Save target</Button>
               {editing && (
                 <Button type="button" variant="ghost" onClick={() => setEditing(null)}>
+                  Cancel
+                </Button>
+              )}
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{editingHome ? `Edit ${editingHome.name}` : "Add a home machine target"}</CardTitle>
+          <CardDescription>
+            Backups also go to rest-server on your home machine, over the tailnet through Ark's own backup
+            node (tag:ark-backup). Saving pins the machine from the backup node's current view, needs your
+            password and runs the append-only check.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="mb-4 space-y-1 text-sm">
+            {data.tailnetRecipe.server.concat(data.tailnetRecipe.notes).map((line) => (
+              <p key={line} className="text-muted-foreground">
+                {line}
+              </p>
+            ))}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => act(api("/api/backups/tailnet/observe", { method: "POST", body: "{}" }), load)}
+            >
+              Observe the backup tailnet now
+            </Button>
+          </div>
+          <form key={editingHome?.id ?? "new-home"} className="grid gap-4 md:grid-cols-2" onSubmit={saveHome}>
+            <Field label="Name" name="name" required defaultValue={editingHome?.name ?? "home"} />
+            <Field
+              label="REST URL"
+              name="restUrl"
+              required
+              placeholder={data.tailnetRecipe.urlExample}
+              defaultValue={editingHome?.restUrl ?? ""}
+            />
+            <Field
+              label="Recovery window (days)"
+              name="recoveryWindowDays"
+              type="number"
+              min={1}
+              max={3650}
+              defaultValue={String(editingHome?.recoveryWindowDays ?? 30)}
+            />
+            <Field
+              label="htpasswd password (user = first path segment)"
+              name="restPassword"
+              type="password"
+              required={!editingHome}
+              autoComplete="off"
+            />
+            {!editingHome && (
+              <div className="md:col-span-2 space-y-1">
+                <Field
+                  label="restic repository password (store it off-host; it cannot change)"
+                  name="repositoryPassword"
+                  type="text"
+                  required
+                  minLength={24}
+                  value={homeGenerated}
+                  onChange={(event) => setHomeGenerated(event.target.value)}
+                  autoComplete="off"
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setHomeGenerated(randomPassword())}
+                >
+                  Generate
+                </Button>
+              </div>
+            )}
+            <Field
+              label="Current password"
+              name="password"
+              type="password"
+              autoComplete="current-password"
+              required
+            />
+            {homeMessage && <p className="text-sm text-muted-foreground md:col-span-2">{homeMessage}</p>}
+            <div className="flex gap-2 md:col-span-2">
+              <Button>Save home target</Button>
+              {editingHome && (
+                <Button type="button" variant="ghost" onClick={() => setEditingHome(null)}>
                   Cancel
                 </Button>
               )}

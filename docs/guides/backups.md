@@ -1,6 +1,6 @@
-# Off-VPS backups (S3-compatible, append-only)
+# Off-VPS backups (S3-compatible and home machine, append-only)
 
-This guide covers FD-21 (`docs/design/front-door.md` §3.18): backups of both PostgreSQL clusters, mail and reviewed volumes to an S3-compatible bucket that a compromised VPS cannot erase. The home-machine destination over the tailnet (`rest-server --append-only`) is FD-30 and is not described here yet.
+This guide covers FD-21 and FD-30 (`docs/design/front-door.md` §3.18): backups of both PostgreSQL clusters, mail and reviewed volumes to **two** destinations that a compromised VPS cannot erase: an S3-compatible bucket, and `rest-server --append-only` on your home machine, reached over the tailnet through a dedicated backup node. "Backups healthy" needs both.
 
 ## How it works
 
@@ -13,7 +13,10 @@ flowchart LR
     BW -->|read-only| ST
   end
   BW -->|restic, backup-egress| S3[(S3 bucket<br/>prefix/restic)]
+  BW -->|restic REST, HTTP_PROXY=socks5://backup-ts:1055<br/>backup-tailnet| BTS[backup-ts<br/>tag:ark-backup, userspace]
+  BTS -->|tailnet, tcp:8000 only| HOME[(home: rest-server<br/>--append-only --private-repos)]
   REC[recovery machine] -->|read-only key, --no-lock| S3
+  REC -.->|tailnet| HOME
 ```
 
 - **Each PostgreSQL container** (`postgres` and `app-postgres`) runs the pinned image plus pgBackRest 2.60 (PGDG) and a small executor (`workers/src/pg-executor.ts`). WAL is archived into a local, encrypted (`aes-256-cbc`) pgBackRest `repo2` on its own volume, with `archive_timeout=60`. Debian's default `repo1` is removed from the image, so `repo2` is the only repository.
@@ -24,7 +27,7 @@ flowchart LR
 
 Live pgBackRest `*.info` files are never put under a lock or in the bucket: they are mutable. Only completed, staged copies are exported, so each restic snapshot keeps its own `backup.info` and `archive.info`, and the metadata history is immutable too.
 
-## Setting up a target
+## Setting up the S3-compatible target
 
 In **Backups → Add an S3-compatible target** (owner only; saving needs your password), pick the provider recipe, then enter:
 
@@ -71,7 +74,79 @@ A direct, live pgBackRest S3 repository (`repo1`) is never the R2 recipe: `backu
 1. `mc mb --with-lock <alias>/<bucket>` (object locking turns on versioning), then `mc retention set --default COMPLIANCE <days>d <alias>/<bucket>`.
 2. Create a user with the same IAM-style policy as AWS (`mc admin policy create`, then `mc admin policy attach … --user …`), and attach the generated protection document as a bucket policy as described above.
 
-## The append-only canary
+## Home machine over the tailnet (FD-30)
+
+The second destination is a restic REST repository on a machine you own, served by [`rest-server`](https://github.com/restic/rest-server) in **append-only** mode. The VPS reaches it only through its own Tailscale node, `backup-ts`, never through the public edge node.
+
+### How it works
+
+- **`backup-ts`** (Compose service, pinned `tailscale/tailscale:v1.86.2`, the same image as `edge-ts`) joins the tailnet as `tag:ark-backup` with its own key, in **userspace** networking (no tun device, no capabilities) and with `--shields-up`, so nothing on the tailnet can connect to it. It exposes a SOCKS5 proxy on `:1055` on the internal `backup-tailnet` network, whose only other member is the backup worker. Its own egress network (`backup-ts-egress`) has no other member.
+- **Only the home target's restic subprocess is proxied.** It gets exactly `HTTP_PROXY=socks5://backup-ts:1055` (`HTTPS_PROXY` for an `https://` URL) and no other proxy variable; every restic environment is built from scratch, so a `HTTP_PROXY`, `NO_PROXY` or `ALL_PROXY` inherited by the worker can neither redirect it nor leak into S3 subprocesses. S3 uploads, executor calls and API calls never see a proxy. restic 0.19.1 honours the `socks5://` scheme for its REST backend (Go's `ProxyFromEnvironment`), which `mise run test:backups-tailnet` proves, so the shared-namespace fallback from the design is not needed.
+- **Pinned like a route.** `backup.observe` reads `backup-ts`'s **own** LocalAPI status every five minutes (the socket volume `ark_backup_ts_socket` is mounted read-only into the backup worker and nowhere else; as uid 1000 every LocalAPI write is refused) and commits a complete `source = backup` tailnet generation with a six-minute lease. When you save the target, its host must be exactly one peer in that generation: Ark pins the StableNodeID and Tailscale address. For `http://` URLs restic dials the **pinned address** (the URL path, user and repository are unchanged), so a re-pointed MagicDNS name cannot redirect backups. The edge node's snapshot and grants are never used.
+- **Identity and freshness during transfers.** Before every transfer (export, file backup, restore, canary) the pin is checked against the current backup generation, and a local watchdog re-checks it **every second while the transfer runs**. If the observation expires, the pinned node disappears, the name now identifies a different node, or the address changes, the transfer does not start, or the running restic is stopped (SIGTERM, SIGKILL after 2 s): **active REST transfers stop within 5 s** of the change. Nothing waits for the next scheduled backup, and no edge grant or manual step is involved. A stopped transfer is a failed export with no recovery point, and a critical `backup-tailnet:<target>` alert is raised.
+- **Append-only canary** (`backup.verify_target`, weekly and on save), with the deployed htpasswd credentials, through `backup-ts` to the pinned address: it writes a canary pack, then requires overwrite and delete of it to be refused (403) and the pack to read back unchanged; deletes of never-existing names under `snapshots/`, `keys/` and `index/` must be refused (403, not 404); restic must be able to create and remove a lock; unauthenticated requests must get 401; and another user's path must be refused (`--private-repos`). It never writes or deletes `config`, keys, snapshots or index files. A server without `--append-only` is reported **deletable**.
+
+### Setting up the home machine
+
+1. **Join the tailnet.** Install Tailscale on the home machine and name it, for example, `backup-home` (MagicDNS `backup-home.<tailnet>.ts.net`). Do **not** give it any `tag:ark-*` tag: Ark refuses Ark-tagged nodes as targets.
+2. **Install rest-server 0.14.0** (the version V-18 verified) from the [releases](https://github.com/restic/rest-server/releases), or use the image `restic/rest-server:0.14.0`.
+3. **Create one htpasswd user for Ark.** The user name is the first path segment of the URL you will give Ark (`ark` below), because `--private-repos` only lets a user reach paths under its own name:
+
+   ```sh
+   htpasswd -B -c /srv/restic/.htpasswd ark   # bcrypt; enter a long random password
+   ```
+
+4. **Run rest-server in append-only mode on the tailnet address only**, port 8000:
+
+   ```sh
+   rest-server --path /srv/restic --listen "$(tailscale ip -4):8000" \
+     --append-only --private-repos --htpasswd-file /srv/restic/.htpasswd
+   ```
+
+   As a container (with host networking so it can bind the tailnet address):
+
+   ```sh
+   docker run -d --name rest-server --restart unless-stopped --network host \
+     -v /srv/restic:/data restic/rest-server:0.14.0 \
+     rest-server --path /data --listen "$(tailscale ip -4):8000" \
+       --append-only --private-repos --htpasswd-file /data/.htpasswd
+   ```
+
+   Keep it running under systemd or the container's restart policy. Never point Ark at an instance without `--append-only`.
+
+5. **Create the backup node's key.** In the Tailscale admin console, add `tag:ark-backup` to `tagOwners` (the generated snippet declares it) and create a **one-off, pre-approved, non-ephemeral** auth key tagged `tag:ark-backup`. Never reuse the edge key. Put it in `.env` as `TS_BACKUP_AUTHKEY=tskey-auth-…` and start the node: `docker compose -f infra/platform/docker-compose.yml up -d backup-ts backup-worker`. After the first join, empty `TS_BACKUP_AUTHKEY` and revoke the key; the node keeps its identity in `ark_backup_ts_state`.
+6. **Add the target in Ark** (owner, MFA and your password): `PUT /api/backups/targets/tailnet_rest` with
+   ```json
+   {
+     "name": "home",
+     "restUrl": "http://backup-home.tail1234.ts.net:8000/ark",
+     "password": "<the htpasswd password>",
+     "repositoryPassword": "<a new restic password, stored off-host>"
+   }
+   ```
+   The URL must be the home machine's MagicDNS name or Tailscale address, with an explicit port and a path starting with the htpasswd user; credentials never go in the URL. Saving pins the machine from `backup-ts`'s current observation, so it fails until `backup-ts` is logged in **and** the grant below is in place (`POST /api/backups/tailnet/observe` refreshes the observation; `GET /api/backups/tailnet` shows what `backup-ts` sees and each target's identity). Saving queues the canary. The **Backups** page has the same form.
+7. **Add the ACL grant.** Open **Front door ACL** (`GET /api/front/acl`) and merge the generated sections into the tailnet policy. For the home target they contain exactly one grant from the backup node, plus tests that the edge node cannot reach it:
+
+   ```jsonc
+   "hosts": { "ark-backup-home": "100.66.2.9" },
+   "grants": [
+     { "src": ["tag:ark-backup"], "dst": ["ark-backup-home"], "ip": ["tcp:8000"] }
+   ],
+   "tests": [
+     { "src": "tag:ark-edge", "deny": ["ark-backup-home:8000", "…"] },
+     { "src": "tag:ark-backup", "accept": ["ark-backup-home:8000"] }
+   ]
+   ```
+
+   Never give `tag:ark-edge` a grant to the home machine, and never give `tag:ark-backup` anything else: backup reach and route reach must not share grants (§3.7).
+
+### Pruning and recovery from the home machine
+
+Pruning happens **on the home machine**, never from the VPS: append-only mode refuses Ark's deletes (V-18: `restic forget` from the VPS leaves every snapshot in place). Run `restic forget --prune` there directly against `/srv/restic/ark` (or through a second, non-append-only rest-server instance bound to localhost), with the repository password you stored off-host.
+
+To recover, a machine on the tailnet uses the same repository with `restic -r rest:http://backup-home.<tailnet>.ts.net:8000/ark/ restore …` (`RESTIC_REST_USERNAME`, `RESTIC_REST_PASSWORD`, `RESTIC_PASSWORD`), or restores directly from `/srv/restic/ark` on the home machine. PostgreSQL snapshots have the same layout as on S3 (`source=pg:<stanza>`, `stage=<id>`), so the pgBackRest restore steps below apply after `restic restore`.
+
+## The append-only canary (S3)
 
 `backup.verify_target` runs with the **deployed writer credentials**, weekly and whenever a target is saved:
 
@@ -85,7 +160,7 @@ The verdict is one of **append-only: yes**, **deletable: a compromised server co
 
 ## Health and alerts
 
-"Backups healthy" (`ark_backups_healthy`) needs at least one enabled S3 target, and every enabled target healthy: current append-only evidence, a successful export within 36 hours, and a recovery point under 15 minutes old for both clusters. Alerts:
+"Backups healthy" (`ark_backups_healthy`) needs at least one enabled S3 target **and** at least one enabled home (tailnet REST) target, and every enabled target healthy: current append-only evidence, a successful export within 36 hours, and a recovery point under 15 minutes old for both clusters; a home target also needs a valid pin in `backup-ts`'s current observation. Either destination stale makes backups unhealthy. Alerts:
 
 | Alert                          | When                                                                                                                                                                                                                            |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -94,7 +169,8 @@ The verdict is one of **append-only: yes**, **deletable: a compromised server co
 | `backup-target-stale:<target>` | No successful export for 36 hours.                                                                                                                                                                                              |
 | `backup-capacity:<source>`     | WAL is accumulating locally because a destination has not acknowledged it (warning); critical below 10 % or 2 GiB free, or when the growth since the slowest destination's acknowledgement would fill the disk within 72 hours. |
 | `backup-source:<source>`       | Archiving is off, failing, or the executor is unreachable.                                                                                                                                                                      |
-| `backup-no-target`             | No S3-compatible target is configured.                                                                                                                                                                                          |
+| `backup-no-target`             | No S3-compatible target is configured (`backup-no-target:tailnet_rest`: no home target).                                                                                                                                        |
+| `backup-tailnet:<target>`      | Transfers to the home target are suspended: `backup-ts`'s observation expired, or the pinned machine is absent or replaced (critical).                                                                                          |
 
 Metrics on `/api/metrics/prometheus`: `ark_backup_target_last_success_age_seconds`, `ark_backup_target_append_only_verified`, `ark_backup_recovery_point_age_seconds` and `ark_backups_healthy`.
 
@@ -108,7 +184,7 @@ repo2 is never expired on the VPS, so it grows until an operator prunes it. Stag
 
 Store these somewhere that does not depend on the VPS:
 
-- the restic repository password of each target (you generated it when saving the target);
+- the restic repository password of each target (you generated it when saving the target), and the home rest-server's htpasswd password;
 - `ARK_PLATFORM_PG_REPO_CIPHER_PASS` and `ARK_APP_PG_REPO_CIPHER_PASS` from `.env` (generated by the installer);
 - a **read-only** key for the bucket (list and get only), separate from the writer;
 - the image references `ark-postgres` and `ark-app-postgres` for the running Ark version.
@@ -131,16 +207,18 @@ It picks the newest snapshot whose manifest covers the target time (or `ARK_REST
 
 ### Pruning, from off-host only
 
-`pgbackrest expire` and `restic forget --prune` never run from the VPS. To reclaim space, an admin restores a recent snapshot off-host as above and runs `pgbackrest expire` against that scratch copy to plan what is still needed; bucket history itself expires only through the provider's lifecycle after the lock period. Local repo2 pruning on the VPS is a manual, reviewed runbook step (FD-30 adds the home-machine side).
+`pgbackrest expire` and `restic forget --prune` never run from the VPS. To reclaim space, an admin restores a recent snapshot off-host as above and runs `pgbackrest expire` against that scratch copy to plan what is still needed; bucket history itself expires only through the provider's lifecycle after the lock period. Local repo2 pruning on the VPS is a manual, reviewed runbook step. The home repository is pruned on the home machine (above).
 
 ## Testing
 
 - `mise run test:backups` runs the required suite locally against a pinned MinIO, the actual Compose clusters and a throwaway control database. It covers the append-only policy classes, the R2 lock recipe emulated with MinIO object lock, an unavailable destination, and full PITR recovery of both clusters after every VPS-local copy is deleted, all path-style. It also runs the deployed backup worker through API claims with blocked jobs, validates its private executor interface, restores exact mail/volume snapshots, checks restic parent reuse, and exercises idle and microsecond recovery boundaries.
+- `mise run test:backups-tailnet` runs the FD-30 suite locally: the shipped `backup-ts` service (offline tailscaled, userspace, SOCKS5), `rest-server --append-only --private-repos` on a Docker network inside 100.64.0.0/10 that only `backup-ts` joins, a mocked LocalAPI for `backup-ts`'s tailnet view, MinIO and a throwaway control database. It checks LocalAPI uid-1000 read access and write denial, pinning from the backup observation with disjoint edge and backup views, that the worker has no direct tailnet route and that REST traffic reaches rest-server only from `backup-ts` while S3 subprocesses and API calls get no proxy, the canary and V-18 (`restic forget` removes nothing), active transfers stopping within 5 s after replacement, removal or lease expiry, and two-destination health.
+- `mise run test:backups-tailnet-live` is opt-in: with `ARK_TEST_TS_BACKUP_AUTHKEY` and `ARK_TEST_TS_HOME_AUTHKEY` (and optionally `ARK_TEST_TS_EDGE_AUTHKEY`, `ARK_TEST_TS_POLICY_API_KEY`) for a scratch tailnet whose policy holds only the generated snippet, it backs up to a real home `rest-server` through `backup-ts` with only the `tag:ark-backup → home:8000` grant and shows that an ungranted port and the edge node cannot reach it. It skips with a message otherwise. The generated snippet's edge isolation is also asserted locally by `shared/src/tailnet-acl.test.ts`.
 - `mise run test:backups-hosted` runs the same backup and restore scenario against AWS S3, B2 or R2 (virtual-host style) when `ARK_TEST_S3_*` credentials are set, and skips with a message otherwise. See the header of `scripts/test-backups-hosted.ts`.
 
 ## Execution and restore safeguards
 
-The worker runs separate bounded lanes for local backups (two), exports (four), canaries (two), and other work. Claims exclude overlapping target IDs, and executors serialize stanza mutations. Exports lease stages for their bounded upload lifetime; pruning skips leased copies even when a destination stalls. Scheduled exports are enqueued before executor observations, so an unreachable executor does not postpone scheduling other targets.
+The worker runs separate bounded lanes for local backups (two), exports (four), canaries and `backup.observe` (two), and other work. Claims exclude overlapping target IDs, and executors serialize stanza mutations. Exports lease stages for their bounded upload lifetime; pruning skips leased copies even when a destination stalls. Scheduled exports are enqueued before executor observations, so an unreachable executor does not postpone scheduling other targets.
 
 New PostgreSQL snapshots store a relative `repo2/` tree plus `manifest.json`, with the stage identifier in tags. An explicit previous snapshot per source/repository and `--ignore-inode` preserve restic parent reuse across fenced copies. The recovery tool also reads older snapshots containing absolute stage paths.
 

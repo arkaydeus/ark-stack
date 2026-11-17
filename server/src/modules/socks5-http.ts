@@ -34,7 +34,12 @@ function socksAddress(host: string) {
 
 /** Opens a TCP connection to `host:port` through the SOCKS5 proxy. */
 export function socks5Connect(proxy: string, host: string, port: number, timeoutMs: number) {
-  const { host: proxyHost, port: proxyPort } = backupSocksProxy(proxy);
+  const configured = backupSocksProxy(proxy);
+  // Test-only (scripts/test-backups-tailnet.ts): the harness process runs outside Docker and reaches
+  // backup-ts's SOCKS5 port through a loopback publish; never set in production.
+  const dial = process.env.ARK_TEST_SOCKS5_DIAL?.trim().match(/^([\w.-]+):(\d+)$/);
+  const proxyHost = dial ? dial[1]! : configured.host;
+  const proxyPort = dial ? Number(dial[2]) : configured.port;
   return new Promise<Socket>((resolve, reject) => {
     const socket = netConnect({ host: proxyHost, port: proxyPort });
     let stage: "greeting" | "connect" = "greeting";

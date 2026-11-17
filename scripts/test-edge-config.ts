@@ -89,9 +89,10 @@ async function checkPins() {
   const tailscalePins = [...compose.matchAll(/^\s*image:\s*(tailscale\/tailscale:\S+)\s*$/gm)].map(
     (match) => match[1],
   );
-  if (tailscalePins.length !== 2 || tailscalePins.some((pin) => pin !== tailscaleImage)) {
+  // edge-ts, tailscale and FD-30's backup-ts.
+  if (tailscalePins.length !== 3 || tailscalePins.some((pin) => pin !== tailscaleImage)) {
     throw new Error(
-      `infra/platform/docker-compose.yml must pin edge-ts and tailscale to the tested ${tailscaleImage}; found ${JSON.stringify(tailscalePins)}.`,
+      `infra/platform/docker-compose.yml must pin edge-ts, tailscale and backup-ts to the tested ${tailscaleImage}; found ${JSON.stringify(tailscalePins)}.`,
     );
   }
   const tailscaleVersion = await docker(
@@ -115,7 +116,7 @@ async function checkPins() {
   console.log(
     `Compose and release.json pin the tested image ${caddyImage} (${version.split(" ")[0]}); release bundle digest matches.`,
   );
-  console.log(`Compose pins edge-ts and tailscale to the tested ${tailscaleImage}.`);
+  console.log(`Compose pins edge-ts, tailscale and backup-ts to the tested ${tailscaleImage}.`);
 }
 
 // ---- Fixture certificates -------------------------------------------------------------------------------

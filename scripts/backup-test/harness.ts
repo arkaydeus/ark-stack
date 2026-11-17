@@ -112,7 +112,7 @@ const SUPERUSER: Record<PgCluster, [string, string]> = {
 const ipv4 = (value: string) => value.split(".").reduce((n, part) => (n << 8n) + BigInt(part), 0n);
 
 /** Allocate small isolated test networks without consuming Docker's limited default /16 pools. */
-async function testNetworkBase() {
+export async function testNetworkBase() {
   const ids = (await run(["docker", "network", "ls", "--quiet"])).stdout.split(/\s+/).filter(Boolean);
   const existing = ids.length
     ? (JSON.parse((await run(["docker", "network", "inspect", ...ids])).stdout) as Array<{
@@ -154,6 +154,9 @@ export async function startClusters(label: string): Promise<Clusters> {
     "database-loopback",
     "backup-management",
     "backup-egress",
+    // FD-30: the Compose backup-worker also joins backup-tailnet (backup-ts's SOCKS5 network).
+    "backup-tailnet",
+    "backup-ts-egress",
     "fd21-loopback",
     "mail-management",
     "monitoring",

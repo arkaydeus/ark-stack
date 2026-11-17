@@ -990,10 +990,13 @@ async function verifyRestTarget(target: BackupTargetRow): Promise<RestCanaryEvid
   });
 }
 
-export async function verifyTarget(
+/** Append-only evidence of either kind; callers verifying a home target ask for RestCanaryEvidence. */
+export type TargetEvidence = CanaryEvidence | RestCanaryEvidence;
+
+export async function verifyTarget<E extends TargetEvidence = CanaryEvidence>(
   targetId: string,
   revision?: string,
-): Promise<CanaryEvidence | RestCanaryEvidence> {
+): Promise<E> {
   const [target] = await db.select().from(backupTargets).where(eq(backupTargets.id, targetId));
   if (!target) throw new Error("Backup target not found.");
   if (revision && revision !== target.configRevision)
@@ -1011,7 +1014,7 @@ export async function verifyTarget(
       })
       .where(and(eq(backupTargets.id, target.id), eq(backupTargets.configRevision, target.configRevision)));
     await evaluateBackupAlerts().catch(() => undefined);
-    return evidence;
+    return evidence as E;
   }
   const config = s3Config(target);
   const secretsForTarget = await targetSecrets(target);
@@ -1038,7 +1041,7 @@ export async function verifyTarget(
     })
     .where(and(eq(backupTargets.id, target.id), eq(backupTargets.configRevision, target.configRevision)));
   await evaluateBackupAlerts().catch(() => undefined);
-  return evidence;
+  return evidence as E;
 }
 
 // ---- Health and alerts ----------------------------------------------------------------------------

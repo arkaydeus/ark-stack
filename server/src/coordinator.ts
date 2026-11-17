@@ -53,6 +53,7 @@ import {
   exportTarget,
   startBackupSchedule,
   verifyTarget,
+  type TargetEvidence,
 } from "./modules/offsite-backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
 import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
@@ -1439,7 +1440,7 @@ async function exportBackupTarget(operation: OperationRow) {
 
 /** `backup.verify_target` (FD-21): the append-only canary with the deployed writer credentials. */
 async function verifyBackupTarget(operation: OperationRow) {
-  const evidence = await verifyTarget(
+  const evidence = await verifyTarget<TargetEvidence>(
     operation.targetIds[0],
     operation.payload.revision as string | undefined,
   );
