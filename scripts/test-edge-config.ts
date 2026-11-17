@@ -637,7 +637,8 @@ async function websocketIdleTest(report: Report) {
 
 type Edge = CaddyContainer & { edgeDir: string; stack: EdgeStack; refreshPorts: () => Promise<void> };
 
-// The shipped `edge-ts` and `edge` Compose services in a disposable project (scripts/edge-test/stack.ts):
+// The shipped `edge-ts`, `edge` and `edge-l4` Compose services in a disposable project (scripts/edge-test/stack.ts;
+// HTTPS reaches Caddy through HAProxy on 443 since FD-25):
 // pinned images, kernel-mode edge-ts with its capabilities and /dev/net/tun, `edge` in its namespace
 // as uid/gid 1000 with every capability dropped, the bootstrap Caddyfile, the edge-admin alias, and the
 // ACME webroot and certificate directory mounted read-only. Only host paths and ports differ.
@@ -1180,10 +1181,17 @@ async function servingOutcome(edge: Edge) {
   const redirect = await plainGet(edge, "www.example.com", "/path").catch(
     (error: Error) => ({ status: 0, body: error.message, headers: {} }) as Reply,
   );
+  // HTTPS goes through edge-l4 (HAProxy on 443) to Caddy on 127.0.0.1:8443 (FD-25).
+  const https = await secureGet(edge, "admin.example.com", "/").catch(
+    (error: Error) => ({ status: 0, body: error.message, headers: {} }) as Reply,
+  );
   return {
     serving:
-      challenge.status === 200 && challenge.body === "fixture-token.key-auth" && redirect.status === 308,
-    observed: `challenge ${challenge.status || challenge.body}, redirect ${redirect.status || redirect.body}`,
+      challenge.status === 200 &&
+      challenge.body === "fixture-token.key-auth" &&
+      redirect.status === 308 &&
+      https.status === 200,
+    observed: `challenge ${challenge.status || challenge.body}, redirect ${redirect.status || redirect.body}, https via edge-l4 ${https.status || https.body}`,
   };
 }
 
@@ -1224,15 +1232,21 @@ async function recreationTest(report: Report) {
     "120",
     "edge-ts",
     "edge",
+    "edge-l4",
   );
-  const [owner, caddy] = [await inspect(stack.edgeTs), await inspect(stack.edge)];
+  const [owner, caddy, haproxy] = [
+    await inspect(stack.edgeTs),
+    await inspect(stack.edge),
+    await inspect(stack.edgeL4),
+  ];
   const composed = await waitUntilServing(edge);
   expect(
     report,
     caddy.Id !== before.Id &&
       caddy.HostConfig.NetworkMode === `container:${owner.Id}` &&
+      haproxy.HostConfig.NetworkMode === `container:${owner.Id}` &&
       (await rejoin()).length === 0,
-    "compose up recreates edge with a changed edge-ts and joins the new namespace; rejoin finds nothing to do",
+    "compose up recreates edge and edge-l4 with a changed edge-ts and joins the new namespace; rejoin finds nothing to do",
     `edge ${before.Id.slice(0, 12)} -> ${caddy.Id.slice(0, 12)} in container:${owner.Id.slice(0, 12)}; ${composed.observed}`,
   );
 
@@ -1249,8 +1263,8 @@ async function recreationTest(report: Report) {
   const afterRestart = await waitUntilServing(edge);
   expect(
     report,
-    fixedRestart.length === 1 && fixedRestart[0]?.reason === "owner-restarted",
-    "rejoin (run by mise run maintain and mise run edge:rejoin) recreates edge and it serves :80 again",
+    fixedRestart.length === 2 && fixedRestart.every((item) => item.reason === "owner-restarted"),
+    "rejoin (run by mise run maintain and mise run edge:rejoin) recreates edge and edge-l4; :80 and 443 serve again",
     `${JSON.stringify(fixedRestart)}; ${afterRestart.observed}`,
   );
 
@@ -1268,10 +1282,10 @@ async function recreationTest(report: Report) {
   const worker = await adminProbe(stack.networks.edgeControl, [], ["http://edge-admin:2019"]);
   expect(
     report,
-    fixedReplace.length === 1 &&
-      fixedReplace[0]?.reason === "owner-replaced" &&
+    fixedReplace.length === 2 &&
+      fixedReplace.every((item) => item.reason === "owner-replaced") &&
       worker["http://edge-admin:2019"] === "HTTP 200",
-    "rejoin recreates edge in the new edge-ts: :80 and edge-admin:2019 work again with the written config",
+    "rejoin recreates edge and edge-l4 in the new edge-ts: :80, 443 and edge-admin:2019 work again",
     `${JSON.stringify(fixedReplace)}; ${afterReplace.observed}; edge-admin ${worker["http://edge-admin:2019"]}`,
   );
 }

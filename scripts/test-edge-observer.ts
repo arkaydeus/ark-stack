@@ -1049,7 +1049,7 @@ try {
   if (failed) await runtime.dumpLogs();
   else
     console.log(
-      "\nAll edge observer tests passed. HAProxy-generation withdrawal is an FD-25 integration gate.",
+      "\nAll edge observer tests passed. HAProxy-generation withdrawal runs in scripts/test-edge-l4.ts.",
     );
 } catch (error) {
   failed = true;

@@ -16,7 +16,8 @@
 // PROXY); SNI/Host 421; no Alt-Svc; every HTTP route through 443; idle and non-TLS rejection within
 // 5 s; master-CLI reload Success=1/0 with old workers serving after a failed reload; a WebSocket across
 // HAProxy and Caddy reloads; watchdog withdrawal of an HAProxy-routed tailnet backend on identity
-// failure and on lease expiry across current and leaving workers; the fail-closed HAProxy launch guard.
+// failure and on lease expiry across current and leaving workers, and the domain worker's own drain;
+// the fail-closed HAProxy launch guard.
 import { randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
@@ -27,6 +28,7 @@ import { connect as tlsConnect, type TLSSocket } from "node:tls";
 
 import {
   CADDY_GLOBAL_BLOCK,
+  routeIdentityKey,
   type EdgeLeaseDocument,
   type EdgePolicyRoute,
   type WatchdogEvent,
@@ -1158,6 +1160,41 @@ async function identityWithdrawalTest(report: Report) {
   expect(report, Boolean(reported), "the watchdog reports the HAProxy withdrawal", reported.detail);
 }
 
+/** `edge.drain` as the domain worker runs it: the HAProxy adapter through the shared master socket. */
+async function workerDrainTest(report: Report) {
+  lease.routes = [webRoute, mqttRoute];
+  lease.validUntil = Number.POSITIVE_INFINITY;
+  await Bun.sleep(1_500);
+  const { leaving, current, workers } = await sessionsAcrossWorkers();
+  const started = Date.now();
+  // The drained policy no longer allows the TLS route; the HTTP route stays allowed.
+  const result = await probe<{ withdrawn: string[]; active: string[]; error?: string }>([
+    "withdraw",
+    JSON.stringify([routeIdentityKey(webRoute)]),
+  ]);
+  const closedAt = await Promise.all(
+    [leaving.closed, current.closed].map((closed) =>
+      Promise.race([closed, Bun.sleep(5_000).then(() => null)]),
+    ),
+  );
+  expect(
+    report,
+    !result.error &&
+      result.withdrawn.includes(`${peerTlsIp}:1883`) &&
+      closedAt.every((at) => at !== null && at - started <= 5_000),
+    "the domain worker (uid 1000, group 4400, no Docker) shuts down route sessions in current and leaving workers",
+    result.error ??
+      `${workers.length} workers; withdrew ${result.withdrawn.join(", ")}; sessions closed after ${closedAt.map((at) => (at === null ? "never" : `${at - started} ms`)).join(", ")}`,
+  );
+  const admin = await secureGet(adminHost);
+  expect(
+    report,
+    admin.status === 200,
+    "HTTP routes are unaffected by the drain",
+    `${adminHost}: ${admin.status}`,
+  );
+}
+
 async function leaseExpiryTest(report: Report) {
   lease.routes = [webRoute, mqttRoute];
   lease.validUntil = Number.POSITIVE_INFINITY;
@@ -1302,6 +1339,7 @@ try {
   await run("master-CLI reload", reloadTest);
   await run("WebSocket across HAProxy and Caddy reloads", websocketTest);
   await run("watchdog: identity failure across HAProxy workers", identityWithdrawalTest);
+  await run("domain worker drain (edge.drain) across HAProxy workers", workerDrainTest);
   await run("watchdog: lease expiry across HAProxy workers", leaseExpiryTest);
   await run("HAProxy launch guard", launchGuardTest);
   console.log("\nAll edge-l4 tests passed.");
