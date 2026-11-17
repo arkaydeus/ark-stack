@@ -1398,10 +1398,15 @@ async function launchGuardTest(report: Report) {
     500,
   );
   await refreshPorts();
+  // Without a watchdog both guards restart-loop by design: each starts closed after five launch
+  // attempts, serves through its 2 s grace, then stops on the first missed heartbeats. 443 answers
+  // only while HAProxy and Caddy are up together. Where the stopped watchdog's name takes seconds to
+  // fail to resolve (Docker behind systemd-resolved, as on the CI runner), each attempt runs to its
+  // `timeout`: Caddy cycles in ~25 s and HAProxy in ~16 s, so allow several cycles to overlap.
   await waitFor(
     "HTTP through 443 after the restart",
     async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
-    30_000,
+    120_000,
     500,
   );
   const after = await tlsOutcome();
