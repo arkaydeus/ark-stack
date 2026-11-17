@@ -797,7 +797,21 @@ async function leaseExpiryTest(report: Report) {
 
 async function expiredStartTest(report: Report) {
   // The lease is expired and the on-disk Caddyfile still names the route (nothing re-applied it).
-  const caddyfile = await Bun.file(join(edgeDir, "Caddyfile")).text();
+  // The worker stand-in (uid 1000) wrote it with mode 0600. Read it as uid 1000: on a Linux host
+  // whose user is not uid 1000 (a CI runner is 1001), a direct read fails with EACCES.
+  const caddyfile = await docker(
+    "run",
+    "--rm",
+    "--network",
+    "none",
+    "--user",
+    "1000:1000",
+    "--volume",
+    `${edgeDir}:/edge:ro`,
+    bunImage,
+    "cat",
+    "/edge/Caddyfile",
+  );
   expect(
     report,
     caddyfile.includes(`# ark-tailnet-route ${routeId} ${peerBackend}`),
