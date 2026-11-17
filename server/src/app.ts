@@ -83,6 +83,7 @@ import type { SessionOrigin } from "./session-origin.ts";
 import {
   GateSettingsError,
   commitGateSettings,
+  enqueueGateOperation,
   gateSettingsSummary,
   prepareGateSettings,
 } from "./modules/gate-settings.ts";
@@ -3176,7 +3177,7 @@ app.put("/api/settings/gate", async (c) => {
   const result = await commitGateSettings(
     plan,
     { userId: access.userId, role: access.role },
-    enqueue,
+    enqueueGateOperation,
     authorize,
   );
   return c.json({ ...(await gateSettingsSummary()), ...result, records: plan.records });

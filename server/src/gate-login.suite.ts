@@ -23,7 +23,8 @@ const { auth, authBaseURL, authCookieName, AUTH_COOKIE_KEYS } = await import("./
 const { sql } = await import("./db.ts");
 const { refreshLoginHost } = await import("./origin-hosts.ts");
 const { enqueue, runOperation } = await import("./coordinator.ts");
-const { prepareGateSettings, commitGateSettings } = await import("./modules/gate-settings.ts");
+const { prepareGateSettings, commitGateSettings, enqueueGateOperation } =
+  await import("./modules/gate-settings.ts");
 
 const adminHost = new URL(process.env.BETTER_AUTH_URL!).host;
 const loginHost = "login.gate.example.com";
@@ -882,6 +883,79 @@ describe("PUT /api/settings/gate", () => {
       await route;
       await gate;
       await sql`DELETE FROM endpoints WHERE id = ${id}`;
+    }
+  });
+
+  test("either durable enqueue failure rolls back settings, grants, sessions and all jobs", async () => {
+    for (const failAt of [1, 2]) {
+      const plan = await prepareGateSettings({ mode: "public", hostname: `rollback-${failAt}.${zone}` });
+      const before = await gateState();
+      const jobs = [...(await sql`SELECT * FROM operations ORDER BY id`)];
+      let inserted = 0;
+      await expect(
+        commitGateSettings(
+          plan,
+          { userId: owner.id, role: "owner" },
+          async (input, tx) => {
+            const job = await enqueueGateOperation(input, tx);
+            if (++inserted === failAt) throw new Error("injected enqueue failure");
+            return job;
+          },
+          async (tx) => {
+            await tx.delete((await import("./schema.ts")).session);
+          },
+        ),
+      ).rejects.toThrow("injected enqueue failure");
+      expect(await gateState()).toEqual(before);
+      expect([...(await sql`SELECT * FROM operations ORDER BY id`)]).toEqual(jobs);
+    }
+  });
+
+  test("enable, move and disable keep durable work after a post-commit refresh failure", async () => {
+    const original = await prepareGateSettings({ mode: "public", hostname: loginHost });
+    try {
+      for (const input of [
+        { mode: "public" as const, hostname: `recover.${zone}` },
+        { mode: "public" as const, hostname: `moved-recover.${zone}` },
+        { mode: "disabled" as const },
+      ]) {
+        const plan = await prepareGateSettings(input);
+        const ids: string[] = [];
+        await expect(
+          commitGateSettings(
+            plan,
+            { userId: owner.id, role: "owner" },
+            async (job, tx) => {
+              const result = await enqueueGateOperation(job, tx);
+              ids.push(result.id);
+              return result;
+            },
+            undefined,
+            async () => {
+              throw new Error("crash immediately after commit");
+            },
+          ),
+        ).rejects.toThrow("crash immediately after commit");
+        // A new connection sees the committed jobs without another PUT or authorization grant.
+        const { default: postgres } = await import("postgres");
+        const restarted = postgres(process.env.DATABASE_URL!, { max: 1 });
+        try {
+          const rows = await restarted`SELECT kind, status FROM operations WHERE id IN ${restarted(ids)}`;
+          expect(rows.map((r) => r.kind).toSorted()).toEqual(
+            input.mode === "public" ? ["domain.verify", "edge.apply"] : ["edge.apply"],
+          );
+          expect(rows.every((r) => r.status === "queued")).toBe(true);
+          const [settings] =
+            await restarted`SELECT gate_login_mode, gate_login_hostname FROM platform_settings WHERE id = 'default'`;
+          expect(settings).toMatchObject({ gate_login_mode: input.mode, gate_login_hostname: plan.hostname });
+        } finally {
+          await restarted.end();
+        }
+        await refreshLoginHost(true);
+        expect((await import("./origin-hosts.ts")).currentLoginHost()).toBe(plan.hostname);
+      }
+    } finally {
+      await commitGateSettings(original, { userId: owner.id, role: "owner" });
     }
   });
 

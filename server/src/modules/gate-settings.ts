@@ -3,7 +3,7 @@
 // R1: the login origin is public or disabled; a tailnet-only login mode is not offered. Enabling it
 // (or moving it to another hostname) is an exposure decision: owner, MFA and an `exposure.public`
 // step-up bound to the exact request. It writes `gate_login_mode`/`gate_login_hostname`, the `gate`
-// endpoint and its address records in one transaction, then queues `domain.verify` (DNS, then the
+// endpoint and its address records and durable jobs in one transaction: `domain.verify` (DNS, then the
 // certificate through the normal endpoint flow) and `edge.apply`. The edge renders the login site only
 // once its certificate is issued. Disabling tightens and needs no step-up: it removes the endpoint and
 // its records, revokes every `gate` session (they belong to an origin that no longer exists) and
@@ -12,6 +12,7 @@
 import {
   createId,
   normalizeRouteHostname,
+  planHash,
   routeAddressRecords,
   routeDomainFor,
   type GateSettingsInput,
@@ -22,7 +23,15 @@ import { and, eq } from "drizzle-orm";
 import { db, type DbTransaction } from "../db.ts";
 import { loadEnv } from "../env.ts";
 import { isAdminHost, refreshLoginHost } from "../origin-hosts.ts";
-import { auditEvents, dnsRecords, domainClaims, endpoints, platformSettings, session } from "../schema.ts";
+import {
+  auditEvents,
+  dnsRecords,
+  domainClaims,
+  endpoints,
+  platformSettings,
+  session,
+  operations,
+} from "../schema.ts";
 
 const env = loadEnv();
 
@@ -39,9 +48,22 @@ export class GateSettingsError extends Error {
   }
 }
 
-type Enqueue = (input: { kind: OperationKind; actorId?: string; targetIds: string[] }) => Promise<{
-  id: string;
-}>;
+type GateOperation = { kind: OperationKind; actorId?: string; targetIds: string[] };
+type Enqueue = (input: GateOperation, tx: DbTransaction) => Promise<{ id: string }>;
+
+/** Each settings commit owns fresh jobs, even if a previous revision is already running. */
+export const enqueueGateOperation: Enqueue = async (input, tx) => {
+  const id = createId("op");
+  await tx.insert(operations).values({
+    ...input,
+    id,
+    idempotencyKey: `settings.gate:${id}`,
+    planHash: planHash({}),
+    payload: {},
+    status: "queued",
+  });
+  return { id };
+};
 
 export async function gateSettingsSummary() {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
@@ -138,8 +160,9 @@ async function removeGateEndpoints(tx: DbTransaction, keepHostname: string | nul
 export async function commitGateSettings(
   plan: GateSettingsPlan,
   actor: { userId: string; role: string },
-  enqueue: Enqueue,
+  enqueue: Enqueue = enqueueGateOperation,
   authorize?: (tx: DbTransaction) => Promise<unknown>,
+  refresh: typeof refreshLoginHost = refreshLoginHost,
 ) {
   const result = await db.transaction(async (tx) => {
     await authorize?.(tx);
@@ -235,16 +258,27 @@ export async function commitGateSettings(
         revokedSessions,
       },
     });
-    return { revokedSessions };
+    const operationIds: string[] = [];
+    if (plan.mode === "public" && plan.domain) {
+      operationIds.push(
+        (
+          await enqueue(
+            {
+              kind: "domain.verify",
+              actorId: actor.userId,
+              targetIds: [plan.domain.id],
+            },
+            tx,
+          )
+        ).id,
+      );
+    }
+    // Platform-wide consequence: no actor, so the owner check never trips.
+    operationIds.push((await enqueue({ kind: "edge.apply", targetIds: ["platform"] }, tx)).id);
+    return { revokedSessions, operationIds };
   });
-  await refreshLoginHost(true);
-  const operations: string[] = [];
-  if (plan.mode === "public" && plan.domain) {
-    operations.push(
-      (await enqueue({ kind: "domain.verify", actorId: actor.userId, targetIds: [plan.domain.id] })).id,
-    );
-  }
-  // Platform-wide consequence (like certificate issuance): no actor, so the owner check never trips.
-  operations.push((await enqueue({ kind: "edge.apply", targetIds: ["platform"] })).id);
-  return { ...result, operationIds: operations };
+  // A refresh failure (or process exit here) cannot lose committed work. Workers poll operations
+  // independently; startup and request refreshes reload the committed hostname.
+  await refresh(true);
+  return result;
 }

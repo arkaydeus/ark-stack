@@ -68,28 +68,53 @@ const adminHosts = new Set(
   [env.authUrl, ...env.trustedOrigins].map(hostOf).filter((host): host is string => Boolean(host)),
 );
 
-const LOGIN_HOST_TTL_MS = 5_000;
-let loginHost: string | null = null;
-let loadedAt = 0;
+/** Serializes forced reads after in-flight reads; failed reads clear gate trust and are retriable. */
+export function createLoginHostCache(load: () => Promise<string | null>, now = Date.now) {
+  let host: string | null = null;
+  let loadedAt: number | null = null;
+  let pending: Promise<string | null> | null = null;
+  return {
+    current: () => host,
+    refresh(force = false): Promise<string | null> {
+      if (!force && pending) return pending;
+      if (!force && loadedAt !== null && now() - loadedAt < 5_000) return Promise.resolve(host);
+      const previous = pending;
+      const read = async () => {
+        // A forced refresh must read again after an older read, even if that read failed.
+        await previous?.catch(() => undefined);
+        try {
+          const value = canonicalHost(await load());
+          host = value && !adminHosts.has(value) ? value : null;
+          loadedAt = now();
+          return host;
+        } catch (error) {
+          host = null;
+          loadedAt = null;
+          throw error;
+        }
+      };
+      const request = read().finally(() => {
+        if (pending === request) pending = null;
+      });
+      pending = request;
+      return request;
+    },
+  };
+}
 
-/** Re-reads the login origin from `platform_settings` (at most every 5 s unless forced). */
-export async function refreshLoginHost(force = false) {
-  if (!force && Date.now() - loadedAt < LOGIN_HOST_TTL_MS) return loginHost;
+const loginHosts = createLoginHostCache(async () => {
   const [settings] = await db
     .select({ mode: platformSettings.gateLoginMode, hostname: platformSettings.gateLoginHostname })
     .from(platformSettings)
     .where(eq(platformSettings.id, "default"));
-  const host = settings?.mode === "public" ? canonicalHost(settings.hostname) : null;
-  // A host is never both origins. `PUT /api/settings/gate` refuses this; a hand-edited row too.
-  loginHost = host && !adminHosts.has(host) ? host : null;
-  loadedAt = Date.now();
-  return loginHost;
-}
+  return settings?.mode === "public" ? settings.hostname : null;
+});
 
-/** The login host as last loaded; `refreshLoginHost` runs before every request that needs it. */
-export function currentLoginHost() {
-  return loginHost;
-}
+/** Re-reads the login origin (at most every 5 s unless forced); errors fail closed. */
+export const refreshLoginHost = (force = false) => loginHosts.refresh(force);
+
+/** The login host as last loaded; refreshed before requests that need it. */
+export const currentLoginHost = () => loginHosts.current();
 
 export function isAdminHost(host: string | null | undefined) {
   return Boolean(host && adminHosts.has(host));
@@ -98,7 +123,7 @@ export function isAdminHost(host: string | null | undefined) {
 /** Positive match only: the origin a canonical host belongs to, or null for any other host. */
 export function originForHost(host: string | null | undefined): SessionOrigin | null {
   if (!host) return null;
-  if (loginHost && host === loginHost) return "gate";
+  if (currentLoginHost() && host === currentLoginHost()) return "gate";
   if (adminHosts.has(host)) return "admin";
   return null;
 }
@@ -110,5 +135,5 @@ export function originForRequest(request: Request) {
 
 /** Better Auth's `allowedHosts`: every admin host and the current login host. */
 export function registeredHosts() {
-  return [...adminHosts, ...(loginHost ? [loginHost] : [])];
+  return [...adminHosts, ...(currentLoginHost() ? [currentLoginHost()!] : [])];
 }
