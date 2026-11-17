@@ -71,6 +71,7 @@ jobs:
       - run: bunx tsc --noEmit -p web/tsconfig.json
       - run: bunx tsc --noEmit -p workers/tsconfig.json
       - run: bunx tsc --noEmit -p scripts/tsconfig.publish.json
+      - run: bunx tsc --noEmit -p scripts/tsconfig.pgbouncer.json
       - run: bun test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/edge-namespace.test.ts
       - run: ARK_DOCKER_INTEGRATION=1 go test ./...
         working-directory: agent

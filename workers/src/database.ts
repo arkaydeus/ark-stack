@@ -1,5 +1,5 @@
 import { runWorker } from "./runtime.ts";
-import { executeClaimedJob } from "../../server/src/coordinator.ts";
+import { executeClaimedJob, startRolloverScheduler } from "../../server/src/coordinator.ts";
 import { cancelWorkspaceQuery } from "../../server/src/modules/database.ts";
 import { secureEqual } from "@ark-stack/shared";
 
@@ -32,8 +32,12 @@ const control = Bun.serve({
   },
 });
 
+// FD-28: the database worker owns the PgBouncer admin socket, so it queues the daily
+// `database.client_rollover` job and retires certificate generations at their not_after.
+const stopRollover = startRolloverScheduler();
 try {
   await runWorker("database", ["database.", "pgbouncer."], executeClaimedJob);
 } finally {
+  stopRollover();
   await control.stop(true);
 }

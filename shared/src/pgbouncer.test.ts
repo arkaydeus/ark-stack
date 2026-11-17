@@ -178,6 +178,24 @@ const byCa = (result: ReturnType<typeof select>) =>
   Object.fromEntries(result.generations.map((item) => [item.caId, item.role]));
 
 describe("client CA bundle generation", () => {
+  test("FD-28: a retired generation leaves the bundle at once, before its +5 s grace", () => {
+    // N reached not_after and its retirement marked it retired/expired; N+1 is current.
+    const certificates = [
+      cert("c0", "ca0", { status: "expired", rolloverState: "retired", supersededBy: "c1", notAfter: now }),
+      cert("c1", "ca1"),
+    ];
+    const result = select([client("dbc_a", "ca1")], certificates, [ca("ca0"), ca("ca1")]);
+    expect(byCa(result)).toEqual({ ca1: "current" });
+    expect(result.excluded).toEqual([{ caId: "ca0", reason: "certificate expired" }]);
+    // A retired, still-`issued` row (an interrupted retirement) is not trusted either.
+    const interrupted = select(
+      [client("dbc_a", "ca1")],
+      [cert("c0", "ca0", { rolloverState: "retired", supersededBy: "c1" }), cert("c1", "ca1")],
+      [ca("ca0"), ca("ca1")],
+    );
+    expect(byCa(interrupted)).toEqual({ ca1: "current" });
+  });
+
   test("includes current, linked pending and retiring generations of an active client", () => {
     // Rollover N-1 -> N (promoted, N-1 retiring until its deadline) and N -> N+1 (pending).
     const certificates = [

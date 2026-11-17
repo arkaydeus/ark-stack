@@ -34,7 +34,7 @@ Useful commands:
 | `mise run test:edge`              | Caddy, edge, observer and harness tests     |
 | `mise run test:edge-tailnet`      | opt-in edge node checks on a real tailnet   |
 | `mise run edge:rejoin`            | put `edge` back in a restarted `edge-ts`    |
-| `mise run test:pgbouncer`         | PgBouncer mTLS/SCRAM and DB client tests    |
+| `mise run test:pgbouncer`         | PgBouncer mTLS/SCRAM, DB client, rollover   |
 | `mise run recover -- status`      | local lockout / bootstrap inspection        |
 | `mise run recover:mfa -- …`       | token- and confirmation-gated MFA reset     |
 | `mise run host:install`           | build and start the complete host topology  |
@@ -42,6 +42,8 @@ Useful commands:
 | `mise run import -- file`         | read-only Orkmail/PgStack inventory compare |
 | `mise run recover-host`           | host-loss checklist                         |
 | `mise run db:studio`              | Drizzle Studio                              |
+
+PgBouncer runtime probes also have a dedicated TypeScript check in CI and `mise run typecheck`. The live PgBouncer harness selects an ephemeral loopback port by default (`ARK_PGBOUNCER_SMOKE_PORT` overrides it); run it after the unit suite because both use the migrated platform test database.
 
 ## Publishing images
 

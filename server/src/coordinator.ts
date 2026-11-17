@@ -40,6 +40,7 @@ import {
 import { and, desc, eq, isNull } from "drizzle-orm";
 
 import { db, sql } from "./db.ts";
+import { withPgbouncerLock } from "./modules/pgbouncer-lock.ts";
 import { loadEnv } from "./env.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
@@ -68,14 +69,36 @@ import {
 } from "./modules/db-clients.ts";
 import {
   PgbouncerReloadError,
+  RetirementError,
   killRoleClients,
   planPgbouncer,
   reloadAndVerify,
   reloadPgbouncerAdmin,
   renderPgbouncerFiles,
+  retireGeneration,
   servedCertificateFingerprint,
+  shutdownPgbouncerAdmin,
+  socketAdmin,
   writePgbouncerFiles,
 } from "./modules/pgbouncer.ts";
+import {
+  claimRetirement,
+  completeRetirement,
+  dueRetirements,
+  ensureRetirement,
+  evaluateRolloverAlerts,
+  failRetirement,
+  issueSuccessor,
+  markGenerationRetired,
+  markSuccessorsTrusted,
+  overdueRetirements,
+  recordWatchdog,
+  retirementAlertKey,
+  runScheduledRollover,
+  successorEvidence,
+  type DueRetirement,
+  type IssueSuccessorResult,
+} from "./modules/db-client-rollover.ts";
 import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
 import {
@@ -92,6 +115,7 @@ import {
 import {
   alerts,
   aliases,
+  auditEvents,
   backups,
   certificates,
   clientCertificates,
@@ -485,9 +509,21 @@ async function addStep(operationId: string, name: string, evidence: Record<strin
 type ClientOperationRuntime = {
   issue: typeof issueDatabaseClient;
   revoke: typeof revokeDatabaseClient;
-  reload: typeof reloadPgbouncer;
+  /** Regenerate and reload PgBouncer; reports the mapped databases when it knows them. */
+  reload: (
+    operation: OperationRow,
+    now?: Date,
+  ) => Promise<Awaited<ReturnType<typeof reloadPgbouncer>> | void>;
   kill: typeof killRoleClients;
   reloadRequired: typeof pgbouncerReloadRequired;
+  /** FD-28: the clock every rollover decision uses; tests inject a timeline. */
+  now: () => Date;
+  /** FD-28: successor issuance (db-client-rollover.issueSuccessor). */
+  issueSuccessor: typeof issueSuccessor;
+  /** FD-28: fence, reduced reload, role and pre-auth drain, reopen (pgbouncer.retireGeneration). */
+  retire: typeof retireGeneration;
+  /** FD-28: the retirement watchdog's escalation when a drain misses its deadline. */
+  watchdog: RetirementWatchdog;
 };
 const clientOperationRuntime: ClientOperationRuntime = {
   issue: issueDatabaseClient,
@@ -495,7 +531,16 @@ const clientOperationRuntime: ClientOperationRuntime = {
   reload: reloadPgbouncer,
   kill: killRoleClients,
   reloadRequired: pgbouncerReloadRequired,
+  now: () => new Date(),
+  issueSuccessor,
+  retire: retireGeneration,
+  watchdog: {
+    fence: (database) => socketAdmin(pgbouncerSocket())(`DISABLE ${database}`).then(() => undefined),
+    stop: () => shutdownPgbouncerAdmin(pgbouncerSocket()),
+    fenceListener: () => fenceDatabasePublicListener(pgbouncerDir()),
+  },
 };
+export type { ClientOperationRuntime };
 
 export async function runOperation(
   kind: OperationKind,
@@ -533,6 +578,8 @@ export async function runOperation(
   if (kind === "database.rotate") return rotateDatabase(operation);
   if (kind === "database.client_issue") return issueDatabaseClientOp(operation, runtime);
   if (kind === "database.client_revoke") return revokeDatabaseClientOp(operation, runtime);
+  if (kind === "database.client_rollover") return rolloverDatabaseClientsOp(operation, runtime);
+  if (kind === "database.client_retire") return retireClientCertificateOp(operation, runtime);
   if (kind === "service.adopt") return adoptService(operation);
   if (kind === "mail.queue_retry" || kind === "mail.queue_delete") return queueMail(operation);
   if (kind === "mailbox.device") return reconcileMailboxDevice(operation);
@@ -552,7 +599,9 @@ export async function assertExecutionAuthorized(operation: OperationRow) {
   };
   if (access.role === "viewer") throw new Error("Operation actor no longer has mutation permission.");
   if (access.role === "owner") return;
-  if (["database.client_issue", "database.client_revoke"].includes(operation.kind))
+  if (
+    ["database.client_issue", "database.client_revoke", "database.client_rollover"].includes(operation.kind)
+  )
     throw new Error("Only owners may execute database client operations.");
   for (const targetId of operation.targetIds) {
     if (targetId === "platform") throw new Error("Only owners may execute platform-wide operations.");
@@ -1461,8 +1510,14 @@ function pgbouncerReloadRequired() {
  * database endpoint certificate change (§3.14) the served fingerprint must match before the
  * certificate is marked as serving; failures are retried, then alerted and the operation fails.
  */
-async function reloadPgbouncer(operation: OperationRow) {
-  const now = new Date();
+async function reloadPgbouncer(
+  operation: OperationRow,
+  now = new Date(),
+): Promise<{ routed: boolean; mappings: string[]; reloaded: boolean }> {
+  return withPgbouncerLock(() => reloadPgbouncerLocked(operation, now));
+}
+
+async function reloadPgbouncerLocked(operation: OperationRow, now: Date) {
   const databases = await db.select().from(managedDatabases);
   const roles = await db.select().from(databaseRoles);
   const clientRows = await db.select().from(databaseClients);
@@ -1532,7 +1587,7 @@ async function reloadPgbouncer(operation: OperationRow) {
         .where(eq(managedDatabases.id, database.id));
     }
     await addStep(operation.id, "db-ingress-startup", { cidrs, limits, ...allowlist });
-    return;
+    return { routed: plan.routed, mappings: plan.mappings.map((item) => item.database), reloaded: false };
   }
   const dbEndpoint = (await db.select().from(endpoints)).find((item) => item.kind === "database");
   // A payload-less reload must recover an earlier failed renewal too. The latest pending row
@@ -1658,6 +1713,7 @@ async function reloadPgbouncer(operation: OperationRow) {
     servedFingerprint: reload?.fingerprint,
     ...allowlist,
   });
+  return { routed: plan.routed, mappings: plan.mappings.map((item) => item.database), reloaded };
 }
 
 function pgbouncerSocket() {
@@ -1687,7 +1743,7 @@ async function issueDatabaseClientOp(operation: OperationRow, runtime: ClientOpe
     actorId: operation.actorId,
   });
   await addStep(operation.id, "database-client-issued", issueEvidence(result));
-  await runtime.reload(operation);
+  await runtime.reload(operation, runtime.now());
   await db
     .update(databaseClients)
     .set({ issuedAt: new Date() })
@@ -1705,6 +1761,10 @@ export const PGBOUNCER_REVOKE_ALERT = "pgbouncer-revoke";
  * clients' sessions and credentials are untouched.
  */
 async function revokeDatabaseClientOp(operation: OperationRow, runtime: ClientOperationRuntime) {
+  return withPgbouncerLock(() => revokeDatabaseClientLocked(operation, runtime));
+}
+
+async function revokeDatabaseClientLocked(operation: OperationRow, runtime: ClientOperationRuntime) {
   const databaseId = operation.targetIds[0] ?? "";
   const result = await runtime.revoke({
     databaseId,
@@ -1712,7 +1772,7 @@ async function revokeDatabaseClientOp(operation: OperationRow, runtime: ClientOp
     actorId: operation.actorId,
   });
   await addStep(operation.id, "database-client-revoked", result);
-  await runtime.reload(operation);
+  await runtime.reload(operation, runtime.now());
   let killed: number | null = null;
   if (runtime.reloadRequired()) {
     try {
@@ -1744,10 +1804,427 @@ async function revokeDatabaseClientOp(operation: OperationRow, runtime: ClientOp
     .update(databaseClients)
     .set({ revocationCompletedAt: new Date() })
     .where(eq(databaseClients.id, result.clientId));
+  await dueRetirements({ now: runtime.now() });
   await auditRevoked(
     { ...result, killed },
     { databaseId, actorId: operation.actorId, operationId: operation.id },
   );
+}
+
+// ---- Client certificate rollover (FD-28, §3.10.4) ------------------------------------------------
+
+/** What the watchdog does when a retirement misses its not_after + 5 s deadline. */
+export type RetirementWatchdog = {
+  /** Fence admission for the database (`DISABLE`) over the admin socket. */
+  fence: (database: string) => Promise<void>;
+  /** Stop PgBouncer (`SHUTDOWN`); its restart reads the reduced files already on disk. */
+  stop: () => Promise<void>;
+  /** Close the public database listener on the host, independent of the admin socket. */
+  fenceListener: () => Promise<void>;
+};
+
+async function auditRolloverIssued(result: IssueSuccessorResult, operation: OperationRow) {
+  if (result.outcome !== "issued" || !result.databaseId) return;
+  await db.insert(auditEvents).values({
+    id: createId("aud"),
+    actorId: operation.actorId,
+    action: "database.client_rollover_issued",
+    resourceType: "database",
+    resourceId: result.databaseId,
+    operationId: operation.id,
+    detail: successorEvidence(result),
+  });
+}
+
+/**
+ * `database.client_rollover`. With `clientId` in the payload it is an owner's early rollover:
+ * one successor on demand, under the same one-successor rule. Without, it is the daily job:
+ * every usable client whose unsuperseded current certificate is within 30 days of not_after
+ * gets exactly one successor from a fresh CA generation. Either way PgBouncer reloads once so
+ * the new generations join the bundle beside their predecessors, the rollover alerts are
+ * re-evaluated, and any overdue retirement is retried as a safety net.
+ */
+async function rolloverDatabaseClientsOp(operation: OperationRow, runtime: ClientOperationRuntime) {
+  const now = runtime.now();
+  const payload = operation.payload as Record<string, unknown>;
+  const results: IssueSuccessorResult[] = [];
+  if (typeof payload.clientId === "string" && payload.clientId) {
+    results.push(
+      await runtime.issueSuccessor({
+        clientId: payload.clientId,
+        now,
+        reason: "early",
+        csrPem: typeof payload.csrPem === "string" ? payload.csrPem : undefined,
+      }),
+    );
+  } else {
+    for (const result of await runScheduledRollover({ now })) results.push(result);
+  }
+  for (const result of results)
+    await addStep(operation.id, "client-rollover-successor", successorEvidence(result));
+  const issued = results.filter((result) => result.outcome === "issued");
+  const deliverable = results.filter((result) => result.outcome === "issued" || result.outcome === "exists");
+  if (deliverable.length) {
+    await runtime.reload(operation, now);
+    await markSuccessorsTrusted(
+      deliverable.flatMap((result) => (result.successor ? [result.successor.id] : [])),
+      now,
+    );
+  }
+  for (const result of issued) await auditRolloverIssued(result, operation);
+  const alertsRaised = await evaluateRolloverAlerts(now);
+  const retired = payload.clientId ? [] : await runDueRetirements(runtime, { operation });
+  const evidence = {
+    issued: issued.map((result) => result.successor?.id),
+    existing: results.filter((result) => result.outcome === "exists").map((result) => result.clientId),
+    needsCsr: results.filter((result) => result.outcome === "needs_csr").map((result) => result.clientId),
+    alerts: alertsRaised.length,
+    retired,
+  };
+  await addStep(operation.id, "client-rollover", evidence);
+  return evidence;
+}
+
+/**
+ * Retire one generation (§3.10.4 step 4). The apply step takes it out of the trust set and runs
+ * the normal PgBouncer reload; retireGeneration fences the database first and drains the role's
+ * sessions and any pre-auth logins before reopening. Without an admin socket (development) the
+ * reload still runs and the drain is recorded as skipped.
+ */
+async function retireOne(
+  item: DueRetirement,
+  operation: OperationRow,
+  runtime: ClientOperationRuntime,
+  preclaimed = false,
+): Promise<Record<string, unknown>> {
+  return withPgbouncerLock(() => retireOneLocked(item, operation, runtime, preclaimed));
+}
+
+async function retireOneLocked(
+  item: DueRetirement,
+  operation: OperationRow,
+  runtime: ClientOperationRuntime,
+  preclaimed: boolean,
+) {
+  const claimed = preclaimed || (await claimRetirement(item, runtime.now()));
+  if (!claimed) return { certificateId: item.certificate.id, skipped: "claimed elsewhere or complete" };
+  let applying: Promise<{ databaseMapped: boolean }> | undefined;
+  const apply = () =>
+    (applying = (async () => {
+      await markGenerationRetired(item.certificate.id);
+      const reloaded = await runtime.reload(operation, runtime.now());
+      return { databaseMapped: reloaded?.mappings.includes(item.databaseName) ?? true };
+    })());
+  try {
+    let timeline: Record<string, unknown> & {
+      fencedAt?: number;
+      reloadedAt?: number;
+      drainedAt?: number;
+      reopenedAt?: number;
+    };
+    if (runtime.reloadRequired()) {
+      timeline = await runtime.retire({
+        database: item.databaseName,
+        role: item.role,
+        deadline: item.deadline,
+        admin: socketAdmin(pgbouncerSocket()),
+        apply,
+        clock: () => runtime.now().getTime(),
+      });
+    } else {
+      await apply();
+      timeline = { reloadedAt: runtime.now().getTime(), drain: "skipped (no admin socket)" };
+    }
+    const done = await completeRetirement(item, { now: runtime.now(), timeline, operationId: operation.id });
+    await addStep(operation.id, "client-certificate-retired", {
+      certificateId: item.certificate.id,
+      role: item.role,
+      notAfter: item.certificate.notAfter.toISOString(),
+      deadline: item.deadline.toISOString(),
+      ...timeline,
+      ...done,
+    });
+    return { certificateId: item.certificate.id, ...done };
+  } catch (error) {
+    const timeline = error instanceof RetirementError ? error.timeline : undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    await failRetirement(item, { now: runtime.now(), error: message, timeline });
+    await addStep(operation.id, "client-certificate-retire-failed", {
+      certificateId: item.certificate.id,
+      role: item.role,
+      error: message,
+      ...timeline,
+    });
+    throw error;
+  } finally {
+    // A timed-out apply may still be writing files. Retain the writer lock until it settles;
+    // the independent watchdog can stop/fence the pooler while this writer is stuck.
+    await applying?.catch(() => undefined);
+  }
+}
+
+/** Run every retirement that is due now. Failures stay open for the next tick and are alerted. */
+async function runDueRetirements(
+  runtime: ClientOperationRuntime,
+  options: { operation?: OperationRow; certificateId?: string } = {},
+) {
+  const due = (await dueRetirements({ now: runtime.now() })).filter(
+    (item) => !options.certificateId || item.certificate.id === options.certificateId,
+  );
+  // Persist all deadlines before waiting on the shared writer lock. The independent watchdog
+  // must see simultaneous expiries even while another retirement owns that lock.
+  for (const item of due) await ensureRetirement(item);
+  const outcomes: Array<Record<string, unknown>> = [];
+  for (const item of due) {
+    if (options.operation) {
+      try {
+        outcomes.push(await retireOne(item, options.operation, runtime));
+      } catch (error) {
+        outcomes.push({ certificateId: item.certificate.id, error: String(error) });
+      }
+    } else {
+      outcomes.push(await runInlineRetirement(item, runtime));
+    }
+  }
+  return outcomes;
+}
+
+/** `database.client_retire`: the durable record (and requeue path) of one retirement. */
+async function retireClientCertificateOp(operation: OperationRow, runtime: ClientOperationRuntime) {
+  const certificateId = String((operation.payload as Record<string, unknown>).certificateId ?? "");
+  const item = (await dueRetirements({ now: runtime.now() })).find(
+    (candidate) => candidate.certificate.id === certificateId,
+  );
+  if (!item) {
+    await addStep(operation.id, "client-certificate-retire-noop", {
+      certificateId,
+      reason: "not due or retired",
+    });
+    return { certificateId, skipped: true };
+  }
+  return retireOne(item, operation, runtime);
+}
+
+/**
+ * Run a retirement right now, without waiting for a worker poll, under an operation row this
+ * process claims itself. If the process dies the lease expires and the database worker runs the
+ * same operation from the queue.
+ */
+async function runInlineRetirement(item: DueRetirement, runtime: ClientOperationRuntime) {
+  return withPgbouncerLock(async () => {
+    if (!(await claimRetirement(item, runtime.now())))
+      return { certificateId: item.certificate.id, skipped: "claimed elsewhere or complete" };
+    const token = createId("claim");
+    const payload = { certificateId: item.certificate.id };
+    const [operation] = await db
+      .insert(operations)
+      .values({
+        id: createId("op"),
+        kind: "database.client_retire",
+        targetIds: [item.client.databaseId, item.client.id],
+        payload,
+        idempotencyKey: `database.client_retire:${item.certificate.id}`,
+        planHash: planHash(payload),
+        status: "running",
+        claimToken: token,
+        heartbeatAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: operations.idempotencyKey,
+        set: {
+          status: "running",
+          claimToken: token,
+          heartbeatAt: new Date(),
+          error: null,
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
+    try {
+      const result = await retireOne(item, operation!, runtime, true);
+      await finishOperation(operation!, token, "succeeded");
+      return result as Record<string, unknown>;
+    } catch (error) {
+      await finishOperation(
+        operation!,
+        token,
+        "failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      return {
+        certificateId: item.certificate.id,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+}
+
+/**
+ * The independent watchdog: a retirement still open after not_after + 5 s is a failure. Fence
+ * admission (`DISABLE`), stop PgBouncer (`SHUTDOWN`, so the restart serves the reduced files and
+ * holds no session), and if the admin socket is unusable close the public listener on the host.
+ * The task stays open and is retried; the critical alert stays until it completes.
+ */
+async function boundedWatchdogAction(action: () => Promise<void>, timeoutMs = 500) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      action(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Watchdog action timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const watchdogRunning = new Set<string>();
+
+export async function runRetirementWatchdog(overrides: Partial<ClientOperationRuntime> = {}) {
+  const runtime = { ...clientOperationRuntime, ...overrides };
+  const now = runtime.now();
+  const actions: Array<Record<string, unknown>> = [];
+  for (const task of await overdueRetirements(now)) {
+    if (task.watchdogAt || watchdogRunning.has(task.certificateId)) continue;
+    watchdogRunning.add(task.certificateId);
+    try {
+      const evidence: Record<string, unknown> = {
+        at: now.toISOString(),
+        deadline: task.deadline.toISOString(),
+      };
+      let succeeded = false;
+      if (runtime.reloadRequired()) {
+        const attempt = async (name: string, action: () => Promise<void>) => {
+          try {
+            await boundedWatchdogAction(action);
+            evidence[name] = "ok";
+            return true;
+          } catch (error) {
+            evidence[name] = error instanceof Error ? error.message : String(error);
+            return false;
+          }
+        };
+        const fenced = await attempt("fence", () => runtime.watchdog.fence(task.databaseName));
+        const stopped = await attempt("stop", () => runtime.watchdog.stop());
+        const listener = !stopped && (await attempt("fenceListener", () => runtime.watchdog.fenceListener()));
+        // DISABLE alone cannot close established sessions. Only a confirmed stop or independent
+        // listener fallback ends escalation; record failed attempts without suppressing retries.
+        succeeded = stopped || listener;
+        evidence.fenced = fenced;
+      } else {
+        evidence.skipped = "no admin socket";
+      }
+      await recordWatchdog(task.certificateId, now, evidence, succeeded);
+      await raiseAlert({
+        severity: "critical",
+        title: `Database client ${task.role}: retirement deadline ${task.deadline.toISOString()} missed; watchdog stop/fence ${succeeded ? "confirmed" : "failed; will retry"}, retrying the drain`,
+        dedupKey: retirementAlertKey(task.certificateId),
+      });
+      actions.push({ certificateId: task.certificateId, ...evidence });
+    } finally {
+      watchdogRunning.delete(task.certificateId);
+    }
+  }
+  return actions;
+}
+
+/** Key of the once-per-UTC-day rollover job. */
+export const dailyRolloverKey = (now: Date) =>
+  `database.client_rollover:daily:${now.toISOString().slice(0, 10)}`;
+
+/** Queue today's `database.client_rollover` job once (idempotent per UTC day across processes). */
+export async function queueDailyRollover(now: Date) {
+  const key = dailyRolloverKey(now);
+  const [row] = await db
+    .insert(operations)
+    .values({
+      id: createId("op"),
+      kind: "database.client_rollover",
+      targetIds: [],
+      payload: { day: key.slice(-10) },
+      idempotencyKey: key,
+      planHash: planHash({ day: key.slice(-10) }),
+      status: "queued",
+    })
+    .onConflictDoNothing({ target: operations.idempotencyKey })
+    .returning();
+  return row ?? null;
+}
+
+/**
+ * One scheduler tick (database worker, or the embedded coordinator): queue the daily job,
+ * re-evaluate rollover alerts hourly, run due retirements immediately, and watch deadlines.
+ * Retirements due before the next tick get a timer at exactly not_after.
+ */
+export async function rolloverTick(
+  overrides: Partial<ClientOperationRuntime> = {},
+  state: { lastAlerts?: number; timers?: Map<string, ReturnType<typeof setTimeout>>; tickMs?: number } = {},
+) {
+  const runtime = { ...clientOperationRuntime, ...overrides };
+  const now = runtime.now();
+  const queued = await queueDailyRollover(now);
+  if (!state.lastAlerts || now.getTime() - state.lastAlerts >= 3_600_000) {
+    await evaluateRolloverAlerts(now);
+    state.lastAlerts = now.getTime();
+  }
+  const timers = state.timers;
+  if (timers) {
+    for (const item of await dueRetirements({ now, lookaheadMs: (state.tickMs ?? 1_000) * 2 })) {
+      const wait = item.certificate.notAfter.getTime() - now.getTime();
+      if (wait <= 0 || timers.has(item.certificate.id)) continue;
+      await ensureRetirement(item);
+      timers.set(
+        item.certificate.id,
+        setTimeout(() => {
+          void runDueRetirements(runtime, { certificateId: item.certificate.id })
+            .catch((error) => console.error(error instanceof Error ? error.message : error))
+            .finally(() => timers.delete(item.certificate.id));
+        }, wait),
+      );
+    }
+  }
+  const [retired, watchdog] = await Promise.all([runDueRetirements(runtime), runRetirementWatchdog(runtime)]);
+  return { queued: queued?.id ?? null, retired, watchdog };
+}
+
+/** Start the rollover scheduler; it runs where the PgBouncer admin socket is (database worker). */
+export function startRolloverScheduler(
+  tickMs = Number(process.env.ARK_ROLLOVER_TICK_MS ?? 1_000),
+  overrides: Partial<ClientOperationRuntime> = {},
+) {
+  const state = { timers: new Map<string, ReturnType<typeof setTimeout>>(), tickMs, lastAlerts: 0 };
+  let running = false;
+  const tick = () => {
+    if (running) return;
+    running = true;
+    void rolloverTick(overrides, state)
+      .catch((error) => console.error(error instanceof Error ? error.message : "rollover tick failed"))
+      .finally(() => {
+        running = false;
+      });
+  };
+  tick();
+  const interval = setInterval(tick, tickMs);
+  // This loop has its own guard: a pending drain/reload never suppresses deadline escalation.
+  let watching = false;
+  const watchdogInterval = setInterval(
+    () => {
+      if (watching) return;
+      watching = true;
+      void runRetirementWatchdog(overrides)
+        .catch((error) => console.error(error instanceof Error ? error.message : error))
+        .finally(() => {
+          watching = false;
+        });
+    },
+    Math.min(tickMs, 250),
+  );
+  return () => {
+    clearInterval(interval);
+    clearInterval(watchdogInterval);
+    for (const timer of state.timers.values()) clearTimeout(timer);
+  };
 }
 
 // The edge serves only hostnames whose current certificate is `issued`. Public `http` endpoints
@@ -2029,6 +2506,8 @@ export function startCoordinator() {
       });
   };
   tick();
+  // Embedded workers include the database worker's duties, so they run the rollover scheduler.
+  startRolloverScheduler();
   scheduleEdgeObserve();
   return setInterval(tick, 1500);
 }

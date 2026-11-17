@@ -59,3 +59,30 @@ groups:
           severity: warning
         annotations:
           summary: The database-ingress reconciler has stopped reporting nftables counters
+      # Database client certificate rollover (docs/design/front-door.md §3.10.4, FD-28). Ark's own
+      # alert pipeline escalates the per-client alert; these rules mirror it for Prometheus.
+      - alert: ArkDatabaseClientRolloverWarning
+        expr: ark_db_client_rollover_pending{severity="warning"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A database client's successor certificate is undelivered within 14 days of expiry
+      - alert: ArkDatabaseClientRolloverCritical
+        expr: ark_db_client_rollover_pending{severity="critical"} > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: A database client's successor certificate is undelivered within 7 days of expiry (or after it)
+      - alert: ArkDatabaseClientRetirementFailed
+        expr: ark_db_client_retirement_failures > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: A retiring database client certificate generation could not be drained by its deadline
+          description: >-
+            The retirement task removes an expired generation from the PgBouncer bundle and closes
+            its role's sessions by not_after + 5 s. It is retried and the watchdog fences admission
+            and stops PgBouncer; check the database worker and the PgBouncer admin socket.

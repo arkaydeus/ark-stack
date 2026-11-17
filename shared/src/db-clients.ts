@@ -241,3 +241,144 @@ export function databaseClientGuide(input: DatabaseClientGuideInput) {
     ],
   };
 }
+
+// ---- Automatic rollover (§3.10.4, FD-28) -------------------------------------------------------
+
+const DAY_MS = 86_400_000;
+
+/** Issue the successor this many days before the current certificate's not_after (T−30). */
+export const ROLLOVER_LEAD_DAYS = 30;
+/** The rollover-pending alert becomes a warning at T−14 and critical at T−7. */
+export const ROLLOVER_WARNING_DAYS = 14;
+export const ROLLOVER_CRITICAL_DAYS = 7;
+/** Every session of a retiring generation's role is closed by not_after plus this deadline. */
+export const RETIREMENT_DEADLINE_MS = 5_000;
+
+/** Dedup key prefixes of the rollover alerts (server/src/modules/alerts.ts). */
+export const ROLLOVER_ALERT_PREFIX = "db-client-rollover:";
+export const RETIREMENT_ALERT_PREFIX = "db-client-retire:";
+
+/** True once a certificate is within the rollover lead time (T−30 days) of its not_after. */
+export function rolloverDue(notAfter: Date, now: Date, leadDays = ROLLOVER_LEAD_DAYS) {
+  return notAfter.getTime() - now.getTime() <= leadDays * DAY_MS;
+}
+
+export type RolloverAlertLevel = "info" | "warning" | "critical";
+
+/**
+ * The rollover-pending alert for a certificate whose successor is not delivered yet: `info`
+ * (pending) from T−30, `warning` from T−14 and `critical` from T−7 (and after expiry). Null
+ * before T−30.
+ */
+export function rolloverAlertLevel(notAfter: Date, now: Date): RolloverAlertLevel | null {
+  const left = notAfter.getTime() - now.getTime();
+  if (left <= ROLLOVER_CRITICAL_DAYS * DAY_MS) return "critical";
+  if (left <= ROLLOVER_WARNING_DAYS * DAY_MS) return "warning";
+  if (left <= ROLLOVER_LEAD_DAYS * DAY_MS) return "info";
+  return null;
+}
+
+/** Whole days (rounded down) until `notAfter`; negative once it has passed. */
+export function daysUntil(notAfter: Date, now: Date) {
+  return Math.floor((notAfter.getTime() - now.getTime()) / DAY_MS);
+}
+
+export function rolloverAlertTitle(input: { role: string; notAfter: Date; now: Date; needsCsr?: boolean }) {
+  const days = daysUntil(input.notAfter, input.now);
+  const when =
+    input.notAfter.getTime() <= input.now.getTime()
+      ? `expired ${input.notAfter.toISOString()} before its successor was delivered`
+      : `expires in ${days} day(s) (${input.notAfter.toISOString()})`;
+  const action = input.needsCsr
+    ? "submit a CSR to the early-rollover endpoint, deliver the successor and confirm"
+    : "reveal the successor, deliver it and confirm";
+  return `Database client ${input.role}: certificate rollover pending; the current certificate ${when}. ${action}.`;
+}
+
+/**
+ * The client-level rollover status derived from its certificate chain:
+ * `none` (no successor in flight) → `pending` (successor issued, not delivered) → `delivered`
+ * (successor promoted; the predecessor stays trusted until its not_after) → `retired` (the
+ * predecessor's generation was removed and its role drained). A new cycle starts at `none`
+ * again only after the predecessor retired; a fresh client with one certificate is `none`.
+ */
+export type ClientRolloverStatus = "none" | "pending" | "delivered" | "retired";
+
+export function clientRolloverStatus(
+  certificates: Array<{ id: string; status: string; rolloverState: string; supersededBy: string | null }>,
+): ClientRolloverStatus {
+  const pending = certificates.find((item) => item.status === "issued" && item.rolloverState === "pending");
+  if (pending) return "pending";
+  const superseded = certificates.some(
+    (item) => item.status === "issued" && item.rolloverState === "superseded",
+  );
+  if (superseded) return "delivered";
+  if (certificates.some((item) => item.rolloverState === "retired")) return "retired";
+  return "none";
+}
+
+/** `POST /api/databases/:id/clients/:clientId/rollover` (owner, step-up). */
+export const earlyRolloverInput = z
+  .object({
+    csrPem: z
+      .string()
+      .min(1)
+      .max(DB_CLIENT_CSR_MAX_BYTES, `CSRs are PEM text of at most ${DB_CLIENT_CSR_MAX_BYTES / 1024} KiB.`)
+      .refine((value) => Buffer.byteLength(value, "utf8") <= DB_CLIENT_CSR_MAX_BYTES, {
+        message: `CSRs are PEM text of at most ${DB_CLIENT_CSR_MAX_BYTES / 1024} KiB.`,
+      })
+      .refine((value) => /^\s*-----BEGIN (?:NEW )?CERTIFICATE REQUEST-----/.test(value), {
+        message: "Submit the CSR as PEM (-----BEGIN CERTIFICATE REQUEST-----).",
+      })
+      .optional(),
+  })
+  .strict();
+
+/** `POST /api/databases/:id/clients/:clientId/rollover/confirm` (owner, MFA). */
+export const rolloverConfirmInput = z.object({ certificateId: z.string().min(1).max(64) }).strict();
+
+/**
+ * §3.12's manual rollover step for one client: only the certificate and key values change (the
+ * env var names, role and password stay), then redeploy and confirm. With `secrets` the env
+ * values are real (the successor's one-time reveal).
+ */
+export function databaseClientRolloverGuide(input: {
+  environment: string;
+  secrets?: { certPem: string; keyPem: string | null };
+}) {
+  const target = input.environment;
+  const secrets = input.secrets;
+  const env: VercelEnvVar[] = [
+    {
+      name: VERCEL_ENV_NAMES.cert,
+      value: secrets ? base64(secrets.certPem) : "<base64 of client-next.crt>",
+      sensitive: true,
+    },
+    {
+      name: VERCEL_ENV_NAMES.key,
+      value: secrets?.keyPem
+        ? base64(secrets.keyPem)
+        : secrets
+          ? "<base64 of the key you generated with your rollover CSR>"
+          : "<base64 of client-next.key>",
+      sensitive: true,
+    },
+  ];
+  const commands = [
+    "# Reveal the new bundle once in Ark (step-up), then:",
+    `base64 -i client-next.crt | tr -d '\\n' | vercel env add ${VERCEL_ENV_NAMES.cert} ${target} --sensitive --force`,
+    `base64 -i client-next.key | tr -d '\\n' | vercel env add ${VERCEL_ENV_NAMES.key} ${target} --sensitive --force`,
+    `vercel deploy${target === "production" ? " --prod" : ""}        # or redeploy from the dashboard`,
+    '# Then press "Confirm rollover" in Ark.',
+  ].join("\n");
+  return {
+    target,
+    env,
+    commands: `${commands}\n`,
+    notes: [
+      "Only ARK_DB_CLIENT_CERT_B64 and ARK_DB_CLIENT_KEY_B64 change; the host, database, user and password stay the same.",
+      "The old certificate admits new connections until its expiry, and its role's sessions are closed by expiry + 5 s; redeploy any time before then.",
+      "Clients must reconnect and refresh their pools after the redeploy. Check the --force and --sensitive flag spellings against your Vercel CLI version.",
+    ],
+  };
+}

@@ -536,7 +536,7 @@ export function buildCrl(input: {
 
 type Database = typeof db;
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
-type Executor = Database | Transaction;
+export type Executor = Database | Transaction;
 
 function sealingKey() {
   const env = loadEnv();
@@ -588,12 +588,19 @@ function summarizeCertificate(row: ClientCertificateRow): ClientCertificateSumma
   return { ...row };
 }
 
-/** Create a CA, seal its key, and record it. Returns metadata only. */
-export async function createPrivateCa(input: {
-  purpose: CaPurpose;
-  name: string;
-  now?: Date;
-}): Promise<PrivateCaSummary> {
+/**
+ * Create a CA, seal its key, and record it. Returns metadata only. Pass `executor` to make the CA
+ * part of the caller's transaction (FD-28 issues a rollover generation and links its successor
+ * certificate atomically); it then runs in a savepoint.
+ */
+export async function createPrivateCa(
+  input: {
+    purpose: CaPurpose;
+    name: string;
+    now?: Date;
+  },
+  executor: Executor = db,
+): Promise<PrivateCaSummary> {
   const { rootKey, rootKeyId } = sealingKey();
   const id = createId("pca");
   const material = createCaMaterial({ id, purpose: input.purpose, name: input.name, now: input.now });
@@ -603,7 +610,7 @@ export async function createPrivateCa(input: {
     material.privateKey.export({ type: "pkcs8", format: "pem" }) as string,
     rootKeyId,
   );
-  const row = await db.transaction(async (tx) => {
+  const row = await executor.transaction(async (tx) => {
     await tx.insert(secrets).values({
       id: keySecretId,
       kind: CA_KEY_SECRET_KIND,
@@ -716,12 +723,13 @@ export type IssueClientCertificateInput = {
 /**
  * Issue a 90-day client certificate from an active CA. With no CSR, Ark generates an ECDSA P-256
  * key and seals it as a `once` secret for the existing one-time reveal. Returns metadata, the
- * public certificate and the CA certificate; never the private key.
+ * public certificate and the CA certificate; never the private key. `executor` joins the
+ * caller's transaction (savepoint), as for createPrivateCa.
  */
-export async function issueClientCertificate(input: IssueClientCertificateInput) {
+export async function issueClientCertificate(input: IssueClientCertificateInput, executor: Executor = db) {
   const csrKey = input.csrPem === undefined ? null : validateCsr(input.csrPem);
   const { rootKey, rootKeyId } = sealingKey();
-  return db.transaction(async (tx) => {
+  return executor.transaction(async (tx) => {
     const [ca] = await tx.select().from(privateCas).where(eq(privateCas.id, input.caId)).for("share");
     if (!ca) throw new PkiPolicyError("CA not found.");
     if (ca.status !== "active") throw new PkiPolicyError(`The CA is ${ca.status}; it cannot issue.`);

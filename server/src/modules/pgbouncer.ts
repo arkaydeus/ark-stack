@@ -205,13 +205,34 @@ export type AdminSocketOptions = {
   port?: number;
   password: string;
   connectTimeoutSeconds?: number;
+  queryTimeoutMs?: number;
 };
 
-const ADMIN_COMMAND = /^(RELOAD|SHOW [A-Z_]+|KILL_CLIENT [1-9][0-9]{0,18})$/;
+// RELOAD and SHOW for FD-16; KILL_CLIENT for FD-17 revocation; DISABLE/ENABLE (admission fence)
+// and SET client_login_timeout (pre-auth drain) for FD-28. SHUTDOWN is never accepted here: only
+// the retirement watchdog may stop PgBouncer, through shutdownPgbouncerAdmin.
+const ADMIN_COMMAND =
+  /^(RELOAD|SHOW [A-Z_]+|KILL_CLIENT [1-9][0-9]{0,18}|(?:DISABLE|ENABLE) [a-z_][a-z0-9_]{0,62}|SET client_login_timeout = [1-9][0-9]{0,5})$/;
 
 /** Run one console command as the administrator over the shared socket (simple protocol). */
 export async function pgbouncerAdminCommand(command: string, options: AdminSocketOptions) {
   if (!ADMIN_COMMAND.test(command)) throw new Error(`Refusing PgBouncer console command: ${command}`);
+  return consoleCommand(command, options);
+}
+
+/**
+ * The FD-28 watchdog's last resort when a retirement misses its deadline: stop PgBouncer. The
+ * container restarts with the reduced files already on disk and no client sessions at all.
+ */
+export async function shutdownPgbouncerAdmin(options: AdminSocketOptions) {
+  // PgBouncer exits while answering, so a dropped connection is the expected outcome.
+  await consoleCommand("SHUTDOWN", options).catch((error: unknown) => {
+    if (!/closed|terminat|ECONNRESET|EPIPE|CONNECTION_ENDED|CONNECTION_CLOSED/i.test(String(error)))
+      throw error;
+  });
+}
+
+async function consoleCommand(command: string, options: AdminSocketOptions) {
   if (!options.password) throw new Error("The PgBouncer administrator password is not configured.");
   const sql = postgres({
     path: join(options.socketDir ?? PGBOUNCER_SOCKET_DIR, `.s.PGSQL.${options.port ?? PGBOUNCER_PORT}`),
@@ -225,10 +246,22 @@ export async function pgbouncerAdminCommand(command: string, options: AdminSocke
     onnotice: () => undefined,
     connection: { application_name: "ark-database-worker" },
   });
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await sql.unsafe(command).simple();
+    return await Promise.race([
+      sql.unsafe(command).simple(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          // This connection executes exactly one command. Destroying it cannot cancel a
+          // later command, and bounds hung queries as well as the connection handshake.
+          void sql.end({ timeout: 0 }).catch(() => undefined);
+          reject(new Error(`PgBouncer console command timed out: ${command}`));
+        }, options.queryTimeoutMs ?? 1_000);
+      }),
+    ]);
   } finally {
-    await sql.end({ timeout: 2 }).catch(() => undefined);
+    clearTimeout(timer);
+    await sql.end({ timeout: 0 }).catch(() => undefined);
   }
 }
 
@@ -379,4 +412,191 @@ export async function reloadAndVerify(input: {
     }
   }
   throw new PgbouncerReloadError(attempts, failures);
+}
+
+// ---- Generation retirement (§3.10.4 step 4, FD-28) ------------------------------------------------
+
+export type AdminCommand = (command: string) => Promise<ReadonlyArray<Record<string, unknown>>>;
+
+/** A console runner over the shared socket, for retireGeneration and the watchdog. */
+export function socketAdmin(options: AdminSocketOptions): AdminCommand {
+  return async (command) => [...(await pgbouncerAdminCommand(command, options))];
+}
+
+/** PgBouncer prints `connect_time` as `YYYY-MM-DD HH:MM:SS UTC` (second resolution). */
+function connectTime(value: unknown) {
+  if (value instanceof Date) return value.getTime();
+  const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?:\.\d+)? (?:UTC|GMT|\+00(?::?00)?)$/.exec(
+    String(value ?? ""),
+  );
+  return match ? Date.parse(`${match[1]}T${match[2]}Z`) : null;
+}
+
+export type RetirementTimeline = {
+  startedAt: number;
+  fencedAt: number;
+  reloadedAt: number;
+  drainedAt: number;
+  reopenedAt: number;
+  killedRoleClients: number;
+  preAuthWaited: number;
+  iterations: number;
+  deadline: number;
+  withinDeadline: boolean;
+  reopenSkipped?: string;
+};
+
+export class RetirementError extends Error {
+  readonly timeline: Partial<RetirementTimeline>;
+  constructor(message: string, timeline: Partial<RetirementTimeline>) {
+    super(message);
+    this.name = "RetirementError";
+    this.timeline = timeline;
+  }
+}
+
+/**
+ * Retire one certificate generation of one login role (§3.10.4 step 4) and close every session
+ * of that role by `deadline` (the certificate's not_after + 5 s):
+ *
+ * 1. `DISABLE <database>` fences admission: PgBouncer refuses any client that finishes login
+ *    while disabled (`finish_client_login`), including one whose TLS handshake with the old
+ *    certificate completed before the reload. Other roles' established sessions are untouched;
+ *    new connections to this database briefly fail and retry.
+ * 2. `apply()` writes the reduced CA bundle and runs RELOAD, so new handshakes need a trusted
+ *    generation.
+ * 3. `SET client_login_timeout = 1`, then `KILL_CLIENT` every client of the role until none is
+ *    left. `SHOW CLIENTS` and `KILL_CLIENT` cannot see pre-auth clients (PgBouncer keeps them on
+ *    its login list), so the shortened login timeout makes the janitor close every pre-auth
+ *    socket that connected before the reload; `SHOW SOCKETS` (`cl_login`) proves they are gone.
+ * 4. Restore `client_login_timeout`, verify the role has no client, then `ENABLE <database>`.
+ *
+ * Throws a RetirementError (with the partial timeline) if the role still has sessions, or
+ * pre-reload logins remain after a bounded recovery budget. A verified late drain returns
+ * withinDeadline=false so its durable task can complete with a critical deadline-missed alert. The fence is left in place on failure: the caller
+ * retries, alerts, and the watchdog escalates.
+ */
+export async function retireGeneration(input: {
+  database: string;
+  role: string;
+  deadline: Date;
+  admin: AdminCommand;
+  /**
+   * Write the reduced bundle and RELOAD. Report `databaseMapped: false` when the database left
+   * [databases] with this reload (its last admitted client is gone), so ENABLE is best-effort.
+   */
+  apply: () => Promise<{ databaseMapped?: boolean } | void>;
+  /** The configured client_login_timeout (seconds) to restore. */
+  loginTimeoutSeconds?: number;
+  clock?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  pollMs?: number;
+  recoveryBudgetMs?: number;
+}) {
+  if (input.role === PGBOUNCER_ADMIN_USER) throw new Error("Refusing to drain the console administrator.");
+  if (!ROLE_NAME.test(input.role)) throw new Error(`Invalid PgBouncer role: ${input.role}`);
+  if (!ROLE_NAME.test(input.database)) throw new Error(`Invalid PgBouncer database: ${input.database}`);
+  const clock = input.clock ?? Date.now;
+  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  const pollMs = input.pollMs ?? 50;
+  const deadline = input.deadline.getTime();
+  const timeline: Partial<RetirementTimeline> = { startedAt: clock(), deadline, iterations: 0 };
+  const fail = (message: string) => new RetirementError(message, { ...timeline, withinDeadline: false });
+
+  const attemptUntil = Math.max(deadline, clock() + (input.recoveryBudgetMs ?? 5_000));
+  const step = async <T>(name: string, work: () => Promise<T>): Promise<T> => {
+    if (clock() > attemptUntil) throw fail(`Retirement ${name} exhausted its recovery budget`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(fail(`Retirement ${name} timed out`)),
+            Math.max(1, attemptUntil - clock()),
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const admin: AdminCommand = (command) => step(command, () => input.admin(command));
+  await admin(`DISABLE ${input.database}`);
+  timeline.fencedAt = clock();
+  const applied = await step("apply", input.apply);
+  timeline.reloadedAt = clock();
+  // RELOAD re-reads client_login_timeout from the INI, so shorten it only after the reload.
+  await admin("SET client_login_timeout = 1");
+  const reloadedSecond = Math.floor(timeline.reloadedAt / 1000) * 1000;
+  let killed = 0;
+  let preAuthWaited = 0;
+  for (;;) {
+    timeline.iterations = (timeline.iterations ?? 0) + 1;
+    const clients = await admin("SHOW CLIENTS");
+    const roleIds = clients
+      .filter((row) => String(row.user) === input.role)
+      .map((row) => String(row.id))
+      .filter((id) => /^[1-9][0-9]{0,18}$/.test(id));
+    for (const id of roleIds) {
+      // A client may disconnect between SHOW CLIENTS and KILL_CLIENT; that is not a failure.
+      await admin(`KILL_CLIENT ${id}`).catch(() => undefined);
+      killed++;
+    }
+    // Pre-auth sockets that may hold a handshake from before the reload. Connect times have
+    // second resolution, so a login in the reload's second counts as old; unknown times too.
+    const logins = (await admin("SHOW SOCKETS")).filter((row) => String(row.state) === "cl_login");
+    const old = logins.filter((row) => {
+      const at = connectTime(row.connect_time);
+      return at === null || at <= reloadedSecond;
+    });
+    preAuthWaited = Math.max(preAuthWaited, old.length);
+    if (!roleIds.length && !old.length) {
+      const remaining = (await admin("SHOW CLIENTS")).filter((row) => String(row.user) === input.role);
+      if (!remaining.length) break;
+    }
+    if (clock() > attemptUntil)
+      throw fail(
+        `Retirement of ${input.role} exhausted its recovery budget: ${roleIds.length} session(s) and ${old.length} pre-auth login(s) remain.`,
+      );
+    await sleep(pollMs);
+  }
+  timeline.drainedAt = clock();
+  timeline.killedRoleClients = killed;
+  timeline.preAuthWaited = preAuthWaited;
+  await admin(
+    `SET client_login_timeout = ${Math.max(1, Math.floor(input.loginTimeoutSeconds ?? PGBOUNCER_DEFAULTS.clientLoginTimeout))}`,
+  );
+  if (applied && applied.databaseMapped === false) {
+    // The database left [databases] with this reload; there is nothing to re-enable.
+    timeline.reopenSkipped = "database no longer mapped";
+    await admin(`ENABLE ${input.database}`).catch(() => undefined);
+  } else {
+    await admin(`ENABLE ${input.database}`);
+  }
+  timeline.reopenedAt = clock();
+  const result = {
+    ...(timeline as RetirementTimeline),
+    withinDeadline: timeline.drainedAt <= deadline,
+  };
+  return result;
+}
+
+/**
+ * Expiry is not a drain: TLS expiry only stops new handshakes. Given the role's sessions observed
+ * after the deadline, refuse to call the retirement complete (the "expiry without drain" case).
+ */
+export function assertDrainedByDeadline(input: {
+  role: string;
+  deadline: Date;
+  observedAt: Date;
+  sessions: number;
+}) {
+  if (input.observedAt.getTime() < input.deadline.getTime())
+    throw new Error("The drain deadline has not passed yet; nothing to assert.");
+  if (input.sessions > 0)
+    throw new Error(
+      `${input.sessions} session(s) of ${input.role} are still open after the retirement deadline ${input.deadline.toISOString()}.`,
+    );
+  return true;
 }
