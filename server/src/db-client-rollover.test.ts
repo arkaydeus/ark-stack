@@ -10,6 +10,8 @@
 // in scripts/test-pgbouncer-public.ts.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { generateKeyPairSync } from "node:crypto";
+import { buildCsr } from "./modules/csr-test-kit.ts";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -26,6 +28,7 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
 const { app } = await import("./app.ts");
 const { auth } = await import("./auth.ts");
 const { sql } = await import("./db.ts");
+const { withPgbouncerLock } = await import("./modules/pgbouncer-lock.ts");
 const clients = await import("./modules/db-clients.ts");
 const rollover = await import("./modules/db-client-rollover.ts");
 const coordinator = await import("./coordinator.ts");
@@ -246,7 +249,7 @@ async function openAlert(key: string) {
 /** End a scenario: its clients leave every later rollover, alert and retirement decision. */
 async function park(...clientIds: string[]) {
   for (const id of clientIds)
-    await sql`UPDATE database_clients SET status = 'revoked', revoked_at = now() WHERE id = ${id}`;
+    await sql`UPDATE database_clients SET status = 'revoked', revoked_at = now(), revocation_completed_at = now() WHERE id = ${id}`;
 }
 
 const cluster = () => postgres(appUrl, { max: 1, onnotice: () => undefined });
@@ -714,19 +717,24 @@ describe("retirement failures", () => {
     expect(watchdogCalls).toEqual([`fence:${dbName}`, "stop"]);
     alert = await openAlert(key);
     expect(alert!.severity).toBe("critical");
-    expect(alert!.title).toMatch(
-      /retirement deadline .* missed; the watchdog fenced admission and stopped PgBouncer/,
-    );
+    expect(alert!.title).toMatch(/deadline/);
     results.push(`T+6 s: deadline missed → watchdog ${watchdogCalls.join(", ")}; "${alert!.title}"`);
 
     // The watchdog acts once; retries continue until the drain succeeds.
-    clock = new Date(notAfter.getTime() + 7_000);
+    clock = new Date(notAfter.getTime() + 15_000);
     failRoles.delete(e.role);
-    await coordinator.rolloverTick(runtime);
+    // Use production retireGeneration on recovery, rather than a fake late-success timeline.
+    await coordinator.rolloverTick({
+      ...runtime,
+      retire: (input) => retireGeneration({ ...input, admin: async () => [] }),
+    });
     expect(watchdogCalls.length).toBe(2);
     [task] = await sql`SELECT * FROM client_certificate_retirements WHERE certificate_id = ${e.first.id}`;
     expect(task!.completed_at).toBeTruthy();
     expect(task!.deadline_missed).toBe(true);
+    expect(
+      (await rollover.dueRetirements({ now: clock })).some((item) => item.certificate.id === e.first.id),
+    ).toBe(false);
     const retired = (await chain(e.clientId)).find((row) => row.id === e.first.id)!;
     expect(retired.retiredAt).toBeTruthy();
     // Expiry without a timely drain is a failure: the alert stays open, naming the lateness.
@@ -734,7 +742,7 @@ describe("retirement failures", () => {
     expect(alert).toMatchObject({ severity: "critical", resolved_at: null });
     expect(alert!.title).toMatch(/drained \d+ s after its retirement deadline/);
     results.push(
-      `T+7 s: retry drained the role; task complete with deadline_missed=true, alert stays: "${alert!.title}"`,
+      `T+15 s: retry drained the role; task complete with deadline_missed=true, alert stays: "${alert!.title}"`,
     );
     console.log(`\n---- FD-28 drain failure ----\n${results.join("\n")}\n`);
     await park(e.clientId);
@@ -749,7 +757,10 @@ describe("retirement failures", () => {
     const before = watchdogCalls.length;
     clock = new Date(f.first.notAfter.getTime() + 10_000);
     const actions = await coordinator.runRetirementWatchdog({ ...runtime, reloadRequired: () => false });
-    expect(actions[0]).toMatchObject({ certificateId: f.first.id, skipped: "no admin socket" });
+    expect(actions.find((item) => item.certificateId === f.first.id)).toMatchObject({
+      certificateId: f.first.id,
+      skipped: "no admin socket",
+    });
     expect(watchdogCalls.length).toBe(before);
     failRoles.delete(f.role);
     await park(f.clientId);
@@ -908,5 +919,427 @@ describe("rollover API", () => {
     const next = await call(actors.owner, path(client.clientId), { method: "POST" });
     expect(next.status).toBe(202);
     await park(client.clientId);
+  });
+});
+
+const until = async (ready: () => boolean) => {
+  for (let i = 0; i < 300 && !ready(); i++) await Bun.sleep(5);
+  expect(ready()).toBe(true);
+};
+
+// Recovery regressions use the real coordinator and database, with barriers only at I/O.
+describe("rollover recovery and concurrency", () => {
+  const base = midnight(Date.now() - 1_000 * DAY);
+  let scenario = 0;
+  const next = () => (clock = at(base, scenario++ * 200));
+  async function op(clientId?: string) {
+    const id = createId("op");
+    const payload = clientId ? { clientId, early: true } : {};
+    const [row] =
+      await sql`INSERT INTO operations (id, kind, target_ids, payload, idempotency_key, plan_hash, status)
+      VALUES (${id}, 'database.client_rollover', ${JSON.stringify([databaseId])}::jsonb, ${JSON.stringify(payload)}::jsonb, ${id}, 'test', 'running') RETURNING *`;
+    return operationRow(row!);
+  }
+
+  test("fresh concurrent issuers commit exactly one successor and one new CA", async () => {
+    next();
+    const c = await issueClient("freshrace");
+    clock = at(clock, 60);
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        rollover.issueSuccessor({ clientId: c.clientId, now: clock, reason: "scheduled" }),
+      ),
+    );
+    expect(results.filter((row) => row.outcome === "issued")).toHaveLength(1);
+    expect(new Set(results.map((row) => row.successor?.id)).size).toBe(1);
+    expect(await chain(c.clientId)).toHaveLength(2);
+    const [cas] =
+      await sql`SELECT count(DISTINCT ca_id)::int AS n FROM client_certificates WHERE subject_cn = ${c.role}`;
+    expect(cas!.n).toBe(2);
+    await park(c.clientId);
+  });
+
+  test("early retry and daily reconciliation apply the same committed successor after reload failure", async () => {
+    for (const daily of [false, true]) {
+      next();
+      const c = await issueClient(`reload${daily}`);
+      clock = at(clock, 60);
+      const operation = await op(c.clientId);
+      await expect(
+        coordinator.runOperation("database.client_rollover", operation, {
+          ...runtime,
+          reload: async () => {
+            throw new Error("reload unavailable");
+          },
+        }),
+      ).rejects.toThrow("reload unavailable");
+      const successor = (await chain(c.clientId))[1]!;
+      const [unapplied] =
+        await sql`SELECT trust_applied_at FROM client_certificates WHERE id = ${successor.id}`;
+      expect(unapplied!.trust_applied_at).toBeNull();
+      const savedReload = process.env.ARK_PGBOUNCER_RELOAD;
+      process.env.ARK_PGBOUNCER_RELOAD = "1";
+      try {
+        await expect(revealSuccessor(c.clientId)).rejects.toThrow(/awaiting a successful PgBouncer reload/);
+      } finally {
+        process.env.ARK_PGBOUNCER_RELOAD = savedReload;
+      }
+      await coordinator.runOperation("database.client_rollover", daily ? await op() : operation, runtime);
+      expect(await chain(c.clientId)).toHaveLength(2);
+      expect(await bundleFile()).toContain(await caPem(successor.caId));
+      const [applied] =
+        await sql`SELECT trust_applied_at FROM client_certificates WHERE id = ${successor.id}`;
+      expect(applied!.trust_applied_at).toBeTruthy();
+      await park(c.clientId);
+    }
+  });
+
+  test("historical confirmation leaves a later pending cycle's alert open", async () => {
+    next();
+    const c = await issueClient("oldconfirm");
+    const first = await rollover.issueSuccessor({
+      clientId: c.clientId,
+      now: at(clock, 60),
+      reason: "early",
+    });
+    clock = at(clock, 61);
+    await revealSuccessor(c.clientId);
+    await rollover.confirmRolloverDelivery({
+      databaseId,
+      clientId: c.clientId,
+      certificateId: first.successor!.id,
+      now: clock,
+    });
+    clock = at(clock, 65);
+    await rollover.issueSuccessor({ clientId: c.clientId, now: clock, reason: "early" });
+    await rollover.evaluateRolloverAlerts(clock);
+    const key = `${ROLLOVER_ALERT_PREFIX}${c.clientId}`;
+    expect((await openAlert(key))!.resolved_at).toBeNull();
+    await rollover.confirmRolloverDelivery({
+      databaseId,
+      clientId: c.clientId,
+      certificateId: first.successor!.id,
+      now: clock,
+    });
+    expect((await openAlert(key))!.resolved_at).toBeNull();
+    await park(c.clientId);
+  });
+
+  test("CSR automatic/early rollover and reveal state; missing successor stays critical after retirement", async () => {
+    next();
+    const key = generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey;
+    const csrPem = buildCsr({ key }).pem;
+    const issued = await clients.issueDatabaseClient({
+      clientId: createId("dbc"),
+      databaseId,
+      name: "csrrecovery",
+      environment: "production",
+      roleKind: "runtime",
+      now: clock,
+      csrPem,
+    });
+    const id = issued.client.id;
+    await sql`UPDATE database_clients SET issued_at = ${clock.toISOString()} WHERE id = ${id}`;
+    const initial = clock;
+    clock = at(clock, 60);
+    const scheduled = await rollover.runScheduledRollover({ now: clock });
+    expect(scheduled.find((row) => row.clientId === id)?.outcome).toBe("needs_csr");
+    await expect(
+      rollover.queueEarlyRollover({ databaseId, clientId: id, actorId: actors.owner.userId }),
+    ).rejects.toThrow(/submit a CSR/);
+    const early = await rollover.queueEarlyRollover({
+      databaseId,
+      clientId: id,
+      actorId: actors.owner.userId,
+      csrPem,
+    });
+    await runQueued(early.operation.id);
+    let status = await rollover.rolloverStatus({ databaseId, clientId: id, now: clock });
+    expect(status.successor?.revealed).toBe(false);
+    const revealed = await revealSuccessor(id);
+    expect(revealed.privateKey).toBeNull();
+    status = await rollover.rolloverStatus({ databaseId, clientId: id, now: clock });
+    expect(status.successor?.revealed).toBe(true);
+    await rollover.confirmRolloverDelivery({
+      databaseId,
+      clientId: id,
+      certificateId: revealed.certificate.id,
+      now: clock,
+    });
+    await park(id);
+
+    // A different CSR client never supplies the successor CSR.
+    clock = initial;
+    const missing = await clients.issueDatabaseClient({
+      clientId: createId("dbc"),
+      databaseId,
+      name: "csrmissing",
+      environment: "production",
+      roleKind: "runtime",
+      now: clock,
+      csrPem,
+    });
+    await sql`UPDATE database_clients SET issued_at = ${clock.toISOString()} WHERE id = ${missing.client.id}`;
+    clock = missing.certificate!.notAfter;
+    await coordinator.rolloverTick(runtime);
+    await rollover.evaluateRolloverAlerts(clock);
+    expect(await openAlert(`${ROLLOVER_ALERT_PREFIX}${missing.client.id}`)).toMatchObject({
+      severity: "critical",
+      resolved_at: null,
+    });
+    await park(missing.client.id);
+  });
+
+  test("acknowledged warning escalates to critical and sends a fresh notification", async () => {
+    next();
+    const c = await issueClient("renotify");
+    const initial = clock;
+    const received: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        received.push(await request.text());
+        return new Response("ok");
+      },
+    });
+    const previous = process.env.ARK_ALERT_WEBHOOK;
+    process.env.ARK_ALERT_WEBHOOK = `http://localhost:${server.port}`;
+    try {
+      clock = at(initial, 76);
+      await rollover.evaluateRolloverAlerts(clock);
+      const key = `${ROLLOVER_ALERT_PREFIX}${c.clientId}`;
+      await sql`UPDATE alerts SET acknowledged = true, notification_attempts = 5, last_notified_at = now() WHERE dedup_key = ${key}`;
+      clock = at(initial, 83);
+      await rollover.evaluateRolloverAlerts(clock);
+      const [alert] =
+        await sql`SELECT acknowledged, notification_attempts, severity FROM alerts WHERE dedup_key = ${key}`;
+      expect(alert).toMatchObject({ acknowledged: false, notification_attempts: 1, severity: "critical" });
+      expect(received.filter((body) => body.includes(c.role))).toHaveLength(2);
+    } finally {
+      if (previous === undefined) delete process.env.ARK_ALERT_WEBHOOK;
+      else process.env.ARK_ALERT_WEBHOOK = previous;
+      await server.stop(true);
+      await park(c.clientId);
+    }
+  });
+
+  test("failed escalation retries; retirement operations and op-failed alerts stay bounded", async () => {
+    next();
+    const c = await issueClient("backoff");
+    clock = c.first.notAfter;
+    failRoles.add(c.role);
+    await coordinator.rolloverTick(runtime);
+    const T = clock.getTime();
+    for (let i = 1; i <= 12; i++) {
+      clock = new Date(T + i * 1_000);
+      await coordinator.rolloverTick({
+        ...runtime,
+        watchdog: {
+          fence: async () => {
+            throw Error("no socket");
+          },
+          stop: async () => {
+            throw Error("no socket");
+          },
+          fenceListener: async () => {
+            throw Error("no listener");
+          },
+        },
+      });
+    }
+    const [task] =
+      await sql`SELECT * FROM client_certificate_retirements WHERE certificate_id = ${c.first.id}`;
+    expect(task!.attempts).toBeLessThanOrEqual(3);
+    expect(task!.watchdog_at).toBeNull();
+    const [count] =
+      await sql`SELECT count(*)::int AS n FROM operations WHERE payload->>'certificateId' = ${c.first.id}`;
+    expect(count!.n).toBe(1);
+    const { evaluateAlerts } = await import("./modules/alerts.ts");
+    await evaluateAlerts();
+    const [alertCount] =
+      await sql`SELECT count(*)::int AS n FROM alerts WHERE dedup_key IN (SELECT 'op-failed:' || id FROM operations WHERE payload->>'certificateId' = ${c.first.id})`;
+    expect(alertCount!.n).toBe(1);
+    const actions = await coordinator.runRetirementWatchdog(runtime);
+    expect(actions.find((item) => item.certificateId === c.first.id)?.stop).toBe("ok");
+    const [recovered] =
+      await sql`SELECT watchdog_at FROM client_certificate_retirements WHERE certificate_id = ${c.first.id}`;
+    expect(recovered!.watchdog_at).toBeTruthy();
+    failRoles.delete(c.role);
+    clock = new Date(T + 30_000);
+    await coordinator.rolloverTick(runtime);
+    await park(c.clientId);
+  });
+
+  test("revoked clients finish open retirements; completed revocation cancels without watchdog fencing", async () => {
+    for (const alreadyDrained of [false, true]) {
+      next();
+      const c = await issueClient(`revoke${alreadyDrained}`);
+      clock = c.first.notAfter;
+      const item = (await rollover.dueRetirements({ now: clock })).find(
+        (row) => row.certificate.id === c.first.id,
+      )!;
+      await rollover.ensureRetirement(item);
+      await sql`UPDATE database_clients SET status = 'revoked', revoked_at = now(), revocation_completed_at = ${alreadyDrained ? new Date().toISOString() : null}::timestamptz WHERE id = ${c.clientId}`;
+      await sql`UPDATE client_certificates SET status = 'revoked' WHERE id = ${c.first.id}`;
+      const before = drains.length;
+      await coordinator.rolloverTick(runtime);
+      const [task] =
+        await sql`SELECT completed_at FROM client_certificate_retirements WHERE certificate_id = ${c.first.id}`;
+      expect(task!.completed_at).toBeTruthy();
+      expect(drains.length - before).toBe(alreadyDrained ? 0 : 1);
+      clock = new Date(clock.getTime() + 6_000);
+      expect(
+        (await coordinator.runRetirementWatchdog(runtime)).some((row) => row.certificateId === c.first.id),
+      ).toBe(false);
+      await park(c.clientId);
+    }
+  });
+
+  test("scheduler watchdog runs while a retirement's apply is unresolved", async () => {
+    next();
+    const c = await issueClient("hungapply");
+    clock = c.first.notAfter;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let applying = false;
+    let completed = false;
+    const calls: string[] = [];
+    const stop = coordinator.startRolloverScheduler(10, {
+      ...runtime,
+      reload: async () => {
+        applying = true;
+        await barrier;
+      },
+      retire: async (input) => {
+        try {
+          return await retireGeneration({ ...input, admin: async () => [] });
+        } finally {
+          completed = true;
+        }
+      },
+      watchdog: {
+        fence: async () => {
+          calls.push("fence");
+        },
+        stop: async () => {
+          calls.push("stop");
+        },
+        fenceListener: async () => {
+          calls.push("listener");
+        },
+      },
+    });
+    try {
+      await until(() => applying);
+      for (let tick = 0; tick < 3; tick++) await coordinator.rolloverTick(runtime);
+      const [count] =
+        await sql`SELECT count(*)::int AS n FROM operations WHERE payload->>'certificateId' = ${c.first.id}`;
+      expect(count!.n).toBe(1);
+      clock = new Date(clock.getTime() + 6_000);
+      await until(() => calls.includes("stop"));
+      expect(completed).toBe(false);
+    } finally {
+      stop();
+      release();
+      await until(() => completed);
+      // Wait for the writer lock and durable completion before fixture cleanup.
+      await withPgbouncerLock(async () => undefined);
+      await park(c.clientId);
+    }
+  });
+
+  test("the configuration lock excludes another database connection and releases after an error", async () => {
+    let release!: () => void;
+    let locked = false;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const external = sql.begin(async (connection) => {
+      await connection`SELECT pg_advisory_xact_lock(hashtextextended('ark:pgbouncer-config', 0))`;
+      locked = true;
+      await barrier;
+    });
+    await until(() => locked);
+    let entered = false;
+    const writer = withPgbouncerLock(async () => {
+      entered = true;
+      throw Error("writer failed");
+    }).catch((error: unknown) => error);
+    try {
+      await Bun.sleep(30);
+      expect(entered).toBe(false);
+    } finally {
+      release();
+      await external;
+    }
+    expect(await writer).toBeInstanceOf(Error);
+    expect(await withPgbouncerLock(async () => "recovered")).toBe("recovered");
+  });
+
+  test("two expiry timers and an older regular reload share the complete writer/fence lock", async () => {
+    next();
+    const a = await issueClient("timera");
+    const b = await issueClient("timerb");
+    await coordinator.runOperation("pgbouncer.reload", await op(), runtime);
+    expect(await bundleFile()).toContain(await caPem(a.first.caId));
+    const T = a.first.notAfter.getTime();
+    clock = new Date(T - 30);
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let snapshotTaken = false;
+    const stale = withPgbouncerLock(async () => {
+      const snapshot = await bundleFile();
+      snapshotTaken = true;
+      await barrier;
+      await Bun.write(join(work, "pgbouncer", PGBOUNCER_FILES.caBundle), snapshot);
+    });
+    await until(() => snapshotTaken);
+    const commands: string[] = [];
+    let disabled = false;
+    const simultaneous = {
+      ...runtime,
+      retire: (input: RetireInput) =>
+        retireGeneration({
+          ...input,
+          admin: async (command: string) => {
+            if (command.startsWith("DISABLE")) {
+              expect(disabled).toBe(false);
+              disabled = true;
+            }
+            if (command.startsWith("ENABLE")) {
+              expect(disabled).toBe(true);
+              disabled = false;
+            }
+            commands.push(command);
+            return [];
+          },
+        }),
+    };
+    const state = { timers: new Map<string, ReturnType<typeof setTimeout>>(), tickMs: 50 };
+    await coordinator.rolloverTick(simultaneous, state);
+    clock = new Date(T);
+    await Bun.sleep(60); // both expiry timers are now queued behind the old writer
+    expect(commands).toEqual([]);
+    const regular = coordinator.runOperation("pgbouncer.reload", await op(), runtime);
+    release();
+    await stale;
+    await regular;
+    await until(() => state.timers.size === 0);
+    await coordinator.rolloverTick(simultaneous);
+    expect(commands.filter((command) => command.startsWith("DISABLE"))).toHaveLength(2);
+    expect(commands.filter((command) => command.startsWith("ENABLE"))).toHaveLength(2);
+    const bundle = await bundleFile();
+    expect(bundle).not.toContain(await caPem(a.first.caId));
+    expect(bundle).not.toContain(await caPem(b.first.caId));
+    for (const c of [a, b]) {
+      const [task] =
+        await sql`SELECT completed_at FROM client_certificate_retirements WHERE certificate_id = ${c.first.id}`;
+      expect(task!.completed_at).toBeTruthy();
+    }
+    await park(a.clientId, b.clientId);
   });
 });

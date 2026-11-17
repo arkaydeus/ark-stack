@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "types": ["bun"] },
+  "include": ["test-pgbouncer-public.ts", "pgbouncer-*-probe.ts", "pgbouncer-smoke-checks.ts"]
+}

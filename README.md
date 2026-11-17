@@ -43,6 +43,8 @@ Useful commands:
 | `mise run recover-host`           | host-loss checklist                         |
 | `mise run db:studio`              | Drizzle Studio                              |
 
+PgBouncer runtime probes also have a dedicated TypeScript check in CI and `mise run typecheck`. The live PgBouncer harness selects an ephemeral loopback port by default (`ARK_PGBOUNCER_SMOKE_PORT` overrides it); run it after the unit suite because both use the migrated platform test database.
+
 ## Publishing images
 
 `mise run images:publish` builds all seven Bake targets for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing.

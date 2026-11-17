@@ -28,7 +28,7 @@ import {
   rolloverDue,
   ROLLOVER_LEAD_DAYS,
 } from "@ark-stack/shared";
-import { and, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 
 import { db } from "../db.ts";
 import { loadEnv } from "../env.ts";
@@ -154,6 +154,15 @@ export async function issueSuccessor(input: {
       if (!usable(client)) return { ...base, outcome: "inactive" as const };
       const role = await roleName(client, tx);
       const chain = certificateChain(client.caId, await loadLinkedCertificates([client.caId], tx));
+      const pending = pendingOf(chain);
+      if (pending)
+        return {
+          ...base,
+          role,
+          predecessor: predecessorOf(chain, pending),
+          successor: pending,
+          outcome: "exists" as const,
+        };
       const current = currentOf(chain);
       if (!current) return { ...base, role, outcome: "no_current" as const };
       if (current.supersededBy) {
@@ -246,9 +255,10 @@ export async function runScheduledRollover(input: { now: Date; leadDays?: number
   const all = await loadLinkedCertificates(clients.map((client) => client.caId));
   const results: IssueSuccessorResult[] = [];
   for (const client of clients) {
-    const current = currentOf(certificateChain(client.caId, all));
-    if (!current || current.supersededBy) continue;
-    if (!rolloverDue(current.notAfter, input.now, input.leadDays)) continue;
+    const chain = certificateChain(client.caId, all);
+    const current = currentOf(chain);
+    const pending = pendingOf(chain);
+    if (!pending && (!current || !rolloverDue(current.notAfter, input.now, input.leadDays))) continue;
     results.push(
       await issueSuccessor({
         clientId: client.id,
@@ -363,6 +373,7 @@ export async function revealRolloverSuccessor(input: {
       .where(eq(clientCertificates.id, pending.id))
       .for("update");
     if (!successor?.certPem) throw new Error("The successor certificate is missing.");
+    assertTrustApplied(successor);
     if (successor.revealedAt)
       throw new DatabaseClientError(
         409,
@@ -465,6 +476,7 @@ export async function confirmRolloverDelivery(input: {
     if (!predecessor) throw new DatabaseClientError(409, "That certificate is not a rollover successor.");
     if (successor.deliveredAt && successor.rolloverState !== "pending")
       return { client, successor, predecessor, alreadyDelivered: true };
+    assertTrustApplied(successor);
     if (successor.status !== "issued" || successor.rolloverState !== "pending")
       throw new DatabaseClientError(409, `The successor is ${successor.status}/${successor.rolloverState}.`);
     if (successor.notAfter.getTime() <= input.now.getTime())
@@ -529,7 +541,7 @@ export async function confirmRolloverDelivery(input: {
       alreadyDelivered: false,
     };
   });
-  await resolveAlert(rolloverAlertKey(input.clientId));
+  await evaluateRolloverAlerts(input.now, input.clientId);
   return {
     clientId: input.clientId,
     alreadyDelivered: result.alreadyDelivered,
@@ -548,6 +560,23 @@ export async function confirmRolloverDelivery(input: {
   };
 }
 
+/** Reconcile delivery readiness only after a successful bundle reload. */
+export async function markSuccessorsTrusted(ids: string[], now: Date) {
+  if (!ids.length) return;
+  await db.update(clientCertificates).set({ trustAppliedAt: now }).where(inArray(clientCertificates.id, ids));
+}
+
+function assertTrustApplied(certificate: CertificateRow) {
+  if (
+    (process.env.ARK_PGBOUNCER_RELOAD === "1" || process.env.NODE_ENV === "production") &&
+    !certificate.trustAppliedAt
+  )
+    throw new DatabaseClientError(
+      409,
+      "The successor is awaiting a successful PgBouncer reload; retry delivery after reconciliation.",
+    );
+}
+
 /** Inventory view of one certificate: no PEM, key or secret ID. */
 const certificateView = (row: CertificateRow | null) =>
   row && {
@@ -560,7 +589,7 @@ const certificateView = (row: CertificateRow | null) =>
     status: row.status,
     rolloverState: row.rolloverState,
     deliveredAt: row.deliveredAt,
-    revealed: row.revealedAt !== null || (row.rolloverState === "pending" && row.keySecretId === null),
+    revealed: row.revealedAt !== null,
     retiredAt: row.retiredAt,
   };
 
@@ -614,8 +643,11 @@ export async function rolloverStatus(input: { databaseId: string; clientId: stri
  * delivered (or not even issued, e.g. a CSR client), `info` → `warning` at T−14 → `critical` at
  * T−7 and after expiry. Delivery, revocation or a new cycle resolve it.
  */
-export async function evaluateRolloverAlerts(now: Date) {
-  const clients = await db.select().from(databaseClients);
+export async function evaluateRolloverAlerts(now: Date, clientId?: string) {
+  const clients = await db
+    .select()
+    .from(databaseClients)
+    .where(clientId ? eq(databaseClients.id, clientId) : undefined);
   const all = await loadLinkedCertificates(clients.filter(usable).map((client) => client.caId));
   const raised: Array<{ clientId: string; severity: string; notAfter: Date }> = [];
   for (const client of clients) {
@@ -627,7 +659,11 @@ export async function evaluateRolloverAlerts(now: Date) {
     const chain = certificateChain(client.caId, all);
     const pending = pendingOf(chain);
     const current = currentOf(chain);
-    const expiring = pending ? predecessorOf(chain, pending) : current;
+    const expiring =
+      (pending ? predecessorOf(chain, pending) : current) ??
+      chain
+        .filter((row) => row.notAfter <= now)
+        .toSorted((a, b) => b.notAfter.getTime() - a.notAfter.getTime())[0];
     const level = expiring ? rolloverAlertLevel(expiring.notAfter, now) : null;
     if (!expiring || !level || (!pending && current?.supersededBy)) {
       await resolveAlert(key, now);
@@ -678,14 +714,37 @@ export async function dueRetirements(input: { now: Date; lookaheadMs?: number })
         lt(clientCertificates.notAfter, new Date(horizon.getTime() + 1)),
       ),
     );
-  if (!expiring.length) return [];
-  const ids = new Set(expiring.map((row) => row.id));
-  const clients = (await db.select().from(databaseClients)).filter(usable);
+  const open = await db
+    .select()
+    .from(clientCertificateRetirements)
+    .where(isNull(clientCertificateRetirements.completedAt));
+  const openIds = new Set(open.map((row) => row.certificateId));
+  const ids = new Set([...expiring.map((row) => row.id), ...openIds]);
+  if (!ids.size) return [];
+  const clients = (await db.select().from(databaseClients)).filter(
+    (client) => usable(client) || open.some((row) => row.clientId === client.id),
+  );
   const all = await loadLinkedCertificates(clients.map((client) => client.caId));
   const due: DueRetirement[] = [];
   for (const client of clients) {
     for (const certificate of certificateChain(client.caId, all)) {
-      if (!ids.has(certificate.id)) continue;
+      if (!ids.has(certificate.id) || certificate.notAfter > horizon) continue;
+      if (!usable(client) && !openIds.has(certificate.id)) continue;
+      const task = open.find((row) => row.certificateId === certificate.id);
+      if (client.revocationCompletedAt) {
+        await db
+          .update(clientCertificateRetirements)
+          .set({
+            completedAt: input.now,
+            leaseUntil: null,
+            updatedAt: input.now,
+            evidence: { cancelled: "client revocation drained sessions" },
+          })
+          .where(eq(clientCertificateRetirements.certificateId, certificate.id));
+        await resolveAlert(retirementAlertKey(certificate.id), input.now);
+        continue;
+      }
+      if (task?.leaseUntil && task.leaseUntil > input.now) continue;
       const [database] = await db
         .select({ name: managedDatabases.name })
         .from(managedDatabases)
@@ -702,8 +761,8 @@ export async function dueRetirements(input: { now: Date; lookaheadMs?: number })
   return due.toSorted((a, b) => a.certificate.notAfter.getTime() - b.certificate.notAfter.getTime());
 }
 
-/** Create (once) and lease the retirement task; false when another runner holds it or it is done. */
-export async function claimRetirement(item: DueRetirement, now: Date, leaseMs = 30_000) {
+/** Persist a deadline before waiting for a configuration writer, without claiming it. */
+export async function ensureRetirement(item: DueRetirement) {
   await db
     .insert(clientCertificateRetirements)
     .values({
@@ -715,6 +774,11 @@ export async function claimRetirement(item: DueRetirement, now: Date, leaseMs = 
       deadline: item.deadline,
     })
     .onConflictDoNothing({ target: clientCertificateRetirements.certificateId });
+}
+
+/** Lease one task; null while another runner owns it, during backoff, or after completion. */
+export async function claimRetirement(item: DueRetirement, now: Date, leaseMs = 30_000) {
+  await ensureRetirement(item);
   const claimed = await db
     .update(clientCertificateRetirements)
     .set({
@@ -726,7 +790,10 @@ export async function claimRetirement(item: DueRetirement, now: Date, leaseMs = 
       and(
         eq(clientCertificateRetirements.certificateId, item.certificate.id),
         isNull(clientCertificateRetirements.completedAt),
-        or(isNull(clientCertificateRetirements.leaseUntil), lt(clientCertificateRetirements.leaseUntil, now)),
+        or(
+          isNull(clientCertificateRetirements.leaseUntil),
+          lte(clientCertificateRetirements.leaseUntil, now),
+        ),
       ),
     )
     .returning();
@@ -841,7 +908,7 @@ export async function failRetirement(
   await db
     .update(clientCertificateRetirements)
     .set({
-      leaseUntil: null,
+      leaseUntil: sql`${input.now.toISOString()}::timestamptz + make_interval(secs => LEAST(power(2, LEAST(${clientCertificateRetirements.attempts}, 9)), 300)::int)`,
       lastError: input.error.slice(0, 1000),
       ...(missed ? { deadlineMissed: true } : {}),
       ...(input.timeline?.fencedAt ? { fencedAt: at(input.timeline.fencedAt) } : {}),
@@ -862,6 +929,20 @@ export async function failRetirement(
 
 /** Open retirement tasks past their deadline: the watchdog's work list. */
 export async function overdueRetirements(now: Date) {
+  await db
+    .update(clientCertificateRetirements)
+    .set({
+      completedAt: now,
+      leaseUntil: null,
+      updatedAt: now,
+      evidence: { cancelled: "client revocation drained sessions" },
+    })
+    .where(
+      and(
+        isNull(clientCertificateRetirements.completedAt),
+        sql`${clientCertificateRetirements.clientId} IN (SELECT id FROM database_clients WHERE revocation_completed_at IS NOT NULL)`,
+      ),
+    );
   return db
     .select()
     .from(clientCertificateRetirements)
@@ -870,11 +951,16 @@ export async function overdueRetirements(now: Date) {
     );
 }
 
-export async function recordWatchdog(certificateId: string, now: Date, evidence: Record<string, unknown>) {
+export async function recordWatchdog(
+  certificateId: string,
+  now: Date,
+  evidence: Record<string, unknown>,
+  succeeded = true,
+) {
   await db
     .update(clientCertificateRetirements)
     .set({
-      watchdogAt: now,
+      watchdogAt: succeeded ? now : null,
       deadlineMissed: true,
       evidence: sql`${clientCertificateRetirements.evidence} || ${JSON.stringify({ watchdog: evidence })}::jsonb`,
       updatedAt: now,

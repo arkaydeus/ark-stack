@@ -74,13 +74,14 @@ run = "ARK_DOCKER_INTEGRATION=1 go test -run TestDisposableDockerDeploymentAndDu
 dir = "agent"
 
 [tasks.typecheck]
-description = "Typecheck every TypeScript workspace and the image publisher"
+description = "Typecheck every TypeScript workspace, the image publisher and PgBouncer probes"
 run = [
   "bunx tsc --noEmit -p shared/tsconfig.json",
   "bunx tsc --noEmit -p server/tsconfig.json",
   "bunx tsc --noEmit -p web/tsconfig.json",
   "bunx tsc --noEmit -p workers/tsconfig.json",
   "bunx tsc --noEmit -p scripts/tsconfig.publish.json",
+  "bunx tsc --noEmit -p scripts/tsconfig.pgbouncer.json",
 ]
 
 [tasks.lint]

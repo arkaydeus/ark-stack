@@ -714,6 +714,7 @@ export const clientCertificates = pgTable(
     revokedReason: text("revoked_reason"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     // 0020 (FD-28): one-time reveal of a rollover successor, and retirement completion.
+    trustAppliedAt: timestamp("trust_applied_at", { withTimezone: true }),
     revealedAt: timestamp("revealed_at", { withTimezone: true }),
     retiredAt: timestamp("retired_at", { withTimezone: true }),
   },

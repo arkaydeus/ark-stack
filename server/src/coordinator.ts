@@ -37,6 +37,7 @@ import {
 import { and, desc, eq, isNull } from "drizzle-orm";
 
 import { db, sql } from "./db.ts";
+import { withPgbouncerLock } from "./modules/pgbouncer-lock.ts";
 import { loadEnv } from "./env.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
@@ -79,10 +80,12 @@ import {
   claimRetirement,
   completeRetirement,
   dueRetirements,
+  ensureRetirement,
   evaluateRolloverAlerts,
   failRetirement,
   issueSuccessor,
   markGenerationRetired,
+  markSuccessorsTrusted,
   overdueRetirements,
   recordWatchdog,
   retirementAlertKey,
@@ -1500,7 +1503,14 @@ function pgbouncerReloadRequired() {
  * database endpoint certificate change (§3.14) the served fingerprint must match before the
  * certificate is marked as serving; failures are retried, then alerted and the operation fails.
  */
-async function reloadPgbouncer(operation: OperationRow, now = new Date()) {
+async function reloadPgbouncer(
+  operation: OperationRow,
+  now = new Date(),
+): Promise<{ routed: boolean; mappings: string[]; reloaded: boolean }> {
+  return withPgbouncerLock(() => reloadPgbouncerLocked(operation, now));
+}
+
+async function reloadPgbouncerLocked(operation: OperationRow, now: Date) {
   const databases = await db.select().from(managedDatabases);
   const roles = await db.select().from(databaseRoles);
   const clientRows = await db.select().from(databaseClients);
@@ -1744,6 +1754,10 @@ export const PGBOUNCER_REVOKE_ALERT = "pgbouncer-revoke";
  * clients' sessions and credentials are untouched.
  */
 async function revokeDatabaseClientOp(operation: OperationRow, runtime: ClientOperationRuntime) {
+  return withPgbouncerLock(() => revokeDatabaseClientLocked(operation, runtime));
+}
+
+async function revokeDatabaseClientLocked(operation: OperationRow, runtime: ClientOperationRuntime) {
   const databaseId = operation.targetIds[0] ?? "";
   const result = await runtime.revoke({
     databaseId,
@@ -1783,6 +1797,7 @@ async function revokeDatabaseClientOp(operation: OperationRow, runtime: ClientOp
     .update(databaseClients)
     .set({ revocationCompletedAt: new Date() })
     .where(eq(databaseClients.id, result.clientId));
+  await dueRetirements({ now: runtime.now() });
   await auditRevoked(
     { ...result, killed },
     { databaseId, actorId: operation.actorId, operationId: operation.id },
@@ -1841,7 +1856,14 @@ async function rolloverDatabaseClientsOp(operation: OperationRow, runtime: Clien
   for (const result of results)
     await addStep(operation.id, "client-rollover-successor", successorEvidence(result));
   const issued = results.filter((result) => result.outcome === "issued");
-  if (issued.length) await runtime.reload(operation, now);
+  const deliverable = results.filter((result) => result.outcome === "issued" || result.outcome === "exists");
+  if (deliverable.length) {
+    await runtime.reload(operation, now);
+    await markSuccessorsTrusted(
+      deliverable.flatMap((result) => (result.successor ? [result.successor.id] : [])),
+      now,
+    );
+  }
   for (const result of issued) await auditRolloverIssued(result, operation);
   const alertsRaised = await evaluateRolloverAlerts(now);
   const retired = payload.clientId ? [] : await runDueRetirements(runtime, { operation });
@@ -1862,14 +1884,30 @@ async function rolloverDatabaseClientsOp(operation: OperationRow, runtime: Clien
  * sessions and any pre-auth logins before reopening. Without an admin socket (development) the
  * reload still runs and the drain is recorded as skipped.
  */
-async function retireOne(item: DueRetirement, operation: OperationRow, runtime: ClientOperationRuntime) {
-  const claimed = await claimRetirement(item, runtime.now());
+async function retireOne(
+  item: DueRetirement,
+  operation: OperationRow,
+  runtime: ClientOperationRuntime,
+  preclaimed = false,
+): Promise<Record<string, unknown>> {
+  return withPgbouncerLock(() => retireOneLocked(item, operation, runtime, preclaimed));
+}
+
+async function retireOneLocked(
+  item: DueRetirement,
+  operation: OperationRow,
+  runtime: ClientOperationRuntime,
+  preclaimed: boolean,
+) {
+  const claimed = preclaimed || (await claimRetirement(item, runtime.now()));
   if (!claimed) return { certificateId: item.certificate.id, skipped: "claimed elsewhere or complete" };
-  const apply = async () => {
-    await markGenerationRetired(item.certificate.id);
-    const reloaded = await runtime.reload(operation, runtime.now());
-    return { databaseMapped: reloaded?.mappings.includes(item.databaseName) ?? true };
-  };
+  let applying: Promise<{ databaseMapped: boolean }> | undefined;
+  const apply = () =>
+    (applying = (async () => {
+      await markGenerationRetired(item.certificate.id);
+      const reloaded = await runtime.reload(operation, runtime.now());
+      return { databaseMapped: reloaded?.mappings.includes(item.databaseName) ?? true };
+    })());
   try {
     let timeline: Record<string, unknown> & {
       fencedAt?: number;
@@ -1911,6 +1949,10 @@ async function retireOne(item: DueRetirement, operation: OperationRow, runtime: 
       ...timeline,
     });
     throw error;
+  } finally {
+    // A timed-out apply may still be writing files. Retain the writer lock until it settles;
+    // the independent watchdog can stop/fence the pooler while this writer is stuck.
+    await applying?.catch(() => undefined);
   }
 }
 
@@ -1922,6 +1964,9 @@ async function runDueRetirements(
   const due = (await dueRetirements({ now: runtime.now() })).filter(
     (item) => !options.certificateId || item.certificate.id === options.certificateId,
   );
+  // Persist all deadlines before waiting on the shared writer lock. The independent watchdog
+  // must see simultaneous expiries even while another retirement owns that lock.
+  for (const item of due) await ensureRetirement(item);
   const outcomes: Array<Record<string, unknown>> = [];
   for (const item of due) {
     if (options.operation) {
@@ -1959,38 +2004,52 @@ async function retireClientCertificateOp(operation: OperationRow, runtime: Clien
  * same operation from the queue.
  */
 async function runInlineRetirement(item: DueRetirement, runtime: ClientOperationRuntime) {
-  const token = createId("claim");
-  const payload = { certificateId: item.certificate.id };
-  const [operation] = await db
-    .insert(operations)
-    .values({
-      id: createId("op"),
-      kind: "database.client_retire",
-      targetIds: [item.client.databaseId, item.client.id],
-      payload,
-      idempotencyKey: `database.client_retire:${item.certificate.id}:${createId("try")}`,
-      planHash: planHash(payload),
-      status: "running",
-      claimToken: token,
-      heartbeatAt: new Date(),
-    })
-    .returning();
-  try {
-    const result = await runOperation("database.client_retire", operation!, runtime);
-    await finishOperation(operation!, token, "succeeded");
-    return result as Record<string, unknown>;
-  } catch (error) {
-    await finishOperation(
-      operation!,
-      token,
-      "failed",
-      error instanceof Error ? error.message : String(error),
-    );
-    return {
-      certificateId: item.certificate.id,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+  return withPgbouncerLock(async () => {
+    if (!(await claimRetirement(item, runtime.now())))
+      return { certificateId: item.certificate.id, skipped: "claimed elsewhere or complete" };
+    const token = createId("claim");
+    const payload = { certificateId: item.certificate.id };
+    const [operation] = await db
+      .insert(operations)
+      .values({
+        id: createId("op"),
+        kind: "database.client_retire",
+        targetIds: [item.client.databaseId, item.client.id],
+        payload,
+        idempotencyKey: `database.client_retire:${item.certificate.id}`,
+        planHash: planHash(payload),
+        status: "running",
+        claimToken: token,
+        heartbeatAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: operations.idempotencyKey,
+        set: {
+          status: "running",
+          claimToken: token,
+          heartbeatAt: new Date(),
+          error: null,
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
+    try {
+      const result = await retireOne(item, operation!, runtime, true);
+      await finishOperation(operation!, token, "succeeded");
+      return result as Record<string, unknown>;
+    } catch (error) {
+      await finishOperation(
+        operation!,
+        token,
+        "failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      return {
+        certificateId: item.certificate.id,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
 }
 
 /**
@@ -1999,40 +2058,66 @@ async function runInlineRetirement(item: DueRetirement, runtime: ClientOperation
  * holds no session), and if the admin socket is unusable close the public listener on the host.
  * The task stays open and is retried; the critical alert stays until it completes.
  */
+async function boundedWatchdogAction(action: () => Promise<void>, timeoutMs = 500) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      action(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Watchdog action timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const watchdogRunning = new Set<string>();
+
 export async function runRetirementWatchdog(overrides: Partial<ClientOperationRuntime> = {}) {
   const runtime = { ...clientOperationRuntime, ...overrides };
   const now = runtime.now();
   const actions: Array<Record<string, unknown>> = [];
   for (const task of await overdueRetirements(now)) {
-    if (task.watchdogAt) continue;
-    const evidence: Record<string, unknown> = {
-      at: now.toISOString(),
-      deadline: task.deadline.toISOString(),
-    };
-    if (runtime.reloadRequired()) {
-      const attempt = async (name: string, action: () => Promise<void>) => {
-        try {
-          await action();
-          evidence[name] = "ok";
-          return true;
-        } catch (error) {
-          evidence[name] = error instanceof Error ? error.message : String(error);
-          return false;
-        }
+    if (task.watchdogAt || watchdogRunning.has(task.certificateId)) continue;
+    watchdogRunning.add(task.certificateId);
+    try {
+      const evidence: Record<string, unknown> = {
+        at: now.toISOString(),
+        deadline: task.deadline.toISOString(),
       };
-      const fenced = await attempt("fence", () => runtime.watchdog.fence(task.databaseName));
-      const stopped = await attempt("stop", () => runtime.watchdog.stop());
-      if (!fenced && !stopped) await attempt("fenceListener", () => runtime.watchdog.fenceListener());
-    } else {
-      evidence.skipped = "no admin socket";
+      let succeeded = false;
+      if (runtime.reloadRequired()) {
+        const attempt = async (name: string, action: () => Promise<void>) => {
+          try {
+            await boundedWatchdogAction(action);
+            evidence[name] = "ok";
+            return true;
+          } catch (error) {
+            evidence[name] = error instanceof Error ? error.message : String(error);
+            return false;
+          }
+        };
+        const fenced = await attempt("fence", () => runtime.watchdog.fence(task.databaseName));
+        const stopped = await attempt("stop", () => runtime.watchdog.stop());
+        const listener = !stopped && (await attempt("fenceListener", () => runtime.watchdog.fenceListener()));
+        // DISABLE alone cannot close established sessions. Only a confirmed stop or independent
+        // listener fallback ends escalation; record failed attempts without suppressing retries.
+        succeeded = stopped || listener;
+        evidence.fenced = fenced;
+      } else {
+        evidence.skipped = "no admin socket";
+      }
+      await recordWatchdog(task.certificateId, now, evidence, succeeded);
+      await raiseAlert({
+        severity: "critical",
+        title: `Database client ${task.role}: retirement deadline ${task.deadline.toISOString()} missed; watchdog stop/fence ${succeeded ? "confirmed" : "failed; will retry"}, retrying the drain`,
+        dedupKey: retirementAlertKey(task.certificateId),
+      });
+      actions.push({ certificateId: task.certificateId, ...evidence });
+    } finally {
+      watchdogRunning.delete(task.certificateId);
     }
-    await recordWatchdog(task.certificateId, now, evidence);
-    await raiseAlert({
-      severity: "critical",
-      title: `Database client ${task.role}: retirement deadline ${task.deadline.toISOString()} missed; the watchdog fenced admission and stopped PgBouncer, retrying the drain`,
-      dedupKey: retirementAlertKey(task.certificateId),
-    });
-    actions.push({ certificateId: task.certificateId, ...evidence });
   }
   return actions;
 }
@@ -2081,6 +2166,7 @@ export async function rolloverTick(
     for (const item of await dueRetirements({ now, lookaheadMs: (state.tickMs ?? 1_000) * 2 })) {
       const wait = item.certificate.notAfter.getTime() - now.getTime();
       if (wait <= 0 || timers.has(item.certificate.id)) continue;
+      await ensureRetirement(item);
       timers.set(
         item.certificate.id,
         setTimeout(() => {
@@ -2091,19 +2177,21 @@ export async function rolloverTick(
       );
     }
   }
-  const retired = await runDueRetirements(runtime);
-  const watchdog = await runRetirementWatchdog(runtime);
+  const [retired, watchdog] = await Promise.all([runDueRetirements(runtime), runRetirementWatchdog(runtime)]);
   return { queued: queued?.id ?? null, retired, watchdog };
 }
 
 /** Start the rollover scheduler; it runs where the PgBouncer admin socket is (database worker). */
-export function startRolloverScheduler(tickMs = Number(process.env.ARK_ROLLOVER_TICK_MS ?? 1_000)) {
+export function startRolloverScheduler(
+  tickMs = Number(process.env.ARK_ROLLOVER_TICK_MS ?? 1_000),
+  overrides: Partial<ClientOperationRuntime> = {},
+) {
   const state = { timers: new Map<string, ReturnType<typeof setTimeout>>(), tickMs, lastAlerts: 0 };
   let running = false;
   const tick = () => {
     if (running) return;
     running = true;
-    void rolloverTick({}, state)
+    void rolloverTick(overrides, state)
       .catch((error) => console.error(error instanceof Error ? error.message : "rollover tick failed"))
       .finally(() => {
         running = false;
@@ -2111,8 +2199,23 @@ export function startRolloverScheduler(tickMs = Number(process.env.ARK_ROLLOVER_
   };
   tick();
   const interval = setInterval(tick, tickMs);
+  // This loop has its own guard: a pending drain/reload never suppresses deadline escalation.
+  let watching = false;
+  const watchdogInterval = setInterval(
+    () => {
+      if (watching) return;
+      watching = true;
+      void runRetirementWatchdog(overrides)
+        .catch((error) => console.error(error instanceof Error ? error.message : error))
+        .finally(() => {
+          watching = false;
+        });
+    },
+    Math.min(tickMs, 250),
+  );
   return () => {
     clearInterval(interval);
+    clearInterval(watchdogInterval);
     for (const timer of state.timers.values()) clearTimeout(timer);
   };
 }

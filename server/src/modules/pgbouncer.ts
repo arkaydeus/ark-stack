@@ -205,6 +205,7 @@ export type AdminSocketOptions = {
   port?: number;
   password: string;
   connectTimeoutSeconds?: number;
+  queryTimeoutMs?: number;
 };
 
 // RELOAD and SHOW for FD-16; KILL_CLIENT for FD-17 revocation; DISABLE/ENABLE (admission fence)
@@ -245,10 +246,22 @@ async function consoleCommand(command: string, options: AdminSocketOptions) {
     onnotice: () => undefined,
     connection: { application_name: "ark-database-worker" },
   });
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await sql.unsafe(command).simple();
+    return await Promise.race([
+      sql.unsafe(command).simple(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          // This connection executes exactly one command. Destroying it cannot cancel a
+          // later command, and bounds hung queries as well as the connection handshake.
+          void sql.end({ timeout: 0 }).catch(() => undefined);
+          reject(new Error(`PgBouncer console command timed out: ${command}`));
+        }, options.queryTimeoutMs ?? 1_000);
+      }),
+    ]);
   } finally {
-    await sql.end({ timeout: 2 }).catch(() => undefined);
+    clearTimeout(timer);
+    await sql.end({ timeout: 0 }).catch(() => undefined);
   }
 }
 
@@ -459,7 +472,8 @@ export class RetirementError extends Error {
  * 4. Restore `client_login_timeout`, verify the role has no client, then `ENABLE <database>`.
  *
  * Throws a RetirementError (with the partial timeline) if the role still has sessions, or
- * pre-reload logins remain, at the deadline. The fence is left in place on failure: the caller
+ * pre-reload logins remain after a bounded recovery budget. A verified late drain returns
+ * withinDeadline=false so its durable task can complete with a critical deadline-missed alert. The fence is left in place on failure: the caller
  * retries, alerts, and the watchdog escalates.
  */
 export async function retireGeneration(input: {
@@ -477,6 +491,7 @@ export async function retireGeneration(input: {
   clock?: () => number;
   sleep?: (ms: number) => Promise<void>;
   pollMs?: number;
+  recoveryBudgetMs?: number;
 }) {
   if (input.role === PGBOUNCER_ADMIN_USER) throw new Error("Refusing to drain the console administrator.");
   if (!ROLE_NAME.test(input.role)) throw new Error(`Invalid PgBouncer role: ${input.role}`);
@@ -488,65 +503,82 @@ export async function retireGeneration(input: {
   const timeline: Partial<RetirementTimeline> = { startedAt: clock(), deadline, iterations: 0 };
   const fail = (message: string) => new RetirementError(message, { ...timeline, withinDeadline: false });
 
-  await input.admin(`DISABLE ${input.database}`);
+  const attemptUntil = Math.max(deadline, clock() + (input.recoveryBudgetMs ?? 5_000));
+  const step = async <T>(name: string, work: () => Promise<T>): Promise<T> => {
+    if (clock() > attemptUntil) throw fail(`Retirement ${name} exhausted its recovery budget`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(fail(`Retirement ${name} timed out`)),
+            Math.max(1, attemptUntil - clock()),
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const admin: AdminCommand = (command) => step(command, () => input.admin(command));
+  await admin(`DISABLE ${input.database}`);
   timeline.fencedAt = clock();
-  const applied = await input.apply();
+  const applied = await step("apply", input.apply);
   timeline.reloadedAt = clock();
   // RELOAD re-reads client_login_timeout from the INI, so shorten it only after the reload.
-  await input.admin("SET client_login_timeout = 1");
+  await admin("SET client_login_timeout = 1");
   const reloadedSecond = Math.floor(timeline.reloadedAt / 1000) * 1000;
   let killed = 0;
   let preAuthWaited = 0;
   for (;;) {
     timeline.iterations = (timeline.iterations ?? 0) + 1;
-    const clients = await input.admin("SHOW CLIENTS");
+    const clients = await admin("SHOW CLIENTS");
     const roleIds = clients
       .filter((row) => String(row.user) === input.role)
       .map((row) => String(row.id))
       .filter((id) => /^[1-9][0-9]{0,18}$/.test(id));
     for (const id of roleIds) {
       // A client may disconnect between SHOW CLIENTS and KILL_CLIENT; that is not a failure.
-      await input.admin(`KILL_CLIENT ${id}`).catch(() => undefined);
+      await admin(`KILL_CLIENT ${id}`).catch(() => undefined);
       killed++;
     }
     // Pre-auth sockets that may hold a handshake from before the reload. Connect times have
     // second resolution, so a login in the reload's second counts as old; unknown times too.
-    const logins = (await input.admin("SHOW SOCKETS")).filter((row) => String(row.state) === "cl_login");
+    const logins = (await admin("SHOW SOCKETS")).filter((row) => String(row.state) === "cl_login");
     const old = logins.filter((row) => {
       const at = connectTime(row.connect_time);
       return at === null || at <= reloadedSecond;
     });
     preAuthWaited = Math.max(preAuthWaited, old.length);
     if (!roleIds.length && !old.length) {
-      const remaining = (await input.admin("SHOW CLIENTS")).filter((row) => String(row.user) === input.role);
+      const remaining = (await admin("SHOW CLIENTS")).filter((row) => String(row.user) === input.role);
       if (!remaining.length) break;
     }
-    if (clock() > deadline)
+    if (clock() > attemptUntil)
       throw fail(
-        `Retirement of ${input.role} missed its deadline: ${roleIds.length} session(s) and ${old.length} pre-auth login(s) remain.`,
+        `Retirement of ${input.role} exhausted its recovery budget: ${roleIds.length} session(s) and ${old.length} pre-auth login(s) remain.`,
       );
     await sleep(pollMs);
   }
   timeline.drainedAt = clock();
   timeline.killedRoleClients = killed;
   timeline.preAuthWaited = preAuthWaited;
-  await input.admin(
+  await admin(
     `SET client_login_timeout = ${Math.max(1, Math.floor(input.loginTimeoutSeconds ?? PGBOUNCER_DEFAULTS.clientLoginTimeout))}`,
   );
   if (applied && applied.databaseMapped === false) {
     // The database left [databases] with this reload; there is nothing to re-enable.
     timeline.reopenSkipped = "database no longer mapped";
-    await input.admin(`ENABLE ${input.database}`).catch(() => undefined);
+    await admin(`ENABLE ${input.database}`).catch(() => undefined);
   } else {
-    await input.admin(`ENABLE ${input.database}`);
+    await admin(`ENABLE ${input.database}`);
   }
   timeline.reopenedAt = clock();
   const result = {
     ...(timeline as RetirementTimeline),
     withinDeadline: timeline.drainedAt <= deadline,
   };
-  if (!result.withinDeadline)
-    throw new RetirementError(`Retirement of ${input.role} drained after its deadline.`, result);
   return result;
 }
 

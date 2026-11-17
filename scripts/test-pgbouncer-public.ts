@@ -66,21 +66,24 @@ const pki = await import("../server/src/modules/pki.ts");
 
 // macOS's system LibreSSL lacks PostgreSQL STARTTLS. Prefer an installed OpenSSL, and
 // fail explicitly rather than treating CLI usage errors as successful security checks.
-const openssl = [
-  process.env.ARK_OPENSSL_BIN,
-  Bun.which("openssl"),
-  "/opt/homebrew/opt/openssl@3/bin/openssl",
-  "/usr/local/opt/openssl@3/bin/openssl",
-]
-  .filter((candidate): candidate is string => Boolean(candidate))
-  .find((candidate) => {
-    const version = Bun.spawnSync([candidate, "version"]);
-    return version.exitCode === 0 && /^OpenSSL (?:[3-9]\.|1\.1\.1)/.test(version.stdout.toString());
-  });
-if (!openssl)
-  throw new Error(
-    "Install OpenSSL 1.1.1 or newer with PostgreSQL STARTTLS support (or set ARK_OPENSSL_BIN).",
-  );
+const openssl = (() => {
+  const selected = [
+    process.env.ARK_OPENSSL_BIN,
+    Bun.which("openssl"),
+    "/opt/homebrew/opt/openssl@3/bin/openssl",
+    "/usr/local/opt/openssl@3/bin/openssl",
+  ]
+    .filter((candidate): candidate is string => Boolean(candidate))
+    .find((candidate) => {
+      const version = Bun.spawnSync([candidate, "version"]);
+      return version.exitCode === 0 && /^OpenSSL (?:[3-9]\.|1\.1\.1)/.test(version.stdout.toString());
+    });
+  if (!selected)
+    throw new Error(
+      "Install OpenSSL 1.1.1 or newer with PostgreSQL STARTTLS support (or set ARK_OPENSSL_BIN).",
+    );
+  return selected;
+})();
 
 const root = resolve(import.meta.dir, "..");
 const composeFile = join(root, "infra", "platform", "docker-compose.yml");
@@ -149,9 +152,9 @@ let bunImage = "";
 const compose = ["docker", "compose", "-f", composeFile, "--project-directory", projectDir, "-p", project];
 const socketVolume = `${project}_ark_pgbouncer_socket`;
 const network = `${project}_database-management`;
-// Default to the real ingress target. A shared developer host can request an ephemeral
-// loopback port with ARK_PGBOUNCER_SMOKE_PORT=0, without changing production Compose.
-const requestedPort = process.env.ARK_PGBOUNCER_SMOKE_PORT ?? "15432";
+// Use an isolated ephemeral loopback port by default so concurrent validation jobs cannot
+// collide. Set ARK_PGBOUNCER_SMOKE_PORT to exercise a specific ingress target.
+const requestedPort = process.env.ARK_PGBOUNCER_SMOKE_PORT ?? "0";
 if (!/^\d+$/.test(requestedPort) || Number(requestedPort) > 65535) {
   throw new Error("ARK_PGBOUNCER_SMOKE_PORT must be 0 (ephemeral) or a port from 1 to 65535.");
 }
@@ -501,6 +504,7 @@ try {
   const built = await Bun.build({
     entrypoints: [
       join(import.meta.dir, "pgbouncer-worker-probe.ts"),
+      join(import.meta.dir, "pgbouncer-coordinator-probe.ts"),
       join(import.meta.dir, "pgbouncer-client-probe.ts"),
     ],
     target: "bun",
@@ -1683,8 +1687,14 @@ try {
     );
     const [emCount] =
       await platform`SELECT count(*)::int AS n FROM client_certificates WHERE subject_cn = ${em.role}`;
-    if (secondRun.length || raced.some((item) => item.outcome !== "exists") || emCount!.n !== 2)
-      throw new Error(`Repeated runs created another successor: ${JSON.stringify({ secondRun, emCount })}`);
+    if (
+      secondRun.some((item) => item.outcome !== "exists") ||
+      raced.some((item) => item.outcome !== "exists") ||
+      emCount!.n !== 2
+    )
+      throw new Error(
+        `Repeated runs created another successor: count=${emCount!.n}, outcomes=${secondRun.map((item) => item.outcome).join(",")}`,
+      );
     const emNext = await revealSuccessor(em);
     if (emNext.caId === em.generations[0]!.caId)
       throw new Error("The successor must come from a fresh CA generation.");
@@ -1707,9 +1717,9 @@ try {
     await expectConnects(em, emNext, "FD-28 two-CA bundle reload: successor N+1 connects");
 
     // -- Emergency removal during overlap: only N's generation, then drain the role ---------------
-    const unrelated = await startStream(bystander, bystander.generations[0]!, Date.now() + 60_000);
+    const unrelated = await startStream(bystander, bystander.generations[0]!, Date.now() + 10 * 60_000);
     const unrelatedBefore = (await probe(["clients", bystander.role])).ids ?? [];
-    const emHolder = await startStream(em, em.generations[0]!, Date.now() + 60_000);
+    const emHolder = await startStream(em, em.generations[0]!, Date.now() + 10 * 60_000);
     revoked.add(em.generations[0]!.id);
     const emergency = await fd28Plan();
     const [emCa] = await platform`SELECT cert_pem FROM private_cas WHERE id = ${em.generations[0]!.caId}`;
@@ -1983,6 +1993,144 @@ try {
       "FD-28 retirement task recorded",
       `rt N ${rtRow!.status}/${rtRow!.rollover_state}, drained_at ${new Date(task!.drained_at as Date).toISOString()}, deadline_missed=false`,
     );
+    // Exercise the full production coordinator reload and expiry scheduler against the live
+    // pooler. Earlier scenarios are finished; revoke those fixtures so only this client's
+    // certificate is due, and avoid a collateral expiry during the acceptance check.
+    await platform`UPDATE database_clients SET status = 'revoked', revoked_at = now(), revocation_completed_at = now() WHERE database_id = ${fd28.databaseId}`;
+    const coordIssuedAt = new Date(Math.ceil((Date.now() + 90_000 - 90 * DAY_MS) / 1000) * 1000);
+    const coord = await issue28("coordinator", coordIssuedAt);
+    const coordSuccessor = await rollover.issueSuccessor({
+      clientId: coord.id,
+      now: new Date(),
+      reason: "scheduled",
+    });
+    if (coordSuccessor.outcome !== "issued") throw new Error("Coordinator successor issuance failed");
+    const coordNext = await revealSuccessor(coord);
+    await rollover.confirmRolloverDelivery({
+      databaseId: fd28.databaseId,
+      clientId: coord.id,
+      certificateId: coordNext.id,
+      now: new Date(),
+    });
+    const certRoot = join(work, "tmp", "certs");
+    for (const endpoint of await platform`SELECT hostname FROM endpoints WHERE kind = 'database'`) {
+      const directory = join(certRoot, String(endpoint.hostname));
+      await mkdir(directory, { recursive: true });
+      for (const name of ["privkey.pem", "fullchain.pem"]) {
+        await Bun.write(join(directory, name), await Bun.file(join(certDir, name)).text());
+        await chmod(join(directory, name), 0o600);
+      }
+    }
+    await Bun.write(
+      join(probeDir, "coordinator.json"),
+      JSON.stringify({ certificateId: coord.generations[0]!.id, databaseId: fd28.databaseId }),
+    );
+    await chownState(arkUid);
+    const platformUrl = new URL(process.env.ARK_PGBOUNCER_PLATFORM_DATABASE_URL ?? process.env.DATABASE_URL!);
+    const coordinatorNetworks = [network];
+    if (["localhost", "127.0.0.1", "::1", "[::1]"].includes(platformUrl.hostname)) {
+      // Loopback is the host-side published port, not an address inside the worker container.
+      // Join the platform Postgres container's network without modifying that container. This
+      // works on shared Docker hosts whose isolated bridges cannot resolve host.docker.internal.
+      const containers = await run([
+        "docker",
+        "ps",
+        "--filter",
+        `publish=${platformUrl.port || "5432"}`,
+        "--format",
+        "{{.ID}}",
+      ]);
+      let found = false;
+      for (const id of containers.stdout.split("\n").filter(Boolean)) {
+        const inspected = await run(["docker", "inspect", id]);
+        const [container] = JSON.parse(inspected.stdout) as Array<{
+          NetworkSettings: {
+            Networks: Record<string, { IPAddress: string }>;
+            Ports: Record<string, Array<{ HostPort: string }> | null>;
+          };
+        }>;
+        const port = Object.entries(container!.NetworkSettings.Ports).find(([, bindings]) =>
+          bindings?.some((binding) => binding.HostPort === (platformUrl.port || "5432")),
+        );
+        const attached = Object.entries(container!.NetworkSettings.Networks).find(
+          ([, networkSettings]) => networkSettings.IPAddress,
+        );
+        if (!port || !attached) continue;
+        platformUrl.hostname = attached[1].IPAddress;
+        platformUrl.port = port[0].split("/")[0]!;
+        if (!coordinatorNetworks.includes(attached[0])) coordinatorNetworks.push(attached[0]);
+        found = true;
+        break;
+      }
+      if (!found) platformUrl.hostname = "host.docker.internal";
+    }
+    const coordinatorEnv = {
+      DATABASE_URL: platformUrl.toString(),
+      ARK_ROOT_KEY: process.env.ARK_ROOT_KEY!,
+      ARK_RUNTIME_ROLE: "worker",
+      ARK_PGBOUNCER_RELOAD: "1",
+      ARK_PGBOUNCER_DIR: "/pgbouncer",
+      ARK_CERT_DIR: "/var/lib/ark/certs",
+      ARK_EMBEDDED_WORKERS: "0",
+      ARK_PGBOUNCER_ADMIN_PASSWORD: adminPassword,
+    };
+    const coordinatorName = `${project}-coordinator`;
+    fd28Holders.push(coordinatorName);
+    const primaryNetwork = coordinatorNetworks.includes("bridge") ? "bridge" : coordinatorNetworks[0]!;
+    await run(
+      [
+        "docker",
+        "create",
+        "--name",
+        coordinatorName,
+        "--user",
+        arkUid,
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--network",
+        primaryNetwork,
+        "--add-host",
+        "host.docker.internal:host-gateway",
+        "--volume",
+        `${socketVolume}:/var/run/pgbouncer`,
+        "--volume",
+        `${pgbouncerDir}:/pgbouncer`,
+        "--volume",
+        `${certRoot}:/var/lib/ark/certs:ro`,
+        "--volume",
+        `${probeDir}:/probe:ro`,
+        ...Object.keys(coordinatorEnv).flatMap((name) => ["--env", name]),
+        bunImage,
+        "bun",
+        "/probe/pgbouncer-coordinator-probe.js",
+        "/probe/coordinator.json",
+      ],
+      { env: coordinatorEnv },
+    );
+    for (const attached of coordinatorNetworks.filter((name) => name !== primaryNetwork))
+      await run(["docker", "network", "connect", attached, coordinatorName]);
+    const coordinated = await run(["docker", "start", "--attach", coordinatorName], { allowFailure: true });
+    const coordinatorExit = await inspect(coordinatorName, "{{.State.ExitCode}}");
+    if (coordinatorExit !== "0")
+      throw new Error(
+        `Coordinator probe failed (${coordinatorExit}): ${coordinated.stderr || coordinated.stdout}`,
+      );
+    const coordinatorLine = coordinated.stdout.split("\n").findLast((line) => line.startsWith("{"));
+    if (!coordinatorLine) throw new Error("The coordinator probe reported no outcome");
+    const coordinatorResult = JSON.parse(coordinatorLine) as {
+      ok: boolean;
+      acknowledgements: number;
+      drainedAt: number;
+      deadline: number;
+    };
+    if (!coordinatorResult.ok || coordinatorResult.drainedAt > coordinatorResult.deadline)
+      throw new Error(`Coordinator missed the live retirement deadline: ${coordinatorLine}`);
+    await expectConnects(coord, coordNext, "FD-28 production coordinator: successor reconnects");
+    note(
+      "FD-28 production coordinator and scheduler",
+      `real admin reload, ${coordinatorResult.acknowledgements} exact-policy ingress acknowledgements, completed before not_after +5 s; independent watchdog remained idle`,
+    );
     log(`\n---- FD-28 drain timing ----\n${fd28Results.join("\n")}\n`);
   } finally {
     for (const name of fd28Holders) await run(["docker", "rm", "--force", name], { allowFailure: true });
@@ -1991,6 +2139,14 @@ try {
       ? await platform`SELECT DISTINCT ca_id FROM client_certificates WHERE subject_cn LIKE ${`${fd28Database}_%`}`
       : [];
     const caIds = caRows.map((row) => String(row.ca_id));
+    const certificateRows = ids.length
+      ? await platform`SELECT id FROM client_certificates WHERE subject_cn LIKE ${`${fd28Database}_%`}`
+      : [];
+    const alertKeys = [
+      ...ids.map((id) => `db-client-rollover:${id}`),
+      ...certificateRows.map((row) => `db-client-retire:${row.id}`),
+    ];
+    if (alertKeys.length) await platform`DELETE FROM alerts WHERE dedup_key IN ${platform(alertKeys)}`;
     await platform`DELETE FROM operations WHERE target_ids ? ${fd28.databaseId}`;
     if (ids.length)
       await platform`DELETE FROM client_certificate_retirements WHERE client_id IN ${platform(ids)}`;

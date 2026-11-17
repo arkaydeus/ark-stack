@@ -413,11 +413,51 @@ describe("retireGeneration (§3.10.4 step 4)", () => {
       },
     }).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(RetirementError);
-    expect((failure as Error).message).toMatch(/missed its deadline: 1 session/);
+    expect((failure as Error).message).toMatch(/exhausted its recovery budget/);
     expect((failure as RetirementError).timeline.withinDeadline).toBe(false);
     expect((failure as RetirementError).timeline.reloadedAt).toBe(start);
     expect(pgb.commands).not.toContain("ENABLE appdb");
     expect(pgb.state().disabled).toBe(true);
+  });
+
+  test("a verified late drain returns its timeline and still reopens", async () => {
+    const clock = { now: start + 6_000 };
+    const pgb = fakeConsole({ clients: [{ id: "9", user: "appdb_shop_production" }], clock });
+    const result = await retireGeneration({
+      database: "appdb",
+      role: "appdb_shop_production",
+      deadline: new Date(start + 5_000),
+      admin: pgb.admin,
+      apply: async () => undefined,
+      clock: () => clock.now,
+      sleep: async (ms) => {
+        clock.now += ms;
+      },
+    });
+    expect(result.withinDeadline).toBe(false);
+    expect(result.drainedAt).toBeGreaterThan(start + 5_000);
+    expect(pgb.state().disabled).toBe(false);
+    expect(pgb.commands).toContain("ENABLE appdb");
+  });
+
+  test("an unresolved admin command or apply has a bounded attempt and never reopens", async () => {
+    for (const hangApply of [false, true]) {
+      const commands: string[] = [];
+      const error = await retireGeneration({
+        database: "appdb",
+        role: "appdb_shop_production",
+        deadline: new Date(Date.now() - 10),
+        recoveryBudgetMs: 20,
+        admin: async (command) => {
+          commands.push(command);
+          return hangApply ? [] : new Promise(() => {});
+        },
+        apply: async () => new Promise(() => {}),
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(RetirementError);
+      expect((error as Error).message).toMatch(/timed out/);
+      expect(commands).not.toContain("ENABLE appdb");
+    }
   });
 
   test("ENABLE is best-effort when the database left [databases] with the reload", async () => {
