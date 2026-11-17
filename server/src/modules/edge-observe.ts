@@ -22,22 +22,19 @@ import {
   type OperationKind,
   type RouteRevalidation,
   type TailnetNode,
-  type TailnetSnapshot,
 } from "@ark-stack/shared";
 import { desc, eq } from "drizzle-orm";
 
-import { db, sql } from "../db.ts";
-import {
-  auditEvents,
-  certificates,
-  endpoints,
-  frontRoutes,
-  operations,
-  tailnetNodes,
-  tailnetSnapshots,
-} from "../schema.ts";
+import { db } from "../db.ts";
+import { auditEvents, certificates, endpoints, frontRoutes, operations } from "../schema.ts";
 import { currentRoute, routeVersion } from "./front-route-state.ts";
 import type { EdgeLocalApi, ProbeResult } from "./tailnet-localapi.ts";
+import {
+  commitTailnetGeneration,
+  loadTailnetSnapshot,
+  snapshotLeaseValid,
+  type LoadedSnapshot,
+} from "./tailnet-snapshot.ts";
 
 type Enqueue = (input: {
   kind: OperationKind;
@@ -65,38 +62,12 @@ type RouteRow = typeof frontRoutes.$inferSelect & {
   version: string;
 };
 
-function toNode(row: typeof tailnetNodes.$inferSelect): TailnetNode {
-  return {
-    source: row.source,
-    generation: row.generation,
-    stableId: row.stableId,
-    dnsName: row.dnsName,
-    hostName: row.hostName,
-    ipv4: row.ipv4,
-    ipv6: row.ipv6,
-    tags: row.tags,
-    isSelf: row.isSelf,
-    online: row.online,
-  };
-}
-
 /** The persisted `edge` snapshot and its nodes. */
-export async function loadEdgeSnapshot() {
-  const [row] = await db.select().from(tailnetSnapshots).where(eq(tailnetSnapshots.source, "edge"));
-  const nodes = (await db.select().from(tailnetNodes).where(eq(tailnetNodes.source, "edge"))).map(toNode);
-  const self = nodes.find((node) => node.isSelf) ?? null;
-  const snapshot: TailnetSnapshot | null = row
-    ? {
-        source: "edge",
-        generation: row.generation,
-        completedAt: row.completedAt.toISOString(),
-        validUntil: row.validUntil.toISOString(),
-      }
-    : null;
-  return { row: row ?? null, snapshot, self, peers: nodes.filter((node) => !node.isSelf) };
+export function loadEdgeSnapshot() {
+  return loadTailnetSnapshot("edge");
 }
 
-type Loaded = Awaited<ReturnType<typeof loadEdgeSnapshot>>;
+type Loaded = LoadedSnapshot;
 
 async function loadRoutes(): Promise<RouteRow[]> {
   const rows = await db
@@ -151,9 +122,7 @@ function revalidate(route: RouteRow, loaded: Loaded, now: Date): RouteRevalidati
   });
 }
 
-function leaseValid(loaded: Loaded, now: Date) {
-  return Boolean(loaded.row && loaded.row.validUntil.getTime() > now.getTime());
-}
+const leaseValid = snapshotLeaseValid;
 
 /**
  * The allowlist every proxy enforces (§3.2): enabled `ready` routes whose pinned StableID and IP
@@ -267,45 +236,14 @@ export async function expireStaleEdgeRoutes(input: { enqueue: Enqueue; now?: Dat
   return committed.map((route) => route.id);
 }
 
-/** Commits one complete generation; refuses to replace a newer one. */
-async function commitGeneration(input: {
+function commitGeneration(input: {
   generation: string;
   self: TailnetNode;
   peers: TailnetNode[];
   completedAt: Date;
   validUntil: Date;
 }) {
-  const nodes = [input.self, ...input.peers];
-  const completedAt = input.completedAt.toISOString();
-  const validUntil = input.validUntil.toISOString();
-  await sql.begin(async (tx) => {
-    await tx`SELECT pg_advisory_xact_lock(hashtext('ark:tailnet:edge'))`;
-    const [current] = await tx`
-      SELECT (extract(epoch FROM completed_at) * 1000)::float8 AS completed_ms
-      FROM tailnet_snapshots WHERE source = 'edge' FOR UPDATE
-    `;
-    if (current && Number(current.completed_ms) >= input.completedAt.getTime()) {
-      throw new Error("A newer edge observation is already committed; this one is discarded.");
-    }
-    await tx`
-      INSERT INTO tailnet_snapshots (source, generation, completed_at, valid_until)
-      VALUES ('edge', ${input.generation}, ${completedAt}::timestamptz, ${validUntil}::timestamptz)
-      ON CONFLICT (source) DO UPDATE
-        SET generation = EXCLUDED.generation, completed_at = EXCLUDED.completed_at,
-            valid_until = EXCLUDED.valid_until
-    `;
-    // Peers absent from this generation disappear in the same transaction.
-    await tx`DELETE FROM tailnet_nodes WHERE source = 'edge'`;
-    for (const node of nodes) {
-      await tx`
-        INSERT INTO tailnet_nodes (source, generation, stable_id, dns_name, host_name, ipv4, ipv6, tags,
-          is_self, online, observed_at)
-        VALUES ('edge', ${input.generation}, ${node.stableId}, ${node.dnsName}, ${node.hostName},
-          ${node.ipv4}, ${node.ipv6}, ${JSON.stringify(node.tags)}::jsonb, ${node.isSelf}, ${node.online},
-          ${completedAt}::timestamptz)
-      `;
-    }
-  });
+  return commitTailnetGeneration("edge", input);
 }
 
 export type RouteOutcome = {

@@ -14,7 +14,9 @@ import {
   createToken,
   privilegedRequestHash,
   s3TargetInput,
+  tailnetRestTargetInput,
   PROVIDER_RECIPES,
+  TAILNET_REST_RECIPE,
   writerPolicy,
   localPart,
   normalizeHostname,
@@ -115,7 +117,13 @@ import {
 } from "./modules/front-routes.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, tailnetOverview } from "./modules/edge-observe.ts";
 import { raiseAlert } from "./modules/alerts.ts";
-import { backupHealth, publicTarget, saveS3Target } from "./modules/offsite-backups.ts";
+import {
+  backupHealth,
+  publicTarget,
+  saveS3Target,
+  saveTailnetRestTarget,
+} from "./modules/offsite-backups.ts";
+import { BACKUP_OBSERVE_TARGET, backupTailnetOverview } from "./modules/backup-observe.ts";
 import {
   CLIENT_PASSWORD_SECRET_KIND,
   DatabaseClientError,
@@ -2542,6 +2550,7 @@ app.get("/api/backups/targets", async (c) => {
     targets: targets.map(publicTarget),
     health: await backupHealth(),
     recipes: PROVIDER_RECIPES,
+    tailnetRecipe: TAILNET_REST_RECIPE,
     regionHint: regionSummary(settings ?? null).backupRegionHint,
     bucketProtectionPolicy: Object.fromEntries(
       targets
@@ -2558,10 +2567,10 @@ app.put("/api/backups/targets/:kind", async (c) => {
   const access = c.get("access");
   requireOwner(access);
   requireMfa(c.get("session"));
+  if (c.req.param("kind") === "tailnet_rest")
+    return c.json(await saveTailnetTarget(await c.req.json(), access, c.get("session")));
   if (c.req.param("kind") !== "s3") {
-    throw new HTTPException(400, {
-      message: "Only the S3-compatible target is configurable here (tailnet REST is FD-30).",
-    });
+    throw new HTTPException(400, { message: "Backup target kind must be s3 or tailnet_rest." });
   }
   const request = await c.req.json();
   const input = s3TargetInput.parse(request);
@@ -2605,6 +2614,66 @@ app.put("/api/backups/targets/:kind", async (c) => {
     access.role,
   );
   return c.json({ target: publicTarget(target), verifyOperationId: operation.id });
+});
+
+/**
+ * The home target (FD-30, front door §3.18.3): pinned from backup-ts's own observation when saved, so
+ * the request fails unless backup-ts currently sees exactly one matching, untagged home machine.
+ */
+async function saveTailnetTarget(request: Record<string, unknown>, access: Access, session: SessionValue) {
+  const input = tailnetRestTargetInput.parse(request);
+  await requirePrivileged(
+    access,
+    session,
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", { backupTarget: "tailnet_rest", ...request }),
+  );
+  let target: Awaited<ReturnType<typeof saveTailnetRestTarget>>;
+  try {
+    target = await saveTailnetRestTarget(input);
+  } catch (error) {
+    throw new HTTPException(422, {
+      message: error instanceof Error ? error.message : "Backup target rejected.",
+    });
+  }
+  const operation = await enqueue({
+    kind: "backup.verify_target",
+    actorId: access.userId,
+    targetIds: [target.id],
+    payload: { revision: target.configRevision },
+  });
+  await audit(
+    access.userId,
+    "backup.target_saved",
+    "backup_target",
+    target.id,
+    {
+      kind: "tailnet_rest",
+      restUrl: input.restUrl,
+      pinned: { stableId: target.targetNodeStableId, ip: target.targetIp },
+      recoveryWindowDays: input.recoveryWindowDays,
+      credentialsReplaced: Boolean(input.password),
+    },
+    operation.id,
+    access.role,
+  );
+  return { target: publicTarget(target), verifyOperationId: operation.id };
+}
+
+// backup-ts's view of the tailnet (FD-30): its own generation, lease and each home target's identity.
+app.get("/api/backups/tailnet", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(await backupTailnetOverview());
+});
+
+app.post("/api/backups/tailnet/observe", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  // Read-only, no exposure effect; a queued or running observation is reused.
+  const operation = await enqueue({ kind: "backup.observe", targetIds: [BACKUP_OBSERVE_TARGET] });
+  await audit(access.userId, "backup.tailnet.observe", "tailnet", "backup", {}, operation?.id, access.role);
+  return c.json({ operation }, 202);
 });
 
 app.post("/api/backups/targets/:id/verify", async (c) => {

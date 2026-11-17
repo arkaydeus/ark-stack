@@ -2,11 +2,18 @@ import { describe, expect, test } from "bun:test";
 
 import {
   PROVIDER_RECIPES,
+  REQUIRED_BACKUP_TARGET_KINDS,
+  backupSocksProxy,
   canaryKey,
   evaluateBackupHealth,
   locksKey,
+  restRepositoryUser,
+  resticRestEnv,
+  resticRestRepository,
   resticS3Repository,
   s3TargetInput,
+  tailnetRestTargetInput,
+  withoutProxyEnv,
   writerPolicy,
   type HealthExport,
   type HealthSource,
@@ -52,6 +59,18 @@ const sources = (overrides: Partial<HealthSource> = {}): HealthSource[] =>
     ...overrides,
   }));
 const pgSources = ["pg:ark-platform", "pg:ark-app"];
+// FD-30: the home target, healthy unless a test overrides it.
+const home = (overrides: Partial<HealthTarget> = {}): HealthTarget =>
+  target({
+    id: "bkt_home",
+    name: "home",
+    kind: "tailnet_rest",
+    retentionUntil: null,
+    identity: { ok: true, message: "pinned" },
+    ...overrides,
+  });
+const homeExports = (overrides: Partial<HealthExport> = {}) =>
+  exported({ targetId: "bkt_home", ...overrides });
 
 describe("S3 target model (FD-21)", () => {
   test("input validation normalizes the endpoint and rejects paths and credentials in it", () => {
@@ -136,10 +155,10 @@ describe("S3 target model (FD-21)", () => {
 });
 
 describe("backup health (FD-21, front door §3.18.4)", () => {
-  test("healthy with a current append-only target and fresh recovery points", () => {
+  test("healthy with a current append-only target of each kind and fresh recovery points", () => {
     const health = evaluateBackupHealth({
-      targets: [target()],
-      exports: exported(),
+      targets: [target(), home()],
+      exports: [...exported(), ...homeExports()],
       sources: sources(),
       pgSources,
       now,
@@ -152,7 +171,10 @@ describe("backup health (FD-21, front door §3.18.4)", () => {
   test("no target configured is unhealthy", () => {
     const health = evaluateBackupHealth({ targets: [], exports: [], sources: sources(), pgSources, now });
     expect(health.healthy).toBe(false);
-    expect(health.alerts.map((item) => item.dedupKey)).toEqual(["backup-no-target"]);
+    expect(health.alerts.map((item) => item.dedupKey)).toEqual([
+      "backup-no-target",
+      "backup-no-target:tailnet_rest",
+    ]);
   });
 
   test("deletable, unknown, short retention and expired evidence are all unhealthy", () => {
@@ -259,5 +281,175 @@ describe("backup health (FD-21, front door §3.18.4)", () => {
       now,
     });
     expect(health.alerts.map((item) => item.dedupKey)).toContain("backup-no-target");
+  });
+});
+
+describe("both destinations are required (FD-30, §3.18.4)", () => {
+  test("S3 and the home target are both required kinds", () => {
+    expect([...REQUIRED_BACKUP_TARGET_KINDS].toSorted()).toEqual(["s3", "tailnet_rest"]);
+  });
+
+  test("an S3 target alone is not healthy: the home destination is missing", () => {
+    const health = evaluateBackupHealth({
+      targets: [target()],
+      exports: exported(),
+      sources: sources(),
+      pgSources,
+      now,
+    });
+    expect(health.healthy).toBe(false);
+    expect(health.targets[0]!.healthy).toBe(true);
+    expect(health.reasons).toEqual(["No home (tailnet REST) backup target is configured."]);
+    expect(health.alerts.map((item) => item.dedupKey)).toEqual(["backup-no-target:tailnet_rest"]);
+  });
+
+  test("either target stale makes backups unhealthy and alerts", () => {
+    for (const [stale, key] of [
+      ["s3", "backup-target-stale:bkt_a"],
+      ["tailnet_rest", "backup-target-stale:bkt_home"],
+    ] as const) {
+      const old = minutesAgo(40 * 60);
+      const health = evaluateBackupHealth({
+        targets: [
+          target(stale === "s3" ? { lastSuccessAt: old } : {}),
+          home(stale === "tailnet_rest" ? { lastSuccessAt: old } : {}),
+        ],
+        exports: [
+          ...exported(stale === "s3" ? { createdAt: old, lastRecoverableAt: old } : {}),
+          ...homeExports(stale === "tailnet_rest" ? { createdAt: old, lastRecoverableAt: old } : {}),
+        ],
+        sources: sources(),
+        pgSources,
+        now,
+      });
+      expect(health.healthy).toBe(false);
+      const keys = health.alerts.map((item) => item.dedupKey);
+      expect(keys).toContain(key);
+      const id = stale === "s3" ? "bkt_a" : "bkt_home";
+      expect(keys).toContain(`backup-rpo:${id}:pg:ark-platform`);
+      expect(health.targets.find((item) => item.id === id)!.healthy).toBe(false);
+      expect(health.targets.find((item) => item.id !== id)!.healthy).toBe(true);
+    }
+  });
+
+  test("an invalid home identity suspends transfers and is a critical alert", () => {
+    const health = evaluateBackupHealth({
+      targets: [target(), home({ identity: { ok: false, message: "backup-ts's observation has expired" } })],
+      exports: [...exported(), ...homeExports()],
+      sources: sources(),
+      pgSources,
+      now,
+    });
+    expect(health.healthy).toBe(false);
+    expect(health.alerts).toContainEqual(
+      expect.objectContaining({ dedupKey: "backup-tailnet:bkt_home", severity: "critical" }),
+    );
+  });
+
+  test("rest-server append-only evidence has no object-retention deadline but still expires", () => {
+    const fresh = evaluateBackupHealth({
+      targets: [target(), home()],
+      exports: [...exported(), ...homeExports()],
+      sources: sources(),
+      pgSources,
+      now,
+    });
+    expect(fresh.targets.find((item) => item.id === "bkt_home")!.appendOnly.current).toBe(true);
+    const expired = evaluateBackupHealth({
+      targets: [target(), home({ appendOnlyCheckedAt: minutesAgo(8 * 24 * 60) })],
+      exports: [...exported(), ...homeExports()],
+      sources: sources(),
+      pgSources,
+      now,
+    });
+    expect(expired.alerts).toContainEqual(
+      expect.objectContaining({ dedupKey: "backup-append-only:bkt_home" }),
+    );
+  });
+});
+
+describe("tailnet REST target model (FD-30)", () => {
+  test("accepts the documented URL and derives the private-repos user", () => {
+    const input = tailnetRestTargetInput.parse({
+      name: "home",
+      restUrl: "http://backup-home.tail1234.ts.net:8000/ark/",
+      password: "htpasswd-secret",
+      repositoryPassword: "x".repeat(32),
+    });
+    expect(input.restUrl).toBe("http://backup-home.tail1234.ts.net:8000/ark");
+    expect(restRepositoryUser(input.restUrl)).toBe("ark");
+    expect(
+      tailnetRestTargetInput.parse({ name: "ip", restUrl: "http://100.66.2.9:8000/ark/vps1" }).restUrl,
+    ).toBe("http://100.66.2.9:8000/ark/vps1");
+  });
+
+  test("rejects public hosts, credentials in the URL, missing ports and odd paths", () => {
+    for (const restUrl of [
+      "http://backup.example.com:8000/ark",
+      "http://8.8.8.8:8000/ark",
+      "http://ark:pw@backup-home.tail1234.ts.net:8000/ark",
+      "http://backup-home.tail1234.ts.net/ark",
+      "http://backup-home.tail1234.ts.net:8000/",
+      "http://backup-home.tail1234.ts.net:8000/ark?x=1",
+      "ftp://backup-home.tail1234.ts.net:8000/ark",
+      "http://100.100.100.100:8000/ark",
+    ]) {
+      expect(tailnetRestTargetInput.safeParse({ name: "home", restUrl }).success).toBe(false);
+    }
+  });
+
+  test("http:// substitutes the pinned address; https:// keeps the certificate's name", () => {
+    expect(
+      resticRestRepository({ restUrl: "http://backup-home.tail1234.ts.net:8000/ark", targetIp: "100.66.2.9" })
+        .repository,
+    ).toBe("rest:http://100.66.2.9:8000/ark/");
+    expect(
+      resticRestRepository({
+        restUrl: "http://backup-home.tail1234.ts.net:8000/ark",
+        targetIp: "fd7a:115c:a1e0::1:2",
+      }).repository,
+    ).toBe("rest:http://[fd7a:115c:a1e0::1:2]:8000/ark/");
+    expect(
+      resticRestRepository({
+        restUrl: "https://backup-home.tail1234.ts.net:8000/ark",
+        targetIp: "100.66.2.9",
+      }).repository,
+    ).toBe("rest:https://backup-home.tail1234.ts.net:8000/ark/");
+    expect(() =>
+      resticRestRepository({ restUrl: "http://backup-home.tail1234.ts.net:8000/ark", targetIp: "10.0.0.1" }),
+    ).toThrow();
+  });
+
+  test("the REST subprocess gets exactly one matching-scheme proxy and no other proxy setting", () => {
+    const keys = { username: "ark", password: "pw", repositoryPassword: "repo" };
+    const http = resticRestEnv(
+      { restUrl: "http://backup-home.tail1234.ts.net:8000/ark" },
+      keys,
+      "socks5://backup-ts:1055",
+    );
+    expect(http).toEqual({
+      RESTIC_REST_USERNAME: "ark",
+      RESTIC_REST_PASSWORD: "pw",
+      RESTIC_PASSWORD: "repo",
+      HTTP_PROXY: "socks5://backup-ts:1055",
+    });
+    const https = resticRestEnv({ restUrl: "https://backup-home.tail1234.ts.net:8000/ark" }, keys, "");
+    expect(https.HTTPS_PROXY).toBe("socks5://backup-ts:1055");
+    expect(https.HTTP_PROXY).toBeUndefined();
+    expect(() => backupSocksProxy("http://backup-ts:1055")).toThrow();
+    expect(() => backupSocksProxy("socks5://user:pw@backup-ts:1055")).toThrow();
+  });
+
+  test("proxy variables are stripped from any inherited environment", () => {
+    expect(
+      withoutProxyEnv({
+        PATH: "/bin",
+        HTTP_PROXY: "socks5://decoy:1",
+        https_proxy: "http://decoy:2",
+        ALL_PROXY: "x",
+        NO_PROXY: "*",
+        no_proxy: "*",
+      }),
+    ).toEqual({ PATH: "/bin" });
   });
 });

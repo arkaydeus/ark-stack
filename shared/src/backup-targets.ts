@@ -3,15 +3,25 @@
 // One `backup_targets` shape covers every S3-compatible provider (AWS S3, Backblaze B2, Cloudflare R2,
 // MinIO): endpoint, region (suggested by the FD-03 region preset), bucket, prefix and path style. Each
 // target holds one restic repository at `<prefix>/restic`, which receives immutable snapshots of the
-// staged local pgBackRest repositories and the mail/volume backups. The kind union is the extension
-// point for FD-30's `tailnet_rest` destination: health, alerts and the exporter iterate targets of any
-// kind and ask `resticRepository` for the repository and its environment.
+// staged local pgBackRest repositories and the mail/volume backups.
+//
+// FD-30 adds `tailnet_rest`: a restic REST repository on the owner's home machine
+// (`rest-server --append-only --private-repos`), reached only through the dedicated `backup-ts`
+// node's SOCKS5 proxy and pinned like a route (StableNodeID + address from backup-ts's own
+// observation, §3.18.3). Health, alerts and the exporter iterate targets of any kind.
 import { z } from "zod";
+
+import { parseIpLiteral, checkTailnetAddress } from "./tailnet.ts";
 
 export const BACKUP_TARGET_KINDS = ["s3", "tailnet_rest"] as const;
 export type BackupTargetKind = (typeof BACKUP_TARGET_KINDS)[number];
-/** Kinds whose fresh, append-only coverage "backups healthy" requires. FD-30 adds `tailnet_rest`. */
-export const REQUIRED_BACKUP_TARGET_KINDS: readonly BackupTargetKind[] = ["s3"];
+/** Kinds whose fresh, append-only coverage "backups healthy" requires (R8: both destinations). */
+export const REQUIRED_BACKUP_TARGET_KINDS: readonly BackupTargetKind[] = ["s3", "tailnet_rest"];
+
+export const BACKUP_TARGET_KIND_LABELS: Record<BackupTargetKind, string> = {
+  s3: "S3-compatible",
+  tailnet_rest: "home (tailnet REST)",
+};
 
 export const S3_PROVIDERS = ["aws", "b2", "r2", "minio", "other"] as const;
 export type S3Provider = (typeof S3_PROVIDERS)[number];
@@ -158,6 +168,205 @@ export function resticS3Env(
     RESTIC_PASSWORD: secrets.repositoryPassword,
   };
 }
+
+// ---- Home machine over the tailnet (FD-30, §3.18.3) ----------------------------------------------
+
+/** backup-ts's SOCKS5 listener on the internal `backup-tailnet` network. */
+export const DEFAULT_BACKUP_SOCKS5_PROXY = "socks5://backup-ts:1055";
+/** The local transfer watchdog re-checks identity and freshness this often during a transfer. */
+export const TRANSFER_GUARD_INTERVAL_MS = 1_000;
+/** Documented bound: an active REST transfer stops this soon after its identity becomes invalid. */
+export const TRANSFER_STOP_BOUND_MS = 5_000;
+/** Grace between SIGTERM and SIGKILL for a guarded restic subprocess (inside the bound). */
+export const TRANSFER_KILL_GRACE_MS = 2_000;
+
+/**
+ * Every proxy variable Go's `ProxyFromEnvironment` (and curl-style tools) read. A restic subprocess
+ * never inherits any of them: S3 runs with none, and the REST subprocess gets exactly one.
+ */
+export const PROXY_ENV_NAMES = [
+  "HTTP_PROXY",
+  "http_proxy",
+  "HTTPS_PROXY",
+  "https_proxy",
+  "ALL_PROXY",
+  "all_proxy",
+  "NO_PROXY",
+  "no_proxy",
+  "REQUEST_METHOD",
+] as const;
+
+const REST_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+
+/**
+ * The home rest-server URL as documented: `http://backup-home.<tailnet>.ts.net:8000/ark`. The host is a
+ * MagicDNS name or a Tailscale address (never a public name), the port is explicit, and the first path
+ * segment is the htpasswd user (`--private-repos` only lets a user reach paths under its own name).
+ * No credentials, query or fragment: the htpasswd password is sealed separately.
+ */
+export const tailnetRestUrlSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(300)
+  .transform((value, context) => {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      context.addIssue({
+        code: "custom",
+        message: "Enter the REST URL, e.g. http://backup-home.tail1234.ts.net:8000/ark.",
+      });
+      return z.NEVER;
+    }
+    const problem = tailnetRestUrlProblem(url, value);
+    if (problem) {
+      context.addIssue({ code: "custom", message: problem });
+      return z.NEVER;
+    }
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
+  });
+
+function tailnetRestUrlProblem(url: URL, raw: string) {
+  if (url.protocol !== "http:" && url.protocol !== "https:")
+    return "The REST URL must be http:// or https://.";
+  if (url.username || url.password)
+    return "Do not put credentials in the URL; enter the htpasswd user and password.";
+  if (url.search || url.hash || raw.includes("?") || raw.includes("#"))
+    return "The REST URL has no query or fragment.";
+  if (!url.port) return "Give the rest-server port explicitly, e.g. :8000.";
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  const ip = parseIpLiteral(host);
+  if (ip) {
+    if (checkTailnetAddress(ip)) return "The REST host must be a Tailscale address or MagicDNS name.";
+  } else if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host) || !host.endsWith(".ts.net")) {
+    return "The REST host must be the home machine's MagicDNS name (…ts.net) or Tailscale address.";
+  }
+  const segments = url.pathname.replace(/\/+$/, "").split("/").slice(1);
+  if (!segments.length || segments.length > 4 || segments.some((segment) => !REST_SEGMENT.test(segment)))
+    return "The REST path is 1-4 segments starting with the htpasswd user, e.g. /ark.";
+  return null;
+}
+
+/** The htpasswd user a `--private-repos` server requires: the first path segment. */
+export function restRepositoryUser(restUrl: string) {
+  return new URL(restUrl).pathname.split("/")[1] ?? "";
+}
+
+/** Host (MagicDNS name or address) and port of a validated REST URL. */
+export function restUrlTarget(restUrl: string) {
+  const url = new URL(restUrl);
+  return {
+    host: url.hostname.replace(/^\[|\]$/g, "").toLowerCase(),
+    port: Number(url.port),
+    https: url.protocol === "https:",
+  };
+}
+
+export const tailnetRestTargetInput = z.object({
+  /** Updates this target; omitted, a new target is created. */
+  id: z.string().trim().min(1).max(64).optional(),
+  name: z.string().trim().min(1).max(80),
+  restUrl: tailnetRestUrlSchema,
+  recoveryWindowDays: z.number().int().min(1).max(3650).default(30),
+  // Credentials are write-only: required when the target is created, optional (kept) on update.
+  password: z.string().min(8).max(512).optional(),
+  repositoryPassword: z.string().min(24).max(512).optional(),
+});
+export type TailnetRestTargetInput = z.infer<typeof tailnetRestTargetInput>;
+
+export type TailnetRestConfig = {
+  restUrl: string;
+  /** Pinned address from backup-ts's observation; substituted for the host on http:// URLs. */
+  targetIp: string;
+};
+
+/** Validates the SOCKS5 proxy URL backup-ts exposes (`socks5://backup-ts:1055`). */
+export function backupSocksProxy(value: string | undefined | null) {
+  const raw = (value ?? "").trim() || DEFAULT_BACKUP_SOCKS5_PROXY;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("ARK_BACKUP_SOCKS5_PROXY is not a URL.");
+  }
+  if ((url.protocol !== "socks5:" && url.protocol !== "socks5h:") || !url.hostname || !url.port) {
+    throw new Error("ARK_BACKUP_SOCKS5_PROXY must be socks5://host:port.");
+  }
+  if (url.username || url.password || (url.pathname && url.pathname !== "/") || url.search)
+    throw new Error("ARK_BACKUP_SOCKS5_PROXY takes no credentials, path or query.");
+  return { url: `${url.protocol}//${url.host}`, host: url.hostname, port: Number(url.port) };
+}
+
+/**
+ * The restic REST repository for a pinned home target (§3.18.3). For http:// the validated pinned
+ * Tailscale address replaces the name, so a re-pointed MagicDNS name never redirects a transfer; the
+ * path (repository and `--private-repos` user) is unchanged. https:// keeps the name, which the
+ * certificate binds; backup-ts resolves it from its own netmap. Credentials never go into the URL.
+ */
+export function resticRestRepository(config: TailnetRestConfig) {
+  const url = new URL(config.restUrl);
+  const pinned = parseIpLiteral(config.targetIp);
+  if (!pinned || checkTailnetAddress(pinned))
+    throw new Error("The pinned target is not a Tailscale address.");
+  const host =
+    url.protocol === "https:"
+      ? url.hostname
+      : pinned.version === 6
+        ? `[${pinned.canonical}]`
+        : pinned.canonical;
+  return {
+    repository: `rest:${url.protocol}//${host}:${url.port}${url.pathname.replace(/\/+$/, "")}/`,
+    options: [] as string[],
+  };
+}
+
+/**
+ * The complete environment of the REST restic subprocess, apart from PATH/HOME/cache: htpasswd and
+ * repository credentials, and exactly one matching-scheme proxy variable (HTTP_PROXY for http://,
+ * HTTPS_PROXY for https://). Nothing else proxy-related is set, so inherited NO_PROXY/ALL_PROXY
+ * values can never bypass or redirect it, and no other subprocess or request ever sees the proxy.
+ */
+export function resticRestEnv(
+  config: Pick<TailnetRestConfig, "restUrl">,
+  secrets: { username: string; password: string; repositoryPassword: string },
+  proxy: string,
+) {
+  const https = new URL(config.restUrl).protocol === "https:";
+  return {
+    RESTIC_REST_USERNAME: secrets.username,
+    RESTIC_REST_PASSWORD: secrets.password,
+    RESTIC_PASSWORD: secrets.repositoryPassword,
+    [https ? "HTTPS_PROXY" : "HTTP_PROXY"]: backupSocksProxy(proxy).url,
+  } as Record<string, string>;
+}
+
+/** Removes every proxy variable from an environment (S3 restic, API/control calls). */
+export function withoutProxyEnv(env: Record<string, string | undefined>) {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    if ((PROXY_ENV_NAMES as readonly string[]).includes(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Steps for the home machine shown in the UI and docs/guides/backups.md. */
+export const TAILNET_REST_RECIPE = {
+  label: "Home machine (rest-server over the tailnet)",
+  urlExample: "http://backup-home.tail1234.ts.net:8000/ark",
+  server: [
+    "Run rest-server --append-only --private-repos --listen <tailnet-ip>:8000 with an htpasswd file holding one user for Ark (the first path segment of the URL, e.g. ark).",
+    "Join the home machine to the tailnet as backup-home, without any tag:ark-* tag.",
+    "Add the generated tag:ark-backup grant for this target from Front door ACL (only tcp:8000 to this machine).",
+  ],
+  notes: [
+    "Ark reaches the server only through its backup-ts node (tag:ark-backup); the edge node has no grant.",
+    "Pruning runs on the home machine, never from the VPS: append-only mode refuses Ark's deletes.",
+  ],
+} as const;
 
 /**
  * Prefix classes the canary must cover (§3.18.2 step 1). Every class that a bucket lock rule, IAM
@@ -365,6 +574,11 @@ export type HealthTarget = {
   recoveryWindowDays: number;
   lastSuccessAt: Date | null;
   lastError: string | null;
+  /**
+   * tailnet_rest only: the pinned identity checked against backup-ts's current observation. Not ok
+   * (expired observation, replaced or absent node) suspends transfers and is a critical alert.
+   */
+  identity?: { ok: boolean; message: string } | null;
 };
 
 export type HealthExport = {
@@ -414,6 +628,7 @@ export const BACKUP_ALERT_PREFIXES = [
   "backup-capacity:",
   "backup-source:",
   "backup-no-target",
+  "backup-tailnet:",
 ] as const;
 
 function age(now: Date, at: Date | null) {
@@ -448,11 +663,13 @@ export function evaluateBackupHealth(input: {
   const enabled = input.targets.filter((target) => target.enabled);
   for (const kind of required) {
     if (!enabled.some((target) => target.kind === kind)) {
-      reasons.push(`No ${kind === "s3" ? "S3-compatible" : "tailnet"} backup target is configured.`);
+      const label = BACKUP_TARGET_KIND_LABELS[kind];
+      reasons.push(`No ${label} backup target is configured.`);
       alerts.push({
-        dedupKey: `backup-no-target`,
+        // The S3 key predates FD-30; keep it so an open alert resolves rather than duplicates.
+        dedupKey: kind === "s3" ? "backup-no-target" : `backup-no-target:${kind}`,
         severity: "critical",
-        title: `Backups are not leaving the VPS: no ${kind === "s3" ? "S3-compatible" : "tailnet"} target is configured`,
+        title: `Backups are not reaching every destination: no ${label} target is configured`,
       });
     }
   }
@@ -468,7 +685,11 @@ export function evaluateBackupHealth(input: {
 
   const targets = enabled.map((target) => {
     const targetReasons: string[] = [];
-    const retentionCovered = target.retentionUntil ? target.retentionUntil.getTime() > now.getTime() : false;
+    // rest-server --append-only refuses deletion for as long as it runs in that mode; there is no
+    // object retention deadline to cover (pruning happens on the home machine, §3.18.3).
+    const retentionCovered =
+      target.kind === "tailnet_rest" ||
+      (target.retentionUntil ? target.retentionUntil.getTime() > now.getTime() : false);
     const current =
       target.appendOnlyStatus === "append_only" &&
       age(now, target.appendOnlyCheckedAt) <= APPEND_ONLY_EVIDENCE_MAX_AGE_MS &&
@@ -483,6 +704,14 @@ export function evaluateBackupHealth(input: {
         dedupKey: `backup-append-only:${target.id}`,
         severity: target.appendOnlyStatus === "deletable" ? "critical" : "warning",
         title: `Backup target ${target.name}: ${why}`,
+      });
+    }
+    if (target.kind === "tailnet_rest" && target.identity && !target.identity.ok) {
+      targetReasons.push(`${target.name}: transfers suspended: ${target.identity.message}`);
+      alerts.push({
+        dedupKey: `backup-tailnet:${target.id}`,
+        severity: "critical",
+        title: `Backup target ${target.name}: transfers suspended: ${target.identity.message}`,
       });
     }
     if (age(now, target.lastSuccessAt) > TARGET_STALE_MS) {

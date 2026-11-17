@@ -1,4 +1,5 @@
-// Off-VPS backups to S3-compatible targets (docs/design/front-door.md §3.18, FD-21).
+// Off-VPS backups to S3-compatible targets (docs/design/front-door.md §3.18, FD-21) and to the
+// owner's home machine over the tailnet (§3.18.3, FD-30).
 //
 // - The PostgreSQL executors (workers/src/pg-executor.ts) keep an encrypted local pgBackRest repo2 per
 //   cluster and stage completed copies of it under an exclusive lock.
@@ -8,7 +9,13 @@
 //   `backup_exports`. Targets are exported independently: one failing never blocks another.
 // - `backup.verify_target` runs the append-only canary (backup-canary.ts) with the deployed writer
 //   credentials, weekly and whenever a target is saved.
-// - Health and alerts come from evaluateBackupHealth (shared/src/backup-targets.ts).
+// - Health and alerts come from evaluateBackupHealth (shared/src/backup-targets.ts); "healthy" needs
+//   both an S3 and a home target.
+// - A `tailnet_rest` (home) target is pinned from backup-ts's own observation (backup-observe.ts).
+//   Its restic subprocess, and only that subprocess, gets `HTTP_PROXY=socks5://backup-ts:1055`
+//   (HTTPS_PROXY for https://) and the pinned address; every transfer checks identity and freshness
+//   first and runs under the local watchdog, which kills it within the documented bound when either
+//   fails. S3 subprocesses and API/executor calls never see a proxy setting.
 //
 // pgBackRest `expire` is never run from here (scripts/backup-no-expire.test.ts).
 import {
@@ -16,20 +23,27 @@ import {
   PG_CLUSTERS,
   PG_EXPORT_INTERVAL_MS,
   PG_STAGE_MOUNT_ROOT,
+  TRANSFER_KILL_GRACE_MS,
+  backupSocksProxy,
   createId,
   decryptSecret,
   dueBackupType,
   encryptSecret,
   evaluateBackupHealth,
   pgSnapshotTags,
+  restRepositoryUser,
+  resticRestEnv,
+  resticRestRepository,
   resticS3Env,
   resticS3Repository,
+  withoutProxyEnv,
   type BackupHealth,
   type PgCluster,
   type S3Provider,
   type S3TargetInput,
   type StageManifest,
   type StagedBackup,
+  type TailnetRestTargetInput,
 } from "@ark-stack/shared";
 import { and, desc, eq, inArray, isNull, like, or } from "drizzle-orm";
 
@@ -37,8 +51,17 @@ import { db } from "../db.ts";
 import { alerts, backupExports, backupSources, backupTargets, backups, secrets } from "../schema.ts";
 import { raiseAlert } from "./alerts.ts";
 import { runAppendOnlyCanary, type CanaryEvidence } from "./backup-canary.ts";
+import {
+  checkTailnetIdentity,
+  currentTailnetIdentity,
+  guardTransfer,
+  loadBackupSnapshot,
+  pinTailnetTarget,
+} from "./backup-observe.ts";
 import { callExecutor, executorConfig } from "./pg-executor-client.ts";
+import { runRestCanary, type RestCanaryEvidence } from "./rest-canary.ts";
 import { S3Client } from "./s3-client.ts";
+import { socks5HttpRequest } from "./socks5-http.ts";
 
 export { callExecutor, executorConfig };
 
@@ -60,11 +83,31 @@ async function openSecret(id: string | null) {
   return row ? decryptSecret(rootKey(), row) : null;
 }
 
+/** Credentials for one restic invocation: S3 keys, or the home rest-server's htpasswd user. */
+export type ResticKeys = {
+  repositoryPassword: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  username?: string;
+  password?: string;
+};
+
 export async function targetSecrets(target: BackupTargetRow) {
   const credential = await openSecret(target.credentialSecretId);
   const repositoryPassword = await openSecret(target.repositorySecretId);
   if (!credential || !repositoryPassword)
     throw new Error(`Backup target ${target.name} has no sealed credentials.`);
+  if (target.kind === "tailnet_rest") {
+    const rest = JSON.parse(credential) as { username: string; password: string };
+    return {
+      accessKeyId: "",
+      secretAccessKey: "",
+      username: rest.username,
+      password: rest.password,
+      repositoryPassword,
+      verifier: null,
+    };
+  }
   const parsed = JSON.parse(credential) as { accessKeyId: string; secretAccessKey: string };
   const verifier = await openSecret(target.verifierSecretId);
   return {
@@ -204,6 +247,102 @@ export async function saveS3Target(input: S3TargetInput) {
   });
 }
 
+/**
+ * Creates (no `id`) or updates the home target (PUT /api/backups/targets/tailnet_rest). The URL's host
+ * is pinned from backup-ts's own current observation (StableNodeID + address), like a route. The
+ * htpasswd password is write-only; the repository password can be set once. Changing the URL re-pins
+ * and starts a new repository revision; any change resets the append-only verdict.
+ */
+export async function saveTailnetRestTarget(input: TailnetRestTargetInput) {
+  const [existing] = input.id
+    ? await db
+        .select()
+        .from(backupTargets)
+        .where(and(eq(backupTargets.id, input.id), eq(backupTargets.kind, "tailnet_rest")))
+    : [];
+  if (input.id && !existing) throw new Error("Backup target not found.");
+  const id = existing?.id ?? createId("bkt");
+  if (!existing && (!input.password || !input.repositoryPassword)) {
+    throw new Error("A new home target needs the htpasswd password and the repository password.");
+  }
+  if (existing?.repositorySecretId && input.repositoryPassword) {
+    const current = await openSecret(existing.repositorySecretId);
+    if (current !== input.repositoryPassword) {
+      throw new Error("The repository password cannot change; use a new URL path for a new repository.");
+    }
+  }
+  const pin = await pinTailnetTarget(input.restUrl);
+  const moved =
+    !existing ||
+    existing.restUrl !== input.restUrl ||
+    existing.targetNodeStableId !== pin.stableId ||
+    existing.recoveryWindowDays !== input.recoveryWindowDays;
+  const values = {
+    kind: "tailnet_rest" as const,
+    provider: "rest_server" as const,
+    name: input.name,
+    restUrl: input.restUrl,
+    prefix: restRepositoryUser(input.restUrl),
+    targetNodeStableId: pin.stableId,
+    targetIp: pin.ip,
+    recoveryWindowDays: input.recoveryWindowDays,
+    configRevision: createId("rev"),
+    repositoryRevision: moved ? createId("repo") : existing!.repositoryRevision,
+    ...(moved ? { lastSuccessAt: null, lastAttemptAt: null, lastError: null } : {}),
+    updatedAt: new Date(),
+  };
+  return db.transaction(async (tx) => {
+    const credentialSecretId = input.password
+      ? await sealSecret(
+          tx,
+          "backup.rest.credential",
+          id,
+          JSON.stringify({ username: restRepositoryUser(input.restUrl), password: input.password }),
+        )
+      : existing!.credentialSecretId;
+    if (
+      !input.password &&
+      existing &&
+      restRepositoryUser(existing.restUrl ?? "") !== restRepositoryUser(input.restUrl)
+    ) {
+      throw new Error("The URL's user changed; enter that user's htpasswd password too.");
+    }
+    const repositorySecretId =
+      existing?.repositorySecretId ??
+      (await sealSecret(tx, "backup.restic.password", id, input.repositoryPassword!));
+    const reset = {
+      appendOnlyStatus: "unverified" as const,
+      appendOnlyVerified: false,
+      appendOnlyCheckedAt: null,
+      retentionUntil: null,
+      appendOnlyEvidence: null,
+    };
+    const [row] = existing
+      ? await tx
+          .update(backupTargets)
+          .set({ ...values, credentialSecretId, repositorySecretId, ...reset })
+          .where(eq(backupTargets.id, id))
+          .returning()
+      : await tx
+          .insert(backupTargets)
+          .values({ id, ...values, credentialSecretId, repositorySecretId })
+          .returning();
+    return row!;
+  });
+}
+
+function withoutUserinfo(value: string | null) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
 /** Public view of a target: never credentials or the repository password. */
 export function publicTarget(target: BackupTargetRow) {
   return {
@@ -211,6 +350,9 @@ export function publicTarget(target: BackupTargetRow) {
     kind: target.kind,
     name: target.name,
     provider: target.provider,
+    restUrl: target.kind === "tailnet_rest" ? withoutUserinfo(target.restUrl) : null,
+    pinned:
+      target.kind === "tailnet_rest" ? { stableId: target.targetNodeStableId, ip: target.targetIp } : null,
     endpoint: target.endpoint,
     region: target.region,
     bucket: target.bucket,
@@ -233,32 +375,83 @@ export function publicTarget(target: BackupTargetRow) {
 
 // ---- restic ---------------------------------------------------------------------------------------
 
-export type ResticResult = { status: number; stdout: string; stderr: string; timedOut: boolean };
+export type ResticResult = {
+  status: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  /** Set when the transfer watchdog stopped the subprocess. */
+  aborted?: string | null;
+};
+
+function restConfig(target: BackupTargetRow) {
+  if (target.kind !== "tailnet_rest" || !target.restUrl || !target.targetIp) {
+    throw new Error(`Backup target ${target.name} is not a pinned tailnet REST target.`);
+  }
+  return { restUrl: target.restUrl, targetIp: target.targetIp };
+}
+
+/** restic repository and per-kind environment (credentials, and the REST proxy only for REST). */
+export function resticInvocation(target: BackupTargetRow, keys: ResticKeys) {
+  if (target.kind === "tailnet_rest") {
+    const config = restConfig(target);
+    if (!keys.username || !keys.password)
+      throw new Error(`Backup target ${target.name} has no htpasswd credentials.`);
+    return {
+      ...resticRestRepository(config),
+      env: resticRestEnv(
+        config,
+        { username: keys.username, password: keys.password, repositoryPassword: keys.repositoryPassword },
+        backupSocksProxy(process.env.ARK_BACKUP_SOCKS5_PROXY).url,
+      ),
+    };
+  }
+  const config = s3Config(target);
+  if (!keys.accessKeyId || !keys.secretAccessKey)
+    throw new Error(`Backup target ${target.name} has no S3 keys.`);
+  return {
+    ...resticS3Repository(config),
+    env: resticS3Env(config, {
+      accessKeyId: keys.accessKeyId,
+      secretAccessKey: keys.secretAccessKey,
+      repositoryPassword: keys.repositoryPassword,
+    }),
+  };
+}
 
 /**
- * Runs restic with a minimal environment: the target's credentials and repository password only.
- * No inherited proxy settings (FD-30 sets HTTP_PROXY only for its REST subprocess), no root key.
+ * Runs restic with a minimal environment built from scratch: the target's credentials and repository
+ * password, plus (home targets only) the one matching-scheme proxy variable. Nothing is inherited, so
+ * an HTTP_PROXY/NO_PROXY/ALL_PROXY set on the worker can never reach an S3 subprocess or redirect the
+ * REST one, and no root key leaks. With `signal`, an abort (the transfer watchdog) stops the
+ * subprocess: SIGTERM, then SIGKILL after TRANSFER_KILL_GRACE_MS.
  */
 export async function runRestic(
   target: BackupTargetRow,
-  keys: { accessKeyId: string; secretAccessKey: string; repositoryPassword: string },
+  keys: ResticKeys,
   args: string[],
   timeoutMs = 6 * 60 * 60 * 1000,
   cwd?: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<ResticResult> {
-  const config = s3Config(target);
-  const { repository, options } = resticS3Repository(config);
+  const { repository, options: repositoryOptions, env: targetEnv } = resticInvocation(target, keys);
   const cacheDir = process.env.ARK_RESTIC_CACHE_DIR;
-  const env: Record<string, string> = {
+  const env: Record<string, string> = withoutProxyEnv({
     PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
     HOME: process.env.ARK_RESTIC_HOME ?? "/tmp",
-    ...resticS3Env(config, keys),
     ...(cacheDir ? { RESTIC_CACHE_DIR: cacheDir } : {}),
     ...(cwd ? { ARK_RESTIC_CWD: cwd } : {}),
-  };
-  for (const name of ["ARK_TEST_RESTIC_DOCKER_ARGS"]) if (process.env[name]) env[name] = process.env[name]!;
+  });
+  Object.assign(env, targetEnv);
+  // Test harness hooks (scripts/backup-test/restic-docker.sh); never set in production.
+  for (const [name, value] of Object.entries(process.env))
+    if (name.startsWith("ARK_TEST_RESTIC_") && value) env[name] = value;
   const binary = process.env.ARK_RESTIC_BIN || "restic";
-  const argv = [binary, "-r", repository, ...options, ...(cacheDir ? [] : ["--no-cache"]), ...args];
+  const argv = [binary, "-r", repository, ...repositoryOptions, ...(cacheDir ? [] : ["--no-cache"]), ...args];
+  if (options.signal?.aborted) {
+    const reason = String((options.signal.reason as Error | undefined)?.message ?? "aborted");
+    return { status: -1, stdout: "", stderr: reason, timedOut: false, aborted: reason };
+  }
   const child = Bun.spawn(argv, {
     env,
     ...(cwd && !process.env.ARK_TEST_RESTIC_DOCKER_ARGS ? { cwd } : {}),
@@ -267,26 +460,65 @@ export async function runRestic(
     stderr: "pipe",
   });
   let timedOut = false;
+  let aborted: string | null = null;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const stop = () => {
+    child.kill("SIGTERM");
+    killTimer = setTimeout(() => child.kill("SIGKILL"), TRANSFER_KILL_GRACE_MS);
+  };
   const timer = setTimeout(() => {
     timedOut = true;
-    child.kill("SIGTERM");
+    stop();
   }, timeoutMs);
+  const onAbort = () => {
+    aborted = String((options.signal?.reason as Error | undefined)?.message ?? "aborted");
+    stop();
+  };
+  options.signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const [status, stdout, stderr] = await Promise.all([
       child.exited,
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
     ]);
-    return { status, stdout, stderr, timedOut };
+    return { status, stdout, stderr, timedOut, aborted };
   } finally {
     clearTimeout(timer);
+    clearTimeout(killTimer);
+    options.signal?.removeEventListener("abort", onAbort);
   }
 }
 
 function resticError(what: string, result: ResticResult) {
   const detail = (result.stderr || result.stdout).trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+  if (result.aborted) return new Error(`restic ${what} stopped by the transfer watchdog: ${result.aborted}`);
   const why = result.timedOut ? "timed out; the destination is unavailable" : `failed (${result.status})`;
   return new Error(`restic ${what} ${why}: ${detail.slice(0, 600)}`);
+}
+
+/**
+ * Runs `work` as one transfer to `target`. For a home target the pinned identity and backup-ts's
+ * lease are checked first (a failure means the transfer never starts) and then every second while it
+ * runs (a failure aborts the signal, which kills restic). S3 transfers run unguarded.
+ */
+export async function withTransfer<T>(
+  target: BackupTargetRow,
+  work: (signal: AbortSignal | undefined) => Promise<T>,
+): Promise<T> {
+  if (target.kind !== "tailnet_rest") return work(undefined);
+  const identity = await currentTailnetIdentity(target.id);
+  if (!identity.ok) throw new Error(`Transfer to ${target.name} not started: ${identity.message}`);
+  if (identity.ip !== target.targetIp)
+    throw new Error(`Transfer to ${target.name} not started: the pinned address changed; retry.`);
+  const guard = guardTransfer(target.id, { pinnedIp: identity.ip });
+  try {
+    const result = await work(guard.signal);
+    const reason = guard.reason();
+    if (reason) throw new Error(reason);
+    return result;
+  } finally {
+    guard.stop();
+  }
 }
 
 /**
@@ -302,12 +534,13 @@ function probeTimeoutMs() {
 /** Opens the target's restic repository, initialising it on first use (exit code 10: no repository). */
 export async function ensureResticRepository(
   target: BackupTargetRow,
-  keys: { accessKeyId: string; secretAccessKey: string; repositoryPassword: string },
+  keys: ResticKeys,
+  signal?: AbortSignal,
 ) {
-  const probe = await runRestic(target, keys, ["cat", "config"], probeTimeoutMs());
+  const probe = await runRestic(target, keys, ["cat", "config"], probeTimeoutMs(), undefined, { signal });
   if (probe.status === 0) return { initialised: false };
-  if (probe.timedOut || probe.status !== 10) throw resticError("cat config", probe);
-  const init = await runRestic(target, keys, ["init"], probeTimeoutMs());
+  if (probe.timedOut || probe.aborted || probe.status !== 10) throw resticError("cat config", probe);
+  const init = await runRestic(target, keys, ["init"], probeTimeoutMs(), undefined, { signal });
   if (init.status !== 0) throw resticError("init", init);
   return { initialised: true };
 }
@@ -327,10 +560,11 @@ export function resticSummarySnapshot(stdout: string) {
 /** restic backup of one path with tags; returns the snapshot ID. */
 export async function resticBackup(
   target: BackupTargetRow,
-  keys: { accessKeyId: string; secretAccessKey: string; repositoryPassword: string },
+  keys: ResticKeys,
   path: string,
   tags: string[],
   stage?: { parent?: string | null },
+  signal?: AbortSignal,
 ) {
   const result = await runRestic(
     target,
@@ -347,9 +581,10 @@ export async function resticBackup(
     ],
     undefined,
     stage ? path : undefined,
+    { signal },
   );
   const snapshotId = resticSummarySnapshot(result.stdout);
-  if (result.status !== 0 || !snapshotId) throw resticError("backup", result);
+  if (result.aborted || result.status !== 0 || !snapshotId) throw resticError("backup", result);
   let summary: Record<string, number> = {};
   for (const line of result.stdout.split("\n")) {
     try {
@@ -468,11 +703,64 @@ export async function exportTarget(
   if (!target.enabled) throw new Error(`Backup target ${target.name} is disabled.`);
   await db.update(backupTargets).set({ lastAttemptAt: now() }).where(eq(backupTargets.id, target.id));
   const result: ExportResult = { targetId, sources: [] };
+  try {
+    await withTransfer(target, async (signal) => {
+      await exportSources(target, result, signal, options);
+    });
+  } catch (error) {
+    // A home target whose identity or observation is invalid never starts a transfer: every source
+    // gets a failed attempt (and no recovery point).
+    const message = (error instanceof Error ? error.message : "transfer refused").slice(0, 1000);
+    const done = new Set(result.sources.map((item) => item.source));
+    for (const cluster of Object.keys(PG_CLUSTERS) as PgCluster[]) {
+      const source = `pg:${executorConfig(cluster).profile.stanza}`;
+      if (done.has(source)) continue;
+      await db.insert(backupExports).values({
+        id: createId("bex"),
+        targetId: target.id,
+        repositoryRevision: target.repositoryRevision,
+        source,
+        status: "failed",
+        error: message,
+      });
+      result.sources.push({ source, ok: false, error: message });
+    }
+  }
+  const failures = result.sources.filter((item) => !item.ok);
+  await db
+    .update(backupTargets)
+    .set(
+      failures.length
+        ? {
+            lastError: failures
+              .map((item) => `${item.source}: ${"error" in item ? item.error : ""}`)
+              .join("; ")
+              .slice(0, 1000),
+          }
+        : { lastError: null, lastSuccessAt: now() },
+    )
+    .where(and(eq(backupTargets.id, target.id), eq(backupTargets.configRevision, target.configRevision)));
+  await evaluateBackupAlerts().catch(() => undefined);
+  if (failures.length) {
+    throw new Error(
+      `Export to ${target.name} failed for ${failures.map((item) => item.source).join(", ")}: ${"error" in failures[0]! ? failures[0].error : ""}`,
+    );
+  }
+  return result;
+}
+
+/** Stages and uploads every PostgreSQL source to one target (inside the transfer guard). */
+async function exportSources(
+  target: BackupTargetRow,
+  result: ExportResult,
+  signal: AbortSignal | undefined,
+  options: { fresh?: boolean },
+) {
   let secretsForTarget: Awaited<ReturnType<typeof targetSecrets>> | null = null;
   let repositoryError: string | null = null;
   try {
     secretsForTarget = await targetSecrets(target);
-    await ensureResticRepository(target, secretsForTarget);
+    await ensureResticRepository(target, secretsForTarget, signal);
   } catch (error) {
     repositoryError = error instanceof Error ? error.message : "restic repository unavailable";
   }
@@ -481,6 +769,8 @@ export async function exportTarget(
     const source = `pg:${profile.stanza}`;
     try {
       if (repositoryError || !secretsForTarget) throw new Error(repositoryError ?? "no credentials");
+      if (signal?.aborted)
+        throw new Error(String((signal.reason as Error | undefined)?.message ?? "aborted"));
       // A scheduled export reuses a stage at most four minutes old, so targets exporting in the same
       // interval upload the same completed copy. An export right after a backup stages afresh.
       const staged = await callExecutor<{ reused: boolean; manifest: StageManifest; leaseId?: string }>(
@@ -513,6 +803,7 @@ export async function exportTarget(
             stagePath(profile.stanza, manifest.stageId),
             [...pgSnapshotTags(profile.stanza, manifest.stageId), "layout=relative-v1"],
             { parent: previous?.resticSnapshotId },
+            signal,
           );
         } finally {
           if (staged.leaseId)
@@ -567,27 +858,6 @@ export async function exportTarget(
     }
     await observeSource(cluster);
   }
-  const failures = result.sources.filter((item) => !item.ok);
-  await db
-    .update(backupTargets)
-    .set(
-      failures.length
-        ? {
-            lastError: failures
-              .map((item) => `${item.source}: ${"error" in item ? item.error : ""}`)
-              .join("; ")
-              .slice(0, 1000),
-          }
-        : { lastError: null, lastSuccessAt: now() },
-    )
-    .where(and(eq(backupTargets.id, target.id), eq(backupTargets.configRevision, target.configRevision)));
-  await evaluateBackupAlerts().catch(() => undefined);
-  if (failures.length) {
-    throw new Error(
-      `Export to ${target.name} failed for ${failures.map((item) => item.source).join(", ")}: ${"error" in failures[0]! ? failures[0].error : ""}`,
-    );
-  }
-  return result;
 }
 
 /** Local backups become `uploaded` once a stage containing them reached an off-VPS target. */
@@ -603,20 +873,25 @@ async function markUploaded(kind: string, labels: string[]) {
 
 // ---- Files (mail and reviewed volumes) -----------------------------------------------------------
 
-/** restic backup of a mail snapshot or reviewed volume path to every enabled S3 target. */
+/** restic backup of a mail snapshot or reviewed volume path to every enabled target (S3 and home). */
 export async function exportFiles(source: string, path: string, tags: string[]) {
   const targets = await db.select().from(backupTargets).where(eq(backupTargets.enabled, true));
   if (!targets.length) throw new Error("No backup target is configured for mail and volume backups.");
   const results: Array<{ targetId: string; snapshotId?: string; error?: string }> = [];
   for (const target of targets) {
     try {
-      const secretsForTarget = await targetSecrets(target);
-      await ensureResticRepository(target, secretsForTarget);
-      const { snapshotId } = await resticBackup(target, secretsForTarget, path, [
-        "ark",
-        `source=${source}`,
-        ...tags,
-      ]);
+      const { snapshotId } = await withTransfer(target, async (signal) => {
+        const secretsForTarget = await targetSecrets(target);
+        await ensureResticRepository(target, secretsForTarget, signal);
+        return resticBackup(
+          target,
+          secretsForTarget,
+          path,
+          ["ark", `source=${source}`, ...tags],
+          undefined,
+          signal,
+        );
+      });
       await db.insert(backupExports).values({
         id: createId("bex"),
         targetId: target.id,
@@ -667,18 +942,77 @@ export async function restoreFiles(source: string, snapshotId: string, restoreRo
   if (!target)
     throw new Error("No successful export of this exact snapshot exists in a current target repository.");
   const argv = ["restore", snapshotId, "--target", restoreRoot];
-  const result = await runRestic(target, await targetSecrets(target), argv, 180_000);
-  if (result.status !== 0) throw resticError("restore", result);
-  return { ...result, argv: ["restic", "-r", resticS3Repository(s3Config(target)).repository, ...argv] };
+  const keys = await targetSecrets(target);
+  const result = await withTransfer(target, (signal) =>
+    runRestic(target, keys, argv, 180_000, undefined, { signal }),
+  );
+  if (result.aborted || result.status !== 0) throw resticError("restore", result);
+  return { ...result, argv: ["restic", "-r", resticInvocation(target, keys).repository, ...argv] };
 }
 
 // ---- Append-only canary (backup.verify_target) ----------------------------------------------------
 
-export async function verifyTarget(targetId: string, revision?: string): Promise<CanaryEvidence> {
+/**
+ * The home target's canary (rest-canary.ts): its repository is opened (or initialised) first, then
+ * the canary runs with the deployed htpasswd credentials through backup-ts's SOCKS5 proxy to the
+ * pinned address, under the same identity checks and watchdog as a backup.
+ */
+async function verifyRestTarget(target: BackupTargetRow): Promise<RestCanaryEvidence> {
+  const keys = await targetSecrets(target);
+  const config = restConfig(target);
+  const proxy = backupSocksProxy(process.env.ARK_BACKUP_SOCKS5_PROXY).url;
+  const base = new URL(`${config.restUrl}/`);
+  return withTransfer(target, async (signal) => {
+    await ensureResticRepository(target, keys, signal);
+    const authorization = `Basic ${Buffer.from(`${keys.username}:${keys.password}`).toString("base64")}`;
+    return runRestCanary({
+      restUrl: config.restUrl,
+      pinned: { stableId: target.targetNodeStableId!, ip: config.targetIp },
+      request: async ({ method, path, body, auth }) => {
+        if (signal?.aborted)
+          throw new Error(String((signal.reason as Error | undefined)?.message ?? "aborted"));
+        const response = await socks5HttpRequest({
+          proxy,
+          url: new URL(path, base).toString(),
+          connectHost: base.protocol === "https:" ? undefined : config.targetIp,
+          method,
+          body,
+          headers: {
+            ...(auth === false ? {} : { authorization }),
+            accept: "application/vnd.x.restic.rest.v2",
+            ...(body ? { "content-type": "application/octet-stream" } : {}),
+          },
+          timeoutMs: 30_000,
+        });
+        return { status: response.status, body: response.body };
+      },
+    });
+  });
+}
+
+export async function verifyTarget(
+  targetId: string,
+  revision?: string,
+): Promise<CanaryEvidence | RestCanaryEvidence> {
   const [target] = await db.select().from(backupTargets).where(eq(backupTargets.id, targetId));
   if (!target) throw new Error("Backup target not found.");
   if (revision && revision !== target.configRevision)
     throw new Error("Backup target configuration changed; verify its current revision.");
+  if (target.kind === "tailnet_rest") {
+    const evidence = await verifyRestTarget(target);
+    await db
+      .update(backupTargets)
+      .set({
+        appendOnlyStatus: evidence.status,
+        appendOnlyVerified: evidence.status === "append_only",
+        appendOnlyEvidence: evidence as unknown as Record<string, unknown>,
+        appendOnlyCheckedAt: new Date(evidence.checkedAt),
+        retentionUntil: null,
+      })
+      .where(and(eq(backupTargets.id, target.id), eq(backupTargets.configRevision, target.configRevision)));
+    await evaluateBackupAlerts().catch(() => undefined);
+    return evidence;
+  }
   const config = s3Config(target);
   const secretsForTarget = await targetSecrets(target);
   const client = new S3Client(
@@ -710,7 +1044,7 @@ export async function verifyTarget(targetId: string, revision?: string): Promise
 // ---- Health and alerts ----------------------------------------------------------------------------
 
 export async function backupHealth(now = new Date()): Promise<BackupHealth> {
-  const [targets, exportsRows, sources] = await Promise.all([
+  const [targets, exportsRows, sources, backupSnapshot] = await Promise.all([
     db.select().from(backupTargets),
     db
       .select()
@@ -719,6 +1053,7 @@ export async function backupHealth(now = new Date()): Promise<BackupHealth> {
       .orderBy(desc(backupExports.createdAt))
       .limit(2000),
     db.select().from(backupSources),
+    loadBackupSnapshot(),
   ]);
   return evaluateBackupHealth({
     now,
@@ -734,6 +1069,13 @@ export async function backupHealth(now = new Date()): Promise<BackupHealth> {
       recoveryWindowDays: target.recoveryWindowDays,
       lastSuccessAt: target.lastSuccessAt,
       lastError: target.lastError,
+      identity:
+        target.kind === "tailnet_rest"
+          ? (() => {
+              const identity = checkTailnetIdentity(target, backupSnapshot, now);
+              return { ok: identity.ok, message: identity.ok ? "pinned" : identity.message };
+            })()
+          : null,
     })),
     exports: exportsRows
       .filter((row) =>
@@ -814,7 +1156,6 @@ const VERIFY_EVERY_MS = 6.5 * 24 * 60 * 60 * 1000;
 export async function backupScheduleTick(enqueue: Enqueue, now = new Date()) {
   const targets = await db.select().from(backupTargets).where(eq(backupTargets.enabled, true));
   for (const target of targets) {
-    if (target.kind !== "s3") continue; // FD-30 adds the tailnet REST exporter.
     await enqueue({ kind: "backup.export", targetIds: [target.id] });
     if (
       !target.appendOnlyCheckedAt ||

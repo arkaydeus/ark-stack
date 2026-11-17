@@ -48,7 +48,12 @@ import { withPgbouncerLock } from "./modules/pgbouncer-lock.ts";
 import { loadEnv } from "./env.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
-import { exportTarget, startBackupSchedule, verifyTarget } from "./modules/offsite-backups.ts";
+import {
+  evaluateBackupAlerts,
+  exportTarget,
+  startBackupSchedule,
+  verifyTarget,
+} from "./modules/offsite-backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
 import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
@@ -65,6 +70,12 @@ import {
   routesCertificateFailed,
 } from "./modules/front-routes.ts";
 import { edgeLocalApi, edgeSocketPath } from "./modules/tailnet-localapi.ts";
+import {
+  backupLocalApi,
+  backupSocketPath,
+  observeBackupTailnet,
+  startBackupObserveSchedule,
+} from "./modules/backup-observe.ts";
 import {
   executeWorkspaceQuery,
   inspectDatabaseSchema,
@@ -586,6 +597,7 @@ export async function runOperation(
   if (kind === "backup.restore_test") return restoreBackup(operation);
   if (kind === "backup.export") return exportBackupTarget(operation);
   if (kind === "backup.verify_target") return verifyBackupTarget(operation);
+  if (kind === "backup.observe") return observeBackup(operation);
   if (kind === "update.apply") return applyUpdate(operation);
   if (kind === "admin.mode_change") return changeMode(operation);
   if (kind === "dns.publish") return publishDns(operation);
@@ -1435,6 +1447,37 @@ async function verifyBackupTarget(operation: OperationRow) {
     status: evidence.status,
     findings: evidence.findings,
     retentionUntil: evidence.retentionUntil,
+  });
+}
+
+/**
+ * `backup.observe` (FD-30, front door §3.18.3): backup-ts's own LocalAPI status, read-only, as one
+ * complete `source = 'backup'` generation. Alerts are re-evaluated either way, so an expired or
+ * failed observation raises the critical suspension alert at once.
+ */
+async function observeBackup(operation: OperationRow) {
+  const socket = backupSocketPath();
+  try {
+    if (!socket) {
+      throw new Error(
+        "ARK_BACKUP_TS_SOCKET is not set: backup-ts's LocalAPI socket is not mounted here (backup worker only).",
+      );
+    }
+    const result = await observeBackupTailnet({ api: backupLocalApi(socket), operationId: operation.id });
+    await addStep(operation.id, "backup-observe", result as unknown as Record<string, unknown>);
+    return result;
+  } finally {
+    await evaluateBackupAlerts().catch(() => undefined);
+  }
+}
+
+/** Schedules `backup.observe` every five minutes where backup-ts's socket is mounted (FD-30). */
+export function scheduleBackupObserve(intervalMs?: number) {
+  if (!backupSocketPath()) return null;
+  return startBackupObserveSchedule({
+    enqueue: (input) => enqueue(input),
+    intervalMs,
+    log: (line) => console.error(redactLogLine(line)),
   });
 }
 
@@ -2689,7 +2732,8 @@ export function startCoordinator() {
   // Embedded workers include the database worker's duties, so they run the rollover scheduler.
   startRolloverScheduler();
   scheduleEdgeObserve();
-  // ...and the backup worker's (FD-21), when backups execute.
+  // ...and the backup worker's (FD-21), when backups execute, and its backup-ts observation (FD-30).
   scheduleBackups();
+  scheduleBackupObserve();
   return setInterval(tick, 1500);
 }

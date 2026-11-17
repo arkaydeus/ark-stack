@@ -302,6 +302,11 @@ services:
       ARK_APP_PG_EXECUTOR_TOKEN: ${ARK_APP_PG_EXECUTOR_TOKEN:-}
       ARK_PG_STAGE_ROOT: /var/lib/ark/pg-stages
       ARK_RESTIC_CACHE_DIR: /var/lib/ark/backups/restic-cache
+      # FD-30: backup-ts's LocalAPI (read-only, status only) and its SOCKS5 proxy. The proxy is given to
+      # the home target's restic subprocess alone (HTTP_PROXY for http://, HTTPS_PROXY for https://);
+      # never set HTTP_PROXY/ALL_PROXY here, or S3 and API traffic would follow it.
+      ARK_BACKUP_TS_SOCKET: /var/run/tailscale-backup/tailscaled.sock
+      ARK_BACKUP_SOCKS5_PROXY: socks5://backup-ts:1055
     # Staged pgBackRest copies are postgres:postgres (999) 0640/0750; the worker reads them through
     # the group, read-only. It never mounts the live repo2 or PGDATA.
     group_add: ["999"]
@@ -310,9 +315,15 @@ services:
       - ../../tmp/restore-runs:/var/lib/ark/restore-runs
       - ark_platform_pg_stages:/var/lib/ark/pg-stages/ark-platform:ro
       - ark_app_pg_stages:/var/lib/ark/pg-stages/ark-app:ro
+      # Read-only, and the worker runs as the non-root `bun` user (uid 1000): tailscaled grants it
+      # read access only and refuses every state-changing endpoint with 403 (FD-30 runtime test,
+      # `mise run test:backups-tailnet`). No other service mounts this volume.
+      - ark_backup_ts_socket:/var/run/tailscale-backup:ro
     depends_on: [api]
-    # backup-egress reaches the S3-compatible target; backup-management reaches the executors only.
-    networks: [control, backup-management, backup-egress]
+    # backup-egress reaches the S3-compatible target; backup-management reaches the executors only;
+    # backup-tailnet reaches backup-ts's SOCKS5 proxy only (FD-30). The worker has no tailnet route
+    # of its own: the home rest-server is reachable through backup-ts or not at all.
+    networks: [control, backup-management, backup-egress, backup-tailnet]
 
   agent:
     build:
@@ -437,6 +448,39 @@ services:
       # process and the tailnet containers — can rewrite public routing.
       edge-control:
         aliases: [edge-admin]
+    restart: unless-stopped
+
+  # The backup node (tag:ark-backup, docs/design/front-door.md §3.18.3, FD-30). Separate from edge-ts
+  # so backup reach and route reach never share an identity or a grant: the tailnet policy grants
+  # tag:ark-backup only tcp:8000 on the home backup server, and tag:ark-edge nothing there. Userspace
+  # networking (no tun device, no capabilities) with SOCKS5 on :1055, which only the backup worker can
+  # reach (backup-tailnet is internal; backup-ts-egress has no other member).
+  backup-ts:
+    image: tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2
+    hostname: ark-backup
+    environment:
+      TS_USERSPACE: "true"
+      # A one-off, pre-approved key for tag:ark-backup (docs/guides/backups.md, "Home machine").
+      # Without it the node waits for login and the home target stays suspended (unhealthy).
+      TS_AUTHKEY: ${TS_BACKUP_AUTHKEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_ACCEPT_DNS: "false"
+      # No inbound tailnet connections to the backup node, whatever the tailnet policy allows.
+      TS_EXTRA_ARGS: "--shields-up"
+      TS_SOCKS5_SERVER: ":1055"
+      # The host tailscaled keeps 41641 and edge-ts 41642.
+      TS_TAILSCALED_EXTRA_ARGS: "--port=41643"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ark_backup_ts_state:/var/lib/tailscale
+      # tailscaled's LocalAPI socket, shared read-only with backup-worker only (FD-30).
+      - ark_backup_ts_socket:/var/run/tailscale
+    networks:
+      backup-tailnet:
+        aliases: [backup-ts]
+      backup-ts-egress: {}
     restart: unless-stopped
 
   edge:
@@ -599,6 +643,9 @@ volumes:
   ark_edge_ts_state:
   # tailscaled's LocalAPI socket: read-write in edge-ts, read-only in domain-worker, nowhere else.
   ark_edge_ts_socket:
+  ark_backup_ts_state:
+  # backup-ts's LocalAPI socket: read-write in backup-ts, read-only in backup-worker, nowhere else.
+  ark_backup_ts_socket:
   ark_tailscale_state:
   # PgBouncer's admin console socket directory. A tmpfs owned by uid 1000 (PgBouncer and the
   # database worker), mode 0700, mounted only into pgbouncer-public and database-worker.
@@ -634,6 +681,10 @@ networks:
   backup-management: { internal: true }
   # FD-21: backup worker -> S3-compatible targets (internet).
   backup-egress: {}
+  # FD-30: backup worker -> backup-ts SOCKS5 (port 1055), internal only.
+  backup-tailnet: { internal: true }
+  # FD-30: backup-ts -> Tailscale coordination, DERP and peers (internet). backup-ts is its only member.
+  backup-ts-egress: {}
   mail-management:
     external: true
     name: ark_mail_management
