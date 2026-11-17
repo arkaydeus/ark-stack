@@ -1398,10 +1398,13 @@ async function launchGuardTest(report: Report) {
     500,
   );
   await refreshPorts();
+  // With the watchdog unreachable, the guard asks it five times before starting closed, and
+  // `wget -T` does not bound resolving the stopped container's name (on the Linux CI runner one
+  // guard took about 30 s in all). Allow the guard's full retry budget.
   await waitFor(
     "HTTP through 443 after the restart",
     async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
-    30_000,
+    60_000,
     500,
   );
   const after = await tlsOutcome();
