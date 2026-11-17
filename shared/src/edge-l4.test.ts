@@ -8,6 +8,7 @@ import {
   generationId,
   haproxyConfigServers,
   haproxyLaunchDecision,
+  haproxyLoopServerName,
   haproxyServerName,
   parseReload,
   parseServersState,
@@ -130,9 +131,12 @@ describe("edge-l4 rendering (§3.8.5 fe_tls443)", () => {
     expect(withRoute.manifest.routes).toEqual([
       {
         id: "rt_p7q2",
+        kind: "tls",
         hostname: "mqtt.example.com",
         stableId: "nNAS1CNTRL",
         target: "100.88.1.20:1883",
+        listenPort: 443,
+        mode: "passthrough",
         backend: "be_rt_p7q2_tls",
         server,
       },
@@ -709,3 +713,66 @@ test("validator client allows both 10-second checks and aborts a hung validator"
     await rm(root, { recursive: true, force: true });
   }
 }, 26_000);
+
+describe("HaproxyWithdrawalAdapter with terminated routes (FD-14)", () => {
+  const terminated = { ...route, policy: "0123456789abcdef" };
+  const target = haproxyServerName(terminated);
+  const loop = haproxyLoopServerName(terminated);
+  const state = (): FakeWorker[] => [
+    {
+      pid: 70,
+      section: "current",
+      stopped: false,
+      servers: [
+        { backend: "be_caddy", server: "caddy", addr: "127.0.0.1", port: 8443, admin: 0 },
+        { backend: "be_rt_p7q2_tls", server: loop, addr: "-", port: 0, admin: 0 },
+        { backend: "be_rt_p7q2", server: target, addr: "100.88.1.20", port: 1883, admin: 0 },
+      ],
+      sessions: [
+        { id: "0x1", backend: "be_rt_p7q2_tls", server: loop },
+        { id: "0x2", backend: "be_rt_p7q2", server: target },
+        { id: "0x3", backend: "be_caddy", server: "caddy" },
+      ],
+    },
+  ];
+
+  test("the loop server is authorised exactly when its target server is", async () => {
+    const workers = state();
+    const log: string[] = [];
+    const adapter = new HaproxyWithdrawalAdapter("/fake", fakeMaster(workers, log));
+    const kept = await adapter.enforce(new Set([routeIdentityKey(terminated)]));
+    expect(kept.error).toBeUndefined();
+    expect(kept.withdrawn).toEqual([]);
+    expect(log.some((command) => command.includes("disable"))).toBe(false);
+  });
+
+  test("a revoked policy fences the loop and target servers, then drains both sessions", async () => {
+    const workers = state();
+    const log: string[] = [];
+    const adapter = new HaproxyWithdrawalAdapter("/fake", fakeMaster(workers, log));
+    // The same route with a new policy fingerprint (for example a narrowed allowlist).
+    const result = await adapter.enforce(
+      new Set([routeIdentityKey({ ...terminated, policy: "fedcba9876543210" })]),
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.withdrawn).toEqual(["100.88.1.20:1883"]);
+    const disables = log.filter((command) => command.includes("disable server"));
+    expect(disables).toEqual([
+      `@!70 disable server be_rt_p7q2_tls/${loop}`,
+      `@!70 disable server be_rt_p7q2/${target}`,
+    ]);
+    expect(log.indexOf(disables[1]!)).toBeLessThan(log.findIndex((command) => command.includes("shutdown")));
+    expect(workers[0]!.sessions.map((session) => session.id)).toEqual(["0x3"]);
+  });
+
+  test("stop fences loop servers too, never Caddy", async () => {
+    const workers = state();
+    const log: string[] = [];
+    const adapter = new HaproxyWithdrawalAdapter("/fake", fakeMaster(workers, log));
+    await adapter.enforce(new Set([routeIdentityKey(terminated)]));
+    await adapter.stop();
+    expect(log).toContain(`@!70 disable server be_rt_p7q2_tls/${loop}`);
+    expect(log).not.toContain("@!70 disable server be_caddy/caddy");
+    expect(workers[0]!.sessions.map((session) => session.id)).toEqual(["0x3"]);
+  });
+});

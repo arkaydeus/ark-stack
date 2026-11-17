@@ -67,6 +67,8 @@ export async function writeEdgeL4(input: EdgeL4Input, env: Record<string, string
     ...result,
     reloadLog: result.reloadLog?.slice(-1_000),
     httpHostnames: generation.manifest.httpHostnames,
-    tlsRoutes: generation.manifest.routes.map((route) => route.id),
+    sniPorts: generation.manifest.sniPorts,
+    tlsRoutes: generation.manifest.routes.filter((route) => route.kind === "tls").map((route) => route.id),
+    tcpRoutes: generation.manifest.routes.filter((route) => route.kind === "tcp").map((route) => route.id),
   };
 }

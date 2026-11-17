@@ -32,7 +32,9 @@ import {
   allowedServerIndex,
   GENERATION_ID,
   generationId,
-  haproxyServerAllowed,
+  haproxyServerDenied,
+  haproxyServerProtected,
+  loopTargetServer,
   parseReload,
   parseServersState,
   parseShowProc,
@@ -249,9 +251,16 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     withdrawn: Set<string>,
   ) {
     const servers = await this.master.servers(pid);
-    const denied = servers.filter((server) => server.key !== null && !haproxyServerAllowed(server, index));
+    // Tailnet target servers and terminated routes' loop servers (FD-14), which are fenced with
+    // their target so no new connection is even terminated for a revoked route.
+    const denied = servers.filter((server) => haproxyServerDenied(server, index));
     for (const server of servers) if (server.key) active.add(server.key);
     if (!denied.length) return { clean: true, problem: "" };
+    // A loop server has no tailnet address; report it under its target's backend key.
+    const keyFor = (server: ServerState) =>
+      server.key ??
+      servers.find((item) => item.server === loopTargetServer(server.server) && item.key)?.key ??
+      `loop:${server.server}`;
     let leaving = false;
     // 1. Admission: disable every denied server in an accepting worker before touching sessions.
     for (const server of denied) {
@@ -261,14 +270,14 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
       ).trim();
       if (PROXY_STOPPED.test(answer)) leaving = true;
       else if (answer) throw new Error(`disable server ${server.backend}/${server.server}: ${answer}`);
-      else withdrawn.add(server.key!);
+      else withdrawn.add(keyFor(server));
     }
     // 2. Sessions: per server where the proxy runs, per session where it is stopping.
     const deniedNames = new Set(denied.map((server) => `${server.backend}/${server.server}`));
     const sessions = (await this.master.sessions(pid)).filter((session) =>
       deniedNames.has(`${session.backend}/${session.server}`),
     );
-    const keyOf = new Map(denied.map((server) => [`${server.backend}/${server.server}`, server.key!]));
+    const keyOf = new Map(denied.map((server) => [`${server.backend}/${server.server}`, keyFor(server)]));
     for (const name of new Set(sessions.map((session) => `${session.backend}/${session.server}`))) {
       withdrawn.add(keyOf.get(name)!);
       if (!leaving) {
@@ -321,7 +330,7 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     const workers = (await this.master.workers()).filter((worker) => this.inspected.has(worker.pid));
     for (const worker of workers) {
       try {
-        const servers = (await this.master.servers(worker.pid)).filter((server) => server.key !== null);
+        const servers = (await this.master.servers(worker.pid)).filter(haproxyServerProtected);
         const names = new Set(servers.map((server) => `${server.backend}/${server.server}`));
         for (const server of servers) {
           const answer = (

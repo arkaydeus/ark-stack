@@ -13,6 +13,7 @@ export * from "./dns-plan.ts";
 export * from "./edge.ts";
 export * from "./edge-http.ts";
 export * from "./errors.ts";
+export * from "./front-raw-nft.ts";
 export * from "./front-routes.ts";
 export * from "./gate-login.ts";
 export * from "./hash.ts";

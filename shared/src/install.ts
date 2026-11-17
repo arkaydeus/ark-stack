@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
 
+import { parseSniPorts } from "./edge-l4.ts";
+
 export const installEnvKeys = [
   "BETTER_AUTH_SECRET",
   "ARK_ROOT_KEY",
@@ -202,3 +204,21 @@ export const hostLossChecklist = [
   "Disable reconciliation, outbound SES, and public ingress until ownership and credentials are verified.",
   "Re-enroll Tailscale, verify private login, then enable public routes last.",
 ];
+
+/**
+ * Install-time selection of the shared SNI ports (docs/design/front-door.md §3.8.2, FD-14). The
+ * selection comes from `supplied` (the installer's environment) or else the existing `.env`, is
+ * validated against the supported set, and is written as `ARK_EDGE_SNI_PORTS` plus one
+ * `ARK_EDGE_SNI_PORT_<n>=<n>:<n>` publish entry per enabled port, which the edge-ts `ports` list
+ * interpolates. Entries for ports no longer enabled are removed, so the published set and the set the
+ * API and domain worker accept can never diverge.
+ */
+export function applyEdgeSniPorts(env: string, supplied?: string) {
+  const current = parseEnvFile(env).ARK_EDGE_SNI_PORTS ?? "";
+  const ports = parseSniPorts(supplied ?? current);
+  const lines = env.split("\n").filter((line) => !/^\s*ARK_EDGE_SNI_PORTS?(?:_\d+)?=/.test(line));
+  while (lines.length && lines.at(-1) === "") lines.pop();
+  lines.push(`ARK_EDGE_SNI_PORTS=${ports.join(",")}`);
+  for (const port of ports) lines.push(`ARK_EDGE_SNI_PORT_${port}=${port}:${port}`);
+  return { env: `${lines.join("\n")}\n`, ports };
+}

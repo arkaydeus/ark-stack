@@ -59,6 +59,10 @@ import {
   frontRouteCreateInput,
   frontRouteUpdateInput,
   gateSettingsInput,
+  PROTOCOL_GUIDANCE,
+  RESERVED_ROUTE_PORTS,
+  SHARED_SNI_PORTS,
+  TCP_ROUTE_PORTS,
   isGateLoginPath,
   buildDomainPlan,
   nextBackupStatus,
@@ -121,13 +125,17 @@ import {
   commitRouteEnable,
   commitRouteUpdate,
   disableRoute,
+  issueRouteClientCertificate,
   listFrontRoutes,
+  listRouteClientCertificates,
+  revokeRouteClientCertificate,
   prepareRouteCreate,
   prepareRouteDelete,
   prepareRouteEnable,
   prepareRouteUpdate,
 } from "./modules/front-routes.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, tailnetOverview } from "./modules/edge-observe.ts";
+import { enabledSniPorts } from "./modules/l4-routes.ts";
 import { raiseAlert } from "./modules/alerts.ts";
 import {
   backupHealth,
@@ -3222,6 +3230,20 @@ app.get("/api/front/routes", async (c) => {
   return c.json({ routes: await listFrontRoutes() });
 });
 
+// Listeners and protocol guidance for route creation (front door §3.8.2, FD-14): which shared SNI
+// ports this host enabled at install time, the dedicated raw-TCP range, the ports that can never be
+// a dedicated port, and which protocols can be routed by name.
+app.get("/api/front/listeners", async (c) => {
+  return c.json({
+    sniRouterPort: 443,
+    sharedSniPorts: { available: SHARED_SNI_PORTS, enabled: enabledSniPorts() },
+    tcpPorts: TCP_ROUTE_PORTS,
+    reservedPorts: RESERVED_ROUTE_PORTS,
+    tlsModes: ["passthrough", "terminate", "terminate_mtls"],
+    guidance: PROTOCOL_GUIDANCE,
+  });
+});
+
 app.get("/api/front/routes/:id", async (c) => {
   const [route] = await listFrontRoutes(c.req.param("id"));
   if (!route) throw new HTTPException(404, { message: "Route not found." });
@@ -3317,6 +3339,65 @@ app.post("/api/front/routes/:id/disable", async (c) => {
   await disableRoute(routeId, { userId: access.userId, role: access.role }, enqueue);
   const [route] = await listFrontRoutes(routeId);
   return c.json({ route });
+});
+
+// Client certificates of a terminate_mtls route (front door §3.8.4, FD-14). Owner-only. Issuing
+// grants access, so it needs a `credential.rotate` grant bound to the route and exact body;
+// revoking tightens (the CRL is regenerated and the route's sessions drained) and needs none.
+const routeClientCertificateInput = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._@-]*$/, "Use letters, digits, '.', '_', '@' or '-'."),
+    csrPem: z
+      .string()
+      .max(16 * 1024)
+      .optional(),
+  })
+  .strict();
+
+app.get("/api/front/routes/:id/client-certificates", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(await listRouteClientCertificates(c.req.param("id")));
+});
+
+app.post("/api/front/routes/:id/client-certificates", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  const request = (await c.req.json()) as Record<string, unknown>;
+  const input = routeClientCertificateInput.parse(request);
+  if (input.csrPem !== undefined) validateCsr(input.csrPem);
+  await listRouteClientCertificates(routeId);
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", { routeId, ...request }),
+  );
+  const issued = await issueRouteClientCertificate(routeId, input, {
+    userId: access.userId,
+    role: access.role,
+  });
+  c.header("cache-control", "no-store");
+  return c.json(issued, 201);
+});
+
+app.post("/api/front/routes/:id/client-certificates/:certificateId/revoke", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const result = await revokeRouteClientCertificate(
+    c.req.param("id"),
+    c.req.param("certificateId"),
+    { userId: access.userId, role: access.role },
+    enqueue,
+  );
+  return c.json(result);
 });
 
 app.delete("/api/front/routes/:id", async (c) => {

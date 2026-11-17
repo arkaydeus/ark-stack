@@ -82,10 +82,10 @@ describe("route address records (§3.13.1)", () => {
 });
 
 describe("route request policy", () => {
-  test("only http routes can be created", () => {
-    expect(() => assertSupportedRouteKind(undefined)).not.toThrow();
-    expect(() => assertSupportedRouteKind("http")).not.toThrow();
-    for (const kind of ["tls", "tcp", "postgres", "udp"]) {
+  test("http, tls and tcp routes can be created; postgres waits for FD-26", () => {
+    expect(assertSupportedRouteKind(undefined)).toBe("http");
+    for (const kind of ["http", "tls", "tcp"] as const) expect(assertSupportedRouteKind(kind)).toBe(kind);
+    for (const kind of ["postgres", "udp"]) {
       expect(() => assertSupportedRouteKind(kind)).toThrow(UnsupportedRouteError);
     }
   });

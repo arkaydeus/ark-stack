@@ -1,6 +1,9 @@
-// HTTP route lifecycle (docs/design/front-door.md §3.3, §3.13, §3.14, FD-08).
+// Route lifecycle (docs/design/front-door.md §3.3, §3.8, §3.13, §3.14, FD-08, FD-14).
 //
-// Owners create, update, enable, disable and delete public HTTP routes to tailnet services. A route
+// Owners create, update, enable, disable and delete public routes to tailnet services: `http`
+// routes (Caddy behind the 443 SNI router), `tls` routes (TLS-TCP by SNI on 443 or an enabled shared
+// SNI port: passthrough, terminate or terminate_mtls) and `tcp` routes (raw TCP, `plain`, on a
+// dedicated port from 20000-20049). Every kind shares one lifecycle. A route
 // moves through `draft -> awaiting_acl -> awaiting_dns -> issuing_certificate -> ready`:
 //
 // - draft: creation audit state; persisted atomically with endpoint, DNS and awaiting_acl.
@@ -13,7 +16,14 @@
 // - ready: an issued certificate and a fresh passing probe. Only `edge.observe` writes `ready`.
 //
 // `enable` is refused before `ready`. `edge.apply` renders enabled `ready` public routes allowed by
-// the lease into the edge (FD-09, modules/edge-routes.ts and shared/src/edge-http.ts).
+// the lease into the edge (FD-09, modules/edge-routes.ts and shared/src/edge-http.ts); `edge.l4_apply`
+// renders `tls` and `tcp` routes into HAProxy (FD-14, modules/l4-routes.ts, shared/src/edge-l4.ts).
+//
+// L4 routes deny every source until their `sourceCidrs` list says otherwise (empty = deny all).
+// Enabling an L4 route with an empty list is refused; `allowInternet` opens it to every source only
+// when saved under the owner's exposure.public step-up (`internet_confirmed_at`). Any change to an
+// L4 route's admission policy renames its HAProxy servers (the lease fingerprint), so a live route's
+// old sessions are drained in every HAProxy worker.
 //
 // Preparation validates without writes; final validation and grant consumption share the mutation
 // transaction, so conflicts roll back the grant. Every action is audited.
@@ -21,9 +31,16 @@
 import {
   HTTP_LISTEN_PORT,
   ROUTE_RECORD_PURPOSE,
+  assertFieldsForKind,
+  assertL4Enableable,
   assertSupportedAccessMode,
   assertSupportedRouteKind,
   backendKey,
+  checkL4RouteSettings,
+  l4LooseningChanges,
+  routeListenPort,
+  type L4RouteSettings,
+  type SupportedRouteKind,
   createId,
   looseningChanges,
   normalizeRedirectTo,
@@ -49,9 +66,12 @@ import {
   endpoints,
   frontRoutes,
   platformSettings,
+  privateCas,
 } from "../schema.ts";
 import { currentRoute, routeVersion } from "./front-route-state.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, loadEdgeSnapshot } from "./edge-observe.ts";
+import { enabledSniPorts, storedL4Settings } from "./l4-routes.ts";
+import * as pki from "./pki.ts";
 
 export type RouteEnqueue = (input: {
   kind: OperationKind;
@@ -152,10 +172,52 @@ async function loadRoute(routeId: string) {
   return { route: row.route, endpoint: row.endpoint, domain: domain ?? null, version: row.version };
 }
 
-function requireHttp(route: RouteRow) {
-  if (route.kind !== "http") {
+function requireManaged(route: RouteRow) {
+  if (route.kind !== "http" && route.kind !== "tls" && route.kind !== "tcp") {
     throw new FrontRouteError(422, `Route kind "${route.kind}" is not managed by this API yet.`);
   }
+}
+
+/** Refusals from the shared L4 rules are request errors (422), not server faults. */
+function l4Check<T>(work: () => T): T {
+  try {
+    return work();
+  } catch (error) {
+    if (error instanceof FrontRouteError) throw error;
+    if (error instanceof Error && error.name !== "Error") throw new FrontRouteError(422, error.message);
+    throw error;
+  }
+}
+
+/** The stored L4 settings of a `tls`/`tcp` row, refusing a corrupt row instead of guessing. */
+function currentL4(route: RouteRow): L4RouteSettings {
+  const stored = storedL4Settings(route);
+  if (!stored) throw new FrontRouteError(409, "The route's stored TLS/TCP settings are invalid.");
+  return stored;
+}
+
+function l4Summary(route: RouteRow) {
+  if (route.kind !== "tls" && route.kind !== "tcp") return null;
+  const stored = storedL4Settings(route);
+  return {
+    tlsMode: route.tlsMode,
+    sourceCidrs: route.sourceCidrs,
+    allowInternet: route.allowInternet,
+    internetConfirmedAt: route.internetConfirmedAt?.toISOString() ?? null,
+    protocolAuthConfirmed: route.protocolAuthConfirmed,
+    limits: stored?.limits ?? null,
+    clientCaId: route.clientCaId,
+    // Empty = deny all; the route cannot be enabled until it admits someone.
+    admits: route.allowInternet ? "internet" : route.sourceCidrs.length ? "allowlist" : "nobody",
+  };
+}
+
+async function routeDrain(enqueue: RouteEnqueue, route: RouteRow, reason: string) {
+  await enqueue({
+    kind: "edge.drain",
+    targetIds: ["edge:drain"],
+    payload: { reason, routeIds: [route.id], backends: [backendKey(route.targetIp, route.targetPort)] },
+  });
 }
 
 // ---- Listing ----------------------------------------------------------------------------------
@@ -173,8 +235,9 @@ function summarize(
     kind: route.kind,
     hostname: endpoint.hostname,
     listenPort: route.listenPort,
-    accessMode: route.accessMode,
+    accessMode: route.kind === "http" ? route.accessMode : null,
     redirectTo: redirectOf(route),
+    l4: l4Summary(route),
     enabled: route.enabled,
     status: route.status,
     lastError: route.lastError,
@@ -259,8 +322,28 @@ export type RouteCreatePlan = Awaited<ReturnType<typeof prepareRouteCreate>>;
 
 /** Every check for `POST /api/front/routes`, with no writes. Throws `FrontRouteError` or 422s. */
 export async function prepareRouteCreate(input: FrontRouteCreateInput) {
-  assertSupportedRouteKind(input.kind);
-  assertSupportedAccessMode(input.accessMode, "create");
+  const kind: SupportedRouteKind = assertSupportedRouteKind(input.kind);
+  assertFieldsForKind(kind, input);
+  if (kind === "http") assertSupportedAccessMode(input.accessMode, "create");
+  const listenPort =
+    kind === "http"
+      ? HTTP_LISTEN_PORT
+      : l4Check(() => routeListenPort(kind, input.listenPort, enabledSniPorts()));
+  const l4 =
+    kind === "http"
+      ? null
+      : l4Check(() =>
+          checkL4RouteSettings({
+            kind,
+            listenPort,
+            tlsMode: input.tlsMode,
+            sourceCidrs: input.sourceCidrs,
+            allowInternet: input.allowInternet,
+            allowPlaintext: input.allowPlaintext,
+            protocolAuthConfirmed: input.protocolAuthConfirmed,
+            limits: input.limits,
+          }),
+        );
   const hostname = normalizeRouteHostname(input.hostname);
   const domain = routeDomainFor(hostname, await db.select().from(domainClaims));
   if (!domain) {
@@ -286,13 +369,30 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
   if (endpoint && endpoint.kind !== "route") {
     throw new FrontRouteError(409, `${hostname} is already used by the ${endpoint.kind} endpoint.`);
   }
-  if (endpoint) {
+  if (kind === "tcp") {
+    // A dedicated port carries exactly one route, whatever its hostname.
+    const [taken] = await db
+      .select({ id: frontRoutes.id })
+      .from(frontRoutes)
+      .where(and(eq(frontRoutes.kind, "tcp"), eq(frontRoutes.listenPort, listenPort)));
+    if (taken) throw new FrontRouteError(409, `Port ${listenPort} already carries route ${taken.id}.`);
+  } else if (endpoint) {
+    // HTTP and TLS-TCP routes share a listener by SNI: one route per hostname and port.
     const [existing] = await db
       .select({ id: frontRoutes.id })
       .from(frontRoutes)
-      .where(and(eq(frontRoutes.endpointId, endpoint.id), eq(frontRoutes.listenPort, HTTP_LISTEN_PORT)));
+      .where(
+        and(
+          eq(frontRoutes.endpointId, endpoint.id),
+          eq(frontRoutes.listenPort, listenPort),
+          statement`${frontRoutes.kind} <> 'tcp'`,
+        ),
+      );
     if (existing)
-      throw new FrontRouteError(409, `${hostname} already has a route on port 443 (${existing.id}).`);
+      throw new FrontRouteError(
+        409,
+        `${hostname} already has a route on port ${listenPort} (${existing.id}).`,
+      );
   }
   const redirectTo =
     input.redirectTo == null ? null : normalizeRedirectTo(input.redirectTo, { hostname, zone: domain.name });
@@ -308,6 +408,9 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
     purpose: ROUTE_RECORD_PURPOSE,
   });
   return {
+    kind,
+    listenPort,
+    l4,
     hostname,
     domain,
     endpoint: endpoint ?? null,
@@ -408,6 +511,12 @@ export async function commitRouteCreate(
   try {
     await db.transaction(async (tx) => {
       await authorize?.(tx);
+      // terminate_mtls: the route's own client CA, created atomically with the route. Its CRL is
+      // generated before the route is first rendered (`edge.l4_apply` refreshes missing CRLs).
+      const clientCa =
+        plan.l4?.tlsMode === "terminate_mtls"
+          ? await pki.createPrivateCa({ purpose: "tcp-client", name: `Route ${routeId}` }, tx)
+          : null;
       let endpointId = plan.endpoint?.id;
       if (!endpointId) {
         endpointId = createId("end");
@@ -422,9 +531,22 @@ export async function commitRouteCreate(
       }
       await tx.insert(frontRoutes).values({
         id: routeId,
-        kind: "http",
+        kind: plan.kind,
         endpointId,
-        listenPort: HTTP_LISTEN_PORT,
+        listenPort: plan.listenPort,
+        ...(plan.l4
+          ? {
+              tlsMode: plan.l4.tlsMode,
+              sourceCidrs: plan.l4.sourceCidrs,
+              allowInternet: plan.l4.allowInternet,
+              // Saved under this request's exposure.public grant (`authorize` above).
+              internetConfirmedBy: plan.l4.allowInternet ? actor.userId : null,
+              internetConfirmedAt: plan.l4.allowInternet ? now : null,
+              protocolAuthConfirmed: plan.l4.protocolAuthConfirmed,
+              tcpOptions: plan.l4.limits,
+              clientCaId: clientCa?.id ?? null,
+            }
+          : {}),
         targetInput: plan.targetInput,
         targetNodeStableId: plan.pinned.stableId,
         targetIp: plan.pinned.ip,
@@ -443,13 +565,16 @@ export async function commitRouteCreate(
         "front_route.create",
         routeId,
         {
+          kind: plan.kind,
           hostname: plan.hostname,
+          listenPort: plan.listenPort,
           domainId: plan.domain.id,
           target: plan.targetInput,
           targetPort: plan.targetPort,
           pinned: plan.pinned,
-          accessMode: plan.accessMode,
-          redirectTo: plan.redirectTo,
+          ...(plan.kind === "http"
+            ? { accessMode: plan.accessMode, redirectTo: plan.redirectTo }
+            : { l4: plan.l4, clientCaId: clientCa?.id ?? null }),
           records: plan.records,
           status: "draft",
         },
@@ -471,7 +596,12 @@ export async function commitRouteCreate(
     });
   } catch (error) {
     if (isUniqueViolation(error)) {
-      throw new FrontRouteError(409, `${plan.hostname} already has a route or endpoint; reload and retry.`);
+      throw new FrontRouteError(
+        409,
+        plan.kind === "tcp"
+          ? `Port ${plan.listenPort} or ${plan.hostname} is already taken; reload and retry.`
+          : `${plan.hostname} already has a route or endpoint; reload and retry.`,
+      );
     }
     throw error;
   }
@@ -487,8 +617,30 @@ export type RouteUpdatePlan = Awaited<ReturnType<typeof prepareRouteUpdate>>;
 /** Every check for `PATCH /api/front/routes/:id`, with no writes. */
 export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdateInput) {
   const { route, endpoint, domain, version } = await loadRoute(routeId);
-  requireHttp(route);
+  requireManaged(route);
+  l4Check(() => assertFieldsForKind(route.kind as SupportedRouteKind, input));
   if (input.accessMode !== undefined) assertSupportedAccessMode(input.accessMode, "update");
+  let l4: { current: L4RouteSettings; next: L4RouteSettings } | null = null;
+  if (route.kind === "tls" || route.kind === "tcp") {
+    const current = currentL4(route);
+    const next = l4Check(() =>
+      checkL4RouteSettings({
+        kind: current.kind,
+        listenPort: current.listenPort,
+        tlsMode: input.tlsMode ?? current.tlsMode,
+        sourceCidrs: input.sourceCidrs ?? current.sourceCidrs,
+        allowInternet: input.allowInternet ?? current.allowInternet,
+        // A tcp route was created with allowPlaintext: true; the confirmation stands.
+        allowPlaintext: current.kind === "tcp" ? true : undefined,
+        protocolAuthConfirmed:
+          current.kind === "tcp"
+            ? (input.protocolAuthConfirmed ?? current.protocolAuthConfirmed)
+            : input.protocolAuthConfirmed,
+        limits: { ...current.limits, ...input.limits },
+      }),
+    );
+    l4 = { current, next };
+  }
   let redirectTo = redirectOf(route);
   if (input.redirectTo !== undefined) {
     if (input.redirectTo === null) redirectTo = null;
@@ -513,6 +665,7 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     redirectTo: input.redirectTo === undefined ? undefined : redirectTo,
     allowSensitivePort: input.allowSensitivePort,
   });
+  if (l4) loosening.push(...l4LooseningChanges(l4.current, l4.next));
   const repin = loosening.some((item) => ["target", "targetPort", "reconfirmTarget"].includes(item));
   const pinned = repin ? await pinTarget(targetInput, targetPort, input.allowSensitivePort) : null;
   const changes: Record<string, { from: unknown; to: unknown }> = {};
@@ -521,6 +674,19 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
   if (input.accessMode !== undefined && input.accessMode !== route.accessMode)
     changes.accessMode = { from: route.accessMode, to: input.accessMode };
   if (redirectTo !== redirectOf(route)) changes.redirectTo = { from: redirectOf(route), to: redirectTo };
+  if (l4) {
+    const { current: before, next } = l4;
+    for (const key of [
+      "tlsMode",
+      "sourceCidrs",
+      "allowInternet",
+      "protocolAuthConfirmed",
+      "limits",
+    ] as const) {
+      if (JSON.stringify(before[key]) !== JSON.stringify(next[key]))
+        changes[key] = { from: before[key], to: next[key] };
+    }
+  }
   if (pinned && (pinned.stableId !== route.targetNodeStableId || pinned.ip !== route.targetIp))
     changes.pinned = {
       from: { stableId: route.targetNodeStableId, ip: route.targetIp },
@@ -537,6 +703,7 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     pinned,
     loosening,
     changes,
+    l4: l4?.next ?? null,
   };
 }
 
@@ -552,11 +719,39 @@ export async function commitRouteUpdate(
   const httpOptions = { ...route.httpOptions };
   if (plan.redirectTo) httpOptions.redirectTo = plan.redirectTo;
   else delete httpOptions.redirectTo;
+  const l4 = plan.l4;
+  const now = new Date();
   await db.transaction(async (tx) => {
     await authorize?.(tx);
+    // Switching to terminate_mtls gives the route its own client CA (kept if it already has one).
+    const clientCaId =
+      l4?.tlsMode === "terminate_mtls" && !route.clientCaId
+        ? (await pki.createPrivateCa({ purpose: "tcp-client", name: `Route ${route.id}` }, tx)).id
+        : route.clientCaId;
     const updated = await tx
       .update(frontRoutes)
       .set({
+        ...(l4
+          ? {
+              tlsMode: l4.tlsMode,
+              sourceCidrs: l4.sourceCidrs,
+              allowInternet: l4.allowInternet,
+              // A newly opened route records this request's exposure.public grant (`authorize`).
+              internetConfirmedBy: l4.allowInternet
+                ? route.allowInternet
+                  ? route.internetConfirmedBy
+                  : actor.userId
+                : null,
+              internetConfirmedAt: l4.allowInternet
+                ? route.allowInternet
+                  ? route.internetConfirmedAt
+                  : now
+                : null,
+              protocolAuthConfirmed: l4.protocolAuthConfirmed,
+              tcpOptions: l4.limits,
+              clientCaId,
+            }
+          : {}),
         targetInput: plan.targetInput,
         targetPort: plan.targetPort,
         targetNodeStableId: plan.pinned?.stableId ?? route.targetNodeStableId,
@@ -573,17 +768,13 @@ export async function commitRouteUpdate(
   });
   const live = route.enabled && route.status === "ready";
   const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
-  if (live && plan.pinned) {
-    // The old backend stops serving now, not at the next observation.
-    await enqueue({
-      kind: "edge.drain",
-      targetIds: ["edge:drain"],
-      payload: {
-        reason: "route_updated",
-        routeIds: [route.id],
-        backends: [backendKey(route.targetIp, route.targetPort)],
-      },
-    });
+  // A changed L4 policy renames the route's HAProxy servers: the old ones are fenced and drained.
+  const policyChanged = ["tlsMode", "sourceCidrs", "allowInternet", "protocolAuthConfirmed", "limits"].some(
+    (key) => key in plan.changes,
+  );
+  if (live && (plan.pinned || policyChanged)) {
+    // The old backend (or policy) stops serving now, not at the next observation.
+    await routeDrain(enqueue, route, plan.pinned ? "route_updated" : "route_policy_changed");
   }
   await auditRoute(
     actor,
@@ -609,12 +800,20 @@ export async function commitRouteUpdate(
 
 // ---- Enable, disable, delete ------------------------------------------------------------------
 
-/** Checks for `enable`: an implemented access mode, and a `ready` route that is not yet enabled. */
+/**
+ * Checks for `enable`: an implemented access mode (HTTP), an L4 route that admits someone (a
+ * non-empty allowlist, or `allowInternet` saved with the owner's exposure.public confirmation), and
+ * a `ready` route that is not yet enabled.
+ */
 export async function prepareRouteEnable(routeId: string) {
   const { route, endpoint, version } = await loadRoute(routeId);
-  requireHttp(route);
+  requireManaged(route);
   if (route.enabled) throw new FrontRouteError(409, "The route is already enabled.");
-  assertSupportedAccessMode(route.accessMode, "enable");
+  if (route.kind === "http") assertSupportedAccessMode(route.accessMode, "enable");
+  else {
+    currentL4(route);
+    l4Check(() => assertL4Enableable(route));
+  }
   if (route.status !== "ready") {
     throw new FrontRouteError(
       409,
@@ -644,7 +843,16 @@ export async function commitRouteEnable(
     actor,
     "front_route.enable",
     plan.route.id,
-    { hostname: plan.endpoint.hostname, accessMode: plan.route.accessMode },
+    plan.route.kind === "http"
+      ? { hostname: plan.endpoint.hostname, accessMode: plan.route.accessMode }
+      : {
+          hostname: plan.endpoint.hostname,
+          kind: plan.route.kind,
+          listenPort: plan.route.listenPort,
+          tlsMode: plan.route.tlsMode,
+          sourceCidrs: plan.route.sourceCidrs,
+          allowInternet: plan.route.allowInternet,
+        },
     idOf(apply),
   );
 }
@@ -652,22 +860,14 @@ export async function commitRouteEnable(
 /** Disabling only tightens exposure: no step-up, and the backend is drained at once. */
 export async function disableRoute(routeId: string, actor: RouteActor, enqueue: RouteEnqueue) {
   const { route, endpoint } = await loadRoute(routeId);
-  requireHttp(route);
+  requireManaged(route);
   if (!route.enabled) throw new FrontRouteError(409, "The route is already disabled.");
   await db
     .update(frontRoutes)
     .set({ enabled: false, updatedAt: new Date() })
     .where(eq(frontRoutes.id, route.id));
   const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
-  await enqueue({
-    kind: "edge.drain",
-    targetIds: ["edge:drain"],
-    payload: {
-      reason: "route_disabled",
-      routeIds: [route.id],
-      backends: [backendKey(route.targetIp, route.targetPort)],
-    },
-  });
+  await routeDrain(enqueue, route, "route_disabled");
   await auditRoute(
     actor,
     "front_route.disable",
@@ -679,7 +879,7 @@ export async function disableRoute(routeId: string, actor: RouteActor, enqueue: 
 
 export async function prepareRouteDelete(routeId: string) {
   const plan = await loadRoute(routeId);
-  requireHttp(plan.route);
+  requireManaged(plan.route);
   return plan;
 }
 
@@ -702,6 +902,16 @@ export async function commitRouteDelete(
       .where(currentRoute(route.id, plan.version))
       .returning({ id: frontRoutes.id });
     if (!removed.length) throw new FrontRouteError(409, "The route changed state; reload and retry.");
+    // The route's own client CA issues nothing more once the route is gone.
+    if (route.clientCaId) {
+      const [shared] = await tx
+        .select({ id: frontRoutes.id })
+        .from(frontRoutes)
+        .where(eq(frontRoutes.clientCaId, route.clientCaId))
+        .limit(1);
+      if (!shared)
+        await tx.update(privateCas).set({ status: "retired" }).where(eq(privateCas.id, route.clientCaId));
+    }
     const others = await tx
       .select({ id: frontRoutes.id })
       .from(frontRoutes)
@@ -723,15 +933,7 @@ export async function commitRouteDelete(
     return true;
   });
   const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
-  await enqueue({
-    kind: "edge.drain",
-    targetIds: ["edge:drain"],
-    payload: {
-      reason: "route_deleted",
-      routeIds: [route.id],
-      backends: [backendKey(route.targetIp, route.targetPort)],
-    },
-  });
+  await routeDrain(enqueue, route, "route_deleted");
   await auditRoute(
     actor,
     "front_route.delete",
@@ -870,4 +1072,114 @@ export async function routesCertificateFailed(endpointId: string, message: strin
       })
       .where(currentRoute(route.id, route.version));
   }
+}
+
+// ---- Route client certificates (terminate_mtls, §3.8.4, FD-14) ---------------------------------------
+
+async function mtlsRoute(routeId: string) {
+  const { route, endpoint } = await loadRoute(routeId);
+  if (route.kind !== "tls" || route.tlsMode !== "terminate_mtls" || !route.clientCaId) {
+    throw new FrontRouteError(409, "Client certificates exist only for tls routes in terminate_mtls mode.");
+  }
+  return { route, endpoint, caId: route.clientCaId };
+}
+
+/** The route CA (public certificate) and its client certificates. Never a private key. */
+export async function listRouteClientCertificates(routeId: string) {
+  const { caId } = await mtlsRoute(routeId);
+  const [ca, issued] = await Promise.all([pki.getPrivateCa(caId), pki.listClientCertificates(caId)]);
+  return {
+    ca: ca
+      ? {
+          id: ca.id,
+          name: ca.name,
+          status: ca.status,
+          certPem: ca.certPem,
+          notAfter: ca.notAfter,
+          crlNextUpdate: ca.crlNextUpdate,
+        }
+      : null,
+    certificates: issued.map((item) => ({
+      id: item.id,
+      subjectCn: item.subjectCn,
+      serial: item.serial,
+      fingerprintSha256: item.fingerprintSha256,
+      notBefore: item.notBefore,
+      notAfter: item.notAfter,
+      status: item.status,
+      revokedAt: item.revokedAt,
+      certPem: item.certPem,
+      // A generated key is revealed once through POST /api/secrets/:id/reveal (secret.reveal step-up).
+      keySecretId: item.keySecretId,
+    })),
+  };
+}
+
+/** Issues a 90-day client certificate from the route CA: a generated key, or the caller's CSR. */
+export async function issueRouteClientCertificate(
+  routeId: string,
+  input: { name: string; csrPem?: string },
+  actor: RouteActor,
+) {
+  const { caId } = await mtlsRoute(routeId);
+  let issued: Awaited<ReturnType<typeof pki.issueClientCertificate>>;
+  try {
+    issued = await pki.issueClientCertificate({
+      caId,
+      subjectCn: input.name,
+      csrPem: input.csrPem,
+      keyOwner: { resourceType: "platform", resourceId: "platform" },
+    });
+  } catch (error) {
+    if (error instanceof pki.PkiPolicyError) throw new FrontRouteError(422, error.message);
+    throw error;
+  }
+  await auditRoute(actor, "front_route.client_certificate_issue", routeId, {
+    certificateId: issued.certificate.id,
+    subjectCn: input.name,
+    serial: issued.certificate.serial,
+    keySource: input.csrPem === undefined ? "generated" : "csr",
+  });
+  return {
+    id: issued.certificate.id,
+    serial: issued.certificate.serial,
+    certPem: issued.certificate.certPem,
+    caCertPem: issued.caCertPem,
+    keySecretId: issued.certificate.keySecretId,
+    notAfter: issued.certificate.notAfter,
+  };
+}
+
+/**
+ * Revokes a route client certificate: the CRL is regenerated, and the serial enters the route's lease
+ * policy fingerprint, so its HAProxy servers are fenced and every session drained (current and
+ * leaving workers) before the generation with the new CRL is reloaded. Tightening: no step-up.
+ */
+export async function revokeRouteClientCertificate(
+  routeId: string,
+  certificateId: string,
+  actor: RouteActor,
+  enqueue: RouteEnqueue,
+) {
+  const { route, caId } = await mtlsRoute(routeId);
+  const certificate = await pki.getClientCertificate(certificateId);
+  if (!certificate || certificate.caId !== caId)
+    throw new FrontRouteError(404, "Client certificate not found.");
+  const revoked = await pki.revokeClientCertificate({ id: certificateId, reason: "cessationOfOperation" });
+  const crl = await pki.generateCaCrl({ caId });
+  const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
+  if (route.enabled) await routeDrain(enqueue, route, "client_certificate_revoked");
+  await auditRoute(
+    actor,
+    "front_route.client_certificate_revoke",
+    routeId,
+    { certificateId, serial: revoked.serial, crlNumber: crl.crlNumber },
+    idOf(apply),
+  );
+  return {
+    id: certificateId,
+    status: revoked.status,
+    revokedAt: revoked.revokedAt,
+    crlNumber: crl.crlNumber,
+  };
 }

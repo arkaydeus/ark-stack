@@ -28,6 +28,7 @@ import { desc, eq } from "drizzle-orm";
 import { db } from "../db.ts";
 import { auditEvents, certificates, endpoints, frontRoutes, operations } from "../schema.ts";
 import { currentRoute, routeVersion } from "./front-route-state.ts";
+import { l4RoutePolicy, revokedSerials, storedL4Settings } from "./l4-routes.ts";
 import type { EdgeLocalApi, ProbeResult } from "./tailnet-localapi.ts";
 import {
   commitTailnetGeneration,
@@ -136,10 +137,25 @@ export async function edgePolicy(
   const valid = leaseValid(loaded, now);
   const routes: EdgePolicyRoute[] = [];
   if (valid) {
-    for (const route of await loadRoutes()) {
-      if (!route.enabled || route.status !== "ready") continue;
+    const live = (await loadRoutes()).filter((route) => route.enabled && route.status === "ready");
+    // TLS-TCP and raw-TCP routes (FD-14) carry their admission policy in the identity, so a policy
+    // change or a client certificate revocation fences and drains their old servers everywhere.
+    const revoked = await revokedSerials(
+      live.flatMap((route) =>
+        route.tlsMode === "terminate_mtls" && route.clientCaId ? [route.clientCaId] : [],
+      ),
+    );
+    for (const route of live) {
       const check = revalidate(route, loaded, now);
       if (!check.ok || check.ip !== route.targetIp) continue;
+      let policy: string | undefined;
+      if (route.kind === "tls" || route.kind === "tcp") {
+        const settings = storedL4Settings(route);
+        // Invalid stored settings, or an unconfirmed open route: never allowed (fail closed). An
+        // empty list stays allowed and renders deny-all (the route admits nobody).
+        if (!settings || (settings.allowInternet && !route.internetConfirmedAt)) continue;
+        policy = l4RoutePolicy(settings, revoked);
+      }
       routes.push({
         id: route.id,
         kind: route.kind,
@@ -147,6 +163,7 @@ export async function edgePolicy(
         ip: route.targetIp,
         port: route.targetPort,
         stableId: route.targetNodeStableId,
+        ...(policy ? { policy } : {}),
       });
     }
   }

@@ -601,6 +601,11 @@ export const frontRoutes = pgTable(
     tcpOptions: jsonb("tcp_options").$type<Record<string, unknown>>().notNull().default({}),
     sourceCidrs: jsonb("source_cidrs").$type<string[]>().notNull().default([]), // empty = deny all
     allowInternet: boolean("allow_internet").notNull().default(false),
+    // FD-14 (0027): the owner's exposure.public confirmation saved with allow_internet, and the
+    // owner-confirmed protocol authentication a plain route needs to open to the internet.
+    internetConfirmedBy: text("internet_confirmed_by").references(() => user.id),
+    internetConfirmedAt: timestamp("internet_confirmed_at", { withTimezone: true }),
+    protocolAuthConfirmed: boolean("protocol_auth_confirmed").notNull().default(false),
     clientCaId: text("client_ca_id").references(() => privateCas.id),
     rateLimit: jsonb("rate_limit").$type<Record<string, unknown>>(), // reserved; not rendered in v1
     enabled: boolean("enabled").notNull().default(false),
@@ -617,6 +622,30 @@ export const frontRoutes = pgTable(
     check(
       "front_routes_tls_mode_check",
       sql`${table.tlsMode} IN ('passthrough', 'terminate', 'terminate_mtls', 'plain')`,
+    ),
+    check(
+      "front_routes_internet_confirmed_check",
+      sql`NOT ${table.allowInternet} OR ${table.internetConfirmedAt} IS NOT NULL`,
+    ),
+    check(
+      "front_routes_l4_shape_check",
+      sql`(${table.kind} = 'http' AND ${table.tlsMode} IS NULL)
+        OR (${table.kind} = 'tcp' AND ${table.tlsMode} = 'plain' AND ${table.listenPort} BETWEEN 20000 AND 20049)
+        OR (${table.kind} = 'tls' AND ${table.tlsMode} IN ('passthrough', 'terminate', 'terminate_mtls')
+            AND ${table.listenPort} IN (443, 8883, 5671, 636, 6380))
+        OR (${table.kind} = 'postgres' AND ${table.tlsMode} IN ('passthrough', 'terminate', 'terminate_mtls'))`,
+    ),
+    check(
+      "front_routes_mtls_ca_check",
+      sql`${table.tlsMode} IS DISTINCT FROM 'terminate_mtls' OR ${table.clientCaId} IS NOT NULL`,
+    ),
+    check(
+      "front_routes_terminate_cidrs_check",
+      sql`${table.tlsMode} IS DISTINCT FROM 'terminate' OR (NOT ${table.allowInternet} AND jsonb_array_length(${table.sourceCidrs}) > 0)`,
+    ),
+    check(
+      "front_routes_plain_internet_check",
+      sql`${table.kind} <> 'tcp' OR NOT ${table.allowInternet} OR ${table.protocolAuthConfirmed}`,
     ),
     uniqueIndex("front_routes_endpoint_listener")
       .on(table.endpointId, table.listenPort)
