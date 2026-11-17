@@ -52,7 +52,7 @@ const fixtures = join(import.meta.dir, "edge-test");
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-observer-${suffix}-`));
 const network = `ark-edge-observer-${suffix}`;
-const runtime = new EdgeTestRuntime(directory, network);
+const runtime = new EdgeTestRuntime(directory, network, bunImage);
 const removeSignalHandlers = runtime.installSignalHandlers();
 const docker = (...args: string[]) => runtime.docker(...args);
 const leaseMs = 8_000;
