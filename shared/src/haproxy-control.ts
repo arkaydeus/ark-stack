@@ -94,7 +94,9 @@ export class HaproxyMaster {
   async workers(): Promise<HaproxyProcess[]> {
     const text = await this.command("show proc");
     if (!/<PID>|master/.test(text)) throw new Error(`unexpected show proc answer: ${text.slice(0, 120)}`);
-    return parseShowProc(text).filter((process) => process.type === "worker");
+    const workers = parseShowProc(text).filter((process) => process.type === "worker");
+    if (!workers.length) throw new Error("show proc returned no inspectable worker");
+    return workers;
   }
 
   async worker(pid: number, command: string) {
@@ -104,11 +106,39 @@ export class HaproxyMaster {
   }
 
   async servers(pid: number): Promise<ServerState[]> {
-    return parseServersState(await this.worker(pid, "show servers state"));
+    const text = await this.worker(pid, "show servers state");
+    if (!/^#.*be_id.*srv_name/m.test(text)) throw new Error("incomplete show servers state answer");
+    const servers = parseServersState(text);
+    if (
+      !text.endsWith("\n") ||
+      !servers.length ||
+      servers.some(
+        (server) =>
+          !server.backend ||
+          !server.server ||
+          !Number.isInteger(server.port) ||
+          !Number.isInteger(server.adminState) ||
+          !Number.isInteger(server.operState),
+      )
+    ) {
+      throw new Error("incomplete show servers state answer");
+    }
+    return servers;
   }
 
   async sessions(pid: number) {
-    return parseShowSess(await this.worker(pid, "show sess"));
+    const text = await this.worker(pid, "show sess");
+    const sessions = parseShowSess(text);
+    // Worker-local CLI inspection itself appears as GLOBAL. A missing/truncated dump is not
+    // evidence that the protected sessions disappeared during a racing master reload.
+    if (
+      !text.endsWith("\n") ||
+      !sessions.some((session) => session.frontend === "GLOBAL") ||
+      text.split("\n").filter((line) => line.trim()).length !== sessions.length
+    ) {
+      throw new Error("incomplete show sess answer");
+    }
+    return sessions;
   }
 
   async stat(pid: number) {
@@ -188,7 +218,8 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
         after = await this.master.workers();
       } catch (error) {
         problem = `HAProxy master CLI failed mid-withdrawal: ${(error as Error).message}`;
-        break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        continue;
       }
       const stable =
         after.map((worker) => worker.pid).join(",") === workers.map((worker) => worker.pid).join(",");
@@ -278,11 +309,8 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     return { clean: true, problem: "" };
   }
 
-  /**
-   * Fallback when withdrawal cannot be applied: close every listener and every proxied session in
-   * the workers whose withdrawal failed. The HAProxy launch guard then stops the container once the
-   * watchdog no longer reports verified enforcement, and restarts it closed. A worker that started
-   * after the failed pass (HAProxy restarting) is left to the next pass, which inspects it.
+  /** Fail closed for tailnet backends only; public HTTP is never collateral to a CLI failure.
+   * If inspection or fencing fails, the latched launch guard kills the container.
    */
   async stop() {
     if (!this.inspected.size) {
@@ -291,27 +319,26 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
       );
     }
     const workers = (await this.master.workers()).filter((worker) => this.inspected.has(worker.pid));
-    const failures: string[] = [];
     for (const worker of workers) {
       try {
-        const frontends = (await this.master.stat(worker.pid))
-          .filter((row) => row.svname === "FRONTEND")
-          .map((row) => row.pxname!);
-        for (const frontend of frontends) {
-          const answer = (await this.master.worker(worker.pid, `shutdown frontend ${frontend}`)).trim();
-          if (answer && !PROXY_STOPPED.test(answer) && !/already/i.test(answer))
-            failures.push(`${frontend}: ${answer}`);
+        const servers = (await this.master.servers(worker.pid)).filter((server) => server.key !== null);
+        const names = new Set(servers.map((server) => `${server.backend}/${server.server}`));
+        for (const server of servers) {
+          const answer = (
+            await this.master.worker(worker.pid, `disable server ${server.backend}/${server.server}`)
+          ).trim();
+          if (answer && !PROXY_STOPPED.test(answer)) throw new Error(answer);
         }
+        if (!names.size) continue;
         for (const session of await this.master.sessions(worker.pid)) {
-          if (session.frontend === "GLOBAL") continue;
-          await this.master.worker(worker.pid, `shutdown session ${session.id}`);
+          if (!names.has(`${session.backend}/${session.server}`)) continue;
+          const answer = (await this.master.worker(worker.pid, `shutdown session ${session.id}`)).trim();
+          if (answer && !/not found|no such|unknown session/i.test(answer)) throw new Error(answer);
         }
       } catch (error) {
-        if (!(error instanceof WorkerGoneError))
-          failures.push(`worker ${worker.pid}: ${(error as Error).message}`);
+        if (!(error instanceof WorkerGoneError)) throw error;
       }
     }
-    if (failures.length) throw new Error(`HAProxy stop incomplete: ${failures.slice(0, 4).join("; ")}`);
   }
 }
 
@@ -320,7 +347,7 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
 export type ValidationAnswer = { ok: boolean; generation: string; hash?: string; diagnostics?: string };
 
 /** `POST /v1/validate` on the restricted validator's Unix socket. */
-export async function validateGeneration(socket: string, generation: string, timeoutMs = 15_000) {
+export async function validateGeneration(socket: string, generation: string, timeoutMs = 25_000) {
   const response = await fetch("http://haproxy-validator/v1/validate", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -457,7 +484,7 @@ export class InvalidGenerationError extends Error {
  * 2. the restricted validator checks it (`haproxy -c` on the same build) and returns its hash;
  * 3. re-hash: no byte may have changed since validation;
  * 4. swap `current` atomically, then `reload` on the master CLI;
- * 5. `Success=0` restores the previous `current` (the old workers keep serving) and fails.
+ * 5. Any failed or unconfirmed reload restores `current` and leaves a durable retry marker.
  */
 export async function installEdgeL4Generation(input: {
   root: string;
@@ -483,18 +510,28 @@ export async function installEdgeL4Generation(input: {
   }
   const rehash = await hashGenerationDir(join(root, "generations", generation.id));
   if (rehash !== generation.id) throw new Error(`generation ${generation.id} changed after validation`);
-  if (previous === generation.id && !input.force) {
+  const pending = await lstat(join(root, "reload-pending")).catch(() => null);
+  if (previous === generation.id && !input.force && !pending) {
     return { generation: generation.id, previous, changed: false, reloaded: false, pruned: [] };
   }
+  if (input.master) await writeFile(join(root, "reload-pending"), generation.id, { mode: FILE_MODE });
   await pointCurrent(root, generation.id);
   if (!input.master) {
     return { generation: generation.id, previous, changed: true, reloaded: false, pruned: [] };
   }
-  const reload = await input.master.reload();
-  if (!reload.success) {
+  let reload: Awaited<ReturnType<HaproxyMaster["reload"]>>;
+  try {
+    reload = await input.master.reload();
+    if (!reload.success)
+      throw new Error(`HAProxy reload failed (old workers keep serving): ${reload.log.slice(-1_000)}`);
+  } catch (error) {
+    // A timeout is ambiguous: keep both generations and force the next apply to reload, even
+    // after a process restart or a same-generation forced reload. Never treat the link as proof.
     if (previous) await pointCurrent(root, previous);
-    throw new Error(`HAProxy reload failed (old workers keep serving): ${reload.log.slice(-1_000)}`);
+    else await rm(join(root, "current"), { force: true });
+    throw error;
   }
+  await rm(join(root, "reload-pending"), { force: true });
   // Keep every generation while a previous worker is still draining; prune once it has left.
   const workers = await input.master.workers().catch(() => null);
   const pruned =

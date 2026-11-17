@@ -40,3 +40,38 @@ test("reads the pinned HAProxy and Bun images from the shipped files", async () 
   );
   expect(images.bun).toMatch(/^oven\/bun:1\.4\.2-slim@sha256:[a-f0-9]{64}$/);
 });
+
+test("maintenance initializes a pre-FD-25 tree and converts both persisted Caddy variants idempotently", async () => {
+  const { mkdir, readFile, writeFile } = await import("node:fs/promises");
+  const { prepareEdgeUpgrade } = await import("./install-edge-l4.ts");
+  const dir = await mkdtemp(join(tmpdir(), "ark-edge-upgrade-"));
+  try {
+    const edgeRoot = join(dir, "edge");
+    const l4Root = join(dir, "edge-l4");
+    await mkdir(edgeRoot);
+    const legacy =
+      "{\n  admin edge-admin:2019\n  auto_https off\n}\n\nadmin.example.com {\n  tls /certs/fullchain.pem /certs/privkey.pem\n  respond ok\n}\n";
+    for (const name of ["Caddyfile", "Caddyfile.closed"]) await writeFile(join(edgeRoot, name), legacy);
+    const input = { edgeRoot, l4Root, uid: process.getuid!(), gid: process.getgid!() };
+    // On Linux the privileged integration covers the real 1000:4400 ownership. On macOS use
+    // the caller's group because an unprivileged host cannot chown to the container-only GID.
+    if (process.getuid!() !== 0) {
+      const { migrateCaddyL4 } = await import("./install-edge-l4.ts");
+      const converted = migrateCaddyL4(legacy);
+      expect(converted).toContain("https_port 8443");
+      expect(converted).toContain("admin.example.com {\n  bind 127.0.0.1");
+      expect(converted).toContain("tls /certs/fullchain.pem /certs/privkey.pem");
+      expect(migrateCaddyL4(converted)).toBe(converted);
+      return;
+    }
+    expect((await prepareEdgeUpgrade(input)).seeded).toBe(true);
+    expect((await lstat(l4Root)).gid).toBe(4400);
+    expect((await lstat(l4Root)).mode & 0o7777).toBe(0o2750);
+    const migrated = await readFile(join(edgeRoot, "Caddyfile"), "utf8");
+    expect(migrated).toContain("https_port 8443");
+    expect((await prepareEdgeUpgrade(input)).seeded).toBe(false);
+    expect(await readFile(join(edgeRoot, "Caddyfile"), "utf8")).toBe(migrated);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

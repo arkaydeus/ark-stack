@@ -7,10 +7,11 @@
 // - seeds `tmp/edge-l4` with an initial generation (no tailnet route: every hostname goes to Caddy)
 //   and the `current` symlink, so edge-l4 can start before the domain worker's first edge.l4_apply;
 // - as root on Linux, gives the tree to the worker's uid and group 4400: directories 2750, files 0640.
-import { chmod, chown, lstat, readdir } from "node:fs/promises";
+import { chmod, chown, lstat, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+  CADDY_GLOBAL_BLOCK,
   currentGeneration,
   EDGE_L4_SHARED_GID,
   HAPROXY_IMAGE_UID,
@@ -65,7 +66,7 @@ export function checkImageIds(
 }
 
 async function capture(args: string[]) {
-  const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(args, { env: process.env, stdout: "pipe", stderr: "pipe" });
   const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
   if (code !== 0) throw new Error(`${args.slice(0, 4).join(" ")} failed`);
   return stdout;
@@ -100,4 +101,40 @@ export function composeImages(compose: string, dockerfile: string) {
   const bun = /^FROM (oven\/bun:\S+-slim@sha256:[a-f0-9]{64}) AS runtime$/m.exec(dockerfile)?.[1];
   if (!haproxy || !bun) throw new Error("Could not find the pinned HAProxy and Bun images.");
   return { haproxy, bun };
+}
+
+/** Upgrade Ark-rendered Caddy files without changing routes, pins, certificate paths or policy. */
+export function migrateCaddyL4(source: string) {
+  if (/^  https_port 8443$/m.test(source)) return source;
+  if (!/^\{\n[\s\S]*?^\}/m.test(source))
+    throw new Error("Unrecognized Caddy global block; refusing edge cutover");
+  return source
+    .replace(/^\{\n[\s\S]*?^\}/m, CADDY_GLOBAL_BLOCK)
+    .replace(/^([a-z0-9.-]+) \{$/gm, "$1 {\n  bind 127.0.0.1");
+}
+
+/** Runs in a root one-shot container before maintenance starts the new edge services. */
+export async function prepareEdgeUpgrade(input: {
+  l4Root: string;
+  edgeRoot: string;
+  uid: number;
+  gid?: number;
+}) {
+  const result = await seedEdgeL4(input.l4Root);
+  await chownEdgeL4(input.l4Root, input.uid);
+  for (const name of ["Caddyfile", "Caddyfile.closed"]) {
+    const path = join(input.edgeRoot, name);
+    const source = await readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (source === null) continue;
+    const migrated = migrateCaddyL4(source);
+    if (migrated === source) continue;
+    const next = `${path}.l4-upgrade`;
+    await writeFile(next, migrated, { mode: 0o600 });
+    await chown(next, input.uid, input.gid ?? input.uid);
+    await rename(next, path);
+  }
+  return result;
 }

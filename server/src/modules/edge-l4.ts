@@ -41,7 +41,7 @@ export function haproxyAdapter(env: Record<string, string | undefined> = process
 /**
  * Renders and installs a generation: write, validate (restricted validator), verify, swap `current`,
  * reload on the master CLI. The caller holds the edge lock. Throws on a refused candidate (nothing is
- * swapped or reloaded) and on `Success=0` (the previous generation is restored).
+ * swapped or reloaded) and on any failed/unconfirmed reload (current is restored; retries reload).
  */
 export async function writeEdgeL4(input: EdgeL4Input, env: Record<string, string | undefined> = process.env) {
   const settings = edgeL4Settings(env);

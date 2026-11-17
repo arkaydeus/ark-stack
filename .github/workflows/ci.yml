@@ -83,7 +83,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y postgresql-client openssl
       - run: bun scripts/test-pgbouncer-public.ts
       - run: |
-          bun test scripts/edge-test
+          bun test scripts/edge-test scripts/edge-l4-guard.test.ts scripts/maintain.test.ts
           bun scripts/test-edge-config.ts
       - run: bun scripts/test-db-ingress.ts
       - run: bun scripts/test-edge-observer.ts

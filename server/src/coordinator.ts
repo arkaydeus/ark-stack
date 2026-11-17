@@ -33,6 +33,7 @@ import {
   type BackupStatus,
   type DnsWrite,
   type ExternalInventory,
+  type EdgeWithdrawalAdapter,
   type MaintenanceBundle,
   type OperationKind,
   type OperationState,
@@ -1794,7 +1795,7 @@ async function applyEdge(operation: OperationRow) {
  * Serializes edge-l4 apply, reload and drain (§3.8.6: one edge lock). A transaction-scoped advisory
  * lock, so a crashed worker never leaves it held.
  */
-async function withEdgeLock<T>(work: () => Promise<T>) {
+export async function withEdgeLock<T>(work: () => Promise<T>) {
   return (await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(hashtext('ark:edge:l4'))`;
     return work();
@@ -1919,26 +1920,32 @@ async function drainEdge(operation: OperationRow) {
   });
 }
 
-/** HAProxy half of `edge.drain`, under the edge lock; a failure stops HAProxy and alerts. */
-async function drainHaproxy(allowed: ReadonlySet<string>) {
-  const adapter = haproxyAdapter();
+/** HAProxy half of `edge.drain`, under the edge lock; a failure fences protected traffic and alerts. */
+export async function drainHaproxy(
+  allowed: ReadonlySet<string>,
+  adapter: EdgeWithdrawalAdapter | null = haproxyAdapter(),
+  alert: (input: Parameters<typeof raiseAlert>[0]) => Promise<unknown> = raiseAlert,
+) {
   if (!adapter) return "not configured";
-  const result = await withEdgeLock(() => adapter.enforce(allowed));
-  if (result.error) {
-    let outcome = "HAProxy listeners were shut down";
-    try {
-      await adapter.stop();
-    } catch (error) {
-      outcome = `HAProxy stop failed: ${(error as Error).message}`;
+  // Keep the fallback under the same lock: an apply must not race a failing drain's stop.
+  return withEdgeLock(async () => {
+    const result = await adapter.enforce(allowed);
+    if (result.error) {
+      let outcome = "HAProxy tailnet backends were fenced";
+      try {
+        await adapter.stop();
+      } catch (error) {
+        outcome = `HAProxy stop failed: ${(error as Error).message}`;
+      }
+      await alert({
+        severity: "critical",
+        title: `Edge route withdrawal failed; ${outcome} (${result.error})`,
+        dedupKey: EDGE_WITHDRAWAL_ALERT,
+      });
+      throw new Error(`HAProxy withdrawal failed; ${outcome}: ${result.error}`);
     }
-    await raiseAlert({
-      severity: "critical",
-      title: `Edge route withdrawal failed; ${outcome} (${result.error})`,
-      dedupKey: EDGE_WITHDRAWAL_ALERT,
-    });
-    throw new Error(`HAProxy withdrawal failed; ${outcome}: ${result.error}`);
-  }
-  return { active: result.active, withdrawn: result.withdrawn };
+    return { active: result.active, withdrawn: result.withdrawn };
+  });
 }
 
 /** Schedules `edge.observe` every five minutes where the edge node's socket is mounted (§3.4). */

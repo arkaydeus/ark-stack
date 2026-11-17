@@ -147,6 +147,8 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
     `${seedDir}:/seed:ro`,
     "--volume",
     `${l4Volume}:/usr/local/etc/haproxy`,
+    "--volume",
+    `${options.edgeDir}:/var/lib/ark/edge`,
     bunImage,
     "bun",
     "/seed/seed-edge-l4.js",

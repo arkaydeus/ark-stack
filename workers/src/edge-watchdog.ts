@@ -7,7 +7,9 @@
 // endpoint with its own token and withdraws every tailnet backend the policy does not allow from the
 // running Caddy and from every current and leaving HAProxy worker; when the lease expires, or the
 // policy cannot be read for 5 s, that is all of them. If a withdrawal cannot be applied and verified
-// it stops the affected proxy and raises an alert. It works with the operation workers stopped.
+// it fences protected traffic and raises an alert. Caddy stops its HTTP app; HAProxy preserves
+// unrelated HTTP, with its launch guard stopping the process if enforcement stays unverified.
+// It works with the operation workers stopped.
 //
 // `GET /v1/launch[?proxy=haproxy]` answers `open` or `closed` for the launch guards
 // (infra/platform/edge-launch-guard.sh, infra/platform/edge-l4-launch-guard.sh): `open` only when
@@ -18,7 +20,6 @@ import { join } from "node:path";
 
 import {
   CaddyWithdrawalAdapter,
-  EdgeWatchdog,
   HaproxyWithdrawalAdapter,
   haproxyLaunchDecision,
   launchDecision,
@@ -27,6 +28,8 @@ import {
   type EdgeWithdrawalAdapter,
   type WatchdogEvent,
 } from "@ark-stack/shared";
+
+import { ProxyWatchdog } from "./proxy-watchdog.ts";
 
 import { watchdogConfig } from "./watchdog-config.ts";
 
@@ -65,32 +68,23 @@ async function report(event: WatchdogEvent) {
 
 const adapters: EdgeWithdrawalAdapter[] = [new CaddyWithdrawalAdapter(adminUrl)];
 if (haproxyMaster) adapters.push(new HaproxyWithdrawalAdapter(haproxyMaster));
-const watchdog = new EdgeWatchdog({ fetchLease, adapters, report, log, staleMs });
-
+const proxies = new Map(
+  adapters.map((adapter) => [
+    adapter.proxy,
+    new ProxyWatchdog({ fetchLease, adapters: [adapter], report, log, staleMs }),
+  ]),
+);
 const run = { stopped: false };
-/** When each proxy last passed a verified enforcement pass (local monotonic clock). */
-const lastVerifiedAt = new Map<string, number>();
-let lastTick: { at: string; withdrawn: string[]; errors: string[] } | null = null;
 
 // Each pass reads the lease (waiting at most 300 ms, so a slow API never delays enforcement) and
 // enforces it. Passes run every interval and also exactly when the current lease runs out.
-async function loop() {
+async function loop(proxy: ProxyWatchdog) {
+  const watchdog = proxy.watchdog;
   while (!run.stopped) {
     const started = performance.now();
     try {
-      const results = await watchdog.tick(300);
-      const now = performance.now();
-      for (const result of results) {
-        if (result.error) lastVerifiedAt.delete(result.proxy);
-        else lastVerifiedAt.set(result.proxy, now);
-      }
-      lastTick = {
-        at: new Date().toISOString(),
-        withdrawn: results.flatMap((result) => result.withdrawn),
-        errors: results.flatMap((result) => (result.error ? [`${result.proxy}: ${result.error}`] : [])),
-      };
+      await proxy.tick();
     } catch (error) {
-      lastVerifiedAt.clear();
       log(`enforcement failed: ${(error as Error).message}`);
     }
     const took = performance.now() - started;
@@ -108,6 +102,7 @@ const server = Bun.serve({
     const { pathname, searchParams } = new URL(request.url);
     if (request.method !== "GET") return new Response("method not allowed", { status: 405 });
     const proxy = searchParams.get("proxy");
+    const watchdog = (proxies.get(proxy ?? "caddy") ?? proxies.get("caddy")!).watchdog;
     if (pathname === "/v1/launch") {
       // Refresh first so a guard starting right after a watchdog restart sees the current lease. The
       // HAProxy guard's periodic re-check (`cached=1`) uses the policy the watchdog loop keeps fresh.
@@ -132,11 +127,8 @@ const server = Bun.serve({
     if (pathname === "/v1/supervise") {
       // Respond only from a recently completed, verified enforcement pass on that proxy. A responsive
       // HTTP server with a wedged loop or an unreadable admin API must not keep the proxy alive.
-      const proxies = proxy ? [proxy] : adapters.map((adapter) => adapter.proxy);
-      const now = performance.now();
-      const healthy =
-        proxies.every((name) => adapters.some((adapter) => adapter.proxy === name)) &&
-        proxies.every((name) => now - (lastVerifiedAt.get(name) ?? Number.NEGATIVE_INFINITY) <= 2_000);
+      const names = proxy ? [proxy] : [...proxies.keys()];
+      const healthy = names.every((name) => proxies.get(name)?.healthy());
       return new Response(healthy ? "ok\n" : "closed\n", {
         status: healthy ? 200 : 503,
         headers: { "cache-control": "no-store" },
@@ -146,7 +138,20 @@ const server = Bun.serve({
       // Counts and timings only: no route, address or token.
       return Response.json({
         ...watchdog.state(),
-        lastTick: lastTick && { ...lastTick, withdrawn: lastTick.withdrawn.length },
+        // Preserve the original Caddy health summary for existing monitoring clients.
+        lastTick: proxies.get("caddy")!.lastTick && {
+          ...proxies.get("caddy")!.lastTick,
+          withdrawn: proxies.get("caddy")!.lastTick!.withdrawn.length,
+        },
+        proxies: Object.fromEntries(
+          [...proxies].map(([name, state]) => [
+            name,
+            {
+              ...state.watchdog.state(),
+              lastTick: state.lastTick && { ...state.lastTick, withdrawn: state.lastTick.withdrawn.length },
+            },
+          ]),
+        ),
       });
     }
     return new Response("not found", { status: 404 });
@@ -165,4 +170,4 @@ log(
     (haproxyMaster ? `; HAProxy master ${haproxyMaster}` : "; HAProxy not configured"),
 );
 if (!token) log("ARK_EDGE_WATCHDOG_TOKEN is not set: every tailnet route stays withdrawn");
-await loop();
+await Promise.all([...proxies.values()].map(loop));

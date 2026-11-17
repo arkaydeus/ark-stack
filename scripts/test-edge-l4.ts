@@ -169,7 +169,11 @@ async function prepareFiles() {
   await mkdir(join(acmeDir, ".well-known", "acme-challenge"), { recursive: true });
   await mkdir(edgeDir);
   await mkdir(peerCertDir);
-  await Bun.write(join(edgeDir, "Caddyfile"), await Bun.file(join(root, "infra/platform/Caddyfile")).text());
+  await Bun.write(
+    join(edgeDir, "Caddyfile"),
+    `{\n  admin edge-admin:2019\n  auto_https off\n}\n${adminHost} {\n  tls /var/lib/ark/certs/${adminHost}/fullchain.pem /var/lib/ark/certs/${adminHost}/privkey.pem\n  respond ok\n}\n`,
+  );
+  await Bun.write(join(edgeDir, "Caddyfile.closed"), await Bun.file(join(edgeDir, "Caddyfile")).text());
   await chmod(directory, 0o755);
   const script = [
     "set -e",
@@ -328,11 +332,12 @@ async function startWatchdog() {
   );
 }
 
-/** The domain worker's edge-l4 side (bundled production code) with its production identity and mounts. */
+/** The production worker is already running when it drains. Keep the probe container alive too,
+ * so Docker container creation time is not counted as withdrawal latency. */
+const probeName = `ark-edge-l4-worker-${suffix}`;
+let probeStarted = false;
 async function probe<T = Record<string, unknown>>(args: string[], options: { group?: boolean } = {}) {
-  const output = await docker(
-    "run",
-    "--rm",
+  const identity = [
     "--user",
     "1000:1000",
     ...(options.group === false ? [] : ["--group-add", "4400"]),
@@ -365,11 +370,16 @@ async function probe<T = Record<string, unknown>>(args: string[], options: { gro
     `${bundles.probe}:/probe:ro`,
     "--workdir",
     "/tmp",
-    bunImage,
-    "bun",
-    "/probe/l4-worker-probe.js",
-    ...args,
-  );
+  ];
+  if (options.group !== false && !probeStarted) {
+    runtime.containers.push(probeName);
+    await docker("run", "--detach", "--name", probeName, ...identity, bunImage, "sleep", "3600");
+    probeStarted = true;
+  }
+  const output =
+    options.group === false
+      ? await docker("run", "--rm", ...identity, bunImage, "bun", "/probe/l4-worker-probe.js", ...args)
+      : await docker("exec", probeName, "bun", "/probe/l4-worker-probe.js", ...args);
   return JSON.parse(output.split("\n").at(-1) ?? "{}") as T;
 }
 
@@ -596,7 +606,7 @@ function rawConnection(payload?: Buffer, waitMs = 9_000) {
       resolveRaw({ closedAfterMs: null, response: Buffer.concat(chunks).toString("latin1") });
     }, waitMs);
     socket.on("connect", () => payload && socket.write(payload));
-    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
     socket.on("error", () => undefined);
     socket.on("close", () => {
       clearTimeout(timer);
@@ -1013,6 +1023,32 @@ async function idleTest(report: Report) {
 }
 
 async function reloadTest(report: Report) {
+  // With no tailnet servers, a master re-exec may drop an in-flight watchdog CLI connection.
+  // Repeated real reloads must preserve both established and fresh public HTTP traffic.
+  const failures: string[] = [];
+  const reloadTraffic = { done: false };
+  const traffic = (async () => {
+    while (!reloadTraffic.done) {
+      const reply = await secureGet(adminHost).catch(() => ({ status: 0 }));
+      if (reply.status !== 200) failures.push(String(reply.status));
+      await Bun.sleep(100);
+    }
+  })();
+  try {
+    for (let i = 0; i < 3; i++) {
+      const reply = await probe<{ reload?: { success: boolean }; error?: string }>(["reload"]);
+      if (!reply.reload?.success) throw new Error(reply.error ?? "reload failed");
+    }
+  } finally {
+    reloadTraffic.done = true;
+    await traffic;
+  }
+  expect(
+    report,
+    failures.length === 0,
+    "watchdog ticks and concurrent HAProxy reloads preserve public HTTP",
+    failures.join(", ") || "all requests returned 200",
+  );
   const good = await probe<{ reload: { success: boolean; log: string }; workers: unknown[] }>(["reload"]);
   expect(
     report,
@@ -1200,6 +1236,7 @@ async function leaseExpiryTest(report: Report) {
   lease.validUntil = Number.POSITIVE_INFINITY;
   await Bun.sleep(1_500);
   const { leaving, current, workers } = await sessionsAcrossWorkers();
+  const eventsBefore = events.length;
   const expiresAt = Date.now() + 4_000;
   lease.validUntil = expiresAt;
   const closedAt = await Promise.all(
@@ -1212,6 +1249,15 @@ async function leaseExpiryTest(report: Report) {
     closedAt.every((at) => at !== null && at >= expiresAt - 500 && at - expiresAt <= 5_000),
     "lease expiry withdraws the HAProxy-routed backend across current and leaving workers by expiry + 5 s",
     `${workers.length} workers; closed ${closedAt.map((at) => (at === null ? "never" : `${at - expiresAt} ms after expiry`)).join(", ")}`,
+  );
+  // The adapters now enforce independently. HAProxy may close its sessions while Caddy is still
+  // inside /load; wait for Caddy's verified withdrawal before asserting its post-withdrawal reply.
+  await waitFor(
+    "Caddy to verify its independent lease withdrawal",
+    async () =>
+      events.slice(eventsBefore).find((event) => event.event === "withdrawn" && event.proxy === "caddy"),
+    5_000,
+    50,
   );
   const fresh = await tlsOutcome();
   const admin = await secureGet(adminHost);
@@ -1254,8 +1300,17 @@ async function launchGuardTest(report: Report) {
     "with an expired lease the launch guard starts HAProxy from the closed configuration (no tailnet backend)",
     `${started.trim()}; ${mqttHost}: ${outcome}`,
   );
+  // Make the first closed-to-full reload fail at the real master CLI, then repair its input.
+  await probe(["guard-reload-fault"]);
   const renewedAt = Date.now();
   lease.validUntil = Number.POSITIVE_INFINITY;
+  await waitFor(
+    "the guard to reject a failed reopen",
+    async () => ((await logsOf(stack.edgeL4)).includes("full reload unconfirmed") ? true : undefined),
+    15_000,
+    250,
+  );
+  await probe(["guard-reload-fault", "restore"]);
   await waitFor(
     "the guard to switch to the full configuration",
     async () => ((await tlsOutcome()) === "relayed" ? true : undefined),
@@ -1271,6 +1326,55 @@ async function launchGuardTest(report: Report) {
     "once the lease is valid, the guard switches to the full configuration and reloads",
     `${Date.now() - renewedAt} ms; ${switched?.trim()}`,
   );
+
+  // Freeze a live watchdog (hung HTTP, not connection refusal) at several polling phases.
+  // Remove the last route during the final freeze while both old/current workers retain sessions.
+  for (const phase of [0, 400, 900]) {
+    const { leaving, current } = await sessionsAcrossWorkers();
+    await Bun.sleep(phase);
+    if (phase === 900) {
+      const applied = await probe<{ error?: string }>([
+        "apply",
+        JSON.stringify({ httpHostnames: httpHosts, tlsRoutes: [] }),
+      ]);
+      if (applied.error) throw new Error(applied.error);
+      // The lease still allows the removed route, so the watchdog leaves these old sessions alone.
+      // Freeze after the new unguarded generation is live to exercise the retained supervision.
+      if ((await leaving.echo("old-worker")) !== "old-worker")
+        throw new Error("old worker session lost before freeze");
+    }
+    const frozenAt = Date.now();
+    await docker("pause", watchdogName);
+    try {
+      const closes = await Promise.all(
+        [leaving.closed, current.closed].map((closed) =>
+          Promise.race([closed, Bun.sleep(8_000).then(() => null)]),
+        ),
+      );
+      expect(
+        report,
+        closes.every((at) => at !== null && at - frozenAt <= 5_000),
+        `frozen watchdog closes current and leaving sessions within 5 s (phase ${phase} ms, final route removed=${phase === 900})`,
+        closes.map((at) => (at === null ? "never" : `${at - frozenAt} ms`)).join(", "),
+      );
+    } finally {
+      await docker("unpause", watchdogName);
+    }
+    await docker("restart", "--time", "1", stack.edgeL4);
+    await refreshPorts();
+    await waitFor(
+      "HAProxy after freeze",
+      async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
+      30_000,
+      500,
+    );
+    await Bun.sleep(1_000);
+  }
+  // Restore the route before exercising stopped-watchdog recovery as well.
+  await sessionsAcrossWorkers().then(({ leaving, current }) => {
+    leaving.socket.destroy();
+    current.socket.destroy();
+  });
 
   // Losing the watchdog while a tailnet route exists stops HAProxy (listeners and sessions).
   const session = await tlsSession();
@@ -1323,6 +1427,11 @@ try {
   await prepareFiles();
   await startContainers();
   await refreshPorts();
+  await waitFor(
+    "HTTPS after the pre-FD-25 maintenance cutover",
+    async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
+    30_000,
+  );
   const applied = await edgeApply();
   if (!applied.applied) throw new Error("writeEdge did not apply the configuration.");
   await waitFor(

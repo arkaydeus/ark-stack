@@ -10,7 +10,7 @@
 //   reload | proc | stat | servers | sessions | sockets
 //   withdraw '<allowed identity keys JSON>'
 //   stop                                 the adapter's stop fallback
-import { lstat, stat } from "node:fs/promises";
+import { lstat, stat, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -95,6 +95,17 @@ async function run(): Promise<unknown> {
         workers: await master.workers(),
         ...(await masterReloads()),
       };
+    }
+    case "guard-reload-fault": {
+      const path = join(root, "current", "haproxy.cfg");
+      const backup = join(root, "guard-fault-backup");
+      if (argument === "restore") await writeFile(path, await readFile(backup));
+      else {
+        const text = await readFile(path, "utf8");
+        await writeFile(backup, text);
+        await writeFile(path, text + "\ninvalid-guard-reload-fault\n");
+      }
+      return { injected: argument !== "restore" };
     }
     case "reload":
       return { reload: await master.reload(), workers: await master.workers() };

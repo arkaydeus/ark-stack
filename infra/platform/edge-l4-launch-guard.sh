@@ -8,11 +8,11 @@
 # generation symlink the domain worker swaps, so a master-CLI `reload` always reads the newest
 # generation in the mode this guard chose:
 #
-# - A configuration without any tailnet server needs no lease: the full variant, unsupervised.
+# - A configuration without any tailnet server needs no lease: the full variant; supervision stays latched after any protected generation.
 # - Otherwise the edge watchdog must answer `open` (every tailnet server authorised by a valid lease)
 #   for the full variant; else (or when the watchdog cannot be reached) the closed variant, which
 #   renders no tailnet backend. HTTP routes through Caddy keep working; tailnet routes fail closed.
-# - While a tailnet route exists, the watchdog must keep reporting verified HAProxy enforcement every
+# - Once a tailnet route has existed, the watchdog must keep reporting verified HAProxy enforcement every
 #   second. After two consecutive misses, every HAProxy process is killed (listeners and established
 #   sessions), the container exits, and the next start is decided again.
 # - Started closed, the guard re-asks the watchdog and switches to the full variant (link + reload)
@@ -33,7 +33,7 @@ watchdog="${ARK_EDGE_WATCHDOG_URL:-http://edge-watchdog:2021}"
 export ARK_EDGE_L4_GENERATION="$root/current"
 
 guarded() { grep -q '^# ark-tailnet-route ' "$full" 2>/dev/null; }
-ask() { wget -q -T 3 -O - "$watchdog/v1/launch?proxy=haproxy$1" 2>/dev/null || true; }
+ask() { wget -q -T 1 -O - "$watchdog/v1/launch?proxy=haproxy$1" 2>/dev/null || true; }
 point() {
   ln -s "$1" "$link.next"
   mv -f "$link.next" "$link"
@@ -44,6 +44,9 @@ if [ ! -r "$full" ]; then
   exit 1
 fi
 mode=full
+# Latch before starting: removing the final route must not abandon leaving workers.
+latched=0
+if guarded; then latched=1; fi
 if ! guarded; then
   reason="the configuration has no tailnet route"
 else
@@ -77,12 +80,17 @@ kill_all() {
   pkill -KILL -x haproxy 2>/dev/null || true
 }
 
+# Keep heartbeat enforcement independent of launch requests and potentially slow reloads.
+# An immutable generation records that protected workers might exist, including generations
+# installed and replaced between two polls. Generations are retained while workers leave.
+protected_generation() { grep -q '^# ark-tailnet-route ' "$root"/generations/*/haproxy.cfg 2>/dev/null; }
 supervise() {
   # Allow the first enforcement pass to inspect the newly started HAProxy.
   sleep 2
   misses=0
   while kill -0 "$haproxy_pid" 2>/dev/null; do
-    if guarded; then
+    if guarded || protected_generation; then latched=1; fi
+    if [ "$latched" = 1 ]; then
       heartbeat="$(wget -q -T 1 -O - "$watchdog/v1/supervise?proxy=haproxy" 2>/dev/null || true)"
       if [ "$heartbeat" = "ok" ]; then
         misses=0
@@ -96,12 +104,27 @@ supervise() {
         kill_all
         return
       fi
+      # Never spend the remaining shutdown budget on launch polling after a missed heartbeat.
+      if [ "$heartbeat" != "ok" ]; then sleep 1; continue; fi
+    fi
+    sleep 1
+  done
+}
+# A separate process may block on the CLI without delaying heartbeat enforcement.
+reopen() {
+  while kill -0 "$haproxy_pid" 2>/dev/null; do
+    if guarded; then
       decision="$(ask "&cached=1")"
       if [ "$mode" = closed ] && [ "$decision" = "open" ]; then
         point "$full"
-        mode=full
-        answer="$(echo reload | socat -t 30 - "UNIX-CONNECT:$master" 2>&1 | head -n 1 || true)"
-        echo "ark edge-l4 launch guard: lease valid; switched to the full configuration ($answer)" >&2
+        answer="$(echo reload | socat -t 30 - "UNIX-CONNECT:$master" 2>&1 || true)"
+        if printf '%s\n' "$answer" | grep -q '^Success=1$'; then
+          mode=full
+          echo "ark edge-l4 launch guard: lease valid; switched to the full configuration" >&2
+        else
+          point "$closed"
+          echo "ark edge-l4 launch guard: full reload unconfirmed; retaining closed mode and retrying" >&2
+        fi
       elif [ "$mode" = full ] && [ "$decision" = "closed" ]; then
         point "$closed"
         mode=closed
@@ -113,7 +136,10 @@ supervise() {
 }
 supervise &
 supervisor_pid=$!
+reopen &
+reopen_pid=$!
 shutdown() {
+  kill "$reopen_pid" 2>/dev/null || true
   kill "$supervisor_pid" 2>/dev/null || true
   kill -USR1 "$haproxy_pid" 2>/dev/null || true
 }
@@ -123,6 +149,7 @@ wait "$haproxy_pid"
 status=$?
 # `wait` returns early when a trapped signal arrives; wait for HAProxy itself to finish.
 while kill -0 "$haproxy_pid" 2>/dev/null; do wait "$haproxy_pid"; status=$?; done
+kill "$reopen_pid" 2>/dev/null || true
 kill "$supervisor_pid" 2>/dev/null || true
 wait "$supervisor_pid" 2>/dev/null
 exit "$status"

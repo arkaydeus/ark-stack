@@ -25,6 +25,7 @@ import {
   HaproxyWithdrawalAdapter,
   installEdgeL4Generation,
   InvalidGenerationError,
+  validateGeneration,
   type HaproxyCli,
 } from "./haproxy-control.ts";
 
@@ -255,9 +256,14 @@ function fakeMaster(workers: FakeWorker[], log: string[] = []): HaproxyCli {
       return `1\n${header}\n${worker.servers.map((s, i) => `${i + 3} ${s.backend} 1 ${s.server} ${s.addr} 2 ${s.admin} 1 1 3 1 0 2 0 0 0 0 - ${s.port} - 0 0 - - 0`).join("\n")}\n\n`;
     }
     if (match[2] === "show sess") {
-      return worker.sessions
-        .map((s) => `${s.id}: proto=tcpv4 src=1.2.3.4:5 fe=fe_tls443 be=${s.backend} srv=${s.server} ts=00\n`)
-        .join("");
+      return (
+        "0xffff: proto=sockpair fe=GLOBAL be=<NONE> srv=<none>\n" +
+        worker.sessions
+          .map(
+            (s) => `${s.id}: proto=tcpv4 src=1.2.3.4:5 fe=fe_tls443 be=${s.backend} srv=${s.server} ts=00\n`,
+          )
+          .join("")
+      );
     }
     if (match[2] === "show stat") {
       return `# pxname,svname,scur\nfe_tls443,FRONTEND,${worker.sessions.length}\n`;
@@ -366,12 +372,13 @@ describe("HaproxyWithdrawalAdapter", () => {
     expect(result).toMatchObject({ unreachable: true });
   });
 
-  test("stop shuts every frontend and proxied session down in the workers of the failed pass", async () => {
+  test("stop fences tailnet servers and sessions without shutting down public HTTP", async () => {
     const state = workers();
     const log: string[] = [];
     const cli = fakeMaster(state, log);
+    let fail = true;
     const failing: HaproxyCli = async (socket, command, timeout) =>
-      command.includes("disable server") ? "Unexpected failure.\n" : cli(socket, command, timeout);
+      fail && command.includes("disable server") ? "Unexpected failure.\n" : cli(socket, command, timeout);
     const adapter = new HaproxyWithdrawalAdapter("/fake", failing);
     expect((await adapter.enforce(new Set())).error).toMatch(/Unexpected failure/);
     // A worker that appears after the failed pass (a restart) is not touched by stop.
@@ -382,13 +389,103 @@ describe("HaproxyWithdrawalAdapter", () => {
       servers: [],
       sessions: [{ id: "0x77", backend: "be_caddy", server: "caddy" }],
     });
+    // The disable operation recovers before the fallback is attempted.
+    fail = false;
     await adapter.stop();
-    expect(log).toContain("@!53 shutdown frontend fe_tls443");
+    expect(log.some((command) => command.includes("shutdown frontend"))).toBe(false);
     expect(log).not.toContain("@!99 shutdown frontend fe_tls443");
-    expect(state.filter((worker) => worker.pid !== 99).every((worker) => worker.sessions.length === 0)).toBe(
+    expect(
+      state
+        .filter((worker) => worker.pid !== 99)
+        .every((worker) => worker.sessions.every((session) => session.backend === "be_caddy")),
+    ).toBe(true);
+    expect(state.find((worker) => worker.pid === 99)!.sessions).toHaveLength(1);
+  });
+
+  test.each(["throw", "empty"])(
+    "a transient mid-pass show proc %s retries without stopping public HTTP",
+    async (failure) => {
+      const state = workers().slice(0, 1);
+      state[0]!.servers = state[0]!.servers.slice(0, 1);
+      state[0]!.sessions = [{ id: "0x3", backend: "be_caddy", server: "caddy" }];
+      const log: string[] = [];
+      const cli = fakeMaster(state, log);
+      let proc = 0;
+      const adapter = new HaproxyWithdrawalAdapter("/fake", async (socket, command, timeout) => {
+        if (command === "show proc" && ++proc === 2) {
+          if (failure === "throw") throw new Error("reload disconnected CLI");
+          return "";
+        }
+        return cli(socket, command, timeout);
+      });
+      expect((await adapter.enforce(new Set())).error).toBeUndefined();
+      await adapter.stop();
+      expect(log.some((command) => command.includes("shutdown"))).toBe(false);
+      expect(state[0]!.sessions).toHaveLength(1);
+    },
+  );
+
+  test("a departing worker is skipped and a newly appearing worker is drained", async () => {
+    const state = workers();
+    const cli = fakeMaster(state);
+    let changed = false;
+    const adapter = new HaproxyWithdrawalAdapter("/fake", async (socket, command, timeout) => {
+      if (!changed && command === "@!53 show servers state") {
+        changed = true;
+        const next = { ...state.shift()!, pid: 99 };
+        state.push(next);
+        return "Can't find the target PID";
+      }
+      return cli(socket, command, timeout);
+    });
+    expect((await adapter.enforce(new Set())).error).toBeUndefined();
+    expect(state.every((worker) => worker.sessions.every((session) => session.backend === "be_caddy"))).toBe(
       true,
     );
-    expect(state.find((worker) => worker.pid === 99)!.sessions).toHaveLength(1);
+  });
+
+  test("continuous worker churn exhausts the bounded passes without claiming success", async () => {
+    const state = workers().slice(0, 1);
+    const cli = fakeMaster(state);
+    let count = 0;
+    const adapter = new HaproxyWithdrawalAdapter("/fake", async (socket, command, timeout) => {
+      if (command === "show proc" && ++count > 1) state[0]!.pid++;
+      return cli(socket, command, timeout);
+    });
+    expect((await adapter.enforce(new Set())).error).toContain("worker set changed");
+    expect(count).toBe(21);
+  });
+
+  test.each(["show servers state", "show sess"])(
+    "dropped %s answers never verify withdrawal",
+    async (verb) => {
+      const cli = fakeMaster(workers());
+      const adapter = new HaproxyWithdrawalAdapter("/fake", async (socket, command, timeout) =>
+        command.endsWith(verb) ? "" : cli(socket, command, timeout),
+      );
+      expect((await adapter.enforce(new Set())).error).toContain(`incomplete ${verb}`);
+    },
+  );
+
+  test.each(["garbage", "0xffff: proto=sockpair fe=GLOBAL be=<NONE> srv=<none>\n0x12: fe=truncated"])(
+    "malformed session dumps fail closed (%s)",
+    async (answer) => {
+      const cli = fakeMaster(workers());
+      const adapter = new HaproxyWithdrawalAdapter("/fake", async (socket, command, timeout) =>
+        command.endsWith("show sess") ? answer : cli(socket, command, timeout),
+      );
+      expect((await adapter.enforce(new Set())).error).toContain("incomplete show sess");
+    },
+  );
+
+  test("a server dump dropped after its header is not a verified empty router", async () => {
+    const cli = fakeMaster(workers());
+    const adapter = new HaproxyWithdrawalAdapter("/fake", async (socket, command, timeout) =>
+      command.endsWith("show servers state")
+        ? "1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_port\n"
+        : cli(socket, command, timeout),
+    );
+    expect((await adapter.enforce(new Set())).error).toContain("incomplete show servers state");
   });
 
   test("stop refuses to act without an inspected worker", async () => {
@@ -506,6 +603,58 @@ describe("generation install (§3.8.6)", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  test.each(["refused", "timeout", "empty", "Success=0"])(
+    "unconfirmed reload (%s) restores and retries even on first install",
+    async (failure) => {
+      for (const initial of [false, true]) {
+        const root = await scratch();
+        try {
+          const good = renderEdgeL4Generation({ httpHostnames: ["old.example.com"] });
+          if (initial)
+            await installEdgeL4Generation({ root, generation: good, validatorSocket: "/v", validate: valid });
+          const candidate = renderEdgeL4Generation({ httpHostnames: ["new.example.com"] });
+          let attempts = 0;
+          const master = new HaproxyMaster("/fake", async (_socket, command) => {
+            if (command !== "reload") return "#<PID> <type>\n1 master 0\n# workers\n9 worker 0\n";
+            if (++attempts === 1) {
+              if (failure === "empty") return "";
+              if (failure === "Success=0") return "Success=0\n--\n";
+              throw new Error(failure);
+            }
+            return "Success=1\n--\n";
+          });
+          const input = { root, generation: candidate, validatorSocket: "/v", validate: valid, master };
+          await expect(installEdgeL4Generation(input)).rejects.toThrow();
+          expect(await currentGeneration(root)).toBe(initial ? good.id : null);
+          expect((await installEdgeL4Generation(input)).reloaded).toBe(true);
+          expect(attempts).toBe(2);
+          expect(await currentGeneration(root)).toBe(candidate.id);
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    },
+  );
+
+  test("a failed forced reload of the current generation stays retryable", async () => {
+    const root = await scratch();
+    try {
+      const generation = renderEdgeL4Generation({ httpHostnames: [] });
+      await installEdgeL4Generation({ root, generation, validatorSocket: "/v", validate: valid });
+      let attempts = 0;
+      const master = new HaproxyMaster("/fake", async (_socket, command) => {
+        if (command !== "reload") return "#<PID>\n1 master 0\n";
+        if (++attempts === 1) throw new Error("ambiguous timeout");
+        return "Success=1\n--\n";
+      });
+      const input = { root, generation, validatorSocket: "/v", validate: valid, master };
+      await expect(installEdgeL4Generation({ ...input, force: true })).rejects.toThrow();
+      expect((await installEdgeL4Generation(input)).reloaded).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("hashing refuses symlinks inside a generation", async () => {
     const root = await scratch();
     await writeFile(join(root, "haproxy.cfg"), "x");
@@ -514,3 +663,24 @@ describe("generation install (§3.8.6)", () => {
     await rm(root, { recursive: true, force: true });
   });
 });
+
+test("validator client allows both 10-second checks and aborts a hung validator", async () => {
+  const root = await scratch();
+  const socket = join(root, "validator.sock");
+  let delay = 20_050;
+  const server = Bun.serve({
+    unix: socket,
+    async fetch() {
+      await Bun.sleep(delay);
+      return Response.json({ ok: true, hash: "a".repeat(64) });
+    },
+  });
+  try {
+    expect((await validateGeneration(socket, "a".repeat(64))).ok).toBe(true);
+    delay = 100;
+    await expect(validateGeneration(socket, "a".repeat(64), 20)).rejects.toThrow();
+  } finally {
+    await server.stop(true);
+    await rm(root, { recursive: true, force: true });
+  }
+}, 26_000);

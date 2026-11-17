@@ -39,7 +39,13 @@ async function fixture() {
   for (const path of ["scripts", "bin", "infra/platform", "tmp/certs/database"]) {
     await mkdir(join(directory, path), { recursive: true });
   }
-  for (const name of ["install.ts", "install-edge-auth.ts", "edge-namespace.ts", "pgbouncer-bootstrap.ts"]) {
+  for (const name of [
+    "install.ts",
+    "install-edge-auth.ts",
+    "install-edge-l4.ts",
+    "edge-namespace.ts",
+    "pgbouncer-bootstrap.ts",
+  ]) {
     await copyFile(join(root, "scripts", name), join(directory, "scripts", name));
   }
   await symlink(join(root, "node_modules"), join(directory, "node_modules"));
@@ -48,6 +54,11 @@ async function fixture() {
   for (const name of ["Caddyfile", "serve.json"]) {
     await copyFile(join(root, "infra/platform", name), join(directory, "infra/platform", name));
   }
+  await copyFile(join(root, "Dockerfile"), join(directory, "Dockerfile"));
+  await copyFile(
+    join(root, "infra/platform/docker-compose.yml"),
+    join(directory, "infra/platform/docker-compose.yml"),
+  );
   // Existing certs avoid invoking openssl; Docker is replaced only inside this disposable install.
   for (const name of ["fullchain.pem", "privkey.pem"]) {
     await Bun.write(join(directory, "tmp/certs/database", name), "fixture");
@@ -56,6 +67,7 @@ async function fixture() {
     join(directory, "bin/docker"),
     `#!${process.execPath}
 import { appendFileSync } from "node:fs";
+if (process.argv.some((arg) => arg.includes("id -u"))) console.log(process.argv.some((arg) => arg.startsWith("haproxy:")) ? "99\\n---" : "1000\\n---");
 appendFileSync(process.env.INSTALL_CALLS, JSON.stringify({args:process.argv.slice(2), key:process.env.TS_EDGE_AUTHKEY}) + "\\n");
 `,
   );

@@ -4,9 +4,10 @@
 // with directories 2750 and files 0640, exactly as `mise run host:install` does on the host.
 //
 //   bun seed-edge-l4.js <root> <uid>
-import { chownEdgeL4, seedEdgeL4 } from "../install-edge-l4.ts";
+import { prepareEdgeUpgrade } from "../install-edge-l4.ts";
 
 const [root = "/usr/local/etc/haproxy", uid = "1000"] = process.argv.slice(2);
-const seeded = await seedEdgeL4(root);
-await chownEdgeL4(root, Number(uid));
+const seeded = await prepareEdgeUpgrade({ l4Root: root, edgeRoot: "/var/lib/ark/edge", uid: Number(uid) });
+const again = await prepareEdgeUpgrade({ l4Root: root, edgeRoot: "/var/lib/ark/edge", uid: Number(uid) });
+if (again.seeded) throw new Error("Maintenance initialization was not idempotent");
 console.log(JSON.stringify(seeded));
