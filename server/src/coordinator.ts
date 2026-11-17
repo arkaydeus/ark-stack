@@ -53,6 +53,7 @@ import {
 import {
   routesAfterCertificate,
   routesAfterDnsCheck,
+  reconcileRouteRecords,
   routesCertificateFailed,
 } from "./modules/front-routes.ts";
 import { edgeLocalApi, edgeSocketPath } from "./modules/tailnet-localapi.ts";
@@ -671,7 +672,16 @@ async function verifyDomain(operation: OperationRow) {
   const domainId = operation.targetIds[0];
   const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, domainId));
   if (!domain) throw new Error("Domain not found.");
-  const records = await db.select().from(dnsRecords).where(eq(dnsRecords.domainId, domainId));
+  const routeEndpointsOnly = operation.payload?.routeEndpointsOnly === true;
+  await reconcileRouteRecords(domainId);
+  const endpointRows = (await db.select().from(endpoints).where(eq(endpoints.domainId, domainId))).filter(
+    (endpoint) => !routeEndpointsOnly || endpoint.kind === "route",
+  );
+  const routeHostnames = new Set(endpointRows.map((endpoint) => endpoint.hostname));
+  const records = (await db.select().from(dnsRecords).where(eq(dnsRecords.domainId, domainId))).filter(
+    (record) =>
+      !routeEndpointsOnly || record.name === `_ark-stack.${domain.name}` || routeHostnames.has(record.name),
+  );
   if (!records.length) throw new Error("Domain has no stored DNS ownership challenge.");
   const ownership = records.find(
     (record) =>
@@ -712,7 +722,6 @@ async function verifyDomain(operation: OperationRow) {
     .update(domainClaims)
     .set({ status: "verified", lastError: null, updatedAt: new Date() })
     .where(eq(domainClaims.id, domainId));
-  const endpointRows = await db.select().from(endpoints).where(eq(endpoints.domainId, domainId));
   const verifiedEndpointIds = new Set<string>();
   for (const endpoint of endpointRows) {
     const endpointRecords = records.filter((record) => record.name === endpoint.hostname && record.required);
@@ -739,6 +748,7 @@ async function verifyDomain(operation: OperationRow) {
             observed: observedById.get(record.id) ?? "",
           })),
         operationId: operation.id,
+        routeEndpointsOnly,
       });
       if (!verified || !requested) continue;
     } else if (!verified) continue;
@@ -749,6 +759,7 @@ async function verifyDomain(operation: OperationRow) {
     });
   }
   await addStep(operation.id, "dns-verified", { records: records.length });
+  if (routeEndpointsOnly) return;
   const clusters = await db.select().from(databaseClusters);
   for (const database of await db.select().from(managedDatabases)) {
     const cluster = clusters.find((item) => item.id === database.clusterId);

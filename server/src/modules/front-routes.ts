@@ -3,11 +3,11 @@
 // Owners create, update, enable, disable and delete public HTTP routes to tailnet services. A route
 // moves through `draft -> awaiting_acl -> awaiting_dns -> issuing_certificate -> ready`:
 //
-// - draft: the row, its endpoint and its address records exist (created by the API).
+// - draft: creation audit state; persisted atomically with endpoint, DNS and awaiting_acl.
 // - awaiting_acl: the ACL snippet was handed out; waiting for the edge-netns TCP probe that
 //   `edge.observe` runs (FD-06). Netmap presence alone is never enough.
 // - awaiting_dns: the probe passed; `domain.verify` checks that the A (and gated AAAA) record
-//   resolves to this server. The observer re-queues it on every run until it does.
+//   resolves to this server. The observer re-queues a route-only check until it does.
 // - issuing_certificate: DNS resolves to `public_ipv4`; `certificate.issue` was queued. Certificates
 //   are never requested before this point.
 // - ready: an issued certificate and a fresh passing probe. Only `edge.observe` writes `ready`.
@@ -37,9 +37,9 @@ import {
   type FrontRouteUpdateInput,
   type OperationKind,
 } from "@ark-stack/shared";
-import { and, eq, like } from "drizzle-orm";
+import { and, desc, eq, like, sql as statement } from "drizzle-orm";
 
-import { db } from "../db.ts";
+import { db, type DbTransaction } from "../db.ts";
 import {
   auditEvents,
   certificates,
@@ -49,6 +49,7 @@ import {
   frontRoutes,
   platformSettings,
 } from "../schema.ts";
+import { currentRoute, routeVersion } from "./front-route-state.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, loadEdgeSnapshot } from "./edge-observe.ts";
 
 export type RouteEnqueue = (input: {
@@ -57,9 +58,11 @@ export type RouteEnqueue = (input: {
   payload?: Record<string, unknown>;
 }) => Promise<unknown>;
 
+export type RouteAuthorize = (tx: DbTransaction) => Promise<unknown>;
+
 export type RouteActor = { userId: string; role: string };
 
-/** A refusal with an HTTP status. The API maps it to that status before any grant is consumed. */
+/** A refusal with an HTTP status; rejected transactional mutations roll back grant consumption. */
 export class FrontRouteError extends Error {
   status: 404 | 409 | 422;
   constructor(status: 404 | 409 | 422, message: string) {
@@ -84,9 +87,11 @@ export async function auditRoute(
   routeId: string,
   detail: Record<string, unknown>,
   operationId?: string,
+  executor: Pick<typeof db, "insert"> = db,
 ) {
-  await db.insert(auditEvents).values({
+  await executor.insert(auditEvents).values({
     id: createId("aud"),
+    createdAt: statement`clock_timestamp()`,
     actorId: actor?.userId,
     role: actor?.role,
     action,
@@ -135,7 +140,7 @@ async function pinTarget(target: string, port: number, allowSensitivePort: boole
 
 async function loadRoute(routeId: string) {
   const [row] = await db
-    .select({ route: frontRoutes, endpoint: endpoints })
+    .select({ route: frontRoutes, endpoint: endpoints, version: routeVersion })
     .from(frontRoutes)
     .innerJoin(endpoints, eq(endpoints.id, frontRoutes.endpointId))
     .where(eq(frontRoutes.id, routeId));
@@ -143,7 +148,7 @@ async function loadRoute(routeId: string) {
   const [domain] = row.endpoint.domainId
     ? await db.select().from(domainClaims).where(eq(domainClaims.id, row.endpoint.domainId))
     : [];
-  return { route: row.route, endpoint: row.endpoint, domain: domain ?? null };
+  return { route: row.route, endpoint: row.endpoint, domain: domain ?? null, version: row.version };
 }
 
 function requireHttp(route: RouteRow) {
@@ -314,12 +319,23 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
   };
 }
 
-async function writeRecords(domainId: string, records: DnsRecordPlan[]) {
-  const existing = await db.select().from(dnsRecords).where(eq(dnsRecords.domainId, domainId));
+async function writeRecords(tx: DbTransaction, domainId: string, hostname: string, records: DnsRecordPlan[]) {
+  const existing = await tx
+    .select()
+    .from(dnsRecords)
+    .where(and(eq(dnsRecords.domainId, domainId), eq(dnsRecords.name, hostname)));
+  for (const current of existing) {
+    if (
+      current.purpose.startsWith(ROUTE_RECORD_PURPOSE) &&
+      !records.some((record) => record.type === current.type && record.name === current.name)
+    ) {
+      await tx.delete(dnsRecords).where(eq(dnsRecords.id, current.id));
+    }
+  }
   for (const record of records) {
     const current = existing.find((item) => item.type === record.type && item.name === record.name);
     if (!current) {
-      await db.insert(dnsRecords).values({
+      await tx.insert(dnsRecords).values({
         id: createId("dns"),
         domainId,
         type: record.type,
@@ -329,9 +345,11 @@ async function writeRecords(domainId: string, records: DnsRecordPlan[]) {
         purpose: record.purpose,
         required: record.required,
       });
-    } else if (current.purpose.startsWith(ROUTE_RECORD_PURPOSE) && current.expectedValue !== record.value) {
-      // A leftover route record for an old address: re-check it against the current one.
-      await db
+    } else if (
+      current.purpose.startsWith(ROUTE_RECORD_PURPOSE) &&
+      (current.expectedValue !== record.value || current.required !== record.required)
+    ) {
+      await tx
         .update(dnsRecords)
         .set({
           expectedValue: record.value,
@@ -344,15 +362,51 @@ async function writeRecords(domainId: string, records: DnsRecordPlan[]) {
   }
 }
 
+/** Re-plan owned address records before DNS checks, including removal after IPv6 is disabled. */
+export async function reconcileRouteRecords(domainId: string) {
+  await db.transaction(async (tx) => {
+    // Serialise record reconciliation for this domain (including concurrent manual/observer checks).
+    const [domain] = await tx.select().from(domainClaims).where(eq(domainClaims.id, domainId)).for("update");
+    const [platform] = await tx.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+    if (!domain || !platform?.publicIpv4) return;
+    for (const endpoint of await tx
+      .select()
+      .from(endpoints)
+      .where(and(eq(endpoints.domainId, domainId), eq(endpoints.kind, "route")))) {
+      await writeRecords(
+        tx,
+        domainId,
+        endpoint.hostname,
+        routeAddressRecords({
+          hostname: endpoint.hostname,
+          zone: domain.name,
+          publicIpv4: platform.publicIpv4,
+          publicIpv6: platform.publicIpv6,
+          ipv6Status: platform.ipv6Status,
+          aaaaEnabled: domain.aaaaEnabled,
+          purpose: ROUTE_RECORD_PURPOSE,
+        }),
+      );
+    }
+  });
+}
+
 /**
- * Writes the endpoint, address records and route (`draft`), then hands it to the lifecycle
- * (`awaiting_acl`) and queues the edge-netns probe. Call only after the step-up grant.
+ * Atomically writes the endpoint, address records, route, audits and awaiting_acl handoff.
+ * The optional step-up callback runs in the same transaction. Periodic observation recovers an
+ * interrupted immediate enqueue after commit.
  */
-export async function commitRouteCreate(plan: RouteCreatePlan, actor: RouteActor, enqueue: RouteEnqueue) {
+export async function commitRouteCreate(
+  plan: RouteCreatePlan,
+  actor: RouteActor,
+  enqueue: RouteEnqueue,
+  authorize?: RouteAuthorize,
+) {
   const routeId = createId("rt");
   const now = new Date();
   try {
     await db.transaction(async (tx) => {
+      await authorize?.(tx);
       let endpointId = plan.endpoint?.id;
       if (!endpointId) {
         endpointId = createId("end");
@@ -382,6 +436,37 @@ export async function commitRouteCreate(plan: RouteCreatePlan, actor: RouteActor
         createdAt: now,
         updatedAt: now,
       });
+      await writeRecords(tx, plan.domain.id, plan.hostname, plan.records);
+      await auditRoute(
+        actor,
+        "front_route.create",
+        routeId,
+        {
+          hostname: plan.hostname,
+          domainId: plan.domain.id,
+          target: plan.targetInput,
+          targetPort: plan.targetPort,
+          pinned: plan.pinned,
+          accessMode: plan.accessMode,
+          redirectTo: plan.redirectTo,
+          records: plan.records,
+          status: "draft",
+        },
+        undefined,
+        tx,
+      );
+      await tx
+        .update(frontRoutes)
+        .set({ status: "awaiting_acl", updatedAt: new Date() })
+        .where(eq(frontRoutes.id, routeId));
+      await auditRoute(
+        actor,
+        "front_route.awaiting_acl",
+        routeId,
+        { from: "draft", to: "awaiting_acl", reason: "acl_snippet_issued" },
+        undefined,
+        tx,
+      );
     });
   } catch (error) {
     if (isUniqueViolation(error)) {
@@ -389,31 +474,8 @@ export async function commitRouteCreate(plan: RouteCreatePlan, actor: RouteActor
     }
     throw error;
   }
-  await writeRecords(plan.domain.id, plan.records);
-  await auditRoute(actor, "front_route.create", routeId, {
-    hostname: plan.hostname,
-    domainId: plan.domain.id,
-    target: plan.targetInput,
-    targetPort: plan.targetPort,
-    pinned: plan.pinned,
-    accessMode: plan.accessMode,
-    redirectTo: plan.redirectTo,
-    records: plan.records.map((record) => ({ type: record.type, name: record.name, value: record.value })),
-    status: "draft",
-  });
-  // The ACL snippet goes back with the response; the route now waits for the edge probe.
-  await db
-    .update(frontRoutes)
-    .set({ status: "awaiting_acl", updatedAt: new Date() })
-    .where(and(eq(frontRoutes.id, routeId), eq(frontRoutes.status, "draft")));
+  // The committed awaiting_acl row is also picked up by the periodic observer after a crash here.
   const observe = await enqueue({ kind: "edge.observe", targetIds: [EDGE_OBSERVE_TARGET] });
-  await auditRoute(
-    actor,
-    "front_route.awaiting_acl",
-    routeId,
-    { from: "draft", to: "awaiting_acl", reason: "acl_snippet_issued" },
-    idOf(observe),
-  );
   return { routeId, observeOperationId: idOf(observe) ?? null };
 }
 
@@ -423,7 +485,7 @@ export type RouteUpdatePlan = Awaited<ReturnType<typeof prepareRouteUpdate>>;
 
 /** Every check for `PATCH /api/front/routes/:id`, with no writes. */
 export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdateInput) {
-  const { route, endpoint, domain } = await loadRoute(routeId);
+  const { route, endpoint, domain, version } = await loadRoute(routeId);
   requireHttp(route);
   if (input.accessMode !== undefined) assertSupportedAccessMode(input.accessMode, "update");
   let redirectTo = redirectOf(route);
@@ -466,6 +528,7 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
   return {
     route,
     endpoint,
+    version,
     targetInput,
     targetPort,
     accessMode: input.accessMode ?? route.accessMode,
@@ -477,26 +540,36 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
 }
 
 /** Applies a prepared update, re-pins and restarts the lifecycle at `awaiting_acl` on a new target. */
-export async function commitRouteUpdate(plan: RouteUpdatePlan, actor: RouteActor, enqueue: RouteEnqueue) {
+export async function commitRouteUpdate(
+  plan: RouteUpdatePlan,
+  actor: RouteActor,
+  enqueue: RouteEnqueue,
+  authorize?: RouteAuthorize,
+) {
   const { route } = plan;
   const status = plan.pinned ? "awaiting_acl" : route.status;
   const httpOptions = { ...route.httpOptions };
   if (plan.redirectTo) httpOptions.redirectTo = plan.redirectTo;
   else delete httpOptions.redirectTo;
-  await db
-    .update(frontRoutes)
-    .set({
-      targetInput: plan.targetInput,
-      targetPort: plan.targetPort,
-      targetNodeStableId: plan.pinned?.stableId ?? route.targetNodeStableId,
-      targetIp: plan.pinned?.ip ?? route.targetIp,
-      accessMode: plan.accessMode,
-      httpOptions,
-      status,
-      lastError: plan.pinned ? null : route.lastError,
-      updatedAt: new Date(),
-    })
-    .where(eq(frontRoutes.id, route.id));
+  await db.transaction(async (tx) => {
+    await authorize?.(tx);
+    const updated = await tx
+      .update(frontRoutes)
+      .set({
+        targetInput: plan.targetInput,
+        targetPort: plan.targetPort,
+        targetNodeStableId: plan.pinned?.stableId ?? route.targetNodeStableId,
+        targetIp: plan.pinned?.ip ?? route.targetIp,
+        accessMode: plan.accessMode,
+        httpOptions,
+        status,
+        lastError: plan.pinned ? null : route.lastError,
+        updatedAt: new Date(),
+      })
+      .where(currentRoute(route.id, plan.version))
+      .returning({ id: frontRoutes.id });
+    if (!updated.length) throw new FrontRouteError(409, "The route changed state; reload and retry.");
+  });
   const live = route.enabled && route.status === "ready";
   const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   if (live && plan.pinned) {
@@ -537,7 +610,7 @@ export async function commitRouteUpdate(plan: RouteUpdatePlan, actor: RouteActor
 
 /** Checks for `enable`: an implemented access mode, and a `ready` route that is not yet enabled. */
 export async function prepareRouteEnable(routeId: string) {
-  const { route, endpoint } = await loadRoute(routeId);
+  const { route, endpoint, version } = await loadRoute(routeId);
   requireHttp(route);
   if (route.enabled) throw new FrontRouteError(409, "The route is already enabled.");
   assertSupportedAccessMode(route.accessMode, "enable");
@@ -547,22 +620,24 @@ export async function prepareRouteEnable(routeId: string) {
       `The route is ${route.status}; it can be enabled once it is ready (ACL probe, DNS and certificate complete).`,
     );
   }
-  return { route, endpoint };
+  return { route, endpoint, version };
 }
 
 export async function commitRouteEnable(
   plan: Awaited<ReturnType<typeof prepareRouteEnable>>,
   actor: RouteActor,
   enqueue: RouteEnqueue,
+  authorize?: RouteAuthorize,
 ) {
-  const updated = await db
-    .update(frontRoutes)
-    .set({ enabled: true, updatedAt: new Date() })
-    .where(
-      and(eq(frontRoutes.id, plan.route.id), eq(frontRoutes.status, "ready"), eq(frontRoutes.enabled, false)),
-    )
-    .returning({ id: frontRoutes.id });
-  if (!updated.length) throw new FrontRouteError(409, "The route changed state; reload and retry.");
+  await db.transaction(async (tx) => {
+    await authorize?.(tx);
+    const updated = await tx
+      .update(frontRoutes)
+      .set({ enabled: true, updatedAt: new Date() })
+      .where(currentRoute(plan.route.id, plan.version))
+      .returning({ id: frontRoutes.id });
+    if (!updated.length) throw new FrontRouteError(409, "The route changed state; reload and retry.");
+  });
   const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   await auditRoute(
     actor,
@@ -602,7 +677,9 @@ export async function disableRoute(routeId: string, actor: RouteActor, enqueue: 
 }
 
 export async function prepareRouteDelete(routeId: string) {
-  return loadRoute(routeId);
+  const plan = await loadRoute(routeId);
+  requireHttp(plan.route);
+  return plan;
 }
 
 /**
@@ -614,10 +691,16 @@ export async function commitRouteDelete(
   plan: Awaited<ReturnType<typeof prepareRouteDelete>>,
   actor: RouteActor,
   enqueue: RouteEnqueue,
+  authorize?: RouteAuthorize,
 ) {
   const { route, endpoint } = plan;
   const removedEndpoint = await db.transaction(async (tx) => {
-    await tx.delete(frontRoutes).where(eq(frontRoutes.id, route.id));
+    await authorize?.(tx);
+    const removed = await tx
+      .delete(frontRoutes)
+      .where(currentRoute(route.id, plan.version))
+      .returning({ id: frontRoutes.id });
+    if (!removed.length) throw new FrontRouteError(409, "The route changed state; reload and retry.");
     const others = await tx
       .select({ id: frontRoutes.id })
       .from(frontRoutes)
@@ -668,7 +751,11 @@ export async function commitRouteDelete(
 // ---- Lifecycle hooks for domain.verify and certificate.issue ----------------------------------
 
 async function routesOn(endpointId: string) {
-  return db.select().from(frontRoutes).where(eq(frontRoutes.endpointId, endpointId));
+  const rows = await db
+    .select({ route: frontRoutes, version: routeVersion })
+    .from(frontRoutes)
+    .where(eq(frontRoutes.endpointId, endpointId));
+  return rows.map(({ route, version }) => ({ ...route, version }));
 }
 
 /**
@@ -681,22 +768,43 @@ export async function routesAfterDnsCheck(input: {
   verified: boolean;
   pending: Array<{ type: string; name: string; expected: string; observed: string }>;
   operationId?: string;
+  routeEndpointsOnly?: boolean;
 }) {
   const routes = await routesOn(input.endpointId);
+  const [certificate] = await db
+    .select()
+    .from(certificates)
+    .where(eq(certificates.endpointId, input.endpointId))
+    .orderBy(desc(certificates.lastDeployedAt))
+    .limit(1);
+  const needsCertificate =
+    !certificate ||
+    certificate.status !== "issued" ||
+    (certificate.expiresAt !== null && certificate.expiresAt.getTime() <= Date.now() + 30 * 86_400_000);
   let issue = false;
   for (const route of routes) {
-    if (route.status === "issuing_certificate") issue = true;
-    if (route.status !== "awaiting_dns") continue;
+    // An observer check only starts issuance on the transition; explicit verification may retry it.
+    if (route.status === "issuing_certificate") {
+      if (input.verified && !input.routeEndpointsOnly) issue = true;
+      continue;
+    }
+    if (
+      route.status !== "awaiting_dns" &&
+      !(route.status === "ready" && needsCertificate && !input.routeEndpointsOnly)
+    )
+      continue;
     if (input.verified) {
-      await db
+      const changed = await db
         .update(frontRoutes)
         .set({ status: "issuing_certificate", lastError: null, updatedAt: new Date() })
-        .where(and(eq(frontRoutes.id, route.id), eq(frontRoutes.status, "awaiting_dns")));
+        .where(currentRoute(route.id, route.version))
+        .returning({ id: frontRoutes.id });
+      if (!changed.length) continue;
       await auditRoute(
         null,
         "front_route.issuing_certificate",
         route.id,
-        { from: "awaiting_dns", to: "issuing_certificate", reason: "dns_resolves" },
+        { from: route.status, to: "issuing_certificate", reason: "dns_resolves" },
         input.operationId,
       );
       issue = true;
@@ -706,11 +814,11 @@ export async function routesAfterDnsCheck(input: {
     const lastError = first
       ? `Waiting for DNS: ${first.type} ${first.name} must resolve to ${first.expected} (observed: ${first.observed || "nothing"}).`
       : "Waiting for DNS: the route hostname has no address record to check.";
-    if (lastError !== route.lastError) {
+    if (route.status === "awaiting_dns" && lastError !== route.lastError) {
       await db
         .update(frontRoutes)
         .set({ lastError, updatedAt: new Date() })
-        .where(eq(frontRoutes.id, route.id));
+        .where(currentRoute(route.id, route.version));
     }
   }
   return { issueCertificate: issue };
@@ -737,7 +845,7 @@ export async function routesAfterCertificate(input: {
     await db
       .update(frontRoutes)
       .set({ lastError, updatedAt: new Date() })
-      .where(eq(frontRoutes.id, route.id));
+      .where(currentRoute(route.id, route.version));
     await auditRoute(
       null,
       "front_route.certificate_issued",
@@ -759,6 +867,6 @@ export async function routesCertificateFailed(endpointId: string, message: strin
         lastError: `Certificate issuance failed: ${message.slice(0, 500)}. Verify the domain again to retry.`,
         updatedAt: new Date(),
       })
-      .where(eq(frontRoutes.id, route.id));
+      .where(currentRoute(route.id, route.version));
   }
 }

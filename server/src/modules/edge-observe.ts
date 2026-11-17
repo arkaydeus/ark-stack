@@ -36,6 +36,7 @@ import {
   tailnetNodes,
   tailnetSnapshots,
 } from "../schema.ts";
+import { currentRoute, routeVersion } from "./front-route-state.ts";
 import type { EdgeLocalApi, ProbeResult } from "./tailnet-localapi.ts";
 
 type Enqueue = (input: {
@@ -58,7 +59,11 @@ const LIFECYCLE_OBSERVATION_ERROR = "Edge observation: ";
 
 export const EDGE_OBSERVE_TARGET = "tailnet:edge";
 
-type RouteRow = typeof frontRoutes.$inferSelect & { hostname: string; domainId: string | null };
+type RouteRow = typeof frontRoutes.$inferSelect & {
+  hostname: string;
+  domainId: string | null;
+  version: string;
+};
 
 function toNode(row: typeof tailnetNodes.$inferSelect): TailnetNode {
   return {
@@ -95,10 +100,20 @@ type Loaded = Awaited<ReturnType<typeof loadEdgeSnapshot>>;
 
 async function loadRoutes(): Promise<RouteRow[]> {
   const rows = await db
-    .select({ route: frontRoutes, hostname: endpoints.hostname, domainId: endpoints.domainId })
+    .select({
+      route: frontRoutes,
+      hostname: endpoints.hostname,
+      domainId: endpoints.domainId,
+      version: routeVersion,
+    })
     .from(frontRoutes)
     .innerJoin(endpoints, eq(endpoints.id, frontRoutes.endpointId));
-  return rows.map((row) => ({ ...row.route, hostname: row.hostname, domainId: row.domainId }));
+  return rows.map((row) => ({
+    ...row.route,
+    hostname: row.hostname,
+    domainId: row.domainId,
+    version: row.version,
+  }));
 }
 
 /**
@@ -224,15 +239,19 @@ export async function expireStaleEdgeRoutes(input: { enqueue: Enqueue; now?: Dat
   if (leaseValid(loaded, now)) return [];
   const expired = (await loadRoutes()).filter((route) => route.status === "ready");
   if (!expired.length) return [];
+  const committed: RouteRow[] = [];
   for (const route of expired) {
-    await db
+    const changed = await db
       .update(frontRoutes)
       .set({
         status: "observation_expired",
         lastError: "The edge node's tailnet observation expired; the route is withdrawn until it is renewed.",
         updatedAt: now,
       })
-      .where(eq(frontRoutes.id, route.id));
+      .where(currentRoute(route.id, route.version))
+      .returning({ id: frontRoutes.id });
+    if (!changed.length) continue;
+    committed.push(route);
     await audit(
       "front_route.observation_expired",
       route.id,
@@ -242,10 +261,10 @@ export async function expireStaleEdgeRoutes(input: { enqueue: Enqueue; now?: Dat
   }
   await withdraw(
     input.enqueue,
-    expired.map((route) => ({ id: route.id, ip: route.targetIp, port: route.targetPort })),
+    committed.map((route) => ({ id: route.id, ip: route.targetIp, port: route.targetPort })),
     "observation_expired",
   );
-  return expired.map((route) => route.id);
+  return committed.map((route) => route.id);
 }
 
 /** Commits one complete generation; refuses to replace a newer one. */
@@ -339,29 +358,28 @@ async function revalidateRoutes(input: {
         const key = backendKey(check.ip, route.targetPort);
         if (!probes.has(key)) probes.set(key, input.api.probe(check.ip, route.targetPort));
         probe = await probes.get(key)!;
-        // `ready` and `observation_expired` routes completed their lifecycle already; any other
-        // route continues it (awaiting_dns) until its hostname has an issued certificate.
-        const completed = route.status === "ready" || route.status === "observation_expired";
-        status = !probe.ok ? "awaiting_acl" : completed || certified ? "ready" : "awaiting_dns";
+        // A route that loses its usable certificate re-enters DNS/certificate repair.
+        status = !probe.ok ? "awaiting_acl" : certified ? "ready" : "awaiting_dns";
         lastError = probe.ok
           ? null
           : `The edge cannot open TCP to ${key} (${probe.detail}). Check the tailnet grant for this port.`;
       }
       // DNS is re-checked on every observation until it resolves (the five-minute schedule).
-      if (status === "awaiting_dns" && route.domainId) verifyDomains.add(route.domainId);
     }
     const ipChanged = ip !== route.targetIp;
+    // Even a no-change probe must compare the snapshot before emitting follow-up work.
+    const changed = await db
+      .update(frontRoutes)
+      .set({ status, targetIp: ip, lastError, updatedAt: input.now })
+      .where(currentRoute(route.id, route.version))
+      .returning({ id: frontRoutes.id });
+    if (!changed.length) continue;
+    if (check.ok && status === "awaiting_dns" && route.domainId) verifyDomains.add(route.domainId);
     const live = route.enabled && route.status === "ready";
     if (live && (status !== "ready" || ipChanged)) {
       withdrawn.push({ id: route.id, ip: route.targetIp, port: route.targetPort });
     }
     if (route.enabled && (status === "ready") !== live) renderChanged = true;
-    if (status !== route.status || ipChanged || lastError !== route.lastError) {
-      await db
-        .update(frontRoutes)
-        .set({ status, targetIp: ip, lastError, updatedAt: input.now })
-        .where(eq(frontRoutes.id, route.id));
-    }
     if (ipChanged) {
       await audit(
         "front_route.target_ip_changed",
@@ -393,7 +411,11 @@ async function revalidateRoutes(input: {
     await withdraw(input.enqueue, withdrawn, "identity");
   }
   for (const domainId of [...verifyDomains].toSorted()) {
-    await input.enqueue({ kind: "domain.verify", targetIds: [domainId] });
+    await input.enqueue({
+      kind: "domain.verify",
+      targetIds: [domainId],
+      payload: { routeEndpointsOnly: true },
+    });
   }
   return { outcomes, withdrawn: withdrawn.map((route) => route.id) };
 }

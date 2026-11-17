@@ -2750,14 +2750,16 @@ app.post("/api/front/routes", async (c) => {
   requireMfa(c.get("session"));
   const request = (await c.req.json()) as Record<string, unknown>;
   const plan = await prepareRouteCreate(frontRouteCreateInput.parse(request));
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "exposure.public",
-    privilegedRequestHash("exposure.public", request),
-  );
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "exposure.public",
+      privilegedRequestHash("exposure.public", request),
+      tx,
+    );
   const actor = { userId: access.userId, role: access.role };
-  const { routeId, observeOperationId } = await commitRouteCreate(plan, actor, enqueue);
+  const { routeId, observeOperationId } = await commitRouteCreate(plan, actor, enqueue, authorize);
   const [route] = await listFrontRoutes(routeId);
   return c.json(
     {
@@ -2784,15 +2786,22 @@ app.patch("/api/front/routes/:id", async (c) => {
   const routeId = c.req.param("id");
   const request = (await c.req.json()) as Record<string, unknown>;
   const plan = await prepareRouteUpdate(routeId, frontRouteUpdateInput.parse(request));
-  if (plan.loosening.length) {
-    await requirePrivileged(
-      access,
-      c.get("session"),
-      "exposure.public",
-      privilegedRequestHash("exposure.public", { routeId, ...request }),
-    );
-  }
-  const { status } = await commitRouteUpdate(plan, { userId: access.userId, role: access.role }, enqueue);
+  const authorize = plan.loosening.length
+    ? (tx: import("./db.ts").DbTransaction) =>
+        requirePrivileged(
+          access,
+          c.get("session"),
+          "exposure.public",
+          privilegedRequestHash("exposure.public", { routeId, ...request }),
+          tx,
+        )
+    : undefined;
+  const { status } = await commitRouteUpdate(
+    plan,
+    { userId: access.userId, role: access.role },
+    enqueue,
+    authorize,
+  );
   const [route] = await listFrontRoutes(routeId);
   return c.json({ route, status, loosening: plan.loosening });
 });
@@ -2803,13 +2812,15 @@ app.post("/api/front/routes/:id/enable", async (c) => {
   requireMfa(c.get("session"));
   const routeId = c.req.param("id");
   const plan = await prepareRouteEnable(routeId);
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "exposure.public",
-    privilegedRequestHash("exposure.public", { routeId }),
-  );
-  await commitRouteEnable(plan, { userId: access.userId, role: access.role }, enqueue);
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "exposure.public",
+      privilegedRequestHash("exposure.public", { routeId }),
+      tx,
+    );
+  await commitRouteEnable(plan, { userId: access.userId, role: access.role }, enqueue, authorize);
   const [route] = await listFrontRoutes(routeId);
   return c.json({ route });
 });
@@ -2830,13 +2841,20 @@ app.delete("/api/front/routes/:id", async (c) => {
   requireMfa(c.get("session"));
   const routeId = c.req.param("id");
   const plan = await prepareRouteDelete(routeId);
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "resource.delete",
-    privilegedRequestHash("resource.delete", { routeId }),
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "resource.delete",
+      privilegedRequestHash("resource.delete", { routeId }),
+      tx,
+    );
+  const result = await commitRouteDelete(
+    plan,
+    { userId: access.userId, role: access.role },
+    enqueue,
+    authorize,
   );
-  const result = await commitRouteDelete(plan, { userId: access.userId, role: access.role }, enqueue);
   return c.json({ id: routeId, ...result });
 });
 

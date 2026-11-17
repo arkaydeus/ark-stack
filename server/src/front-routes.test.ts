@@ -63,6 +63,7 @@ const mock = new MockLocalApi({
 const savedEnv: Record<string, string | undefined> = {};
 let savedSettings: Record<string, unknown> | undefined;
 let certDir = "";
+const sideEffectFixtures = { databases: [] as string[], clusters: [] as string[], mailboxes: [] as string[] };
 
 async function signUp(role: Role, mfa: boolean): Promise<Actor> {
   const ctx = await auth.$context;
@@ -287,6 +288,12 @@ afterAll(async () => {
     else process.env[key] = value;
   }
   await rm(certDir, { recursive: true, force: true });
+  if (sideEffectFixtures.databases.length)
+    await sql`DELETE FROM managed_databases WHERE id IN ${sql(sideEffectFixtures.databases)}`;
+  if (sideEffectFixtures.clusters.length)
+    await sql`DELETE FROM database_clusters WHERE id IN ${sql(sideEffectFixtures.clusters)}`;
+  if (sideEffectFixtures.mailboxes.length)
+    await sql`DELETE FROM mailboxes WHERE id IN ${sql(sideEffectFixtures.mailboxes)}`;
   const ids = Object.values(domainIds);
   const routeRows = await sql`
     SELECT r.id FROM front_routes r JOIN endpoints e ON e.id = r.endpoint_id WHERE e.domain_id IN ${sql(ids)}
@@ -712,5 +719,335 @@ describe("state machine walkthrough", () => {
     ))
       expect(row.actor_id).toBe(actors.owner.userId);
     console.log(`FD-08 walkthrough for ${hostname}:\n  ${trail.join("\n  ")}`);
+  });
+});
+
+const routes = () => import("./modules/front-routes.ts");
+const enqueue = async () => undefined;
+
+describe("lifecycle regression coverage", () => {
+  const actor = () => ({ userId: actors.owner.userId, role: "owner" });
+
+  async function authorize(action: "exposure.public" | "resource.delete", request: Record<string, unknown>) {
+    const { requirePrivileged } = await import("./access.ts");
+    const { privilegedRequestHash } = await import("@ark-stack/shared");
+    const session = await auth.api.getSession({ headers: new Headers({ cookie: actors.owner.cookie }) });
+    if (!session) throw new Error("Missing fixture session");
+    return (tx: import("./db.ts").DbTransaction) =>
+      requirePrivileged(
+        { ...actor(), role: "owner", projectIds: [], domainIds: [] },
+        session,
+        action,
+        privilegedRequestHash(action, request),
+        tx,
+      );
+  }
+
+  test("overlapping PATCH plans preserve the accepted target and sticky identity mismatch", async () => {
+    const { route } = await createRoute(`stale.${zone}`);
+    await sql`UPDATE front_routes SET status = 'ready' WHERE id = ${route.id}`;
+    const { prepareRouteUpdate, commitRouteUpdate } = await routes();
+    const old = await prepareRouteUpdate(route.id, { redirectTo: `www.${zone}` });
+    const newer = await prepareRouteUpdate(route.id, { targetPort: 3001 });
+    await commitRouteUpdate(newer, actor(), enqueue);
+    await expect(commitRouteUpdate(old, actor(), enqueue)).rejects.toMatchObject({ status: 409 });
+    expect(await routeRow(route.id)).toMatchObject({ target_port: 3001, status: "awaiting_acl" });
+    const redirect = await prepareRouteUpdate(route.id, { redirectTo: `www.${zone}` });
+    await sql`UPDATE front_routes SET status = 'identity_mismatch', last_error = 'Owner must reconfirm' WHERE id = ${route.id}`;
+    await expect(commitRouteUpdate(redirect, actor(), enqueue)).rejects.toMatchObject({ status: 409 });
+    expect(await routeRow(route.id)).toMatchObject({
+      status: "identity_mismatch",
+      last_error: "Owner must reconfirm",
+    });
+  });
+
+  test("DNS and audit insertion failures roll back creation and its grant", async () => {
+    // Transactional triggers fail only on this fixture's hostnames. Always remove them afterwards.
+    for (const table of ["dns_records", "audit_events"]) {
+      const hostname = `rollback-${table.replaceAll("_", "-")}.${zone}`;
+      const request = routeRequest(hostname);
+      await stepUp(actors.owner, "exposure.public", request);
+      const before = await openGrants(actors.owner);
+      const fn = `fd08_fail_${suffix}`;
+      const condition =
+        table === "dns_records"
+          ? `NEW.name = '${hostname}'`
+          : `NEW.action = 'front_route.create' AND NEW.detail->>'hostname' = '${hostname}'`;
+      await sql.unsafe(
+        `CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF ${condition} THEN RAISE EXCEPTION 'injected creation failure'; END IF; RETURN NEW; END $$`,
+      );
+      await sql.unsafe(
+        `CREATE TRIGGER ${fn} BEFORE INSERT ON ${table} FOR EACH ROW EXECUTE FUNCTION ${fn}()`,
+      );
+      try {
+        const { prepareRouteCreate, commitRouteCreate } = await routes();
+        const plan = await prepareRouteCreate(request as never);
+        await expect(
+          commitRouteCreate(plan, actor(), enqueue, await authorize("exposure.public", request)),
+        ).rejects.toMatchObject({ cause: { message: "injected creation failure" } });
+        expect(await sql`SELECT id FROM endpoints WHERE hostname = ${hostname}`).toHaveLength(0);
+        expect(await records(hostname)).toHaveLength(0);
+        expect(await sql`SELECT id FROM audit_events WHERE detail->>'hostname' = ${hostname}`).toHaveLength(
+          0,
+        );
+        expect(await openGrants(actors.owner)).toBe(before);
+      } finally {
+        await sql.unsafe(`DROP TRIGGER ${fn} ON ${table}`);
+        await sql.unsafe(`DROP FUNCTION ${fn}()`);
+      }
+      // The same request and unspent grant can now finish creation.
+      expect((await call(actors.owner, "POST", "/api/front/routes", request)).status).toBe(201);
+    }
+  });
+
+  test("periodic observation recovers creation after immediate enqueue is interrupted", async () => {
+    const { prepareRouteCreate, commitRouteCreate } = await routes();
+    const { observeEdgeTailnet } = await import("./modules/edge-observe.ts");
+    const { edgeLocalApi } = await import("./modules/tailnet-localapi.ts");
+    const hostname = `handoff.${zone}`;
+    const plan = await prepareRouteCreate(routeRequest(hostname) as never);
+    await expect(
+      commitRouteCreate(plan, actor(), async () => {
+        throw new Error("enqueue interrupted");
+      }),
+    ).rejects.toThrow("enqueue interrupted");
+    const [row] =
+      await sql`SELECT r.id, r.status FROM front_routes r JOIN endpoints e ON e.id = r.endpoint_id WHERE e.hostname = ${hostname}`;
+    expect(row!.status).toBe("awaiting_acl");
+    mock.state.reachable.add(`${homeIp}:3000`);
+    await observeEdgeTailnet({ api: edgeLocalApi(socket), enqueue });
+    expect((await routeRow(String(row!.id)))!.status).toBe("awaiting_dns");
+  });
+
+  test("enable and concurrent hostname conflicts roll back the rejected grant", async () => {
+    const { prepareRouteCreate, commitRouteCreate, prepareRouteEnable, commitRouteEnable } = await routes();
+    const { route } = await createRoute(`enable-race.${zone}`);
+    await sql`UPDATE front_routes SET status = 'ready' WHERE id = ${route.id}`;
+    const plan = await prepareRouteEnable(route.id);
+    const request = { routeId: route.id };
+    await stepUp(actors.owner, "exposure.public", request);
+    const before = await openGrants(actors.owner);
+    await sql`UPDATE front_routes SET status = 'awaiting_acl' WHERE id = ${route.id}`;
+    await expect(
+      commitRouteEnable(plan, actor(), enqueue, await authorize("exposure.public", request)),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(await openGrants(actors.owner)).toBe(before);
+    const create = routeRequest(`create-race.${zone}`);
+    const plans = await Promise.all([
+      prepareRouteCreate(create as never),
+      prepareRouteCreate(create as never),
+    ]);
+    await stepUp(actors.owner, "exposure.public", create);
+    await stepUp(actors.owner, "exposure.public", create);
+    const grants = await openGrants(actors.owner);
+    const consume = await authorize("exposure.public", create);
+    const results = await Promise.allSettled(
+      plans.map((p) => commitRouteCreate(p, actor(), enqueue, consume)),
+    );
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(rejected.reason).toMatchObject({ status: 409 });
+    expect(await openGrants(actors.owner)).toBe(grants - 1);
+  });
+
+  test("every HTTP mutation refuses other kinds and preserves resources and grants", async () => {
+    for (const kind of ["tls", "tcp", "postgres"]) {
+      const { route } = await createRoute(`kind-${kind}.${zone}`);
+      await sql`UPDATE front_routes SET kind = ${kind}, status = 'ready', enabled = true WHERE id = ${route.id}`;
+      const certId = createId("crt");
+      await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
+        VALUES (${certId}, ${route.endpointId ?? (await routeRow(route.id))!.endpoint_id}, '[]', 'issued', now())`;
+      for (const [method, path, body, action] of [
+        ["PATCH", `/api/front/routes/${route.id}`, { targetPort: 3002 }, "exposure.public"],
+        ["POST", `/api/front/routes/${route.id}/enable`, {}, "exposure.public"],
+        ["POST", `/api/front/routes/${route.id}/disable`, {}, null],
+        ["DELETE", `/api/front/routes/${route.id}`, {}, "resource.delete"],
+      ] as const) {
+        if (action) await stepUp(actors.owner, action, { routeId: route.id, ...body });
+        const before = await openGrants(actors.owner);
+        expect((await call(actors.owner, method, path, body)).status).toBe(422);
+        expect(await openGrants(actors.owner)).toBe(before);
+        expect(await routeRow(route.id)).toMatchObject({ kind, enabled: true, target_port: 3000 });
+        expect(await sql`SELECT id FROM certificates WHERE id = ${certId}`).toHaveLength(1);
+        expect(await records(route.hostname)).toHaveLength(1);
+      }
+    }
+  });
+
+  test("DNS replanning removes obsolete required AAAA after either IPv6 downgrade", async () => {
+    const { enqueue: realEnqueue } = await import("./coordinator.ts");
+    for (const mode of ["unchecked", "disabled"]) {
+      await sql`UPDATE platform_settings SET ipv6_status = 'passed' WHERE id = 'default'`;
+      await sql`UPDATE domain_claims SET aaaa_enabled = true WHERE id = ${domainIds.flow}`;
+      const { route } = await createRoute(`ipv6-${mode}.${flowZone}`);
+      expect((await records(route.hostname)).map((r) => r.type)).toEqual(["A", "AAAA"]);
+      await sql`UPDATE front_routes SET status = 'awaiting_dns' WHERE id = ${route.id}`;
+      if (mode === "unchecked")
+        await sql`UPDATE platform_settings SET ipv6_status = 'unchecked' WHERE id = 'default'`;
+      else await sql`UPDATE domain_claims SET aaaa_enabled = false WHERE id = ${domainIds.flow}`;
+      resolvedA = [publicIpv4];
+      const op = await realEnqueue({
+        kind: "domain.verify",
+        targetIds: [domainIds.flow],
+        payload: { routeEndpointsOnly: true, fixture: mode },
+      });
+      await runOperation("domain.verify", op!);
+      expect((await records(route.hostname)).map((r) => r.type)).toEqual(["A"]);
+      expect((await routeRow(route.id))!.status).toBe("issuing_certificate");
+    }
+    await sql`UPDATE platform_settings SET ipv6_status = 'unchecked' WHERE id = 'default'`;
+  });
+});
+
+describe("certificate recovery and scoped observer DNS", () => {
+  test("ready certificates can renew or repair, with failed and untrusted retries", async () => {
+    const { enqueue: realEnqueue } = await import("./coordinator.ts");
+    const { observeEdgeTailnet } = await import("./modules/edge-observe.ts");
+    const { edgeLocalApi } = await import("./modules/tailnet-localapi.ts");
+    const { routesCertificateFailed, routesAfterCertificate } = await import("./modules/front-routes.ts");
+    mock.state.reachable.add(`${homeIp}:3000`);
+    resolvedA = [publicIpv4];
+    for (const state of ["missing", "expired", "near-expiry", "untrusted"]) {
+      const { route } = await createRoute(`cert-${state}.${flowZone}`);
+      const endpointId = (await routeRow(route.id))!.endpoint_id as string;
+      await sql`UPDATE front_routes SET status = 'ready' WHERE id = ${route.id}`;
+      if (state !== "missing") {
+        // A newer untrusted row must win over an older usable certificate.
+        if (state === "untrusted")
+          await sql`INSERT INTO certificates (id, endpoint_id, names, status, expires_at, last_deployed_at)
+          VALUES (${createId("crt")}, ${endpointId}, '[]', 'issued', now() + interval '90 days', now() - interval '1 day')`;
+        const expires =
+          state === "expired" ? new Date(Date.now() - 1000) : new Date(Date.now() + 5 * 86_400_000);
+        await sql`INSERT INTO certificates (id, endpoint_id, names, status, expires_at, last_deployed_at)
+          VALUES (${createId("crt")}, ${endpointId}, '[]', ${state === "untrusted" ? "untrusted" : "issued"}, ${expires.toISOString()}::timestamptz, now())`;
+      }
+      const verify = async () => {
+        const op = await realEnqueue({
+          kind: "domain.verify",
+          targetIds: [domainIds.flow],
+          payload: { fixture: state, attempt: createId("a") },
+        });
+        await runOperation("domain.verify", op!);
+      };
+      await verify();
+      expect((await routeRow(route.id))!.status).toBe("issuing_certificate");
+      expect(await queuedCount("certificate.issue", endpointId)).toBe(1);
+      if (state === "expired") {
+        await sql`UPDATE operations SET status = 'failed' WHERE kind = 'certificate.issue' AND target_ids ? ${endpointId}`;
+        const lego = process.env.ARK_LEGO_BIN;
+        try {
+          process.env.ARK_LEGO_BIN = "/nonexistent/fd08-lego";
+          const op = await realEnqueue({ kind: "certificate.issue", targetIds: [endpointId] });
+          await expect(runOperation("certificate.issue", op!)).rejects.toThrow();
+          await sql`UPDATE operations SET status = 'failed' WHERE id = ${op!.id}`;
+        } finally {
+          process.env.ARK_LEGO_BIN = lego;
+        }
+        expect((await routeRow(route.id))!.last_error).toMatch(
+          /Certificate issuance failed.*Verify the domain again/,
+        );
+        await verify();
+      }
+      if (state === "untrusted") {
+        await routesAfterCertificate({ endpointId, status: "untrusted", issuer: "letsencrypt-staging" });
+        expect((await routeRow(route.id))!.last_error).toMatch(/not publicly trusted.*ARK_ACME_STAGING=0/);
+        await sql`UPDATE operations SET status = 'failed' WHERE kind = 'certificate.issue' AND target_ids ? ${endpointId}`;
+        await verify();
+      }
+      // A successful certificate and a new probe finish repair.
+      await runQueued("certificate.issue", endpointId);
+      await observeEdgeTailnet({ api: edgeLocalApi(socket), enqueue: async () => undefined });
+      expect((await routeRow(route.id))!.status).toBe("ready");
+      expect((await routeRow(route.id))!.last_error).toBeNull();
+      // A current 90-day certificate does not create another order on manual verify.
+      await sql`UPDATE certificates SET expires_at = now() + interval '90 days' WHERE endpoint_id = ${endpointId} AND status = 'issued'`;
+      await verify();
+      expect(await queuedCount("certificate.issue", endpointId)).toBe(0);
+    }
+    // Explicit failure diagnostics are bounded and say how to retry.
+    const { route } = await createRoute(`cert-diagnostic.${flowZone}`);
+    const endpointId = (await routeRow(route.id))!.endpoint_id;
+    await sql`UPDATE front_routes SET status = 'issuing_certificate' WHERE id = ${route.id}`;
+    await routesCertificateFailed(endpointId, "CA unavailable");
+    expect((await routeRow(route.id))!.last_error).toContain("CA unavailable");
+  });
+
+  test("repeated observer DNS checks do not issue or provision unrelated endpoints", async () => {
+    const { enqueue: realEnqueue } = await import("./coordinator.ts");
+    const { observeEdgeTailnet } = await import("./modules/edge-observe.ts");
+    const { edgeLocalApi } = await import("./modules/tailnet-localapi.ts");
+    const unrelatedId = createId("end");
+    await sql`INSERT INTO endpoints (id, kind, hostname, domain_id, exposure, status)
+      VALUES (${unrelatedId}, 'database', ${`unrelated.${flowZone}`}, ${domainIds.flow}, 'public', 'verified')`;
+    await sql`INSERT INTO dns_records (id, domain_id, type, name, relative_name, expected_value, required, purpose)
+      VALUES (${createId("dns")}, ${domainIds.flow}, 'A', ${`unrelated.${flowZone}`}, 'unrelated', ${publicIpv4}, true, 'database endpoint')`;
+    const clusterId = createId("dcl");
+    const databaseId = createId("mdb");
+    const mailboxId = createId("mbx");
+    const mailEndpointId = createId("end");
+    sideEffectFixtures.clusters.push(clusterId);
+    sideEffectFixtures.databases.push(databaseId);
+    sideEffectFixtures.mailboxes.push(mailboxId);
+    await sql`INSERT INTO database_clusters (id, name, endpoint_id, status) VALUES (${clusterId}, ${`scoped-${suffix}`}, ${unrelatedId}, 'ready')`;
+    await sql`INSERT INTO managed_databases (id, cluster_id, name, exposure, status) VALUES (${databaseId}, ${clusterId}, ${`scoped_${suffix}`}, 'public', 'queued')`;
+    await sql`INSERT INTO endpoints (id, kind, hostname, domain_id, exposure) VALUES (${mailEndpointId}, 'mail', ${`mail.${flowZone}`}, ${domainIds.flow}, 'public')`;
+    await sql`INSERT INTO dns_records (id, domain_id, type, name, relative_name, expected_value, required, purpose)
+      VALUES (${createId("dns")}, ${domainIds.flow}, 'A', ${`mail.${flowZone}`}, 'mail', ${publicIpv4}, true, 'mail endpoint')`;
+    await sql`INSERT INTO mailboxes (id, domain_id, local_part, display_name) VALUES (${mailboxId}, ${domainIds.flow}, 'scoped', 'Scoped fixture')`;
+    await sql`UPDATE domain_claims SET dns_provider = 'cloudflare' WHERE id = ${domainIds.flow}`;
+    const { route } = await createRoute(`waiting.${flowZone}`);
+    await sql`UPDATE front_routes SET status = 'awaiting_dns' WHERE id = ${route.id}`;
+    const endpointId = (await routeRow(route.id))!.endpoint_id;
+    resolvedA = [publicIpv4];
+    for (let cycle = 0; cycle < 2; cycle++) {
+      const queued: Array<{ kind: string; targetIds: string[]; payload?: Record<string, unknown> }> = [];
+      await observeEdgeTailnet({
+        api: edgeLocalApi(socket),
+        enqueue: async (op) => {
+          queued.push(op);
+        },
+      });
+      // Another waiting route keeps triggering DNS even while this route's issuance is in flight.
+      const scope = queued.find((op) => op.kind === "domain.verify" && op.targetIds.includes(domainIds.flow));
+      expect(scope?.payload).toEqual({ routeEndpointsOnly: true });
+      const before =
+        await sql`SELECT id FROM operations WHERE kind IN ('certificate.issue', 'database.provision', 'mail.provision', 'dns.publish', 'pgbouncer.reload', 'edge.apply')`;
+      const op = await realEnqueue({
+        ...scope!,
+        kind: "domain.verify",
+        payload: { ...scope!.payload, cycle },
+      });
+      await runOperation("domain.verify", op!);
+      const after =
+        await sql`SELECT kind, target_ids FROM operations WHERE kind IN ('certificate.issue', 'database.provision', 'mail.provision', 'dns.publish', 'pgbouncer.reload', 'edge.apply') AND id NOT IN ${sql(before.map((r) => String(r.id)).concat("-"))}`;
+      expect(after.every((r) => r.kind === "certificate.issue" && !r.target_ids.includes(unrelatedId))).toBe(
+        true,
+      );
+      // Mark this route's order terminal: another observer DNS check must not retry issuance.
+      await sql`UPDATE operations SET status = 'succeeded' WHERE kind = 'certificate.issue' AND target_ids ? ${endpointId}`;
+      if (cycle === 0) {
+        const other = await createRoute(`still-waiting.${flowZone}`);
+        await sql`UPDATE front_routes SET status = 'awaiting_dns' WHERE id = ${other.route.id}`;
+      }
+    }
+    expect(await queuedCount("certificate.issue", unrelatedId)).toBe(0);
+    expect(await queuedCount("certificate.issue", endpointId)).toBe(0);
+    const [unrelated] = await sql`SELECT status, last_verified_at FROM endpoints WHERE id = ${unrelatedId}`;
+    expect(unrelated).toEqual({ status: "verified", last_verified_at: null });
+    expect(await queuedCount("database.provision", databaseId)).toBe(0);
+    expect(await queuedCount("mail.provision", mailboxId)).toBe(0);
+    expect(await queuedCount("dns.publish", domainIds.flow)).toBe(0);
+    // Positive control: an explicit full-domain verification retains the existing service flow.
+    const manual = await realEnqueue({
+      kind: "domain.verify",
+      targetIds: [domainIds.flow],
+      payload: { fixture: "explicit" },
+    });
+    await runOperation("domain.verify", manual!);
+    expect(await queuedCount("certificate.issue", unrelatedId)).toBe(1);
+    expect(await queuedCount("database.provision", databaseId)).toBe(1);
+    expect(await queuedCount("mail.provision", mailboxId)).toBe(1);
+    expect(await queuedCount("dns.publish", domainIds.flow)).toBe(1);
+    await sql`UPDATE domain_claims SET dns_provider = 'manual' WHERE id = ${domainIds.flow}`;
   });
 });
