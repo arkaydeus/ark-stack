@@ -52,7 +52,7 @@ description = "Check edge harness cleanup and pins, validate Caddy configuration
 run = ["bun test scripts/edge-test", "bun scripts/test-edge-config.ts", "bun scripts/test-db-ingress.ts"]
 
 [tasks."test:pgbouncer"]
-description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM, admin-socket reloads and database clients (connect, read-only preview, revoke)"
+description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM, admin-socket reloads, database clients (connect, read-only preview, revoke) and certificate rollover (two-CA overlap, emergency removal, retirement drain by not_after + 5 s; needs the migrated platform database)"
 run = "bun scripts/test-pgbouncer-public.ts"
 
 [tasks."test:db-ingress"]

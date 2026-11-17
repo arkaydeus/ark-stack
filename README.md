@@ -34,7 +34,7 @@ Useful commands:
 | `mise run test:edge`              | Caddy validation, edge and harness tests    |
 | `mise run test:edge-tailnet`      | opt-in edge node checks on a real tailnet   |
 | `mise run edge:rejoin`            | put `edge` back in a restarted `edge-ts`    |
-| `mise run test:pgbouncer`         | PgBouncer mTLS/SCRAM and DB client tests    |
+| `mise run test:pgbouncer`         | PgBouncer mTLS/SCRAM, DB client, rollover   |
 | `mise run recover -- status`      | local lockout / bootstrap inspection        |
 | `mise run recover:mfa -- …`       | token- and confirmation-gated MFA reset     |
 | `mise run host:install`           | build and start the complete host topology  |

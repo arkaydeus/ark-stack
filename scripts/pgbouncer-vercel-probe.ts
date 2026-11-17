@@ -11,6 +11,9 @@
 //   probe.js write     SELECT, INSERT, UPDATE and DELETE on the probe table; reports each outcome
 //   probe.js hold      check out one client, print {"ready":true}, wait for SIGUSR1, then query
 //                      the same client again and report whether the session survived
+//   probe.js stream    FD-28: check out one client, print {"ready":true}, then query it every
+//                      100 ms until the session fails or ARK_PROBE_STOP_AT (epoch ms) passes, and
+//                      report the last successful query and the moment the session failed
 import type { Pool, PoolClient } from "pg";
 
 const { pool } = (await import(process.env.ARK_PROBE_DB_MODULE ?? "/probe/vercel/db.js")) as { pool: Pool };
@@ -77,6 +80,35 @@ try {
     );
     console.log(JSON.stringify({ done: true, existing, ended, errors }));
     // pool.end() waits for checked-out clients, so hand this one back (destroyed) first.
+    client.release(true);
+  } else if (mode === "stream") {
+    const client = await pool.connect();
+    let failedAt: number | null = null;
+    let lastOk: number | null = null;
+    let queries = 0;
+    let error: string | null = null;
+    client.on("error", (cause) => {
+      failedAt ??= Date.now();
+      error ??= cause.message;
+    });
+    const before = await client.query("SELECT current_user AS user");
+    console.log(JSON.stringify({ ready: true, user: before.rows[0].user, at: Date.now() }));
+    const stopAt = Number(process.env.ARK_PROBE_STOP_AT ?? Date.now() + 60_000);
+    while (failedAt === null && Date.now() < stopAt) {
+      try {
+        await client.query("SELECT 1");
+        lastOk = Date.now();
+        queries++;
+      } catch (cause) {
+        failedAt ??= Date.now();
+        error ??= (cause as Error).message;
+        break;
+      }
+      await Bun.sleep(100);
+    }
+    console.log(
+      JSON.stringify({ done: true, user: before.rows[0].user, lastOk, failedAt, error, queries, stopAt }),
+    );
     client.release(true);
   } else {
     throw new Error(`unknown probe mode ${mode}`);

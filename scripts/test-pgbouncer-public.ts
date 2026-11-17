@@ -13,14 +13,24 @@
 //   and DELETE while production's can write, and revoking client B (reduced CA bundle, rotated
 //   NOLOGIN password, RELOAD, KILL_CLIENT) closes B's live session and new handshakes with
 //   `unknown ca` while client A's sessions, password and new connections are unaffected.
+// - FD-28 certificate rollover, driven by the real rollover code against the migrated platform
+//   database (DATABASE_URL): on day 60 the job issues exactly one successor from a fresh CA and
+//   both generations connect after the two-CA reload; removing only N's generation during the
+//   overlap (fence, reload, drain) stops N, lets N+1 reconnect and leaves an unrelated established
+//   role alone; at N's not_after the worker stand-in runs the production retireGeneration, which
+//   closes a session querying through not_after and racing pre-auth clients by not_after + 5 s,
+//   after which the successor reconnects; and a certificate that expires without a drain keeps
+//   its session, which the deadline check reports as a failure.
 //
 // The Compose file's relative bind mounts (`../../tmp/...`) are redirected into a temporary
 // directory with `--project-directory`, so the repository's own `tmp/` state is never touched.
 import { generateKeyPairSync, randomBytes } from "node:crypto";
+import { once } from "node:events";
+import { connect as netConnect } from "node:net";
 import { chmod, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createServer as createTlsServer } from "node:tls";
+import { connect as tlsConnect, createServer as createTlsServer } from "node:tls";
 
 import {
   DB_CLIENT_CONNECTION_LIMITS,
@@ -37,9 +47,16 @@ import {
   revokedClientRoleSql,
   terminateRoleSessionsSql,
 } from "@ark-stack/shared";
+import postgres from "postgres";
+
 import { assertTls12Rejected } from "./pgbouncer-smoke-checks.ts";
 
-import { planPgbouncer, renderPgbouncerFiles, writePgbouncerFiles } from "../server/src/modules/pgbouncer.ts";
+import {
+  assertDrainedByDeadline,
+  planPgbouncer,
+  renderPgbouncerFiles,
+  writePgbouncerFiles,
+} from "../server/src/modules/pgbouncer.ts";
 import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 
 // The FD-13 CA module issues the client certificates. Its pure functions need no database, but
@@ -312,7 +329,7 @@ async function socketPsql(role: string, password: string, dbname: string, sql: s
 }
 
 /** The database-worker stand-in (scripts/pgbouncer-worker-probe.ts), bundled and containerised. */
-async function probe(args: string[], extraEnv: Record<string, string> = {}) {
+async function probe(args: string[], extraEnv: Record<string, string> = {}, mounts: string[] = []) {
   const command = [
     "docker",
     "run",
@@ -328,6 +345,7 @@ async function probe(args: string[], extraEnv: Record<string, string> = {}) {
     `${socketVolume}:/var/run/pgbouncer`,
     "--volume",
     `${probeDir}:/probe:ro`,
+    ...mounts,
     "--env",
     "ARK_PGBOUNCER_ADMIN_PASSWORD",
     ...Object.keys(extraEnv).flatMap((name) => ["--env", name]),
@@ -350,6 +368,18 @@ async function probe(args: string[], extraEnv: Record<string, string> = {}) {
     ids?: string[];
     killed?: number;
     remaining?: number;
+    // FD-28 `retire`: the measured retirement timeline (epoch ms).
+    startedLateMs?: number;
+    startedAt?: number;
+    fencedAt?: number;
+    reloadedAt?: number;
+    drainedAt?: number;
+    reopenedAt?: number;
+    killedRoleClients?: number;
+    preAuthWaited?: number;
+    iterations?: number;
+    withinDeadline?: boolean;
+    timeline?: Record<string, unknown>;
     environment: { dockerCli: string | null; dockerSocket: boolean; uid: number };
   };
 }
@@ -1330,6 +1360,654 @@ try {
     );
   } finally {
     for (const holder of holders) await run(["docker", "rm", "--force", holder.name], { allowFailure: true });
+  }
+
+  // ---- FD-28 certificate rollover: the job, the two-CA overlap, emergency removal, retirement ----
+  // Drives the real rollover code against the migrated platform database (DATABASE_URL): the
+  // daily job's successor issuance, the one-time reveals and the delivery confirmation. PgBouncer
+  // trusts what the worker's planner selects from those rows, and the worker stand-in runs the
+  // production retireGeneration (fence, reduced reload, role and pre-auth drain, reopen).
+  process.env.ARK_RUNTIME_ROLE ??= "worker";
+  const { sql: platform } = await import("../server/src/db.ts");
+  try {
+    await platform`SELECT 1 FROM ark_migrations WHERE id = '0020_database_client_rollover.sql'`.then(
+      (rows) => {
+        if (!rows.length) throw new Error("migration 0020 is not applied");
+      },
+    );
+  } catch (error) {
+    throw new Error(
+      `The FD-28 checks drive the real rollover job and need DATABASE_URL to point at the migrated platform database: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  const dbClients = await import("../server/src/modules/db-clients.ts");
+  const rollover = await import("../server/src/modules/db-client-rollover.ts");
+  const tag = randomBytes(3).toString("hex");
+  const fd28Database = `ark_fd28_${tag}`;
+  const fd28 = {
+    databaseId: `mdb_fd28_${tag}`,
+    clusterId: `dcl_fd28_${tag}`,
+    endpointId: `end_fd28_${tag}`,
+  };
+  const DAY_MS = 86_400_000;
+  type Generation = {
+    id: string;
+    caId: string;
+    certPem: string;
+    keyPem: string;
+    cert: string;
+    key: string;
+    notAfter: Date;
+  };
+  type Fd28Client = { id: string; name: string; role: string; password: string; generations: Generation[] };
+  const fd28Clients: Fd28Client[] = [];
+  const fd28Holders: string[] = [];
+  const retired = new Set<string>();
+  const revoked = new Set<string>();
+  const fd28Results: string[] = [];
+  const note = (check: string, outcome: string) => {
+    record(check, outcome);
+    fd28Results.push(`${check}: ${outcome}`);
+  };
+  try {
+    await platform`INSERT INTO endpoints (id, kind, hostname, exposure, status) VALUES (${fd28.endpointId}, 'database', ${`fd28-${tag}.example.com`}, 'public', 'verified')`;
+    await platform`INSERT INTO database_clusters (id, name, endpoint_id, status) VALUES (${fd28.clusterId}, ${`fd28-${tag}`}, ${fd28.endpointId}, 'ready')`;
+    await platform`INSERT INTO managed_databases (id, cluster_id, name, exposure, status) VALUES (${fd28.databaseId}, ${fd28.clusterId}, ${fd28Database}, 'public', 'ready')`;
+    const fd28Provision = buildProvisionPlan({
+      name: fd28Database,
+      passwords: { owner: secret(), migration: secret(), runtime: secret(), readonly: secret() },
+      withPgvector: false,
+      withTestDatabase: false,
+    });
+    await appSql(fd28Provision.statements);
+    await appSql(fd28Provision.extensionStatements, fd28Database);
+
+    const generationFiles = async (name: string, index: number, certPem: string, keyPem: string) => {
+      const cert = join(clientDir, `fd28-${name}-${index}.crt`);
+      const key = join(clientDir, `fd28-${name}-${index}.key`);
+      await Bun.write(cert, certPem);
+      await Bun.write(key, keyPem);
+      await chmod(key, 0o600);
+      return { cert, key };
+    };
+    /** database.client_issue on an injected clock, with the role applied to this app-postgres. */
+    const issue28 = async (name: string, issuedAt: Date) => {
+      const result = await dbClients.issueDatabaseClient(
+        {
+          clientId: `dbc_fd28_${name}_${tag}`,
+          databaseId: fd28.databaseId,
+          name,
+          environment: "production",
+          roleKind: "runtime",
+          now: issuedAt,
+        },
+        async (input) => {
+          await appSql(clientRoleSql({ ...input, exists: false }));
+        },
+      );
+      await platform`UPDATE database_clients SET issued_at = now() WHERE id = ${result.client.id}`;
+      const revealed = await dbClients.revealDatabaseClient({
+        databaseId: fd28.databaseId,
+        clientId: result.client.id,
+        actorId: "fd28-smoke",
+        actorRole: "owner",
+      });
+      const client: Fd28Client = {
+        id: result.client.id,
+        name,
+        role: result.role,
+        password: revealed.password,
+        generations: [
+          {
+            id: revealed.certificate.id,
+            caId: result.client.caId,
+            certPem: revealed.certificate.pem,
+            keyPem: revealed.privateKey!,
+            notAfter: new Date(revealed.certificate.notAfter),
+            ...(await generationFiles(name, 0, revealed.certificate.pem, revealed.privateKey!)),
+          },
+        ],
+      };
+      fd28Clients.push(client);
+      return client;
+    };
+    /** The successor's one-time reveal (the manual guided path). */
+    const revealSuccessor = async (client: Fd28Client) => {
+      const revealed = await rollover.revealRolloverSuccessor({
+        databaseId: fd28.databaseId,
+        clientId: client.id,
+        actorId: "fd28-smoke",
+        actorRole: "owner",
+      });
+      const [row] =
+        await platform`SELECT ca_id FROM client_certificates WHERE id = ${revealed.certificate.id}`;
+      client.generations.push({
+        id: revealed.certificate.id,
+        caId: String(row!.ca_id),
+        certPem: revealed.certificate.pem,
+        keyPem: revealed.privateKey!,
+        notAfter: new Date(revealed.certificate.notAfter),
+        ...(await generationFiles(
+          client.name,
+          client.generations.length,
+          revealed.certificate.pem,
+          revealed.privateKey!,
+        )),
+      });
+      return client.generations.at(-1)!;
+    };
+    /** The worker's plan from the platform rows (retired/revoked mark what the task would set). */
+    const fd28Plan = async () => {
+      const certificates = [];
+      const caIds = new Set<string>();
+      const planClients = [];
+      for (const client of fd28Clients) {
+        const [row] = await platform`SELECT ca_id FROM database_clients WHERE id = ${client.id}`;
+        planClients.push({
+          id: client.id,
+          databaseId: "mdb_fd28",
+          environment: "production",
+          status: "active",
+          caId: String(row!.ca_id),
+          role: {
+            name: client.role,
+            connectionLimit: DB_CLIENT_CONNECTION_LIMITS.runtime,
+            password: client.password,
+          },
+        });
+        for (const item of await dbClients.linkedCertificates({ caId: String(row!.ca_id) })) {
+          caIds.add(item.caId);
+          certificates.push({
+            id: item.id,
+            caId: item.caId,
+            status: revoked.has(item.id) ? "revoked" : retired.has(item.id) ? "expired" : item.status,
+            rolloverState: retired.has(item.id) ? "retired" : item.rolloverState,
+            supersededBy: item.supersededBy,
+            notAfter: item.notAfter,
+          });
+        }
+      }
+      const cas = (
+        await platform`SELECT id, purpose, status, cert_pem, not_after FROM private_cas WHERE id IN ${platform([...caIds])}`
+      ).map((row) => ({
+        id: String(row.id),
+        purpose: String(row.purpose),
+        status: String(row.status),
+        certPem: String(row.cert_pem),
+        notAfter: new Date(row.not_after as Date),
+      }));
+      return planPgbouncer({
+        databases: [
+          { id: "mdb_smoke", name: database, exposure: "public" },
+          { id: "mdb_fd28", name: fd28Database, exposure: "public" },
+        ],
+        clients: [...smokeClients, ...planClients],
+        certificates: [...smokeCertificates, ...certificates],
+        cas: [...smokeCas, ...cas],
+        now: new Date(),
+        host: "app-postgres",
+        settings: { previewMaxUserClientConnections: limitedClientConnections },
+      });
+    };
+    const fd28Psql = (client: Fd28Client, generation: Generation) =>
+      hostPsql({
+        role: client.role,
+        password: client.password,
+        dbname: fd28Database,
+        client: generation,
+        sql: "SELECT current_user",
+      });
+    const expectConnects = async (client: Fd28Client, generation: Generation, check: string) => {
+      const result = await fd28Psql(client, generation);
+      if (result.status !== 0 || result.stdout !== client.role)
+        throw new Error(
+          `${check}: expected to connect as ${client.role}: (${result.status}) ${result.stderr}`,
+        );
+      note(check, `connected as ${result.stdout}`);
+    };
+    /** A §3.12 node-postgres client that queries every 100 ms with one generation. */
+    const startStream = async (client: Fd28Client, generation: Generation, stopAt: number) => {
+      const name = `${project}-fd28-${client.name}-${client.generations.indexOf(generation)}-${fd28Holders.length}`;
+      const values: Record<string, string> = {
+        ...Object.fromEntries(
+          databaseClientGuide({
+            host: "pgbouncer-public",
+            database: fd28Database,
+            role: client.role,
+            environment: "production",
+            roleKind: "runtime",
+            region: "us-east",
+            secrets: { password: client.password, certPem: generation.certPem, keyPem: generation.keyPem },
+          }).env.map((item) => [item.name, item.value]),
+        ),
+        ARK_PROBE_STOP_AT: String(stopAt),
+      };
+      await run(
+        [
+          "docker",
+          "run",
+          "--detach",
+          "--name",
+          name,
+          "--user",
+          arkUid,
+          "--read-only",
+          "--cap-drop",
+          "ALL",
+          "--network",
+          network,
+          "--volume",
+          `${probeDir}:/probe:ro`,
+          ...Object.keys(values).flatMap((key) => ["--env", key]),
+          "--env",
+          "NODE_EXTRA_CA_CERTS=/probe/server-ca.pem",
+          bunImage,
+          "bun",
+          "/probe/vercel/pgbouncer-vercel-probe.js",
+          "stream",
+        ],
+        { env: values },
+      );
+      fd28Holders.push(name);
+      const deadline = Date.now() + 30_000;
+      for (;;) {
+        const logs = await run(["docker", "logs", name], { allowFailure: true });
+        if (logs.stdout.includes('"ready":true')) break;
+        if (Date.now() > deadline)
+          throw new Error(`${name} never held a session:\n${logs.stdout}${logs.stderr}`);
+        await Bun.sleep(200);
+      }
+      return name;
+    };
+    type StreamOutcome = {
+      lastOk: number | null;
+      failedAt: number | null;
+      error: string | null;
+      queries: number;
+    };
+    const streamOutcome = async (name: string) => {
+      await run(["docker", "wait", name]);
+      const logs = await run(["docker", "logs", name]);
+      const line = logs.stdout.split("\n").findLast((item) => item.includes('"done":true'));
+      if (!line) throw new Error(`${name} reported nothing:\n${logs.stdout}${logs.stderr}`);
+      return JSON.parse(line) as StreamOutcome;
+    };
+    const retireSpec = async (input: {
+      file: string;
+      role: string;
+      startAt?: number;
+      deadline?: number;
+      plan: Awaited<ReturnType<typeof fd28Plan>>;
+    }) => {
+      const specFiles = renderPgbouncerFiles({
+        plan: input.plan,
+        adminPassword,
+        certificateDir: "/var/lib/ark/certs/database",
+      });
+      await asHost(() =>
+        Bun.write(
+          join(probeDir, input.file),
+          JSON.stringify({
+            database: fd28Database,
+            role: input.role,
+            startAt: input.startAt,
+            deadline: input.deadline,
+            deadlineAfterStartMs: 5_000,
+            files: specFiles,
+            databaseMapped: input.plan.mappings.some((item) => item.database === fd28Database),
+            loginTimeoutSeconds: input.plan.settings.clientLoginTimeout,
+          }),
+        ),
+      );
+    };
+    const retireProbe = (file: string) =>
+      probe(["retire", `/probe/${file}`], {}, ["--volume", `${pgbouncerDir}:/pgbouncer`]);
+    const liveBundle = () => asHost(() => Bun.file(join(pgbouncerDir, PGBOUNCER_FILES.caBundle)).text());
+
+    // -- Day 60: the job issues exactly one successor from a fresh CA; both connect --------------
+    const startedAt = Date.now();
+    const em = await issue28("em", new Date(startedAt - 60 * DAY_MS));
+    const firstRun = (await rollover.runScheduledRollover({ now: new Date() })).filter(
+      (item) => item.clientId === em.id,
+    );
+    if (firstRun.length !== 1 || firstRun[0]!.outcome !== "issued")
+      throw new Error(
+        `The day-60 job should issue one successor: ${JSON.stringify(firstRun.map((item) => item.outcome))}`,
+      );
+    const secondRun = (await rollover.runScheduledRollover({ now: new Date() })).filter(
+      (item) => item.clientId === em.id,
+    );
+    const raced = await Promise.all(
+      [1, 2].map(() => rollover.issueSuccessor({ clientId: em.id, now: new Date(), reason: "scheduled" })),
+    );
+    const [emCount] =
+      await platform`SELECT count(*)::int AS n FROM client_certificates WHERE subject_cn = ${em.role}`;
+    if (secondRun.length || raced.some((item) => item.outcome !== "exists") || emCount!.n !== 2)
+      throw new Error(`Repeated runs created another successor: ${JSON.stringify({ secondRun, emCount })}`);
+    const emNext = await revealSuccessor(em);
+    if (emNext.caId === em.generations[0]!.caId)
+      throw new Error("The successor must come from a fresh CA generation.");
+    note(
+      "FD-28 day 60: the job issues exactly one successor",
+      `N not_after ${em.generations[0]!.notAfter.toISOString()} (T−30); N+1 ${firstRun[0]!.successor!.serial.slice(0, 12)}… from fresh CA ${emNext.caId}; a second run and two concurrent issuers added none (${emCount!.n} certificates)`,
+    );
+
+    // An established session of another client of the same database, for the emergency removal.
+    const bystander = await issue28("bystander", new Date(startedAt - 10 * DAY_MS));
+
+    const overlap = await fd28Plan();
+    for (const caId of [em.generations[0]!.caId, emNext.caId]) {
+      const [ca] = await platform`SELECT cert_pem FROM private_cas WHERE id = ${caId}`;
+      if (!overlap.caBundle.includes(String(ca!.cert_pem).trim()))
+        throw new Error(`The overlap bundle lacks CA ${caId}.`);
+    }
+    await applyPlan(overlap);
+    await expectConnects(em, em.generations[0]!, "FD-28 two-CA bundle reload: predecessor N connects");
+    await expectConnects(em, emNext, "FD-28 two-CA bundle reload: successor N+1 connects");
+
+    // -- Emergency removal during overlap: only N's generation, then drain the role ---------------
+    const unrelated = await startStream(bystander, bystander.generations[0]!, Date.now() + 60_000);
+    const unrelatedBefore = (await probe(["clients", bystander.role])).ids ?? [];
+    const emHolder = await startStream(em, em.generations[0]!, Date.now() + 60_000);
+    revoked.add(em.generations[0]!.id);
+    const emergency = await fd28Plan();
+    const [emCa] = await platform`SELECT cert_pem FROM private_cas WHERE id = ${em.generations[0]!.caId}`;
+    const [emNextCa] = await platform`SELECT cert_pem FROM private_cas WHERE id = ${emNext.caId}`;
+    if (
+      emergency.caBundle.includes(String(emCa!.cert_pem).trim()) ||
+      !emergency.caBundle.includes(String(emNextCa!.cert_pem).trim())
+    )
+      throw new Error("The emergency bundle must drop exactly N's generation.");
+    // An emergency removal starts at once; its deadline is 5 s after the worker starts.
+    await retireSpec({ file: "fd28-emergency.json", role: em.role, plan: emergency });
+    const emRetire = await retireProbe("fd28-emergency.json");
+    if (!emRetire.ok)
+      throw new Error(`Emergency removal failed: ${emRetire.error} ${JSON.stringify(emRetire.timeline)}`);
+    const emStream = await streamOutcome(emHolder);
+    expectRejected(
+      await fd28Psql(em, em.generations[0]!),
+      /unknown ca/,
+      "FD-28 emergency removal: N's new connection",
+    );
+    await expectConnects(em, emNext, "FD-28 emergency removal: N+1 reconnects");
+    const unrelatedAfter = (await probe(["clients", bystander.role])).ids ?? [];
+    if (!unrelatedBefore.length || JSON.stringify(unrelatedAfter) !== JSON.stringify(unrelatedBefore))
+      throw new Error(
+        `The unrelated role's established session was disturbed: ${JSON.stringify({ unrelatedBefore, unrelatedAfter })}`,
+      );
+    if (emStream.failedAt === null || emStream.failedAt > emRetire.startedAt! + 5_000)
+      throw new Error(`N's established session was not drained: ${JSON.stringify(emStream)}`);
+    note(
+      "FD-28 emergency removal of N during overlap",
+      `fence→reload ${emRetire.reloadedAt! - emRetire.fencedAt!} ms, drained ${emRetire.drainedAt! - emRetire.fencedAt!} ms after the fence (${emRetire.killedRoleClients} session(s) killed); N's held session closed (${emStream.error}); unrelated ${bystander.role} session survived (console id ${unrelatedAfter.join(",")})`,
+    );
+    await probe(["kill", bystander.role]);
+    await streamOutcome(unrelated);
+
+    // rt (retirement) and nodrain (expiry without drain) expire 90 s from now, issued only after the steps above so that
+    // setup before their not_after stays short.
+    const expiresIn = 90_000;
+    const rtIssuedAt = new Date(Math.ceil((Date.now() + expiresIn - 90 * DAY_MS) / 1000) * 1000);
+    const rt = await issue28("rt", rtIssuedAt);
+    const nodrain = await issue28("nodrain", rtIssuedAt);
+    const rtSuccessor = await rollover.issueSuccessor({
+      clientId: rt.id,
+      now: new Date(),
+      reason: "scheduled",
+    });
+    if (rtSuccessor.outcome !== "issued") throw new Error(`rt successor: ${rtSuccessor.outcome}`);
+    const rtNext = await revealSuccessor(rt);
+    await rollover.confirmRolloverDelivery({
+      databaseId: fd28.databaseId,
+      clientId: rt.id,
+      certificateId: rtNext.id,
+      actorId: "fd28-smoke",
+      now: new Date(),
+    });
+
+    await applyPlan(await fd28Plan());
+    await expectConnects(rt, rt.generations[0]!, "FD-28 rt: predecessor connects before its not_after");
+    await expectConnects(rt, rtNext, "FD-28 rt: delivered successor connects");
+    const nodrainHolder = await startStream(nodrain, nodrain.generations[0]!, Date.now() + 10 * 60_000);
+
+    // -- Day 90: retire rt's N at its not_after; drain by +5 s, including pre-auth races ----------
+    const T = rt.generations[0]!.notAfter.getTime();
+    const deadline = T + 5_000;
+    if (T - Date.now() < 12_000)
+      throw new Error(`Setup took too long: ${T - Date.now()} ms left before not_after.`);
+    const rtHolder = await startStream(rt, rt.generations[0]!, T + 15_000);
+    retired.add(rt.generations[0]!.id);
+    const reduced = await fd28Plan();
+    const [rtCa] = await platform`SELECT cert_pem FROM private_cas WHERE id = ${rt.generations[0]!.caId}`;
+    const [rtNextCa] = await platform`SELECT cert_pem FROM private_cas WHERE id = ${rtNext.caId}`;
+    if (
+      reduced.caBundle.includes(String(rtCa!.cert_pem).trim()) ||
+      !reduced.caBundle.includes(String(rtNextCa!.cert_pem).trim())
+    )
+      throw new Error("The retirement bundle must drop exactly rt's N generation.");
+    await retireSpec({ file: "fd28-retire.json", role: rt.role, startAt: T, deadline, plan: reduced });
+    const retirement = retireProbe("fd28-retire.json");
+
+    /** A client whose TLS handshake with N completes before not_after, then idles or logs in late. */
+    const racer = async (loginAt: number | null) => {
+      const raw = netConnect({ host: "127.0.0.1", port: Number(loopbackPort) });
+      await once(raw, "connect");
+      raw.write(Buffer.from([0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]));
+      const [reply] = (await once(raw, "data")) as [Buffer];
+      if (reply[0] !== 0x53) throw new Error("PgBouncer refused the racer's SSLRequest.");
+      const secure = tlsConnect({
+        socket: raw,
+        cert: rt.generations[0]!.certPem,
+        key: rt.generations[0]!.keyPem,
+        rejectUnauthorized: false,
+        minVersion: "TLSv1.3",
+      });
+      await once(secure, "secureConnect");
+      const handshakeAt = Date.now();
+      let closedAt: number | null = null;
+      const closed = new Promise<number>((done) =>
+        secure.once("close", () => {
+          closedAt ??= Date.now();
+          done(closedAt);
+        }),
+      );
+      secure.on("error", () => undefined);
+      // Keep the socket flowing so PgBouncer closing it is observed. PgBouncer sends nothing before
+      // a startup packet, so nothing is lost before postgres.js takes the socket over.
+      secure.on("data", () => undefined);
+      const outcome = (async () => {
+        if (loginAt === null)
+          return {
+            handshakeAt,
+            // Bounded: an unclosed racer reports "now", which then fails the +5 s check.
+            closedAt: await Promise.race([closed, Bun.sleep(15_000).then(() => Date.now())]),
+            authenticated: false,
+            error: "never sent a startup packet",
+          };
+        await Promise.race([closed, Bun.sleep(Math.max(0, loginAt - Date.now()))]);
+        if (closedAt !== null)
+          return { handshakeAt, closedAt, authenticated: false, error: "closed before its startup packet" };
+        // postgres.js runs startup and SCRAM over a supplied, already-connected socket (its
+        // `socket` option is supported at runtime but missing from its type definitions).
+        const late = postgres({
+          socket: () => secure,
+          ssl: false,
+          database: fd28Database,
+          username: rt.role,
+          password: rt.password,
+          max: 1,
+          prepare: false,
+          fetch_types: false,
+          connect_timeout: 10,
+          onnotice: () => undefined,
+        } as never);
+        let authenticated = false;
+        let error: string | null = null;
+        try {
+          // Bounded: postgres.js may retry a supplied socket that PgBouncer already closed.
+          await Promise.race([
+            late`SELECT 1`.then(() => {
+              authenticated = true;
+            }),
+            Bun.sleep(8_000).then(() => {
+              throw new Error("no answer within 8 s");
+            }),
+          ]);
+        } catch (cause) {
+          error = cause instanceof Error ? cause.message : String(cause);
+        } finally {
+          await Promise.race([late.end({ timeout: 1 }).catch(() => undefined), Bun.sleep(2_000)]);
+          secure.destroy();
+        }
+        return {
+          handshakeAt,
+          closedAt: await Promise.race([closed, Bun.sleep(10_000).then(() => Date.now())]),
+          authenticated,
+          error,
+        };
+      })();
+      return { handshakeAt, outcome };
+    };
+    await Bun.sleep(Math.max(0, T - 3_000 - Date.now()));
+    const idleRacer = await racer(null);
+    const lateRacer = await racer(T + 300);
+    const retireResult = await retirement;
+    log(
+      `FD-28 retirement worker finished at not_after+${Date.now() - T} ms; collecting racers and the held session…`,
+    );
+    const racers = await Promise.all([idleRacer.outcome, lateRacer.outcome]);
+    const rtStream = await streamOutcome(rtHolder);
+    if (!retireResult.ok)
+      throw new Error(`Retirement failed: ${retireResult.error} ${JSON.stringify(retireResult.timeline)}`);
+    if (!retireResult.withinDeadline || retireResult.drainedAt! > deadline)
+      throw new Error(`Retirement drained after not_after + 5 s: ${JSON.stringify(retireResult)}`);
+    if (rtStream.failedAt === null || rtStream.failedAt > deadline || (rtStream.lastOk ?? 0) < T - 1_000)
+      throw new Error(
+        `The predecessor's querying session was not closed by +5 s: ${JSON.stringify(rtStream)}`,
+      );
+    for (const [index, item] of racers.entries())
+      if (item.authenticated || item.closedAt > deadline || item.handshakeAt >= T)
+        throw new Error(`Pre-auth racer ${index} was not closed by +5 s: ${JSON.stringify(item)}`);
+    note(
+      "FD-28 day 90 retirement: timeline after not_after",
+      `fence +${retireResult.fencedAt! - T} ms, reduced-bundle RELOAD +${retireResult.reloadedAt! - T} ms, drained +${retireResult.drainedAt! - T} ms, reopened +${retireResult.reopenedAt! - T} ms (deadline +5000 ms; worker started ${retireResult.startedLateMs} ms after not_after; ${retireResult.iterations} drain pass(es))`,
+    );
+    note(
+      "FD-28 day 90 retirement: predecessor session querying through not_after",
+      `${rtStream.queries} queries, last success at not_after${rtStream.lastOk! - T >= 0 ? "+" : ""}${rtStream.lastOk! - T} ms, closed at +${rtStream.failedAt - T} ms (${rtStream.error})`,
+    );
+    note(
+      "FD-28 day 90 retirement: racing pre-auth sessions (handshake with N before not_after)",
+      racers
+        .map(
+          (item, index) =>
+            `${index === 0 ? "idle" : "login at +300 ms"}: handshake ${item.handshakeAt - T} ms, closed at +${item.closedAt - T} ms, authenticated=${item.authenticated}${item.error ? ` (${item.error})` : ""}`,
+        )
+        .join("; "),
+    );
+    const bundleNow = await liveBundle();
+    if (
+      bundleNow.includes(String(rtCa!.cert_pem).trim()) ||
+      !bundleNow.includes(String(rtNextCa!.cert_pem).trim())
+    )
+      throw new Error("The live bundle still trusts the retired generation.");
+    const reconnectStart = Date.now();
+    await expectConnects(rt, rtNext, "FD-28 day 90 retirement: the successor reconnects");
+    note(
+      "FD-28 day 90 retirement: old CA removed, successor reconnect",
+      `live bundle has N+1's CA and not N's; reconnect took ${Date.now() - reconnectStart} ms, ${reconnectStart - retireResult.reopenedAt!} ms after reopen`,
+    );
+    expectRejected(
+      await fd28Psql(rt, rt.generations[0]!),
+      /certificate|unknown ca|alert/,
+      "FD-28 day 90 retirement: N's new connection",
+    );
+
+    // Expiry without a drain: nodrain's certificate expired at the same instant, but nothing
+    // drained its role. Its established session is still querying after the deadline, which the
+    // deadline check must report as a failure.
+    await Bun.sleep(Math.max(0, deadline + 1_000 - Date.now()));
+    const survivors = (await probe(["clients", nodrain.role])).ids ?? [];
+    let expiryFailure = "";
+    try {
+      assertDrainedByDeadline({
+        role: nodrain.role,
+        deadline: new Date(deadline),
+        observedAt: new Date(),
+        sessions: survivors.length,
+      });
+    } catch (error) {
+      expiryFailure = error instanceof Error ? error.message : String(error);
+    }
+    if (!expiryFailure) throw new Error("Expiry without a drain was not detected as a failure.");
+    await probe(["kill", nodrain.role]);
+    const unrelatedStream = await streamOutcome(nodrainHolder);
+    if ((unrelatedStream.lastOk ?? 0) <= deadline)
+      throw new Error(
+        `The undrained session should outlive its certificate: ${JSON.stringify(unrelatedStream)}`,
+      );
+    note(
+      "FD-28 expiry without drain (variant) is a failure",
+      `certificate expired at the same not_after, no drain: session kept querying until +${unrelatedStream.lastOk! - T} ms; deadline check: ${expiryFailure}`,
+    );
+
+    // The worker's bookkeeping for the retirement it just performed.
+    const due = (await rollover.dueRetirements({ now: new Date() })).find(
+      (item) => item.certificate.id === rt.generations[0]!.id,
+    );
+    if (!due || !(await rollover.claimRetirement(due, new Date())))
+      throw new Error("The retirement task could not be claimed.");
+    await rollover.markGenerationRetired(due.certificate.id);
+    await rollover.completeRetirement(due, {
+      now: new Date(),
+      timeline: {
+        fencedAt: retireResult.fencedAt,
+        reloadedAt: retireResult.reloadedAt,
+        drainedAt: retireResult.drainedAt,
+        reopenedAt: retireResult.reopenedAt,
+      },
+    });
+    const [task] =
+      await platform`SELECT deadline_missed, drained_at, completed_at FROM client_certificate_retirements WHERE certificate_id = ${due.certificate.id}`;
+    const [rtRow] =
+      await platform`SELECT status, rollover_state, retired_at FROM client_certificates WHERE id = ${due.certificate.id}`;
+    if (
+      task!.deadline_missed ||
+      !task!.completed_at ||
+      rtRow!.rollover_state !== "retired" ||
+      !rtRow!.retired_at
+    )
+      throw new Error(`Retirement bookkeeping is wrong: ${JSON.stringify({ task, rtRow })}`);
+    note(
+      "FD-28 retirement task recorded",
+      `rt N ${rtRow!.status}/${rtRow!.rollover_state}, drained_at ${new Date(task!.drained_at as Date).toISOString()}, deadline_missed=false`,
+    );
+    log(`\n---- FD-28 drain timing ----\n${fd28Results.join("\n")}\n`);
+  } finally {
+    for (const name of fd28Holders) await run(["docker", "rm", "--force", name], { allowFailure: true });
+    const ids = fd28Clients.map((client) => client.id);
+    const caRows = ids.length
+      ? await platform`SELECT DISTINCT ca_id FROM client_certificates WHERE subject_cn LIKE ${`${fd28Database}_%`}`
+      : [];
+    const caIds = caRows.map((row) => String(row.ca_id));
+    await platform`DELETE FROM operations WHERE target_ids ? ${fd28.databaseId}`;
+    if (ids.length)
+      await platform`DELETE FROM client_certificate_retirements WHERE client_id IN ${platform(ids)}`;
+    await platform`DELETE FROM database_clients WHERE database_id = ${fd28.databaseId}`;
+    await platform`DELETE FROM database_roles WHERE database_id = ${fd28.databaseId}`;
+    if (caIds.length) {
+      await platform`UPDATE client_certificates SET superseded_by = NULL WHERE ca_id IN ${platform(caIds)}`;
+      await platform`DELETE FROM client_certificates WHERE ca_id IN ${platform(caIds)}`;
+      await platform`DELETE FROM private_cas WHERE id IN ${platform(caIds)}`;
+      await platform`DELETE FROM secrets WHERE resource_id IN ${platform(caIds)}`;
+    }
+    await platform`DELETE FROM secrets WHERE resource_id = ${fd28.databaseId}`;
+    await platform`DELETE FROM audit_events WHERE resource_id = ${fd28.databaseId}`;
+    await platform`DELETE FROM managed_databases WHERE id = ${fd28.databaseId}`;
+    await platform`DELETE FROM database_clusters WHERE id = ${fd28.clusterId}`;
+    await platform`DELETE FROM endpoints WHERE id = ${fd28.endpointId}`;
+    await platform.end({ timeout: 5 });
   }
 
   const health = await inspect(bouncer, "{{.State.Health.Status}} restarts={{.RestartCount}}");
