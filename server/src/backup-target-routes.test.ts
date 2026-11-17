@@ -45,7 +45,7 @@ async function actor(role: Role, mfa: boolean) {
   return result;
 }
 const call = (a: Actor | null, method: string, path = "/api/backups/targets", body?: unknown) =>
-  app.request(path, {
+  app.request(`${origin}${path}`, {
     method,
     headers: { origin, "content-type": "application/json", ...(a ? { cookie: a.cookie } : {}) },
     ...(method === "GET" ? {} : { body: JSON.stringify(body ?? {}) }),
