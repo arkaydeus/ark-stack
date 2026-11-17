@@ -42,6 +42,7 @@ import {
   type L4RouteSettings,
   type SupportedRouteKind,
   createId,
+  planHash,
   looseningChanges,
   normalizeRedirectTo,
   normalizeRouteHostname,
@@ -67,6 +68,7 @@ import {
   frontRoutes,
   platformSettings,
   privateCas,
+  operations,
 } from "../schema.ts";
 import { currentRoute, routeVersion } from "./front-route-state.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, loadEdgeSnapshot } from "./edge-observe.ts";
@@ -518,6 +520,14 @@ export async function commitRouteCreate(
           ? await pki.createPrivateCa({ purpose: "tcp-client", name: `Route ${routeId}` }, tx)
           : null;
       let endpointId = plan.endpoint?.id;
+      if (endpointId) {
+        const [existing] = await tx
+          .select()
+          .from(endpoints)
+          .where(eq(endpoints.id, endpointId))
+          .for("update");
+        if (!existing) throw new FrontRouteError(409, "The endpoint was deleted; reload and retry.");
+      }
       if (!endpointId) {
         endpointId = createId("end");
         await tx.insert(endpoints).values({
@@ -896,6 +906,8 @@ export async function commitRouteDelete(
 ) {
   const { route, endpoint } = plan;
   const removedEndpoint = await db.transaction(async (tx) => {
+    // Shared endpoint first, before any route row, including concurrent creates.
+    await tx.select().from(endpoints).where(eq(endpoints.id, endpoint.id)).for("update");
     await authorize?.(tx);
     const removed = await tx
       .delete(frontRoutes)
@@ -1159,23 +1171,48 @@ export async function revokeRouteClientCertificate(
   routeId: string,
   certificateId: string,
   actor: RouteActor,
-  enqueue: RouteEnqueue,
 ) {
   const { route, caId } = await mtlsRoute(routeId);
   const certificate = await pki.getClientCertificate(certificateId);
   if (!certificate || certificate.caId !== caId)
     throw new FrontRouteError(404, "Client certificate not found.");
-  const revoked = await pki.revokeClientCertificate({ id: certificateId, reason: "cessationOfOperation" });
-  const crl = await pki.generateCaCrl({ caId });
-  const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
-  if (route.enabled) await routeDrain(enqueue, route, "client_certificate_revoked");
-  await auditRoute(
-    actor,
-    "front_route.client_certificate_revoke",
-    routeId,
-    { certificateId, serial: revoked.serial, crlNumber: crl.crlNumber },
-    idOf(apply),
-  );
+  const { revoked, crl } = await db.transaction(async (tx) => {
+    // Serialize every CRL writer on the CA before changing certificate status.
+    await tx.select().from(privateCas).where(eq(privateCas.id, caId)).for("update");
+    const revokedCertificate = await pki.revokeClientCertificate(
+      { id: certificateId, reason: "cessationOfOperation" },
+      tx,
+    );
+    const generatedCrl = await pki.generateCaCrl({ caId }, tx);
+    // Durable work and the desired policy commit together. No post-commit enqueue gap.
+    const payload = {
+      routeIds: [routeId],
+      backends: [backendKey(route.targetIp, route.targetPort)],
+      reason: "client_certificate_revoked",
+    };
+    for (const kind of ["edge.drain", "edge.apply"] as const) {
+      const id = createId("op");
+      await tx.insert(operations).values({
+        id,
+        kind,
+        actorId: actor.userId,
+        targetIds: kind === "edge.drain" ? ["edge:drain"] : ["platform"],
+        idempotencyKey: `route-revoke:${certificateId}:${id}`,
+        planHash: planHash(payload),
+        payload,
+        status: "queued",
+      });
+    }
+    await auditRoute(
+      actor,
+      "front_route.client_certificate_revoke",
+      routeId,
+      { certificateId, serial: revokedCertificate.serial, crlNumber: generatedCrl.crlNumber },
+      undefined,
+      tx,
+    );
+    return { revoked: revokedCertificate, crl: generatedCrl };
+  });
   return {
     id: certificateId,
     status: revoked.status,

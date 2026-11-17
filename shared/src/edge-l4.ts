@@ -7,6 +7,7 @@
 // parsers for the master and worker CLI output the withdrawal adapter reads. Socket and file IO live
 // in `haproxy-control.ts`.
 
+import { L4_ADMISSION_LUA } from "./l4-admission.ts";
 import { assertCidrs, parseCidr } from "./cidr.ts";
 import { routeIdentityKey, tailnetDialKey, type EdgePolicyRoute } from "./edge-withdrawal.ts";
 import { ValidationError } from "./errors.ts";
@@ -350,7 +351,7 @@ function checkedTlsRoute(route: EdgeL4TlsRoute, sniPorts: number[]) {
     inner: terminated ? { frontend: `fe_${route.id}_tls`, backend: `be_${route.id}` } : null,
     abns: `ark_${base.server.slice(2)}`,
     certificate: terminated
-      ? checkedPem(route.certificatePem, ["CERTIFICATE"], "its certificate and key", route.id)
+      ? checkedPem(route.certificatePem, ["CERTIFICATE", "PRIVATE KEY"], "its certificate and key", route.id)
       : null,
     clientCa:
       mode === "terminate_mtls"
@@ -382,16 +383,26 @@ function checkedTcpRoute(route: EdgeL4TcpRoute) {
 type TlsRoute = ReturnType<typeof checkedTlsRoute>;
 type TcpRoute = ReturnType<typeof checkedTcpRoute>;
 
-/** The per-route admission rules every TLS backend applies before forwarding (§3.8.6). */
-function admissionRules(route: TlsRoute) {
+/** Admission before forwarding: in each TLS backend and dedicated raw frontend (§3.8.6). */
+function admissionRules(route: TlsRoute | TcpRoute) {
   return [
+    "    tcp-request inspect-delay 2s",
     `    tcp-request content reject if !{ src -f allow/${route.id}.lst }`,
-    "    stick-table type ipv6 size 10k expire 10m store conn_cur,conn_rate(10s)",
-    "    tcp-request content track-sc1 src",
-    `    tcp-request content reject if { sc1_conn_cur gt ${route.limits.perSourceConn} } || { sc1_conn_rate gt ${route.limits.perSourceRate} }`,
-    // be_conn includes this connection, so `gt` admits exactly maxConn and refuses the next at once.
-    `    tcp-request content reject if { be_conn gt ${route.limits.maxConn} }`,
+    `    tcp-request content track-sc1 src table ad_src_${route.id}`,
+    `    tcp-request content track-sc2 int(1) table ad_total_${route.id}`,
+    "    tcp-request content reject unless { sc1_conn_cur gt 0 } { sc2_conn_cur gt 0 }",
+    `    tcp-request content lua.ark-admit ${route.id} ${route.limits.maxConn} ${route.limits.perSourceConn} ${route.limits.perSourceRate}`,
+    "    tcp-request content reject unless { var(txn.ark_admitted) -m bool }",
   ];
+}
+
+function admissionTables(route: TlsRoute | TcpRoute) {
+  return `backend ad_src_${route.id}
+    stick-table type ipv6 size 10k expire 10m store conn_cur,conn_rate(10s)
+
+backend ad_total_${route.id}
+    stick-table type integer size 1 store conn_cur
+`;
 }
 
 function renderTlsRoute(route: TlsRoute) {
@@ -438,13 +449,9 @@ function renderTcpRoute(route: TcpRoute) {
     `# ${route.id} ${route.hostname}:${route.listenPort} -> ${route.target} (StableID ${route.stableId}), plain`,
     `frontend ${route.frontend}`,
     `    bind :${route.listenPort}`,
-    // One slot of headroom so the fe_conn rule refuses the next connection instead of queueing it.
+    // One slot of headroom so admission refuses the excess connection instead of queueing it.
     `    maxconn ${route.limits.maxConn + 1}`,
-    `    tcp-request connection reject unless { src -f allow/${route.id}.lst }`,
-    "    stick-table type ipv6 size 10k expire 10m store conn_cur,conn_rate(10s)",
-    "    tcp-request connection track-sc0 src",
-    `    tcp-request connection reject if { sc0_conn_cur gt ${route.limits.perSourceConn} } || { sc0_conn_rate gt ${route.limits.perSourceRate} }`,
-    `    tcp-request connection reject if { fe_conn gt ${route.limits.maxConn} }`,
+    ...admissionRules(route),
     `    default_backend ${route.backend}`,
     "",
     `backend ${route.backend}`,
@@ -504,6 +511,8 @@ global
     log stdout format raw local0
     maxconn 4000
     ssl-default-bind-options ssl-min-ver TLSv1.2
+    tune.lua.bool-sample-conversion normal
+    lua-load "\${${EDGE_L4_GENERATION_ENV}}/admission.lua"
     # Allowlists, certificates and CRLs are referenced relative to this generation's directory, which
     # the executor names: the validator its candidate, the edge-l4 launch guard \`current\` (resolved
     # at every reload, after the swap). \`config\` would resolve from the guard's symlink instead.
@@ -545,7 +554,7 @@ backend be_caddy
     timeout connect ${CADDY_CONNECT_TIMEOUT}
     server caddy ${CADDY_TLS_LISTENER} send-proxy-v2
 
-${[...backends, ...sharedFrontends, reject, ...input.tcpRoutes.map(renderTcpRoute)].filter(Boolean).join("\n")}`;
+${[...[...input.routes, ...input.tcpRoutes].map(admissionTables), ...backends, ...sharedFrontends, reject, ...input.tcpRoutes.map(renderTcpRoute)].filter(Boolean).join("\n")}`;
 }
 
 /** Content hash of a generation: sorted `path NUL sha256(content)` lines. */
@@ -633,6 +642,7 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
   const files: Record<string, string> = {
     "haproxy.cfg": renderConfig({ httpHostnames, routes, tcpRoutes }),
     "haproxy.closed.cfg": renderConfig({ httpHostnames, routes: [], tcpRoutes: [] }),
+    "admission.lua": L4_ADMISSION_LUA,
     "manifest.json": `${JSON.stringify(manifest, null, 2)}\n`,
   };
   for (const route of [...routes, ...tcpRoutes])

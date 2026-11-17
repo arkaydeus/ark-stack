@@ -78,14 +78,12 @@ describe("TLS-TCP routes (§3.8.5)", () => {
   test("terminate_mtls admits in the SNI backend, then loops through abns with PROXY v2", () => {
     expect(config).toContain("    use_backend be_rt_p7q2_tls if { req.ssl_sni -i mqtt.example.com }\n");
     const outer = block(config, "backend be_rt_p7q2_tls");
-    expect(outer.split("\n").slice(1)).toEqual([
-      "    tcp-request content reject if !{ src -f allow/rt_p7q2.lst }",
-      "    stick-table type ipv6 size 10k expire 10m store conn_cur,conn_rate(10s)",
-      "    tcp-request content track-sc1 src",
-      "    tcp-request content reject if { sc1_conn_cur gt 10 } || { sc1_conn_rate gt 20 }",
-      "    tcp-request content reject if { be_conn gt 50 }",
-      `    server ${loop} abns@ark_${target.slice(2)} send-proxy-v2 maxconn 50`,
-    ]);
+    expect(outer).toContain("tcp-request content track-sc1 src table ad_src_rt_p7q2");
+    expect(outer).toContain("tcp-request content track-sc2 int(1) table ad_total_rt_p7q2");
+    expect(outer).toContain("tcp-request content lua.ark-admit rt_p7q2 50 10 20");
+    expect(outer).toContain("tcp-request content reject unless { var(txn.ark_admitted) -m bool }");
+    expect(generation.files["admission.lua"]).toContain('command("show proc")');
+    expect(block(config, "backend ad_total_rt_p7q2")).toContain("store conn_cur");
     const inner = block(config, "frontend fe_rt_p7q2_tls");
     expect(inner).toContain(
       `    bind abns@ark_${target.slice(2)} accept-proxy ssl crt certs/rt_p7q2.pem ca-file cas/rt_p7q2.pem verify required crl-file cas/rt_p7q2.crl\n`,
@@ -137,13 +135,20 @@ describe("TLS-TCP routes (§3.8.5)", () => {
     }
   });
 
+  test("termination refuses a certificate chain without its private key before hashing", () => {
+    for (const tlsMode of ["terminate", "terminate_mtls"] as const) {
+      expect(() =>
+        renderEdgeL4Generation({ httpHostnames: [], tlsRoutes: [{ ...mqtt, tlsMode, certificatePem: CA }] }),
+      ).toThrow(/certificate and key/);
+    }
+  });
+
   test("per-route limits are rendered from the stored values", () => {
     const limited = renderEdgeL4Generation({
       httpHostnames: [],
       tlsRoutes: [{ ...mqtt, limits: { maxConn: 3, perSourceConn: 2, perSourceRate: 7 } }],
     }).files["haproxy.cfg"]!;
-    expect(limited).toContain("{ sc1_conn_cur gt 2 } || { sc1_conn_rate gt 7 }");
-    expect(limited).toContain("{ be_conn gt 3 }");
+    expect(limited).toContain("lua.ark-admit rt_p7q2 3 2 7");
     expect(limited).toContain("    maxconn 4\n");
     expect(() =>
       renderEdgeL4Generation({ httpHostnames: [], tlsRoutes: [{ ...mqtt, limits: { maxConn: 0 } }] }),
@@ -187,16 +192,10 @@ describe("raw-TCP routes (§3.8.5)", () => {
 
   test("one frontend per dedicated port: allowlist, per-source and total limits, then the target", () => {
     const frontend = block(config, "frontend fe_rt_t001");
-    expect(frontend.split("\n").slice(1)).toEqual([
-      "    bind :20001",
-      "    maxconn 21",
-      "    tcp-request connection reject unless { src -f allow/rt_t001.lst }",
-      "    stick-table type ipv6 size 10k expire 10m store conn_cur,conn_rate(10s)",
-      "    tcp-request connection track-sc0 src",
-      "    tcp-request connection reject if { sc0_conn_cur gt 5 } || { sc0_conn_rate gt 10 }",
-      "    tcp-request connection reject if { fe_conn gt 20 }",
-      "    default_backend be_rt_t001",
-    ]);
+    expect(frontend).toContain("bind :20001");
+    expect(frontend).toContain("track-sc1 src table ad_src_rt_t001");
+    expect(frontend).toContain("track-sc2 int(1) table ad_total_rt_t001");
+    expect(frontend).toContain("lua.ark-admit rt_t001 20 5 10");
     expect(block(config, "backend be_rt_t001")).toContain(
       `    server ${haproxyServerName(ssh)} 100.77.9.3:22 maxconn 20`,
     );
@@ -333,7 +332,7 @@ describe("raw-port nftables (FD-14, the ark_db_ingress style)", () => {
     expect(chain("port_20003")).toContain("goto port_20003_limits");
     expect(chain("port_20003")).not.toContain("drop_allowlist");
     expect(chain("port_20001_limits")).toEndWith("    accept");
-    expect(rules).toContain("ct status dnat tcp dport vmap {");
+    expect(rules).toContain("ct direction original ct status dnat tcp dport vmap {");
   });
 
   test("bad ports, duplicates and open prefixes are refused", () => {

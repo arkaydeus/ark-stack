@@ -5,11 +5,13 @@
 // the serial also enters the route's lease policy fingerprint, so the running HAProxy servers of the
 // old policy are fenced and their sessions drained in every worker before the new CRL is reloaded.
 
-import { and, eq, lt, isNull, or } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 
 import { db } from "../db.ts";
 import { privateCas } from "../schema.ts";
 import * as pki from "./pki.ts";
+import { revokedSerials } from "./l4-routes.ts";
+import { routeCrlCovers } from "./route-crl.ts";
 
 /** Regenerate a route CA's CRL once fewer than this many days remain (14-day CRLs, weekly refresh). */
 export const ROUTE_CRL_REFRESH_DAYS = 7;
@@ -17,20 +19,19 @@ export const ROUTE_CRL_REFRESH_DAYS = 7;
 /** Route CAs whose CRL is missing or due for its weekly refresh. */
 export async function routeCrlsDue(now = new Date()) {
   const threshold = new Date(now.getTime() + ROUTE_CRL_REFRESH_DAYS * 86_400_000);
-  return db
-    .select({ id: privateCas.id })
+  const cas = await db
+    .select()
     .from(privateCas)
-    .where(
-      and(
-        eq(privateCas.purpose, "tcp-client"),
-        eq(privateCas.status, "active"),
-        or(
-          isNull(privateCas.crlPem),
-          isNull(privateCas.crlNextUpdate),
-          lt(privateCas.crlNextUpdate, threshold),
-        ),
-      ),
-    );
+    .where(and(eq(privateCas.purpose, "tcp-client"), eq(privateCas.status, "active")));
+  const revoked = await revokedSerials(cas.map((ca) => ca.id));
+  return cas
+    .filter(
+      (ca) =>
+        !ca.crlNextUpdate ||
+        ca.crlNextUpdate < threshold ||
+        !routeCrlCovers(ca.crlPem, revoked.get(ca.id) ?? []),
+    )
+    .map((ca) => ({ id: ca.id }));
 }
 
 /** Generates every missing or due route CA CRL. Returns the refreshed CA IDs. */

@@ -3391,12 +3391,10 @@ app.post("/api/front/routes/:id/client-certificates/:certificateId/revoke", asyn
   const access = c.get("access");
   requireOwner(access);
   requireMfa(c.get("session"));
-  const result = await revokeRouteClientCertificate(
-    c.req.param("id"),
-    c.req.param("certificateId"),
-    { userId: access.userId, role: access.role },
-    enqueue,
-  );
+  const result = await revokeRouteClientCertificate(c.req.param("id"), c.req.param("certificateId"), {
+    userId: access.userId,
+    role: access.role,
+  });
   return c.json(result);
 });
 

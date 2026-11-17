@@ -17,7 +17,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createId, parseEnvFile, renderEdgeL4Generation, type Role } from "@ark-stack/shared";
+import {
+  createId,
+  frontRouteCreateInput,
+  parseEnvFile,
+  renderEdgeL4Generation,
+  type Role,
+} from "@ark-stack/shared";
 import { makeSignature } from "better-auth/crypto";
 
 if (!process.env.DATABASE_URL && existsSync(".env")) {
@@ -27,6 +33,9 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
 const { app } = await import("./app.ts");
 const { auth } = await import("./auth.ts");
 const { sql } = await import("./db.ts");
+const routeLifecycle = await import("./modules/front-routes.ts");
+const pki = await import("./modules/pki.ts");
+const x509 = await import("./modules/x509.ts");
 const { runOperation, enqueue, edgeL4Input } = await import("./coordinator.ts");
 const { edgePolicy } = await import("./modules/edge-observe.ts");
 const { edgeL4Routes } = await import("./modules/l4-routes.ts");
@@ -426,4 +435,176 @@ describe("terminate_mtls (§3.8.4)", () => {
       409,
     );
   });
+});
+
+const noEnqueue = async () => ({});
+
+describe("concurrent L4 lifecycle and revocation recovery", () => {
+  const actor = () => ({ userId: owner.userId, role: "owner" });
+
+  test("concurrent TCP commits on the same dedicated port have exactly one winner", async () => {
+    const plans = await Promise.all(
+      ["race-a", "race-b"].map((name) =>
+        routeLifecycle.prepareRouteCreate(
+          frontRouteCreateInput.parse(tcpRequest(name, { listenPort: 20040 })),
+        ),
+      ),
+    );
+    const outcomes = await Promise.allSettled(
+      plans.map((plan) => routeLifecycle.commitRouteCreate(plan, actor(), noEnqueue)),
+    );
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    const loser = outcomes.find((outcome) => outcome.status === "rejected") as PromiseRejectedResult;
+    expect(loser.reason.status).toBe(409);
+    const rows = await sql`SELECT id FROM front_routes WHERE kind = 'tcp' AND listen_port = 20040`;
+    expect(rows).toHaveLength(1);
+  });
+
+  test("concurrent deletes serialize the shared endpoint and remove its last resources", async () => {
+    const first = await create(tlsRequest("shared-delete"));
+    const second = await create(tlsRequest("shared-delete", { listenPort: 8883 }));
+    const row = await routeRow(first.id);
+    await sql`INSERT INTO certificates (id, endpoint_id, names, status) VALUES (${createId("crt")}, ${row.endpoint_id}, ${JSON.stringify([first.hostname])}::jsonb, 'issued')`;
+    const plans = await Promise.all(
+      [first, second].map((route) => routeLifecycle.prepareRouteDelete(route.id)),
+    );
+    const deleted = await Promise.all(
+      plans.map((plan) => routeLifecycle.commitRouteDelete(plan, actor(), noEnqueue)),
+    );
+    expect(deleted.filter((result) => result.endpointRemoved)).toHaveLength(1);
+    expect(await sql`SELECT id FROM front_routes WHERE endpoint_id = ${row.endpoint_id}`).toHaveLength(0);
+    expect(await sql`SELECT id FROM endpoints WHERE id = ${row.endpoint_id}`).toHaveLength(0);
+    expect(await sql`SELECT id FROM certificates WHERE endpoint_id = ${row.endpoint_id}`).toHaveLength(0);
+    expect(
+      await sql`SELECT id FROM dns_records WHERE domain_id = ${domainId} AND name = ${first.hostname}`,
+    ).toHaveLength(0);
+  });
+
+  test("revocation, CRL and durable jobs roll back together at each persistence boundary, then retry", async () => {
+    const route = await create(tlsRequest("atomic-revoke", { tlsMode: "terminate_mtls" }));
+    const row = await routeRow(route.id);
+    await refreshRouteCrls();
+    await makeReady(route.id);
+    expect((await enable(route.id)).status).toBe(200);
+    await mkdir(join(certDir, route.hostname), { recursive: true });
+    await writeFile(
+      join(certDir, route.hostname, "fullchain.pem"),
+      "-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----",
+    );
+    await writeFile(
+      join(certDir, route.hostname, "privkey.pem"),
+      "-----BEGIN PRIVATE KEY-----\nAA\n-----END PRIVATE KEY-----",
+    );
+    const issued = await pki.issueClientCertificate({
+      caId: row.client_ca_id,
+      subjectCn: "atomic-client",
+      keyOwner: { resourceType: "platform", resourceId: "platform" },
+    });
+    const before = (await policyOf(route.id))!;
+    for (const table of ["client_certificates", "private_cas", "operations"]) {
+      // An exception AFTER the certificate write, AFTER CRL persistence, or BEFORE durable enqueue.
+      const trigger = `fd14_failure_${suffix}`;
+      await sql.unsafe(
+        `CREATE FUNCTION ${trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected revocation failure'; END $$`,
+      );
+      await sql.unsafe(
+        `CREATE TRIGGER ${trigger} ${table === "operations" ? "BEFORE INSERT" : "AFTER UPDATE"} ON ${table} FOR EACH ROW EXECUTE FUNCTION ${trigger}()`,
+      );
+      try {
+        await expect(
+          routeLifecycle.revokeRouteClientCertificate(route.id, issued.certificate.id, actor()),
+        ).rejects.toThrow("Failed query");
+      } finally {
+        await sql.unsafe(`DROP TRIGGER ${trigger} ON ${table}`);
+        await sql.unsafe(`DROP FUNCTION ${trigger}()`);
+      }
+      expect((await pki.getClientCertificate(issued.certificate.id))!.status).toBe("issued");
+      expect((await policyOf(route.id))!.policy).toBe(before.policy);
+      const l4 = await edgeL4Routes({ policyRoutes: [before], certDir });
+      expect(l4.tlsRoutes).toHaveLength(1);
+      expect(x509.parseCrl(x509.fromPem(l4.tlsRoutes[0]!.clientCrlPem!, ["X509 CRL"])).revoked).toHaveLength(
+        0,
+      );
+      expect(
+        await sql`SELECT id FROM operations WHERE payload->>'reason' = 'client_certificate_revoked' AND payload->'routeIds' ? ${route.id}`,
+      ).toHaveLength(0);
+    }
+    // Pause a real production revocation after its certificate write, while the CRL is uncommitted.
+    const gate = await sql.reserve();
+    const lock = `fd14-revoke-${suffix}`;
+    await gate`SELECT pg_advisory_lock(hashtext(${lock}))`;
+    const trigger = `fd14_pause_${suffix}`;
+    await sql.unsafe(
+      `CREATE FUNCTION ${trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(hashtext('${lock}')); RETURN NEW; END $$`,
+    );
+    await sql.unsafe(
+      `CREATE TRIGGER ${trigger} AFTER UPDATE ON client_certificates FOR EACH ROW EXECUTE FUNCTION ${trigger}()`,
+    );
+    const revoking = routeLifecycle.revokeRouteClientCertificate(route.id, issued.certificate.id, actor());
+    try {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        const waiting = await sql`SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`;
+        if (waiting.length) break;
+        await Bun.sleep(10);
+      }
+      expect(await sql`SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`).not.toHaveLength(
+        0,
+      );
+      expect((await policyOf(route.id))!.policy).toBe(before.policy);
+      expect((await edgeL4Routes({ policyRoutes: [before], certDir })).tlsRoutes).toHaveLength(1);
+    } finally {
+      await gate`SELECT pg_advisory_unlock(hashtext(${lock}))`;
+      gate.release();
+      await revoking;
+      await sql.unsafe(`DROP TRIGGER ${trigger} ON client_certificates`);
+      await sql.unsafe(`DROP FUNCTION ${trigger}()`);
+    }
+    const after = (await policyOf(route.id))!;
+    expect(after.policy).not.toBe(before.policy);
+    expect((await edgeL4Routes({ policyRoutes: [before], certDir })).tlsRoutes).toHaveLength(0);
+    const current = await edgeL4Routes({ policyRoutes: [after], certDir });
+    expect(
+      x509
+        .parseCrl(x509.fromPem(current.tlsRoutes[0]!.clientCrlPem!, ["X509 CRL"]))
+        .revoked.map((entry) => entry.serial),
+    ).toContain(issued.certificate.serial);
+    const jobs =
+      await sql`SELECT * FROM operations WHERE payload->>'reason' = 'client_certificate_revoked' AND payload->'routeIds' ? ${route.id}`;
+    expect(jobs.map((job) => job.kind).toSorted()).toEqual(["edge.apply", "edge.drain"]);
+    // A fresh worker can discover and process the committed apply without the API enqueue callback.
+    const { db } = await import("./db.ts");
+    const { operations } = await import("./schema.ts");
+    const { eq } = await import("drizzle-orm");
+    const [apply] = await db
+      .select()
+      .from(operations)
+      .where(eq(operations.id, jobs.find((job) => job.kind === "edge.apply")!.id));
+    const savedRoot = process.env.ARK_EDGE_L4_DIR;
+    const savedEdge = process.env.ARK_EDGE_DIR;
+    process.env.ARK_EDGE_DIR = join(certDir, "recovered-edge");
+    process.env.ARK_EDGE_L4_DIR = certDir;
+    try {
+      await runOperation("edge.apply", apply!);
+      expect((await queued("edge.l4_apply")).length).toBeGreaterThan(0);
+    } finally {
+      if (savedEdge === undefined) delete process.env.ARK_EDGE_DIR;
+      else process.env.ARK_EDGE_DIR = savedEdge;
+      if (savedRoot === undefined) delete process.env.ARK_EDGE_L4_DIR;
+      else process.env.ARK_EDGE_L4_DIR = savedRoot;
+    }
+    // Recover a stale, still-unexpired CRL left by an older interrupted revocation.
+    const another = await pki.issueClientCertificate({
+      caId: row.client_ca_id,
+      subjectCn: "recovery-client",
+      keyOwner: { resourceType: "platform", resourceId: "platform" },
+    });
+    await pki.revokeClientCertificate({ id: another.certificate.id });
+    const stalePolicy = (await policyOf(route.id))!;
+    expect((await edgeL4Routes({ policyRoutes: [stalePolicy], certDir })).omitted[0]!.reason).toMatch(
+      /CRL does not cover/,
+    );
+    expect(await refreshRouteCrls()).toContain(row.client_ca_id);
+    expect((await edgeL4Routes({ policyRoutes: [stalePolicy], certDir })).tlsRoutes).toHaveLength(1);
+  }, 15_000);
 });

@@ -57,7 +57,7 @@ import {
   type TargetEvidence,
 } from "./modules/offsite-backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
-import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
+import { edgeL4Configured, haproxyAdapter, missingL4Routes, writeEdgeL4 } from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import { edgeL4Routes, enabledSniPorts, type OmittedL4Route } from "./modules/l4-routes.ts";
 import { refreshRouteCrls, routeCrlsDue } from "./modules/route-pki.ts";
@@ -2497,10 +2497,23 @@ async function observeEdge(operation: OperationRow) {
     operationId: operation.id,
   });
   const reconcile = await reconcileServedRoutes();
+  const l4Adapter = haproxyAdapter();
+  let l4Recovery: { missing?: string[]; error?: string } = {};
+  if (edgeL4Configured() && l4Adapter) {
+    try {
+      const missing = await missingL4Routes((await edgePolicy()).routes, l4Adapter.master);
+      if (missing.length) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+      l4Recovery = { missing };
+    } catch (error) {
+      // Inspection uncertainty needs a durable retry, too.
+      await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+      l4Recovery = { error: (error as Error).message };
+    }
+  }
   // Weekly route CRL refresh (FD-14): edge.l4_apply regenerates due CRLs before rendering.
   const crlsDue = (await routeCrlsDue()).length;
   if (crlsDue && edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
-  await addStep(operation.id, "edge-observe", { ...result, reconcile, routeCrlsDue: crlsDue });
+  await addStep(operation.id, "edge-observe", { ...result, reconcile, l4Recovery, routeCrlsDue: crlsDue });
   return { ...result, reconcile };
 }
 

@@ -804,10 +804,13 @@ export async function listClientCertificates(caId: string) {
  * The next `generateCaCrl` lists the serial; PgBouncer has no CRL, so DB clients also need the
  * CA removal and role drain of §3.10.4 (FD-17/FD-28).
  */
-export async function revokeClientCertificate(input: { id: string; reason?: CrlReason; now?: Date }) {
+export async function revokeClientCertificate(
+  input: { id: string; reason?: CrlReason; now?: Date },
+  executor: Database | Transaction = db,
+) {
   const reason = input.reason ?? "unspecified";
   if (!Object.hasOwn(CRL_REASONS, reason)) throw new PkiPolicyError("Unknown revocation reason.");
-  return db.transaction(async (tx) => {
+  return executor.transaction(async (tx) => {
     const [current] = await tx
       .select()
       .from(clientCertificates)
@@ -834,11 +837,14 @@ export async function revokeClientCertificate(input: { id: string; reason?: CrlR
  * Generate and store the CA's CRL: every revoked certificate of this CA, `thisUpdate = now`, and
  * `nextUpdate = now + nextUpdateDays` (default 14). The CRL number increases monotonically.
  */
-export async function generateCaCrl(input: { caId: string; nextUpdateDays?: number; now?: Date }) {
+export async function generateCaCrl(
+  input: { caId: string; nextUpdateDays?: number; now?: Date },
+  executor: Database | Transaction = db,
+) {
   const days = input.nextUpdateDays ?? DEFAULT_CRL_NEXT_UPDATE_DAYS;
   if (!Number.isFinite(days) || days <= 0 || days > 366)
     throw new PkiPolicyError("nextUpdate must be between 0 and 366 days ahead.");
-  return db.transaction(async (tx) => {
+  return executor.transaction(async (tx) => {
     const [ca] = await tx.select().from(privateCas).where(eq(privateCas.id, input.caId)).for("update");
     if (!ca) throw new PkiPolicyError("CA not found.");
     const signer = await loadSigner(tx, ca);

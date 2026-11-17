@@ -123,7 +123,7 @@ ${dispatch("")}
   }
   chain forward {
     type filter hook forward priority -1; policy accept;
-${dispatch("ct status dnat ")}
+${dispatch("ct direction original ct status dnat ")}
   }
 ${rules.join("\n")}
 }

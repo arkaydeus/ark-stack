@@ -200,20 +200,22 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     for (let pass = 0; pass < ENFORCE_PASSES; pass++) {
       problem = "";
       let clean = true;
-      for (const worker of workers) {
-        this.inspected.add(worker.pid);
-        try {
-          const outcome = await this.enforceWorker(worker.pid, index, active, withdrawn);
-          if (!outcome.clean) {
+      await Promise.all(
+        workers.map(async (worker) => {
+          this.inspected.add(worker.pid);
+          try {
+            const outcome = await this.enforceWorker(worker.pid, index, active, withdrawn);
+            if (!outcome.clean) {
+              clean = false;
+              problem = outcome.problem;
+            }
+          } catch (error) {
+            if (error instanceof WorkerGoneError) return;
             clean = false;
-            problem = outcome.problem;
+            problem = `worker ${worker.pid}: ${(error as Error).message}`;
           }
-        } catch (error) {
-          if (error instanceof WorkerGoneError) continue;
-          clean = false;
-          problem = `worker ${worker.pid}: ${(error as Error).message}`;
-        }
-      }
+        }),
+      );
       // Re-enumerate: a worker started or left while we were working must be covered too.
       let after: HaproxyProcess[];
       try {

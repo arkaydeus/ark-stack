@@ -57,6 +57,7 @@ import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
 // The PKI module is pure apart from persistence; it only needs a (never used) database URL to load.
 process.env.DATABASE_URL ??= "postgres://unused@127.0.0.1:1/unused";
 const pki = await import("../server/src/modules/pki.ts");
+const x509 = await import("../server/src/modules/x509.ts");
 
 const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
@@ -286,28 +287,37 @@ async function startContainers() {
 
 const watchdogName = `ark-edge-l4r-watchdog-${suffix}`;
 
-/**
- * Waits until the watchdog reports verified HAProxy enforcement on two polls in a row. A reload
- * re-executes the HAProxy master, so its CLI refuses connections for a moment; back-to-back reloads
- * could make the launch guard miss two heartbeats and stop HAProxy (FD-25 fail-closed).
- */
+/** Wait for two distinct completed, verified passes; a busy-pass heartbeat is not readiness. */
 async function settle() {
-  let healthy = 0;
+  let previous: string | undefined;
+  let completed = 0;
   await waitFor(
-    "verified watchdog enforcement on HAProxy",
+    "two completed watchdog enforcement passes",
     async () => {
-      const status = await docker(
+      const text = await docker(
         "exec",
         watchdogName,
         "bun",
         "--eval",
-        'const r = await fetch("http://127.0.0.1:2021/v1/supervise?proxy=haproxy"); console.log(r.ok ? "ok" : "no")',
+        'const r = await fetch("http://127.0.0.1:2021/v1/health?proxy=haproxy"); console.log(JSON.stringify((await r.json()).proxies.haproxy))',
       );
-      healthy = status === "ok" ? healthy + 1 : 0;
-      return healthy >= 2 ? true : undefined;
+      const state = JSON.parse(text) as {
+        policyError: string | null;
+        lastTick: { at: string; errors: string[] } | null;
+      };
+      const tick = state.lastTick;
+      if (!tick || state.policyError || tick.errors.length) {
+        completed = 0;
+        return undefined;
+      }
+      if (previous !== tick.at) {
+        if (previous !== undefined) completed++;
+        previous = tick.at;
+      }
+      return completed >= 2 ? true : undefined;
     },
     30_000,
-    400,
+    300,
   );
 }
 
@@ -538,7 +548,9 @@ function tlsRoute(spec: TlsSpec): EdgeL4TlsRoute {
       allowInternet: Boolean(spec.allowInternet),
       limits,
       clientCaId: spec.tlsMode === "terminate_mtls" ? spec.id : null,
-      revokedSerials: [spec.clientCrlPem ?? ""],
+      revokedSerials: spec.clientCrlPem
+        ? x509.parseCrl(x509.fromPem(spec.clientCrlPem, ["X509 CRL"])).revoked.map((entry) => entry.serial)
+        : [],
     }),
     ...(spec.tlsMode && spec.tlsMode !== "passthrough"
       ? { certificatePem: `${edgeCert.chain.trim()}\n${edgeCert.key.trim()}\n` }
@@ -573,20 +585,14 @@ const policyOf = (route: EdgeL4TlsRoute | EdgeL4TcpRoute, kind: "tls" | "tcp"): 
   policy: route.policy,
 });
 
-/**
- * edge.l4_apply as the domain worker runs it. A test transition (not a revocation) allows the old and
- * new identities while the new generation is reloaded, then narrows the lease to the new routes, so
- * the old servers are fenced and drained in the leaving worker. Changing the lease first would make
- * the launch guard re-point to the closed variant and reopen with a second reload; back-to-back
- * reloads briefly make the master CLI unreachable, and two missed heartbeats make the guard kill
- * HAProxy (FD-25 fail-closed). Revocation tests change the lease themselves.
- */
+/** Production transition: publish the desired policy first, fence old identities, then install. */
 async function apply(input: { tlsRoutes?: EdgeL4TlsRoute[]; tcpRoutes?: EdgeL4TcpRoute[] }) {
   const next = [
     ...(input.tlsRoutes ?? []).map((route) => policyOf(route, "tls")),
     ...(input.tcpRoutes ?? []).map((route) => policyOf(route, "tcp")),
   ];
-  lease.routes = [...lease.routes, ...next];
+  lease.routes = next;
+  await settle();
   const full: EdgeL4Input = { httpHostnames: [appHost], sniPorts: [8883], ...input };
   // The launch guard reacts to the lease too (it re-points or reloads); a reload racing it can go
   // unanswered, which the installer reports and restores, exactly as edge.l4_apply then retries.
@@ -800,6 +806,20 @@ async function perSourceLimitTest(report: Report) {
     "two TLS routes on 443, limit 10 per source: ten sessions from A are relayed and the eleventh fails",
     `${held.filter((item) => item.ok).length}/10 ok; 11th: ${eleventh.error ?? "relayed"}`,
   );
+  await probe(["reload"]);
+  await settle();
+  const afterReload = await open(agents.A, { hold: true });
+  expect(
+    report,
+    !afterReload.ok,
+    "TLS per-source limit includes leaving workers after unchanged reload",
+    JSON.stringify(afterReload),
+  );
+  await agentCall(agents.A, "POST", "/close", { ids: [held[0]!.id] });
+  await waitFor("TLS capacity released by a leaving worker", async () => {
+    const result = await open(agents.A, { hold: true });
+    return result.ok ? result : undefined;
+  });
   const other = await open(agents.B, { hold: true });
   const otherRoute = await open(agents.A, { sni: amqpHost, hold: true });
   expect(
@@ -841,6 +861,20 @@ async function perSourceLimitTest(report: Report) {
     "maxconn is enforced: with maxConn 3 the fourth concurrent session fails, whatever its source",
     `${total.filter((item) => item.ok).length}/3 ok; 4th: ${fourth.error ?? "relayed"}`,
   );
+  await probe(["reload"]);
+  await settle();
+  const fifth = await open(agents.B, { hold: true });
+  expect(
+    report,
+    !fifth.ok,
+    "TLS total cap includes leaving workers after unchanged reload",
+    JSON.stringify(fifth),
+  );
+  await agentCall(agents.A, "POST", "/close", { ids: [total[0]!.id] });
+  await waitFor("TLS total capacity released by a leaving worker", async () => {
+    const result = await open(agents.B, { hold: true });
+    return result.ok ? result : undefined;
+  });
   await closeAll();
 }
 
@@ -1010,6 +1044,15 @@ async function rawTcpTest(report: Report) {
     "raw TCP: the per-source limit (5) admits five sessions and refuses the sixth",
     `${held.filter((item) => item.ok).length}/5; 6th: ${sixth.error ?? "relayed"}`,
   );
+  await probe(["reload"]);
+  await settle();
+  const rawReload = await open(agents.A, { port: 20001, tls: false, hold: true });
+  expect(report, !rawReload.ok, "raw per-source cap includes leaving workers", JSON.stringify(rawReload));
+  await agentCall(agents.A, "POST", "/close", { ids: [held[0]!.id] });
+  held[0] = await waitFor("raw capacity released by a leaving worker", async () => {
+    const result = await open(agents.A, { port: 20001, tls: false, hold: true });
+    return result.ok ? result : undefined;
+  });
   const keep = await open(agents.B, { sni: amqpHost, hold: true });
   const rawB = await open(agents.B, { port: 20001, tls: false, hold: true });
   // Disable: edge.drain as the domain worker runs it (the policy no longer allows rt_t001).
@@ -1041,7 +1084,7 @@ async function rawTcpTest(report: Report) {
   await apply({
     tcpRoutes: [tcpRoute({ ...raw, limits: { maxConn: 2, perSourceConn: 5, perSourceRate: 100 } })],
   });
-  await Bun.sleep(1_500);
+  await settle();
   const capped = [
     await open(agents.A, { port: 20001, tls: false, hold: true }),
     await open(agents.B, { port: 20001, tls: false, hold: true }),
@@ -1051,11 +1094,20 @@ async function rawTcpTest(report: Report) {
     report,
     capped.every((item) => item.ok) && !third.ok,
     "raw TCP: maxconn 2 refuses the third concurrent session",
-    third.error ?? "relayed",
+    `held: ${JSON.stringify(capped)}; third: ${JSON.stringify(third)}`,
   );
+  await probe(["reload"]);
+  await settle();
+  const reloadedThird = await open(agents.A, { port: 20001, tls: false, hold: true });
+  expect(report, !reloadedThird.ok, "raw total cap includes leaving workers", JSON.stringify(reloadedThird));
+  await agentCall(agents.A, "POST", "/close", { ids: [capped[0]!.id] });
+  await waitFor("raw total capacity released by a leaving worker", async () => {
+    const result = await open(agents.A, { port: 20001, tls: false, hold: true });
+    return result.ok ? result : undefined;
+  });
   await closeAll();
   await apply({ tcpRoutes: [tcpRoute({ ...raw, sourceCidrs: [] })] });
-  await Bun.sleep(1_500);
+  await settle();
   const denied = await Promise.all(
     [agents.A, agents.B, agents.C].map((agent) => open(agent, { port: 20001, tls: false })),
   );
@@ -1064,6 +1116,60 @@ async function rawTcpTest(report: Report) {
     denied.every((item) => !item.ok),
     "an empty CIDR list renders deny-all in HAProxy",
     denied.map((item) => item.error).join(", "),
+  );
+}
+
+async function stalledWithdrawalTest(report: Report) {
+  const route = tlsRoute({
+    id: "rt_stall",
+    hostname: mqttHost,
+    tlsMode: "passthrough",
+    sourceCidrs: [cidr(agents.A)],
+    limits: { perSourceRate: 200 },
+  });
+  await apply({ tlsRoutes: [route] });
+  const oldSession = await open(agents.A, { hold: true });
+  await probe(["reload"]);
+  await settle();
+  const currentSession = await open(agents.A, { hold: true });
+  expect(
+    report,
+    oldSession.ok && currentSession.ok,
+    "sessions exist in current and leaving workers before stalled enforcement",
+    JSON.stringify([oldSession, currentSession]),
+  );
+  const { workers } = await probe<{ workers: Array<{ pid: number; section: string }> }>(["proc"]);
+  const leaving = workers.find((worker) => worker.section === "old")!;
+  expect(
+    report,
+    Boolean(leaving),
+    "a leaving worker can be stalled before its drain",
+    JSON.stringify(workers),
+  );
+  const revokedAt = Date.now();
+  // A stopped leaving worker cannot answer any inspection or drain command. Supervision must
+  // include the busy-pass grace, polling and kill time, measured at real client sockets.
+  await docker("exec", stack.edgeL4, "kill", "-STOP", String(leaving.pid));
+  lease.routes = [];
+  const times = await closeTimes(
+    [
+      { agent: agents.A, id: oldSession.id },
+      { agent: agents.A, id: currentSession.id },
+    ],
+    revokedAt,
+    7_000,
+  );
+  expect(
+    report,
+    times.every((ms) => ms !== null && ms <= 5_000),
+    "the shipped launch guard closes sessions within five seconds when leaving-worker enforcement stalls",
+    JSON.stringify(times),
+  );
+  expect(
+    report,
+    (await logsOf(stack.edgeL4)).includes("watchdog enforcement unavailable; terminating HAProxy"),
+    "the launch guard performed the fail-closed shutdown",
+    "guard log",
   );
 }
 
@@ -1104,6 +1210,24 @@ sleep 1
 for port in 20001 20002 20003 20004 20005; do
   ip netns exec cli bun -e "const s=require('node:net').connect({host:'10.99.0.1',port:$port});const t=setTimeout(()=>{console.log('$port dropped');process.exit(0)},1500);s.on('connect',()=>{clearTimeout(t);console.log('$port open');process.exit(0)});s.on('error',e=>{clearTimeout(t);console.log('$port '+e.code);process.exit(0)})"
 done
+# Actual Docker-style DNAT: srv forwards published ports to a separate backend namespace.
+ip netns add backend
+ip link add v2 type veth peer name v3
+ip link set v2 netns srv; ip link set v3 netns backend
+ip -n srv addr add 10.98.0.1/24 dev v2; ip -n backend addr add 10.98.0.2/24 dev v3
+ip -n srv link set v2 up; ip -n backend link set v3 up; ip -n backend link set lo up
+ip -n backend route add default via 10.98.0.1
+ip netns exec srv sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+ip netns exec srv nft 'add table ip published'
+ip netns exec srv nft 'add chain ip published prerouting { type nat hook prerouting priority -100; }'
+ip netns exec srv nft 'add rule ip published prerouting ip daddr 10.99.0.1 tcp dport { 20001, 20002, 20003, 21000 } dnat to 10.98.0.2'
+ip netns exec backend bun -e 'for (const port of [20001,20002,20003,21000]) Bun.listen({hostname:"0.0.0.0",port,socket:{data(s,d){s.write(d)}}})' &
+sleep 1
+for pair in 20001:20003 21000:20002 21000:20001; do
+  port=\${pair%:*}; source=\${pair#*:}
+  ip netns exec cli bun -e "const s=require('node:net').connect({host:'10.99.0.1',port:$port,localPort:$source});const t=setTimeout(()=>{console.log('dnat $pair dropped');process.exit(0)},1500);s.on('connect',()=>s.write('ping'));s.on('data',d=>{clearTimeout(t);console.log('dnat $pair '+(d.toString()==='ping'?'ok':'bad'));process.exit(0)});s.on('error',e=>{clearTimeout(t);console.log('dnat $pair '+e.code);process.exit(0)})"
+done
+ip netns exec cli bun -e "const s=require('node:net').connect({host:'10.99.0.1',port:20003});setTimeout(()=>{console.log('dnat closed dropped');process.exit(0)},1500);s.on('connect',()=>{console.log('dnat closed open');process.exit(0)});s.on('error',()=>{console.log('dnat closed refused');process.exit(0)})"
 `;
   const name = `ark-edge-l4r-nft-${suffix}`;
   runtime.containers.push(name);
@@ -1138,6 +1262,13 @@ done
       verdict(20005) === "dropped",
     "nftables: an allowlisted source is admitted, an empty list drops (deny-all), a port without a route drops, only allowInternet opens to every source, and an outside source is dropped",
     [20001, 20002, 20003, 20004, 20005].map((port) => `${port} ${verdict(port)}`).join(", "),
+  );
+  expect(
+    report,
+    ["20001:20003", "21000:20002", "21000:20001"].every((pair) => lines.includes(`dnat ${pair} ok`)) &&
+      lines.includes("dnat closed dropped"),
+    "DNAT replies reach clients using raw-range source ports, including unrelated published services; closed inbound raw ports still drop",
+    lines.filter((line) => line.startsWith("dnat ")).join("; "),
   );
 }
 
@@ -1180,6 +1311,7 @@ try {
   await run("revocation racing new connections across reloads", revocationRaceTest);
   await run("shared SNI port 8883", sharedPortTest);
   await run("raw TCP route on 20001: allowlist, limits, deny-all and edge.drain", rawTcpTest);
+  await run("stalled leaving-worker enforcement deadline", stalledWithdrawalTest);
   await run("raw-port nftables: deny-all and closed ports", nftTest);
   console.log("\nAll FD-14 route tests passed.");
 } catch (error) {

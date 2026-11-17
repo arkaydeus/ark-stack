@@ -19,8 +19,10 @@ import { and, eq, inArray } from "drizzle-orm";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { db } from "../db.ts";
+import { db, type DbTransaction } from "../db.ts";
 import { clientCertificates, frontRoutes, privateCas } from "../schema.ts";
+
+import { routeCrlCovers } from "./route-crl.ts";
 
 type RouteRow = typeof frontRoutes.$inferSelect;
 
@@ -78,11 +80,11 @@ export function storedL4Settings(
 }
 
 /** Revoked serials per CA, for the policy fingerprint of `terminate_mtls` routes. */
-export async function revokedSerials(caIds: string[]) {
+export async function revokedSerials(caIds: string[], executor: Pick<typeof db, "select"> = db) {
   const ids = [...new Set(caIds)];
   const result = new Map<string, string[]>();
   if (!ids.length) return result;
-  const rows = await db
+  const rows = await executor
     .select({ caId: clientCertificates.caId, serial: clientCertificates.serial })
     .from(clientCertificates)
     .where(and(inArray(clientCertificates.caId, ids), eq(clientCertificates.status, "revoked")));
@@ -119,21 +121,28 @@ export async function edgeL4Routes(input: {
   const tcpRoutes: EdgeL4TcpRoute[] = [];
   if (!l4.length) return { tlsRoutes, tcpRoutes, omitted };
   const sniPorts = input.sniPorts ?? enabledSniPorts();
-  const rows = await db
-    .select()
-    .from(frontRoutes)
-    .where(
-      inArray(
-        frontRoutes.id,
-        l4.map((route) => route.id),
-      ),
-    );
+  // One MVCC snapshot: never pair a newly committed policy with an earlier CRL.
+  const { rows, revoked, cas } = await db.transaction(
+    async (tx: DbTransaction) => {
+      const snapshotRows = await tx
+        .select()
+        .from(frontRoutes)
+        .where(
+          inArray(
+            frontRoutes.id,
+            l4.map((route) => route.id),
+          ),
+        );
+      const caIds = snapshotRows.map((row) => row.clientCaId).filter((id): id is string => Boolean(id));
+      const [snapshotRevoked, snapshotCas] = await Promise.all([
+        revokedSerials(caIds, tx),
+        caIds.length ? tx.select().from(privateCas).where(inArray(privateCas.id, caIds)) : [],
+      ]);
+      return { rows: snapshotRows, revoked: snapshotRevoked, cas: snapshotCas };
+    },
+    { isolationLevel: "repeatable read" },
+  );
   const byId = new Map(rows.map((row) => [row.id, row]));
-  const caIds = rows.map((row) => row.clientCaId).filter((id): id is string => Boolean(id));
-  const [revoked, cas] = await Promise.all([
-    revokedSerials(caIds),
-    caIds.length ? db.select().from(privateCas).where(inArray(privateCas.id, caIds)) : [],
-  ]);
   const caById = new Map(cas.map((ca) => [ca.id, ca]));
   const certDir = input.certDir ?? process.env.ARK_CERT_DIR ?? join(process.cwd(), "tmp", "certs");
   for (const route of l4) {
@@ -195,6 +204,10 @@ export async function edgeL4Routes(input: {
               ? `its route CA is ${ca.status}`
               : "its route CA has no CRL yet",
         );
+        continue;
+      }
+      if (!routeCrlCovers(ca.crlPem, revoked.get(ca.id) ?? [])) {
+        omit("its route CRL does not cover every revoked certificate");
         continue;
       }
       tls.clientCaPem = ca.certPem;
