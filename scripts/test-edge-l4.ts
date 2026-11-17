@@ -1237,6 +1237,14 @@ function failedHandshake(servername: string) {
   });
 }
 
+/** HAProxy tcplog lines for connections the 443 frontend handed to Caddy, whatever their outcome. */
+async function caddyRoutedLines() {
+  return (await logsOf(stack.edgeL4))
+    .split("\n")
+    .filter((line) => line.includes("fe_tls443 be_caddy/caddy "))
+    .map((line) => line.slice(line.indexOf("be_caddy")).trim());
+}
+
 /** HAProxy tcplog lines for connections to Caddy that failed to connect (termination state SC). */
 async function caddyConnectFailures() {
   // %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq
@@ -1598,6 +1606,7 @@ async function launchGuardTest(report: Report) {
 
   // Losing the watchdog while a tailnet route exists stops HAProxy (listeners and sessions).
   const session = await tlsSession();
+  const routedBefore = (await caddyRoutedLines()).length;
   const restarts = Number(await docker("inspect", "--format", "{{.RestartCount}}", stack.edgeL4));
   const stoppedAt = Date.now();
   await docker("stop", "--time", "1", watchdogName);
@@ -1618,18 +1627,27 @@ async function launchGuardTest(report: Report) {
     500,
   );
   await refreshPorts();
-  await waitFor(
-    "HTTP through 443 after the restart",
-    async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
+  // Without the watchdog, Caddy's launch guard restart-loops too (its full Caddyfile has a tailnet
+  // route), so Caddy's listener is up only briefly. HAProxy no longer retries the loopback hop, so a
+  // 200 needs both proxies up at once. Either outcome shows the restarted closed configuration still
+  // routing HTTP SNI to Caddy: a 200, or HAProxy's own log of the request handed to be_caddy.
+  const http = await waitFor(
+    "HTTP SNI routed to Caddy through 443 after the restart",
+    async () => {
+      const reply = await secureGet(adminHost).catch(() => undefined);
+      if (reply?.status === 200) return `${adminHost}: 200`;
+      const routed = (await caddyRoutedLines()).slice(routedBefore);
+      return routed.length ? `${adminHost} -> ${routed.at(-1)}` : undefined;
+    },
     30_000,
-    500,
+    250,
   );
   const after = await tlsOutcome();
   expect(
     report,
     after.startsWith("refused"),
-    "restarted without a watchdog it serves HTTP but no tailnet route",
-    `${adminHost}: 200; ${mqttHost}: ${after}`,
+    "restarted without a watchdog it routes HTTP to Caddy but serves no tailnet route",
+    `${http}; ${mqttHost}: ${after}`,
   );
 }
 
