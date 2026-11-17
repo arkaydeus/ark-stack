@@ -47,7 +47,9 @@ The UI shows the same recipes (`PROVIDER_RECIPES` in `shared/src/backup-targets.
 **AWS S3** (`https://s3.<region>.amazonaws.com`, virtual-host style)
 
 1. Create the bucket with Object Lock enabled (this enables versioning). Set a default retention in COMPLIANCE mode, or GOVERNANCE mode with no principal holding `s3:BypassGovernanceRetention`, of at least the recovery window.
-2. Create an IAM user for Ark with only the generated policy: `PutObject`, `GetObject`, `GetObjectVersion`, `GetObjectRetention` and listing under the prefix; `DeleteObject` **only** on `<prefix>/restic/locks/*`; and an explicit deny of `DeleteObjectVersion`, `BypassGovernanceRetention`, `PutObjectRetention`, `PutObjectLegalHold`, `PutBucketVersioning`, `PutBucketObjectLockConfiguration`, `PutLifecycleConfiguration`, `PutBucketPolicy`, `DeleteBucketPolicy` and `DeleteBucket`.
+2. Create an IAM user for Ark with only the generated policy (including read-only `GetBucketPolicy`): `PutObject`, `GetObject`, `GetObjectVersion`, `GetObjectRetention` and listing under the prefix; `DeleteObject` **only** on `<prefix>/restic/locks/*`; and an explicit deny of `DeleteObjectVersion`, `BypassGovernanceRetention`, `PutObjectRetention`, `PutObjectLegalHold`, `PutBucketVersioning`, `PutBucketObjectLockConfiguration`, `PutLifecycleConfiguration`, `PutBucketPolicy`, `DeleteBucketPolicy` and `DeleteBucket`.
+
+3. Attach the generated `bucketProtectionPolicy` from `GET /api/backups/targets` as a **bucket policy** too. Its unconditional all-principal denies cover permanent version deletion and retention changes/bypass on the exact config key and prevent deleting this policy. Keep permission to replace the policy on an independent off-host administrator; the VPS writer must have neither replacement nor deletion permission. A sibling canary alone cannot prove exact-key permissions. If the policy cannot be read and evaluated, verification stays unknown.
 
 restic deletes its own lock files under `locks/` when a backup ends, so a credential with no delete permission at all would break `restic backup`. On a versioned bucket that delete only adds a delete marker.
 
@@ -58,7 +60,7 @@ restic deletes its own lock files under `locks/` when a backup ends, so a creden
 
 **Cloudflare R2** (`https://<account-id>.r2.cloudflarestorage.com`, region `auto`, virtual-host style)
 
-1. Add bucket lock rules on `<prefix>/restic/data/`, `index/`, `snapshots/`, `keys/`, `<prefix>/restic/config` and `<prefix>/ark-canary/` for at least the recovery window. **Do not lock `<prefix>/restic/locks/`**: restic must remove its lock files.
+1. Add bucket lock rules on `<prefix>/restic/data/`, `index/`, `snapshots/`, `keys/`, `<prefix>/restic/config` and `<prefix>/ark-canary/` with **Indefinite** retention. Finite Age/Date rules expire on old config, keys and reused packs even when recent snapshots still depend on them. **Do not lock `<prefix>/restic/locks/`**: restic must remove its lock files.
 2. R2 tokens have no no-delete level ("Object Read & Write"), so the lock rules are the only control. Scope the token to this bucket.
 3. Give Ark a separate **read-only** Cloudflare API token (with the account ID) so the canary can read the lock rules. Without it the target stays "unknown", never healthy.
 
@@ -67,18 +69,19 @@ A direct, live pgBackRest S3 repository (`repo1`) is never the R2 recipe: `backu
 **MinIO** (path style)
 
 1. `mc mb --with-lock <alias>/<bucket>` (object locking turns on versioning), then `mc retention set --default COMPLIANCE <days>d <alias>/<bucket>`.
-2. Create a user with the same IAM-style policy as AWS (`mc admin policy create`, then `mc admin policy attach … --user …`).
+2. Create a user with the same IAM-style policy as AWS (`mc admin policy create`, then `mc admin policy attach … --user …`), and attach the generated protection document as a bucket policy as described above.
 
 ## The append-only canary
 
 `backup.verify_target` runs with the **deployed writer credentials**, weekly and whenever a target is saved:
 
 1. In each policy class (`restic/data`, `index`, `snapshots`, `keys`, `config`, and `ark-canary/`) it writes a disposable object and records its hash, version ID, retention mode and deadline.
-2. It attempts ordinary delete and overwrite, permanent deletion of the recorded version (plain and with the governance-bypass header), and shortening the canary's retention (plain and with bypass). Destructive attempts address canary objects only and are judged by effect: the original version must still read back with the same hash, and its retention must not move earlier.
+2. It attempts ordinary delete and overwrite, permanent deletion of the recorded version (plain and with the governance-bypass header), and shortening the canary's retention (plain and with bypass). Destructive attempts address canary objects only. Both a supported, conclusive authorization/WORM denial and unchanged original/retention readback are required. An unchanged object after a timeout, 501 or 5xx never proves refusal.
 3. Bucket-level permissions (versioning, object lock, lifecycle and bucket policy changes) are probed **without changing anything**: each request carries a well-formed but invalid configuration, so `AccessDenied` proves the permission is absent and a validation error proves it is present. Nothing is stored either way.
 4. restic's `locks/` must allow create and delete.
+5. Exact config protection needs independent read-only evaluation: an unconditional bucket-policy denial that overrides IAM exceptions (AWS/MinIO), B2 key-wide no-delete/no-bypass capabilities, or R2 indefinite prefix locks. R2 unsupported S3 policy operations can be supplemented by verifier evidence; transport failures and 5xx responses remain unknown.
 
-The verdict is one of **append-only: yes**, **deletable: a compromised server could erase backups**, **unknown** (an unsupported or unverifiable check), or **retention shorter than the recovery window**. Only "append-only: yes" with evidence under seven days old and retention not yet expired counts as healthy. A full-access key on a merely versioned bucket is "deletable", even though ordinary deletes leave history. Evidence (version IDs, denial codes, retention deadline, read-back result) is stored in `append_only_evidence` without credentials.
+The verdict is one of **append-only: yes**, **deletable: a compromised server could erase backups**, **unknown** (an unsupported or unverifiable check), or **retention shorter than the recovery window**. Only "append-only: yes" with evidence under seven days old and retention not yet expired counts as healthy. A full-access key on a merely versioned bucket is "deletable", even though ordinary deletes leave history. Every save creates a new configuration revision and resets verification. Old in-flight canaries cannot update a newer revision. Moving repositories also clears success timestamps and excludes old exports from current recovery health; historical rows remain for audit. Evidence (version IDs, denial codes, retention deadline, read-back result) is stored in `append_only_evidence` without credentials.
 
 ## Health and alerts
 
@@ -134,3 +137,13 @@ It picks the newest snapshot whose manifest covers the target time (or `ARK_REST
 
 - `mise run test:backups` runs the required suite locally against a pinned MinIO, the actual Compose clusters and a throwaway control database. It covers the append-only policy classes, the R2 lock recipe emulated with MinIO object lock, an unavailable destination, and full PITR recovery of both clusters after every VPS-local copy is deleted, all path-style.
 - `mise run test:backups-hosted` runs the same backup and restore scenario against AWS S3, B2 or R2 (virtual-host style) when `ARK_TEST_S3_*` credentials are set, and skips with a message otherwise. See the header of `scripts/test-backups-hosted.ts`.
+
+## Execution and restore safeguards
+
+The worker runs separate bounded lanes for local backups (two), exports (four), canaries (two), and other work. Claims exclude overlapping target IDs, and executors serialize stanza mutations. Exports lease stages for their bounded upload lifetime; pruning skips leased copies even when a destination stalls. Scheduled exports are enqueued before executor observations, so an unreachable executor does not postpone scheduling other targets.
+
+New PostgreSQL snapshots store a relative `repo2/` tree plus `manifest.json`, with the stage identifier in tags. An explicit previous snapshot per source/repository and `--ignore-inode` preserve restic parent reuse across fenced copies. The recovery tool also reads older snapshots containing absolute stage paths.
+
+File restore tests resolve the exact recorded successful snapshot and its current target repository and sealed credentials. They extract into a fresh isolated directory. PostgreSQL restore tests in the application refuse execution because the worker has no live repo2; use the off-VPS tool for actual database recovery. No restore proof is fabricated by the refusal.
+
+The off-VPS recovery tool preserves timestamps to microsecond precision. Each stage commits a small WAL marker before switching segments so the default manifest time is reachable on an idle cluster. Restore resource names must be unused; cleanup checks a unique attempt label and removes only resources created by that attempt. Existing containers and volumes are never adopted or removed.

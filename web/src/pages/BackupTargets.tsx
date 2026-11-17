@@ -57,6 +57,7 @@ type TargetsResponse = {
   recipes: Record<Provider, Recipe>;
   regionHint: string;
   writerPolicy: Record<string, unknown>;
+  bucketProtectionPolicy: Record<string, unknown>;
 };
 
 function randomPassword() {
@@ -209,6 +210,16 @@ export function BackupTargetsPanel() {
                 <summary className="cursor-pointer text-xs">Writer policy (AWS IAM / MinIO)</summary>
                 <pre className="mono overflow-x-auto text-xs">
                   {JSON.stringify(data.writerPolicy[target.id], null, 2)}
+                </pre>
+              </details>
+              <details>
+                <summary className="cursor-pointer text-xs">Bucket protection policy (AWS / MinIO)</summary>
+                <p className="text-xs text-muted-foreground">
+                  Attach this separate bucket policy to protect the exact repository config. Keep permission
+                  to replace it off this server.
+                </p>
+                <pre className="mono overflow-x-auto text-xs">
+                  {JSON.stringify(data.bucketProtectionPolicy[target.id], null, 2)}
                 </pre>
               </details>
               <div className="flex gap-2">

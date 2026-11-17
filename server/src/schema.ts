@@ -892,6 +892,8 @@ export const backupTargets = pgTable(
     retentionUntil: timestamp("retention_until", { withTimezone: true }),
     lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
     lastError: text("last_error"),
+    configRevision: text("config_revision").notNull().default("legacy"),
+    repositoryRevision: text("repository_revision").notNull().default("legacy"),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -918,6 +920,7 @@ export const backupExports = pgTable(
     targetId: text("target_id")
       .notNull()
       .references(() => backupTargets.id, { onDelete: "cascade" }),
+    repositoryRevision: text("repository_revision").notNull().default("legacy"),
     source: text("source").notNull(),
     status: text("status").$type<"succeeded" | "failed">().notNull(),
     stageId: text("stage_id"),

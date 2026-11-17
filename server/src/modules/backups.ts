@@ -1,18 +1,16 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   PG_CLUSTERS,
   backupCommand,
-  createId,
   restoreTestCommand,
   type BackupKind,
   type PgBackupType,
 } from "@ark-stack/shared";
 
 import { clusterForBackupKind, runPgBackup } from "./pg-executor-client.ts";
-
-const exec = promisify(execFile);
 
 function requireExecution() {
   if (process.env.ARK_BACKUP_REQUIRED === "1" && process.env.ARK_BACKUP_EXECUTE !== "1") {
@@ -89,30 +87,38 @@ export async function runBackup(kind: BackupKind, targetId: string, options: { t
 
 export async function runRestoreTest(kind: BackupKind, targetId: string, backupId?: string) {
   requireExecution();
-  if (process.env.ARK_BACKUP_EXECUTE !== "1" && !backupId) {
-    return { status: "planned" as const, executed: false, argv: [], isolated: true };
+  const location = resolvedBackupLocation(kind, targetId);
+  if (process.env.ARK_BACKUP_EXECUTE !== "1") {
+    const argv = backupId
+      ? restoreTestCommand(
+          kind,
+          location.target,
+          backupId,
+          "/var/lib/ark/restore-runs/planned",
+          location.repository,
+        ).argv
+      : [];
+    return { status: "planned" as const, executed: false, argv, isolated: true, backupId };
+  }
+  if (clusterForBackupKind(kind)) {
+    throw new Error(
+      "PostgreSQL restore tests require scripts/offsite-restore.ts on the off-VPS recovery host.",
+    );
   }
   if (!backupId) throw new Error("An exact native backup ID is required for restore execution.");
-  const location = resolvedBackupLocation(kind, targetId);
-  const restoreRoot = `/var/lib/ark/restore-runs/${createId("restore")}`;
-  const plan = restoreTestCommand(kind, location.target, backupId, restoreRoot, location.repository);
-  if (!plan.isolated) throw new Error("Restore tests must target an isolated environment.");
-  if (process.env.ARK_BACKUP_EXECUTE !== "1") {
-    return { status: "planned" as const, executed: false, argv: plan.argv, isolated: true, backupId };
-  }
-  if (process.env.ARK_RESTORE_RUNNER !== "1") {
-    throw new Error("Restore execution requires the isolated restore runner (ARK_RESTORE_RUNNER=1). ");
-  }
-  const { stdout, stderr } = await exec(plan.argv[0], plan.argv.slice(1), { timeout: 180_000 });
-  const output = `${stdout}\n${stderr}`;
+  if (process.env.ARK_RESTORE_RUNNER !== "1")
+    throw new Error("Restore execution requires the isolated restore runner (ARK_RESTORE_RUNNER=1).");
+  const restoreRoot = await mkdtemp(join(tmpdir(), "ark-restore-"));
+  const { restoreFiles } = await import("./offsite-backups.ts");
+  const result = await restoreFiles(kind === "mail" ? "mail" : `volume:${targetId}`, backupId, restoreRoot);
   return {
     status: "integrity_ok" as const,
     executed: true,
-    argv: plan.argv,
+    argv: result.argv,
     isolated: true,
     snapshotId: backupId,
     restoreRoot,
     validation: "Restored bytes require service boot and data/access assertions before proof.",
-    output: output.slice(0, 2000),
+    output: result.stdout.slice(0, 2000),
   };
 }

@@ -116,6 +116,12 @@ function classify(response: S3Response | Error): Attempt {
   ) {
     return { status, code, outcome: "refused" };
   }
+  if (
+    status === 400 &&
+    code === "InvalidRequest" &&
+    /(?:WORM protected|object is locked|retention.*(?:cannot|not allowed))/i.test(response.text)
+  )
+    return { status, code, outcome: "refused" };
   // A lock or retention refusal some providers report as 400.
   if (status === 400 && code && /lock|retention|worm|immutable/i.test(code))
     return { status, code, outcome: "refused" };
@@ -145,7 +151,7 @@ function classifyProbe(response: S3Response | Error): Attempt {
 function byEffect(response: S3Response | Error, changed: boolean | null): Attempt {
   const seen = classify(response);
   if (changed === true) return { ...seen, outcome: "succeeded" };
-  if (changed === false) return { ...seen, outcome: "refused" };
+  if (changed === false) return seen;
   return { ...seen, outcome: seen.outcome === "succeeded" ? "succeeded" : "error" };
 }
 
@@ -155,6 +161,66 @@ async function attempt<T>(action: () => Promise<T>) {
   } catch (error) {
     return error instanceof Error ? error : new Error(String(error));
   }
+}
+
+const policyPatternMatches = (pattern: string, value: string) =>
+  new RegExp(
+    `^${pattern
+      .split("*")
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join(".*")}$`,
+  ).test(value);
+
+/** Conservative read-only proof: only unconditional all-principal bucket Deny statements count.
+ * IAM exceptions cannot override these denies. Unsupported/conditional policies stay unknown.
+ */
+export function protectsRepositoryPolicy(policy: unknown, bucket: string, prefix: string): boolean {
+  const statements = (policy as { Statement?: unknown[] } | null)?.Statement;
+  if (!Array.isArray(statements)) return false;
+  const resource = `arn:aws:s3:::${bucket}/${resticPrefix(prefix)}/config`;
+  return [
+    ["s3:DeleteObjectVersion", resource],
+    ["s3:PutObjectRetention", resource],
+    ["s3:BypassGovernanceRetention", resource],
+    ["s3:PutObjectLegalHold", resource],
+    ["s3:DeleteBucketPolicy", `arn:aws:s3:::${bucket}`],
+  ].every(([action, protectedResource]) =>
+    statements.some((value) => {
+      const statement = value as Record<string, unknown>;
+      if (
+        !statement ||
+        statement.Effect !== "Deny" ||
+        statement.Condition ||
+        statement.NotAction ||
+        statement.NotResource ||
+        statement.NotPrincipal
+      )
+        return false;
+      const principal = statement.Principal;
+      if (
+        principal !== "*" &&
+        !(
+          principal &&
+          typeof principal === "object" &&
+          ((principal as Record<string, unknown>).AWS === "*" ||
+            (Array.isArray((principal as Record<string, unknown>).AWS) &&
+              ((principal as Record<string, unknown>).AWS as unknown[]).includes("*")))
+        )
+      )
+        return false;
+      const actions = Array.isArray(statement.Action) ? statement.Action : [statement.Action];
+      const resources = Array.isArray(statement.Resource) ? statement.Resource : [statement.Resource];
+      return (
+        actions.some(
+          (pattern) =>
+            typeof pattern === "string" && policyPatternMatches(pattern.toLowerCase(), action!.toLowerCase()),
+        ) &&
+        resources.some(
+          (pattern) => typeof pattern === "string" && policyPatternMatches(pattern, protectedResource!),
+        )
+      );
+    }),
+  );
 }
 
 export async function runAppendOnlyCanary(input: CanaryInput): Promise<CanaryEvidence> {
@@ -325,7 +391,7 @@ export async function runAppendOnlyCanary(input: CanaryInput): Promise<CanaryEvi
       ].includes(name);
       if (dangerous && result.outcome === "succeeded")
         deletable(`${policyClass}: ${name} succeeded with the writer credentials`);
-      if (dangerous && (result.outcome === "unsupported" || result.outcome === "error")) {
+      if (result.outcome === "unsupported" || result.outcome === "error") {
         unknown(`${policyClass}: ${name} gave an inconclusive response (${result.code ?? result.status})`);
       }
     }
@@ -375,6 +441,7 @@ export async function runAppendOnlyCanary(input: CanaryInput): Promise<CanaryEvi
   let providerEvidence: Record<string, unknown> | null = null;
   let bucketLevelProven = false;
   let providerRetentionUntil: Date | null = null;
+  let exactConfigProven = false;
   if (input.provider === "b2" && input.writer) {
     providerEvidence = await b2Capabilities(input.writer, input.fetchImpl ?? fetch);
     const capabilities = Array.isArray(providerEvidence.capabilities)
@@ -383,13 +450,18 @@ export async function runAppendOnlyCanary(input: CanaryInput): Promise<CanaryEvi
     if (capabilities) {
       const forbidden = capabilities.filter((item) => B2_FORBIDDEN_CAPABILITIES.includes(item));
       if (forbidden.length) deletable(`the B2 application key holds ${forbidden.join(", ")}`);
-      else bucketLevelProven = true;
+      else {
+        bucketLevelProven = true;
+        exactConfigProven = true;
+      }
     } else unknown("B2 key capabilities could not be read");
   }
   if (input.provider === "r2") {
     // R2 lock rules are managed only through the Cloudflare API, which an S3 key cannot authenticate
     // to; NotImplemented on the S3 probes is therefore expected. Coverage needs the read-only verifier.
-    bucketLevelProven = Object.values(bucketProbes).every((item) => item.outcome !== "succeeded");
+    bucketLevelProven = Object.values(bucketProbes).every(
+      (item) => item.outcome === "refused" || item.outcome === "unsupported",
+    );
     if (input.verifier?.accountId && input.verifier.token) {
       const r2 = await r2LockRules(
         input.verifier.accountId,
@@ -399,7 +471,9 @@ export async function runAppendOnlyCanary(input: CanaryInput): Promise<CanaryEvi
       );
       providerEvidence = r2;
       providerRetentionUntil = r2RetentionUntil(r2, input.prefix, startedAt);
-      if (!providerRetentionUntil) unknown("R2 bucket lock rules do not cover every protected prefix");
+      exactConfigProven = providerRetentionUntil !== null;
+      if (!providerRetentionUntil)
+        unknown("R2 bucket lock rules require indefinite coverage of every protected prefix");
     } else {
       unknown("R2 bucket lock rules need the read-only Cloudflare verifier token to be proven");
     }
@@ -407,9 +481,28 @@ export async function runAppendOnlyCanary(input: CanaryInput): Promise<CanaryEvi
   for (const [name, result] of Object.entries(bucketProbes)) {
     if (result.outcome === "succeeded")
       deletable(`the writer holds the bucket-level ${name} permission (${result.code ?? result.status})`);
-    else if (result.outcome !== "refused" && !bucketLevelProven) {
+    else if (result.outcome === "error" || (result.outcome !== "refused" && !bucketLevelProven)) {
       unknown(`the bucket-level ${name} permission could not be evaluated (${result.code ?? result.status})`);
     }
+  }
+
+  // Class canaries cannot prove permissions on the singleton restic config key. Read an
+  // authoritative bucket-wide Deny; it overrides IAM exceptions without touching live config.
+  if (!exactConfigProven) {
+    const policy = await attempt(() => client.request("GET", undefined, { query: { policy: "" } }));
+    if (!(policy instanceof Error) && policy.status === 200 && versioned) {
+      try {
+        exactConfigProven = protectsRepositoryPolicy(
+          JSON.parse(policy.text),
+          client.location.bucket,
+          input.prefix,
+        );
+      } catch {
+        /* unknown */
+      }
+    }
+    if (!exactConfigProven)
+      unknown("exact restic config protection could not be proven by read-only policy evaluation");
   }
 
   // 6. Retention coverage.
@@ -526,7 +619,7 @@ async function r2LockRules(accountId: string, token: string, bucket: string, fet
 }
 
 /** The earliest end of lock coverage across every protected prefix, or null if one is uncovered. */
-export function r2RetentionUntil(evidence: Record<string, unknown>, prefix: string, now: Date) {
+export function r2RetentionUntil(evidence: Record<string, unknown>, prefix: string, _now: Date) {
   const rules = (Array.isArray(evidence.rules) ? evidence.rules : []) as R2Rule[];
   const repo = resticPrefix(prefix);
   const protectedPrefixes = [
@@ -545,10 +638,8 @@ export function r2RetentionUntil(evidence: Record<string, unknown>, prefix: stri
       if (`${repo}/locks/`.startsWith(rulePrefix)) continue;
       let until: Date | null = null;
       if (rule.condition?.type === "Indefinite") until = new Date("9999-12-31T00:00:00Z");
-      else if (rule.condition?.type === "Age" && rule.condition.maxAgeSeconds) {
-        until = new Date(now.getTime() + rule.condition.maxAgeSeconds * 1000);
-      } else if (rule.condition?.type === "Date" && rule.condition.date)
-        until = new Date(rule.condition.date);
+      // Restic reuses config, keys and packs indefinitely. Finite Age/Date locks
+      // cannot protect dependencies of future snapshots after their original lock expires.
       if (until && (!best || until > best)) best = until;
     }
     if (!best) return null;

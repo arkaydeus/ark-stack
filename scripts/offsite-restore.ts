@@ -79,7 +79,7 @@ export type RestoredCluster = {
 
 type Run = { status: number; stdout: string; stderr: string };
 
-async function run(
+async function executeRestoreCommand(
   argv: string[],
   options: { allowFailure?: boolean; env?: Record<string, string> } = {},
 ): Promise<Run> {
@@ -102,22 +102,33 @@ async function run(
   return { status, stdout: stdout.trim(), stderr: stderr.trim() };
 }
 
-/**
- * pgBackRest's --target format (`YYYY-MM-DD HH:MM:SS.mmm+00`). JavaScript dates hold milliseconds,
- * so a microsecond timestamp is rounded up to the next millisecond: everything committed at or before
- * the requested instant is replayed.
- */
+/** Preserve PostgreSQL's microsecond precision; never round a requested recovery point up. */
 export function pgbackrestTime(value: string) {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) throw new Error(`Invalid target time: ${value}`);
-  const micros = /\.\d{3}(\d+)/.exec(value)?.[1];
-  const rounded = micros && /[1-9]/.test(micros) ? new Date(parsed.getTime() + 1) : parsed;
-  return rounded.toISOString().replace("T", " ").replace("Z", "+00");
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.\d{1,6})?(Z|[+-]\d{2}:?\d{2})$/.exec(value);
+  if (
+    !match ||
+    Number.isNaN(Date.parse(value)) ||
+    new Date(`${match[1]}T00:00:00Z`).toISOString().slice(0, 10) !== match[1]
+  )
+    throw new Error(`Invalid target time: ${value}`);
+  const offset = match[4] === "Z" ? "+00:00" : match[4]!;
+  return `${match[1]} ${match[2]}${match[3] ?? ""}${offset}`;
+}
+
+export function recoveryMicros(value: string) {
+  pgbackrestTime(value);
+  const fraction = /\.(\d+)/.exec(value)?.[1] ?? "";
+  return BigInt(Date.parse(value)) * 1000n + BigInt(fraction.padEnd(6, "0").slice(3, 6));
 }
 
 type Snapshot = { id: string; short_id: string; time: string; tags?: string[]; paths: string[] };
 
-export async function offsiteRestore(options: OffsiteRestoreOptions): Promise<RestoredCluster> {
+export async function offsiteRestore(
+  options: OffsiteRestoreOptions,
+  execute: typeof executeRestoreCommand = executeRestoreCommand,
+): Promise<RestoredCluster> {
+  const run = execute;
+  if (options.targetTime) pgbackrestTime(options.targetTime);
   const log = options.log ?? (() => undefined);
   const profile = PG_CLUSTERS[options.cluster];
   const name = options.name ?? `ark-offsite-restore-${options.cluster}-${randomBytes(3).toString("hex")}`;
@@ -157,12 +168,35 @@ export async function offsiteRestore(options: OffsiteRestoreOptions): Promise<Re
       ],
       { env },
     );
+  const ownership = randomBytes(16).toString("hex");
+  const owned: Array<{ kind: "container" | "volume"; id: string }> = [];
   const cleanup = async () => {
-    await run(["docker", "rm", "--force", container], { allowFailure: true });
-    await run(["docker", "volume", "rm", "--force", scratch, pgdata], { allowFailure: true });
+    for (const resource of owned.toReversed()) {
+      const inspect = await run(["docker", resource.kind, "inspect", resource.id], { allowFailure: true });
+      if (inspect.status !== 0) continue;
+      const [info] = JSON.parse(inspect.stdout);
+      const labels = resource.kind === "container" ? info.Config?.Labels : info.Labels;
+      if (labels?.["ark.restore-attempt"] !== ownership) continue;
+      await run([
+        "docker",
+        ...(resource.kind === "container" ? ["rm", "--force"] : ["volume", "rm"]),
+        resource.id,
+      ]);
+    }
   };
 
   try {
+    // Never adopt an existing resource, including on failures before snapshot selection.
+    for (const [kind, resource] of [
+      ["container", container],
+      ["volume", scratch],
+      ["volume", pgdata],
+    ]) {
+      const existing = await run(["docker", kind!, "inspect", resource!], { allowFailure: true });
+      if (existing.status === 0) throw new Error(`Restore resource already exists: ${resource}`);
+      // A daemon/transport error is not evidence of absence.
+      if (!/No such (object|container|volume)/i.test(existing.stderr)) throw new Error(existing.stderr);
+    }
     // 1. Choose the snapshot.
     const listed = JSON.parse(
       (await restic(["snapshots", "--json", "--tag", `source=pg:${profile.stanza}`])).stdout || "[]",
@@ -181,12 +215,18 @@ export async function offsiteRestore(options: OffsiteRestoreOptions): Promise<Re
     for (const snapshot of candidates) {
       const stage = snapshot.tags?.find((tag) => tag.startsWith("stage="))?.slice("stage=".length);
       if (!stage) continue;
-      const path = `${PG_STAGE_MOUNT_ROOT}/${profile.stanza}/${stage}`;
+      const path = snapshot.tags?.includes("layout=relative-v1")
+        ? ""
+        : `${PG_STAGE_MOUNT_ROOT}/${profile.stanza}/${stage}`;
       const manifest = JSON.parse(
         (await restic(["dump", snapshot.id, `${path}/manifest.json`])).stdout,
       ) as StageManifest;
       if (!manifest.lastRecoverableAt) continue;
-      if (options.targetTime && new Date(manifest.lastRecoverableAt) < new Date(options.targetTime)) continue;
+      if (
+        options.targetTime &&
+        recoveryMicros(manifest.lastRecoverableAt) < recoveryMicros(options.targetTime)
+      )
+        continue;
       chosen = { snapshot, manifest };
       break;
     }
@@ -201,10 +241,17 @@ export async function offsiteRestore(options: OffsiteRestoreOptions): Promise<Re
     );
 
     // 2. restic restore into a scratch posix repository.
-    await run(["docker", "volume", "create", "--label", "ark.offsite-restore=1", scratch]);
-    await run(["docker", "volume", "create", "--label", "ark.offsite-restore=1", pgdata]);
+    for (const volume of [scratch, pgdata]) {
+      await run(["docker", "volume", "create", "--label", `ark.restore-attempt=${ownership}`, volume]);
+      const [created] = JSON.parse((await run(["docker", "volume", "inspect", volume])).stdout);
+      if (created.Labels?.["ark.restore-attempt"] !== ownership)
+        throw new Error(`Volume ownership collision: ${volume}`);
+      owned.push({ kind: "volume", id: volume });
+    }
     await restic(["restore", chosen.snapshot.id, "--target", "/restore"], [`${scratch}:/restore`]);
-    const repoPath = `/restore${PG_STAGE_MOUNT_ROOT}/${profile.stanza}/${chosen.manifest.stageId}/repo2`;
+    const repoPath = chosen.snapshot.tags?.includes("layout=relative-v1")
+      ? "/restore/repo2"
+      : `/restore${PG_STAGE_MOUNT_ROOT}/${profile.stanza}/${chosen.manifest.stageId}/repo2`;
 
     // 3. pgBackRest restore into an empty PGDATA, then 4. replay to the target and promote.
     const pgbackrestEnv = {
@@ -240,7 +287,7 @@ export async function offsiteRestore(options: OffsiteRestoreOptions): Promise<Re
       ],
       { env: pgbackrestEnv },
     );
-    await run(
+    const launched = await run(
       [
         "docker",
         "run",
@@ -248,7 +295,7 @@ export async function offsiteRestore(options: OffsiteRestoreOptions): Promise<Re
         "--name",
         container,
         "--label",
-        "ark.offsite-restore=1",
+        `ark.restore-attempt=${ownership}`,
         "--network",
         "none",
         "--volume",
@@ -268,6 +315,7 @@ export async function offsiteRestore(options: OffsiteRestoreOptions): Promise<Re
       ],
       { env: pgbackrestEnv },
     );
+    owned.push({ kind: "container", id: launched.stdout });
     const superuser = SUPERUSERS[options.cluster];
     const database = DATABASES[options.cluster];
     const query = async (sql: string) =>

@@ -1,7 +1,9 @@
+import { fakeS3 } from "./test-backup-s3.ts";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { repositoryProtectionPolicy } from "@ark-stack/shared";
 
-import { r2RetentionUntil, runAppendOnlyCanary } from "./backup-canary.ts";
+import { protectsRepositoryPolicy, r2RetentionUntil, runAppendOnlyCanary } from "./backup-canary.ts";
 import { S3Client, signV4 } from "./s3-client.ts";
 
 describe("SigV4 (FD-21 canary client)", () => {
@@ -39,61 +41,6 @@ describe("SigV4 (FD-21 canary client)", () => {
   });
 });
 
-const xmlError = (status: number, code: string) =>
-  new Response(`<Error><Code>${code}</Code></Error>`, {
-    status,
-    headers: { "content-type": "application/xml" },
-  });
-
-type Store = Map<string, Array<{ versionId: string; body: Uint8Array }>>;
-
-/**
- * A tiny versioned S3 stand-in. `unsupported` lists subresources answered with 501 NotImplemented,
- * like a provider that cannot report or enforce retention.
- */
-function fakeS3(unsupported: string[]) {
-  const store: Store = new Map();
-  let counter = 0;
-  const server = Bun.serve({
-    port: 0,
-    hostname: "127.0.0.1",
-    async fetch(request) {
-      const url = new URL(request.url);
-      const [, , ...keyParts] = url.pathname.split("/");
-      const key = decodeURIComponent(keyParts.join("/"));
-      const sub = [...url.searchParams.keys()].find((name) => name !== "versionId") ?? "";
-      if (sub && unsupported.includes(sub)) return xmlError(501, "NotImplemented");
-      if (!key) {
-        if (sub === "versioning" && request.method === "GET") {
-          return new Response("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>");
-        }
-        return xmlError(403, "AccessDenied");
-      }
-      const versions = store.get(key) ?? [];
-      const versionId = url.searchParams.get("versionId");
-      if (request.method === "PUT" && !sub) {
-        const entry = { versionId: `v${++counter}`, body: new Uint8Array(await request.arrayBuffer()) };
-        store.set(key, [...versions, entry]);
-        return new Response("", { headers: { "x-amz-version-id": entry.versionId } });
-      }
-      if (request.method === "GET" && !sub) {
-        const found = versionId ? versions.find((item) => item.versionId === versionId) : versions.at(-1);
-        return found ? new Response(Buffer.from(found.body)) : xmlError(404, "NoSuchKey");
-      }
-      if (request.method === "DELETE") {
-        if (key.includes("/locks/") && !versionId) {
-          store.delete(key);
-          return new Response(null, { status: 204 });
-        }
-        return xmlError(403, "AccessDenied");
-      }
-      if (sub === "retention") return xmlError(403, "AccessDenied");
-      return xmlError(400, "InvalidRequest");
-    },
-  });
-  return { server, endpoint: `http://127.0.0.1:${server.port}` };
-}
-
 describe("append-only canary verdicts", () => {
   test("unsupported retention and policy checks are unknown, never healthy", async () => {
     const { server, endpoint } = fakeS3(["retention", "object-lock", "lifecycle", "policy"]);
@@ -114,6 +61,159 @@ describe("append-only canary verdicts", () => {
       // Deletions were refused and history kept, yet that alone is not "append-only: yes".
       expect(evidence.classes.every((item) => item.readback === "match")).toBe(true);
       expect(JSON.stringify(evidence)).not.toContain('"b"');
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  for (const failure of ["501", "500", "timeout"] as const) {
+    test(`destructive ${failure} stays unknown with successful original and retention readbacks`, async () => {
+      const { server, endpoint } = fakeS3([], failure);
+      try {
+        const evidence = await runAppendOnlyCanary({
+          client: new S3Client(
+            { endpoint, region: "auto", bucket: "bkt", pathStyle: true },
+            { accessKeyId: "a", secretAccessKey: "b" },
+          ),
+          provider: "minio",
+          prefix: "ark",
+          recoveryWindowDays: 7,
+        });
+        expect(evidence.status).toBe("unknown");
+        expect(evidence.classes.every((item) => item.readback === "match")).toBe(true);
+        expect(evidence.classes.every((item) => item.attempts.permanentDelete?.outcome !== "refused")).toBe(
+          true,
+        );
+      } finally {
+        server.stop(true);
+      }
+    });
+  }
+
+  test("an IAM exception on exact config is not covered by sibling canaries", async () => {
+    const policy = repositoryProtectionPolicy("bkt", "ark");
+    policy.Statement[0]!.Resource = ["arn:aws:s3:::bkt/ark/restic/config.ark-canary-*"];
+    const { server, endpoint } = fakeS3([], undefined, policy);
+    try {
+      const evidence = await runAppendOnlyCanary({
+        client: new S3Client(
+          { endpoint, region: "auto", bucket: "bkt", pathStyle: true },
+          { accessKeyId: "a", secretAccessKey: "b" },
+        ),
+        provider: "minio",
+        prefix: "ark",
+        recoveryWindowDays: 7,
+      });
+      expect(evidence.status).toBe("unknown");
+      expect(evidence.findings.some((item) => item.message.includes("exact restic config"))).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+    expect(protectsRepositoryPolicy(repositoryProtectionPolicy("bkt", "ark"), "bkt", "ark")).toBe(true);
+    expect(protectsRepositoryPolicy(policy, "bkt", "ark")).toBe(false);
+  });
+
+  test("R2 bucket errors remain unknown despite valid indefinite verifier rules", async () => {
+    const { server, endpoint } = fakeS3(["versioning", "object-lock"], "bucket500");
+    const rules = [
+      "restic/data/",
+      "restic/index/",
+      "restic/snapshots/",
+      "restic/keys/",
+      "restic/config",
+      "ark-canary/",
+    ].map((part) => ({ enabled: true, prefix: `ark/${part}`, condition: { type: "Indefinite" } }));
+    try {
+      const evidence = await runAppendOnlyCanary({
+        client: new S3Client(
+          { endpoint, region: "auto", bucket: "bkt", pathStyle: true },
+          { accessKeyId: "a", secretAccessKey: "b" },
+        ),
+        provider: "r2",
+        prefix: "ark",
+        recoveryWindowDays: 7,
+        verifier: { accountId: "fixture", token: "read-only" },
+        fetchImpl: (async () => Response.json({ result: { rules } })) as unknown as typeof fetch,
+      });
+      expect(evidence.status).toBe("unknown");
+      expect(evidence.findings.some((item) => item.message.includes("bucket-level"))).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+    for (const condition of [
+      { type: "Age", maxAgeSeconds: 3650 * 86400 },
+      { type: "Date", date: "2099-01-01" },
+    ]) {
+      expect(
+        r2RetentionUntil({ rules: rules.map((rule) => ({ ...rule, condition })) }, "ark", new Date()),
+      ).toBeNull();
+    }
+  });
+
+  test("unversioned R2 requires indefinite protection even for aged repository dependencies", async () => {
+    const { server, endpoint } = fakeS3(
+      ["versioning", "object-lock", "retention", "lifecycle", "policy"],
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+    const rules = [
+      "restic/data/",
+      "restic/index/",
+      "restic/snapshots/",
+      "restic/keys/",
+      "restic/config",
+      "ark-canary/",
+    ].map((part) => ({ enabled: true, prefix: `ark/${part}`, condition: { type: "Indefinite" } }));
+    try {
+      for (const finite of [true, false]) {
+        const evidence = await runAppendOnlyCanary({
+          client: new S3Client(
+            { endpoint, region: "auto", bucket: "bkt", pathStyle: true },
+            { accessKeyId: "a", secretAccessKey: "b" },
+          ),
+          provider: "r2",
+          prefix: "ark",
+          recoveryWindowDays: 7,
+          verifier: { accountId: "fixture", token: "read-only" },
+          fetchImpl: (async () =>
+            Response.json({
+              result: {
+                rules: finite
+                  ? rules.map((rule) => ({ ...rule, condition: { type: "Age", maxAgeSeconds: 30 * 86400 } }))
+                  : rules,
+              },
+            })) as unknown as typeof fetch,
+        });
+        expect(evidence.classes.every((item) => item.readback === "match")).toBe(true);
+        expect(evidence.status).toBe(finite ? "unknown" : "append_only");
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("a destructive transport timeout is not a denial", async () => {
+    const { server, endpoint } = fakeS3([]);
+    try {
+      const client = new S3Client(
+        { endpoint, region: "auto", bucket: "bkt", pathStyle: true },
+        { accessKeyId: "a", secretAccessKey: "b" },
+      );
+      const request = client.request.bind(client);
+      client.request = async (...args) => {
+        if (args[0] === "DELETE" && args[2]?.query?.versionId) throw new Error("operation timed out");
+        return request(...args);
+      };
+      const evidence = await runAppendOnlyCanary({
+        client,
+        provider: "minio",
+        prefix: "ark",
+        recoveryWindowDays: 7,
+      });
+      expect(evidence.status).toBe("unknown");
+      expect(evidence.classes.every((item) => item.attempts.permanentDelete?.outcome === "error")).toBe(true);
     } finally {
       server.stop(true);
     }
@@ -180,17 +280,17 @@ describe("append-only canary verdicts", () => {
         .map((item) => ({
           enabled: true,
           prefix: `ark/restic/${item}`,
-          condition: { type: "Age", maxAgeSeconds: 40 * 86_400 },
+          condition: { type: "Indefinite" },
         }))
         .concat([
           {
             enabled: true,
             prefix: "ark/ark-canary/",
-            condition: { type: "Age", maxAgeSeconds: 35 * 86_400 },
+            condition: { type: "Indefinite" },
           },
         ]),
     };
-    expect(r2RetentionUntil(covering, "ark", now)?.toISOString()).toBe("2026-12-22T00:00:00.000Z");
+    expect(r2RetentionUntil(covering, "ark", now)?.toISOString()).toBe("9999-12-31T00:00:00.000Z");
     expect(r2RetentionUntil({ rules: covering.rules.slice(1) }, "ark", now)).toBeNull();
     // A bucket-wide rule would also lock restic's locks/: not counted.
     expect(

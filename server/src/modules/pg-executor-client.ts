@@ -3,11 +3,19 @@
 // `backup-management` network; the backup worker has no Docker socket and no shell on the cluster.
 import { PG_CLUSTERS, type PgBackupType, type PgCluster, type StagedBackup } from "@ark-stack/shared";
 
-export type PgExecutorAction = "status" | "check" | "backup" | "stage" | "prune-stages" | "stanza-create";
+export type PgExecutorAction =
+  | "status"
+  | "check"
+  | "backup"
+  | "stage"
+  | "prune-stages"
+  | "release-stage"
+  | "stanza-create";
 
 export function executorConfig(cluster: PgCluster) {
   const profile = PG_CLUSTERS[cluster];
-  const url = process.env[profile.urlEnv] ?? `http://${profile.service}:8432`;
+  const url =
+    process.env[profile.urlEnv] ?? `http://ark-${cluster === "platform" ? "platform" : "app"}-backup:8432`;
   const token = process.env[profile.tokenEnv] ?? "";
   return { profile, url: url.replace(/\/+$/, ""), token };
 }

@@ -153,6 +153,9 @@ export async function saveS3Target(input: S3TargetInput) {
     prefix: input.prefix,
     pathStyle: input.pathStyle,
     recoveryWindowDays: input.recoveryWindowDays,
+    configRevision: createId("rev"),
+    repositoryRevision: moved ? createId("repo") : existing!.repositoryRevision,
+    ...(moved ? { lastSuccessAt: null, lastAttemptAt: null, lastError: null } : {}),
     updatedAt: new Date(),
   };
   // A different location is a different restic repository; it reuses the sealed password.
@@ -180,17 +183,13 @@ export async function saveS3Target(input: S3TargetInput) {
             )
           : null
         : (existing?.verifierSecretId ?? null);
-    const reset =
-      moved ||
-      credentialSecretId !== existing?.credentialSecretId ||
-      verifierSecretId !== existing?.verifierSecretId
-        ? {
-            appendOnlyStatus: "unverified" as const,
-            appendOnlyVerified: false,
-            appendOnlyCheckedAt: null,
-            retentionUntil: null,
-          }
-        : {};
+    const reset = {
+      appendOnlyStatus: "unverified" as const,
+      appendOnlyVerified: false,
+      appendOnlyCheckedAt: null,
+      retentionUntil: null,
+      appendOnlyEvidence: null,
+    };
     const [row] = existing
       ? await tx
           .update(backupTargets)
@@ -225,6 +224,7 @@ export function publicTarget(target: BackupTargetRow) {
     appendOnlyCheckedAt: target.appendOnlyCheckedAt,
     appendOnlyEvidence: target.appendOnlyEvidence,
     retentionUntil: target.retentionUntil,
+    configRevision: target.configRevision,
     lastSuccessAt: target.lastSuccessAt,
     lastAttemptAt: target.lastAttemptAt,
     lastError: target.lastError,
@@ -244,6 +244,7 @@ export async function runRestic(
   keys: { accessKeyId: string; secretAccessKey: string; repositoryPassword: string },
   args: string[],
   timeoutMs = 6 * 60 * 60 * 1000,
+  cwd?: string,
 ): Promise<ResticResult> {
   const config = s3Config(target);
   const { repository, options } = resticS3Repository(config);
@@ -253,11 +254,18 @@ export async function runRestic(
     HOME: process.env.ARK_RESTIC_HOME ?? "/tmp",
     ...resticS3Env(config, keys),
     ...(cacheDir ? { RESTIC_CACHE_DIR: cacheDir } : {}),
+    ...(cwd ? { ARK_RESTIC_CWD: cwd } : {}),
   };
   for (const name of ["ARK_TEST_RESTIC_DOCKER_ARGS"]) if (process.env[name]) env[name] = process.env[name]!;
   const binary = process.env.ARK_RESTIC_BIN || "restic";
   const argv = [binary, "-r", repository, ...options, ...(cacheDir ? [] : ["--no-cache"]), ...args];
-  const child = Bun.spawn(argv, { env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(argv, {
+    env,
+    ...(cwd && !process.env.ARK_TEST_RESTIC_DOCKER_ARGS ? { cwd } : {}),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -322,18 +330,41 @@ export async function resticBackup(
   keys: { accessKeyId: string; secretAccessKey: string; repositoryPassword: string },
   path: string,
   tags: string[],
+  stage?: { parent?: string | null },
 ) {
-  const result = await runRestic(target, keys, [
-    "backup",
-    "--json",
-    "--host",
-    "ark",
-    ...tags.flatMap((tag) => ["--tag", tag]),
-    path,
-  ]);
+  const result = await runRestic(
+    target,
+    keys,
+    [
+      "backup",
+      "--json",
+      "--host",
+      "ark",
+      ...tags.flatMap((tag) => ["--tag", tag]),
+      ...(stage
+        ? ["--ignore-inode", ...(stage.parent ? ["--parent", stage.parent] : []), "repo2", "manifest.json"]
+        : [path]),
+    ],
+    undefined,
+    stage ? path : undefined,
+  );
   const snapshotId = resticSummarySnapshot(result.stdout);
   if (result.status !== 0 || !snapshotId) throw resticError("backup", result);
-  return snapshotId;
+  let summary: Record<string, number> = {};
+  for (const line of result.stdout.split("\n")) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.message_type === "summary")
+        summary = {
+          filesUnmodified: parsed.files_unmodified ?? 0,
+          bytesProcessed: parsed.total_bytes_processed ?? 0,
+          bytesAdded: parsed.data_added ?? 0,
+        };
+    } catch {
+      /* progress output */
+    }
+  }
+  return { snapshotId, summary };
 }
 
 // ---- Export (backup.export) -----------------------------------------------------------------------
@@ -363,7 +394,7 @@ export async function observeSource(cluster: PgCluster) {
       repoFs: { totalBytes: number; freeBytes: number };
       stagingFs: { totalBytes: number; freeBytes: number };
       newestStage: StageManifest | null;
-    }>(cluster, "status", {}, 10 * 60 * 1000);
+    }>(cluster, "status", {}, 15_000);
     const backupsList = status.info.backups ?? [];
     const fulls = backupsList.filter((item) => item.type === "full");
     const lastFailed = status.archiver.lastFailedAt ? new Date(status.archiver.lastFailedAt).getTime() : 0;
@@ -416,6 +447,7 @@ export type ExportResult = {
         snapshotId: string;
         lastRecoverableAt: string | null;
         reusedStage: boolean;
+        stats: Record<string, number>;
       }
     | { source: string; ok: false; error: string }
   >;
@@ -451,19 +483,51 @@ export async function exportTarget(
       if (repositoryError || !secretsForTarget) throw new Error(repositoryError ?? "no credentials");
       // A scheduled export reuses a stage at most four minutes old, so targets exporting in the same
       // interval upload the same completed copy. An export right after a backup stages afresh.
-      const staged = await callExecutor<{ reused: boolean; manifest: StageManifest }>(cluster, "stage", {
-        maxAgeSeconds: options.fresh ? 0 : Math.floor((PG_EXPORT_INTERVAL_MS * 0.8) / 1000),
-      });
-      const manifest = staged.manifest;
-      const snapshotId = await resticBackup(
-        target,
-        secretsForTarget,
-        stagePath(profile.stanza, manifest.stageId),
-        pgSnapshotTags(profile.stanza, manifest.stageId),
+      const staged = await callExecutor<{ reused: boolean; manifest: StageManifest; leaseId?: string }>(
+        cluster,
+        "stage",
+        {
+          maxAgeSeconds: options.fresh ? 0 : Math.floor((PG_EXPORT_INTERVAL_MS * 0.8) / 1000),
+          leaseSeconds: 6 * 3600 + 900,
+        },
       );
+      const manifest = staged.manifest;
+      const [previous] = await db
+        .select()
+        .from(backupExports)
+        .where(
+          and(
+            eq(backupExports.targetId, target.id),
+            eq(backupExports.repositoryRevision, target.repositoryRevision),
+            eq(backupExports.source, source),
+            eq(backupExports.status, "succeeded"),
+          ),
+        )
+        .orderBy(desc(backupExports.createdAt))
+        .limit(1);
+      const { snapshotId, summary } = await (async () => {
+        try {
+          return await resticBackup(
+            target,
+            secretsForTarget!,
+            stagePath(profile.stanza, manifest.stageId),
+            [...pgSnapshotTags(profile.stanza, manifest.stageId), "layout=relative-v1"],
+            { parent: previous?.resticSnapshotId },
+          );
+        } finally {
+          if (staged.leaseId)
+            await callExecutor(
+              cluster,
+              "release-stage",
+              { stageId: manifest.stageId, leaseId: staged.leaseId },
+              10_000,
+            ).catch(() => undefined);
+        }
+      })();
       await db.insert(backupExports).values({
         id: createId("bex"),
         targetId: target.id,
+        repositoryRevision: target.repositoryRevision,
         source,
         status: "succeeded",
         stageId: manifest.stageId,
@@ -484,15 +548,21 @@ export async function exportTarget(
         snapshotId,
         lastRecoverableAt: manifest.lastRecoverableAt,
         reusedStage: staged.reused,
+        stats: summary,
       });
       // Older stages are subsets of the newest one (repo2 is never expired on the VPS); keep two so
-      // an export still reading the previous stage is not disturbed.
+      // active exports also hold persisted leases so a stalled reader is never pruned.
       await callExecutor(cluster, "prune-stages", { keep: 2 }, 10 * 60 * 1000).catch(() => undefined);
     } catch (error) {
       const message = (error instanceof Error ? error.message : "export failed").slice(0, 1000);
-      await db
-        .insert(backupExports)
-        .values({ id: createId("bex"), targetId: target.id, source, status: "failed", error: message });
+      await db.insert(backupExports).values({
+        id: createId("bex"),
+        targetId: target.id,
+        repositoryRevision: target.repositoryRevision,
+        source,
+        status: "failed",
+        error: message,
+      });
       result.sources.push({ source, ok: false, error: message });
     }
     await observeSource(cluster);
@@ -510,7 +580,7 @@ export async function exportTarget(
           }
         : { lastError: null, lastSuccessAt: now() },
     )
-    .where(eq(backupTargets.id, target.id));
+    .where(and(eq(backupTargets.id, target.id), eq(backupTargets.configRevision, target.configRevision)));
   await evaluateBackupAlerts().catch(() => undefined);
   if (failures.length) {
     throw new Error(
@@ -542,7 +612,7 @@ export async function exportFiles(source: string, path: string, tags: string[]) 
     try {
       const secretsForTarget = await targetSecrets(target);
       await ensureResticRepository(target, secretsForTarget);
-      const snapshotId = await resticBackup(target, secretsForTarget, path, [
+      const { snapshotId } = await resticBackup(target, secretsForTarget, path, [
         "ark",
         `source=${source}`,
         ...tags,
@@ -550,6 +620,7 @@ export async function exportFiles(source: string, path: string, tags: string[]) 
       await db.insert(backupExports).values({
         id: createId("bex"),
         targetId: target.id,
+        repositoryRevision: target.repositoryRevision,
         source,
         status: "succeeded",
         resticSnapshotId: snapshotId,
@@ -557,20 +628,57 @@ export async function exportFiles(source: string, path: string, tags: string[]) 
       results.push({ targetId: target.id, snapshotId });
     } catch (error) {
       const message = (error instanceof Error ? error.message : "export failed").slice(0, 1000);
-      await db
-        .insert(backupExports)
-        .values({ id: createId("bex"), targetId: target.id, source, status: "failed", error: message });
+      await db.insert(backupExports).values({
+        id: createId("bex"),
+        targetId: target.id,
+        repositoryRevision: target.repositoryRevision,
+        source,
+        status: "failed",
+        error: message,
+      });
       results.push({ targetId: target.id, error: message });
     }
   }
   return results;
 }
 
+/** Restore only a recorded successful snapshot from the current repository revision. */
+export async function restoreFiles(source: string, snapshotId: string, restoreRoot: string) {
+  const rows = await db
+    .select({ target: backupTargets })
+    .from(backupExports)
+    .innerJoin(
+      backupTargets,
+      and(
+        eq(backupTargets.id, backupExports.targetId),
+        eq(backupTargets.repositoryRevision, backupExports.repositoryRevision),
+      ),
+    )
+    .where(
+      and(
+        eq(backupExports.source, source),
+        eq(backupExports.resticSnapshotId, snapshotId),
+        eq(backupExports.status, "succeeded"),
+      ),
+    )
+    .orderBy(desc(backupExports.createdAt))
+    .limit(1);
+  const target = rows[0]?.target;
+  if (!target)
+    throw new Error("No successful export of this exact snapshot exists in a current target repository.");
+  const argv = ["restore", snapshotId, "--target", restoreRoot];
+  const result = await runRestic(target, await targetSecrets(target), argv, 180_000);
+  if (result.status !== 0) throw resticError("restore", result);
+  return { ...result, argv: ["restic", "-r", resticS3Repository(s3Config(target)).repository, ...argv] };
+}
+
 // ---- Append-only canary (backup.verify_target) ----------------------------------------------------
 
-export async function verifyTarget(targetId: string): Promise<CanaryEvidence> {
+export async function verifyTarget(targetId: string, revision?: string): Promise<CanaryEvidence> {
   const [target] = await db.select().from(backupTargets).where(eq(backupTargets.id, targetId));
   if (!target) throw new Error("Backup target not found.");
+  if (revision && revision !== target.configRevision)
+    throw new Error("Backup target configuration changed; verify its current revision.");
   const config = s3Config(target);
   const secretsForTarget = await targetSecrets(target);
   const client = new S3Client(
@@ -594,7 +702,7 @@ export async function verifyTarget(targetId: string): Promise<CanaryEvidence> {
       appendOnlyCheckedAt: new Date(evidence.checkedAt),
       retentionUntil: evidence.retentionUntil ? new Date(evidence.retentionUntil) : null,
     })
-    .where(eq(backupTargets.id, target.id));
+    .where(and(eq(backupTargets.id, target.id), eq(backupTargets.configRevision, target.configRevision)));
   await evaluateBackupAlerts().catch(() => undefined);
   return evidence;
 }
@@ -627,14 +735,20 @@ export async function backupHealth(now = new Date()): Promise<BackupHealth> {
       lastSuccessAt: target.lastSuccessAt,
       lastError: target.lastError,
     })),
-    exports: exportsRows.map((row) => ({
-      targetId: row.targetId,
-      source: row.source,
-      status: row.status,
-      lastRecoverableAt: row.lastRecoverableAt,
-      repoBytes: row.repoBytes,
-      createdAt: row.createdAt,
-    })),
+    exports: exportsRows
+      .filter((row) =>
+        targets.some(
+          (target) => target.id === row.targetId && target.repositoryRevision === row.repositoryRevision,
+        ),
+      )
+      .map((row) => ({
+        targetId: row.targetId,
+        source: row.source,
+        status: row.status,
+        lastRecoverableAt: row.lastRecoverableAt,
+        repoBytes: row.repoBytes,
+        createdAt: row.createdAt,
+      })),
     sources: sources.map((row) => ({
       source: row.source,
       observedAt: row.observedAt,
@@ -698,18 +812,6 @@ const VERIFY_EVERY_MS = 6.5 * 24 * 60 * 60 * 1000;
  * never delays another), and re-run the canary when its evidence is about to expire.
  */
 export async function backupScheduleTick(enqueue: Enqueue, now = new Date()) {
-  for (const cluster of Object.keys(PG_CLUSTERS) as PgCluster[]) {
-    const observed = await observeSource(cluster);
-    if (!observed.ok) continue;
-    const type = dueBackupType(observed.backups, now);
-    if (type) {
-      await enqueue({
-        kind: "backup.create",
-        targetIds: [cluster],
-        payload: { kind: PG_CLUSTERS[cluster].backupKind, targetId: cluster, type, scheduled: true },
-      });
-    }
-  }
   const targets = await db.select().from(backupTargets).where(eq(backupTargets.enabled, true));
   for (const target of targets) {
     if (target.kind !== "s3") continue; // FD-30 adds the tailnet REST exporter.
@@ -718,9 +820,27 @@ export async function backupScheduleTick(enqueue: Enqueue, now = new Date()) {
       !target.appendOnlyCheckedAt ||
       now.getTime() - target.appendOnlyCheckedAt.getTime() > VERIFY_EVERY_MS
     ) {
-      await enqueue({ kind: "backup.verify_target", targetIds: [target.id] });
+      await enqueue({
+        kind: "backup.verify_target",
+        targetIds: [target.id],
+        payload: { revision: target.configRevision },
+      });
     }
   }
+  await Promise.all(
+    (Object.keys(PG_CLUSTERS) as PgCluster[]).map(async (cluster) => {
+      const observed = await observeSource(cluster);
+      if (!observed.ok) return;
+      const type = dueBackupType(observed.backups, now);
+      if (type) {
+        await enqueue({
+          kind: "backup.create",
+          targetIds: [cluster],
+          payload: { kind: PG_CLUSTERS[cluster].backupKind, targetId: cluster, type, scheduled: true },
+        });
+      }
+    }),
+  );
 }
 
 export function startBackupSchedule(input: {
@@ -728,10 +848,16 @@ export function startBackupSchedule(input: {
   intervalMs?: number;
   log?: (line: string) => void;
 }) {
-  const tick = () =>
-    void backupScheduleTick(input.enqueue).catch((error: Error) =>
-      input.log?.(`backup schedule tick failed: ${error.message}`),
-    );
+  let running = false;
+  const tick = () => {
+    if (running) return;
+    running = true;
+    void backupScheduleTick(input.enqueue)
+      .catch((error: Error) => input.log?.(`backup schedule tick failed: ${error.message}`))
+      .finally(() => {
+        running = false;
+      });
+  };
   tick();
   return setInterval(tick, input.intervalMs ?? PG_EXPORT_INTERVAL_MS);
 }

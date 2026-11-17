@@ -1424,7 +1424,10 @@ async function exportBackupTarget(operation: OperationRow) {
 
 /** `backup.verify_target` (FD-21): the append-only canary with the deployed writer credentials. */
 async function verifyBackupTarget(operation: OperationRow) {
-  const evidence = await verifyTarget(operation.targetIds[0]);
+  const evidence = await verifyTarget(
+    operation.targetIds[0],
+    operation.payload.revision as string | undefined,
+  );
   await addStep(operation.id, "append-only-canary", {
     status: evidence.status,
     findings: evidence.findings,

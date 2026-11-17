@@ -12,7 +12,8 @@
 //
 // Bundled on its own (Dockerfile `pg-executor-build`), so it imports nothing outside this file and
 // shared/src/pg-backup.ts.
-import { timingSafeEqual } from "node:crypto";
+import { lookup } from "node:dns/promises";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -33,7 +34,7 @@ import {
 } from "../../shared/src/pg-backup.ts";
 
 const config = {
-  stanza: assertStanza(process.env.ARK_PG_STANZA ?? ""),
+  stanza: assertStanza(process.env.ARK_PG_STANZA ?? "ark-platform"),
   token: process.env.ARK_PG_EXECUTOR_TOKEN ?? "",
   port: Number(process.env.ARK_PG_EXECUTOR_PORT ?? PG_EXECUTOR_PORT),
   repoRoot: process.env.ARK_PG_REPO_ROOT ?? PG_REPO_ROOT,
@@ -47,13 +48,6 @@ const config = {
   stageLockWaitSeconds: Number(process.env.ARK_PG_STAGE_LOCK_WAIT_SECONDS ?? 600),
   backupLockWaitSeconds: Number(process.env.ARK_PG_BACKUP_LOCK_WAIT_SECONDS ?? 3600),
 };
-
-if (config.token.length < 24) {
-  console.error(
-    "ark-pg-executor: ARK_PG_EXECUTOR_TOKEN is missing or shorter than 24 characters; not listening.",
-  );
-  process.exit(78);
-}
 
 type Run = { status: number; stdout: string; stderr: string };
 
@@ -194,7 +188,7 @@ async function backup(type: PgBackupType) {
  * Switch WAL, wait until the switched segment is archived, then copy the completed repo2 under the
  * exclusive executor lock. The manifest claims a recovery point only for what the copy contains.
  */
-async function stageRepository(maxAgeSeconds: number) {
+export async function stageRepository(maxAgeSeconds: number) {
   const existing = await listStages();
   const newest = existing.at(-1);
   if (newest && maxAgeSeconds > 0) {
@@ -207,9 +201,10 @@ async function stageRepository(maxAgeSeconds: number) {
   // On an idle cluster pg_switch_wal() does nothing and the "switched" segment stays open until
   // background activity and archive_timeout close it (up to a minute or more). One tiny WAL record
   // first guarantees the switch completes the segment that holds everything committed so far.
-  const switched = await psql(
-    "SELECT pg_logical_emit_message(false, 'ark-backup-stage', '') IS NOT NULL; SELECT pg_walfile_name(pg_switch_wal())",
-  );
+  // Commit a WAL marker *before* switching, in its own transaction. Its commit timestamp is
+  // after switchedAt, so PostgreSQL can reach the default time target even on an idle cluster.
+  await psql("SELECT pg_logical_emit_message(true, 'ark-backup-stage', '') IS NOT NULL");
+  const switched = await psql("SELECT pg_walfile_name(pg_switch_wal())");
   const segment = switched.split("\n").at(-1)!.trim();
   if (!/^[0-9A-F]{24}$/.test(segment)) throw new Error(`Unexpected WAL segment name: ${segment}`);
   await waitForArchive(segment);
@@ -267,10 +262,20 @@ async function stageRepository(maxAgeSeconds: number) {
 }
 
 /** Keeps the newest `keep` stages. A newer stage is a superset: repo2 itself is never expired here. */
-async function pruneStages(keep: number) {
+export async function pruneStages(keep: number) {
+  const leased = new Set<string>();
+  const leaseDir = join(config.staging, ".leases");
+  for (const name of await readdir(leaseDir).catch(() => [])) {
+    const stage = name.split(".")[0]!;
+    if (!STAGE_ID.test(stage)) continue;
+    const expires = Number(await readFile(join(leaseDir, name), "utf8").catch(() => "NaN"));
+    if (!Number.isFinite(expires) || expires > Date.now()) leased.add(stage);
+    else await rm(join(leaseDir, name), { force: true });
+  }
   const stages = await listStages();
   const removed: string[] = [];
   for (const name of stages.slice(0, Math.max(0, stages.length - keep))) {
+    if (leased.has(name)) continue;
     await rm(join(config.staging, name), { recursive: true, force: true });
     removed.push(name);
   }
@@ -283,12 +288,6 @@ async function pruneStages(keep: number) {
     }
   }
   return { kept: (await listStages()).length, removed };
-}
-
-function authorized(request: Request) {
-  const supplied = Buffer.from(request.headers.get("authorization") ?? "");
-  const expected = Buffer.from(`Bearer ${config.token}`);
-  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
 // One mutating action at a time; status is always allowed.
@@ -310,18 +309,43 @@ async function handle(action: string, body: Record<string, unknown>) {
   if (action === "backup") {
     const type = body.type;
     if (type !== "full" && type !== "diff" && type !== "incr")
-      throw new Error("type must be full, diff or incr.");
+      throw new TypeError("type must be full, diff or incr.");
     return serialized(() => backup(type));
   }
   if (action === "stage") {
     const maxAge = Number(body.maxAgeSeconds ?? 0);
     if (!Number.isInteger(maxAge) || maxAge < 0 || maxAge > 86_400)
-      throw new Error("maxAgeSeconds must be 0..86400.");
-    return serialized(() => stageRepository(maxAge));
+      throw new TypeError("maxAgeSeconds must be 0..86400.");
+    const leaseSeconds = Number(body.leaseSeconds ?? 0);
+    if (!Number.isInteger(leaseSeconds) || leaseSeconds < 0 || leaseSeconds > 25200)
+      throw new TypeError("leaseSeconds must be 0..25200.");
+    return serialized(async () => {
+      const result = await stageRepository(maxAge);
+      if (!leaseSeconds) return result;
+      const leaseId = randomBytes(16).toString("hex");
+      await mkdir(join(config.staging, ".leases"), { recursive: true });
+      await writeFile(
+        join(config.staging, ".leases", `${result.manifest.stageId}.${leaseId}`),
+        String(Date.now() + leaseSeconds * 1000),
+        { mode: 0o600 },
+      );
+      return { ...result, leaseId };
+    });
+  }
+  if (action === "release-stage") {
+    if (
+      typeof body.stageId !== "string" ||
+      !STAGE_ID.test(body.stageId) ||
+      typeof body.leaseId !== "string" ||
+      !/^[a-f0-9]{32}$/.test(body.leaseId)
+    )
+      throw new TypeError("Invalid stage lease.");
+    await rm(join(config.staging, ".leases", `${body.stageId}.${body.leaseId}`), { force: true });
+    return { released: true };
   }
   if (action === "prune-stages") {
     const keep = Number(body.keep ?? 2);
-    if (!Number.isInteger(keep) || keep < 1 || keep > 10) throw new Error("keep must be 1..10.");
+    if (!Number.isInteger(keep) || keep < 1 || keep > 10) throw new TypeError("keep must be 1..10.");
     return serialized(() => pruneStages(keep));
   }
   return null;
@@ -348,29 +372,42 @@ async function prepareStanza() {
   }
 }
 
-await mkdir(config.staging, { recursive: true });
-void prepareStanza();
-
-Bun.serve({
-  port: config.port,
-  hostname: "0.0.0.0",
-  async fetch(request) {
+export function executorHandler(token: string, actionHandler = handle) {
+  return async (request: Request) => {
     const url = new URL(request.url);
     if (url.pathname === "/healthz") return new Response("ok");
-    if (!authorized(request)) return Response.json({ error: "unauthorized" }, { status: 401 });
+    const supplied = Buffer.from(request.headers.get("authorization") ?? "");
+    const expected = Buffer.from(`Bearer ${token}`);
+    if (!token || supplied.length !== expected.length || !timingSafeEqual(supplied, expected))
+      return Response.json({ error: "unauthorized" }, { status: 401 });
     const match = /^\/v1\/([a-z-]+)$/.exec(url.pathname);
     if (!match || request.method !== "POST") return Response.json({ error: "not found" }, { status: 404 });
     try {
-      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const result = await handle(match[1]!, body && typeof body === "object" ? body : {});
+      const body = await request.json();
+      if (!body || typeof body !== "object" || Array.isArray(body))
+        throw new TypeError("Expected an object body.");
+      const result = await actionHandler(match[1]!, body);
       if (result === null) return Response.json({ error: "unknown action" }, { status: 404 });
       return Response.json(result);
     } catch (error) {
       return Response.json(
         { error: error instanceof Error ? error.message : "executor error" },
-        { status: 500 },
+        { status: error instanceof TypeError || error instanceof SyntaxError ? 400 : 500 },
       );
     }
-  },
-});
-console.log(`ark-pg-executor: ${config.stanza} listening on ${config.port}`);
+  };
+}
+
+if (import.meta.main) {
+  if (config.token.length < 24) {
+    console.error(
+      "ark-pg-executor: ARK_PG_EXECUTOR_TOKEN is missing or shorter than 24 characters; not listening.",
+    );
+    process.exit(78);
+  }
+  await mkdir(config.staging, { recursive: true });
+  void prepareStanza();
+  const address = (await lookup(process.env.ARK_PG_EXECUTOR_BIND_HOST ?? "127.0.0.1", { family: 4 })).address;
+  Bun.serve({ port: config.port, hostname: address, fetch: executorHandler(config.token) });
+  console.log(`ark-pg-executor: ${config.stanza} listening on ${address}:${config.port}`);
+}

@@ -71,14 +71,10 @@ exit 0
       expect(requests).toEqual([
         { path: "/v1/backup", auth: "Bearer executor-token-0123456789-abcdef", body: { type: "full" } },
       ]);
-      const restore = await runRestoreTest("platform-postgres", "platform", "snap-123");
-      expect(restore.executed).toBe(true);
-      expect(restore.argv).toContain("--set=snap-123");
-      expect(restore.argv).toContain("--repo=2");
-      expect(restore.argv.some((item) => item.startsWith("bak_"))).toBe(false);
-      const args = await Bun.file(argsFile).text();
-      expect(args).toContain("--set=snap-123");
-      expect(args).not.toContain("bak_");
+      await expect(runRestoreTest("platform-postgres", "platform", "snap-123")).rejects.toThrow(
+        /off-VPS recovery host/,
+      );
+      expect(await Bun.file(argsFile).exists()).toBe(false);
     } finally {
       executor.stop(true);
       if (previousUrl === undefined) delete process.env.ARK_PLATFORM_PG_EXECUTOR_URL;

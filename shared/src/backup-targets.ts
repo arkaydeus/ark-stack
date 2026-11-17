@@ -171,6 +171,7 @@ export function canaryKey(prefix: string, policyClass: CanaryPolicyClass, token:
   if (!/^[a-z0-9-]{8,64}$/.test(token)) throw new Error("Canary token must be 8-64 of [a-z0-9-].");
   const repo = resticPrefix(prefix);
   if (policyClass === "ark-canary") return `${prefix.replace(/\/+$/, "")}/ark-canary/${token}`;
+  // A sibling tests disposable behavior only; exact config needs read-only policy proof.
   if (policyClass === "config") return `${repo}/config.ark-canary-${token}`;
   return `${repo}/${policyClass}/ark-canary-${token}`;
 }
@@ -198,6 +199,7 @@ export function writerPolicy(bucket: string, prefix: string) {
           "s3:ListBucketVersions",
           "s3:GetBucketLocation",
           "s3:GetBucketVersioning",
+          "s3:GetBucketPolicy",
           "s3:GetBucketObjectLockConfiguration",
         ],
         Resource: [`arn:aws:s3:::${bucket}`],
@@ -235,6 +237,34 @@ export function writerPolicy(bucket: string, prefix: string) {
   };
 }
 
+/** Attach separately as a bucket policy. Explicit all-principal denies cover exact keys too. */
+export function repositoryProtectionPolicy(bucket: string, prefix: string) {
+  return {
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Sid: "ArkProtectRepositoryDependencies",
+        Effect: "Deny",
+        Principal: "*",
+        Action: [
+          "s3:DeleteObjectVersion",
+          "s3:PutObjectRetention",
+          "s3:BypassGovernanceRetention",
+          "s3:PutObjectLegalHold",
+        ],
+        Resource: [`arn:aws:s3:::${bucket}/${prefix.replace(/\/+$/, "")}/*`],
+      },
+      {
+        Sid: "ArkKeepProtectionPolicy",
+        Effect: "Deny",
+        Principal: "*",
+        Action: ["s3:DeleteBucketPolicy"],
+        Resource: [`arn:aws:s3:::${bucket}`],
+      },
+    ],
+  };
+}
+
 export type ProviderRecipe = {
   provider: S3Provider;
   label: string;
@@ -259,7 +289,7 @@ export const PROVIDER_RECIPES: Readonly<Record<S3Provider, ProviderRecipe>> = Ob
       "Set a default retention in COMPLIANCE mode, or GOVERNANCE mode with no principal holding s3:BypassGovernanceRetention, of at least the recovery window.",
     ],
     writer: [
-      "Create an IAM user for Ark with only the generated policy: write and read under the prefix, DeleteObject only on <prefix>/restic/locks/*, and deny DeleteObjectVersion, retention changes or bypass, and bucket versioning, lock, lifecycle and policy changes.",
+      "Attach the generated repository protection bucket policy too (including denial of policy deletion), and permit GetBucketPolicy. Create an IAM user for Ark with only the generated writer policy: write and read under the prefix, DeleteObject only on <prefix>/restic/locks/*, and deny DeleteObjectVersion, retention changes or bypass, and bucket versioning, lock, lifecycle and policy changes.",
     ],
     notes: [
       "An overwrite or delete by the writer only adds a version or delete marker; the canary proves the recorded version still reads back.",
@@ -287,7 +317,7 @@ export const PROVIDER_RECIPES: Readonly<Record<S3Provider, ProviderRecipe>> = Ob
     pathStyle: false,
     regionOverride: "auto",
     immutability: [
-      "Add bucket lock rules on <prefix>/restic/data/, index/, snapshots/, keys/, config and <prefix>/ark-canary/ for at least the recovery window. Do not lock <prefix>/restic/locks/.",
+      "Add bucket lock rules on <prefix>/restic/data/, index/, snapshots/, keys/, config and <prefix>/ark-canary/ with Indefinite retention (finite Age or Date rules cannot protect reused objects). Do not lock <prefix>/restic/locks/.",
       "Never put a live pgBackRest repository under an R2 lock: Ark snapshots the completed local repository with restic, so the *.info history is immutable too.",
     ],
     writer: [

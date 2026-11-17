@@ -1,3 +1,4 @@
+import { repositoryProtectionPolicy } from "@ark-stack/shared";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 
@@ -329,7 +330,16 @@ const workerPrefixes: Record<string, string[]> = {
   // `integration.` (front door §3.4): the domain worker is the only worker with external egress.
   domains: ["domain.", "dns.", "certificate.", "edge.", "admin.", "integration."],
   mail: ["mail.", "mailbox.", "ses."],
-  backup: ["backup.", "update.detect", "import."],
+  backup: [
+    "backup.",
+    "backup.create",
+    "backup.restore_test",
+    "backup.export",
+    "backup.verify_target",
+    "backup.observe",
+    "update.detect",
+    "import.",
+  ],
   agent: ["service.", "update.apply"],
   module: [
     "database.",
@@ -2533,6 +2543,11 @@ app.get("/api/backups/targets", async (c) => {
     health: await backupHealth(),
     recipes: PROVIDER_RECIPES,
     regionHint: regionSummary(settings ?? null).backupRegionHint,
+    bucketProtectionPolicy: Object.fromEntries(
+      targets
+        .filter((item) => item.bucket)
+        .map((item) => [item.id, repositoryProtectionPolicy(item.bucket!, item.prefix)]),
+    ),
     writerPolicy: Object.fromEntries(
       targets.filter((item) => item.bucket).map((item) => [item.id, writerPolicy(item.bucket!, item.prefix)]),
     ),
@@ -2568,6 +2583,7 @@ app.put("/api/backups/targets/:kind", async (c) => {
     kind: "backup.verify_target",
     actorId: access.userId,
     targetIds: [target.id],
+    payload: { revision: target.configRevision },
   });
   await audit(
     access.userId,
@@ -2603,6 +2619,7 @@ app.post("/api/backups/targets/:id/verify", async (c) => {
     kind: "backup.verify_target",
     actorId: access.userId,
     targetIds: [target.id],
+    payload: { revision: target.configRevision },
   });
   await audit(
     access.userId,
