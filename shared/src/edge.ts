@@ -7,6 +7,7 @@ import {
   type EdgeHttpRoute,
 } from "./edge-http.ts";
 import { ValidationError } from "./errors.ts";
+import { GATE_LOGIN_AUTH_PATHS } from "./gate-login.ts";
 import { normalizeHostname } from "./hostnames.ts";
 
 /** Where the `edge` container mounts Ark's lego certificates (read-only), one directory per hostname. */
@@ -107,6 +108,48 @@ function tlsLine(certificate: EdgeCertificate) {
   return `tls ${checkedPath(certificate.fullchain)} ${checkedPath(certificate.privkey)}`;
 }
 
+function checkedUpstream(upstream: string) {
+  if (!UPSTREAM.test(upstream)) {
+    throw new ValidationError(`Edge upstream ${JSON.stringify(upstream)} is not host:port.`);
+  }
+  return upstream;
+}
+
+/** The comment line that introduces the login-origin site in the Caddyfile. */
+export const GATE_LOGIN_SITE_COMMENT = "# Gate login origin: only login, MFA and gate endpoints";
+
+/**
+ * The login-origin site body (docs/design/front-door.md §3.5, §3.9.1, FD-10). Only the exact Better
+ * Auth paths in `GATE_LOGIN_AUTH_PATHS` and the `/gate/*` pages reach the API; everything else,
+ * including `/api/state`, `/api/internal/*` and `/api/gate/check`, is answered 404 by the edge. The
+ * edge token goes only with the allowlisted login API requests, where the API uses it to trust the
+ * `X-Forwarded-For` that Caddy wrote from the PROXY v2 client address. `ark_route_base` removes
+ * client-forged `X-Ark-*` headers (a forged token included) before any handler runs. The token is a
+ * runtime placeholder, so it never appears in the rendered file.
+ */
+export function gateLoginSiteBody(apiUpstream: string) {
+  const upstream = checkedUpstream(apiUpstream);
+  return `  import ark_route_base
+  header Strict-Transport-Security "max-age=31536000"
+  request_body {
+    max_size 64KB
+  }
+  @gateApi path ${GATE_LOGIN_AUTH_PATHS.join(" ")}
+  @gatePages path /gate/*
+  handle @gateApi {
+    reverse_proxy ${upstream} {
+      header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}
+    }
+  }
+  handle @gatePages {
+    reverse_proxy ${upstream}
+  }
+  handle {
+    respond 404
+  }
+`;
+}
+
 /**
  * Selects the current certificate for each endpoint: the most recently deployed row. Older rows
  * are history; the files on disk always belong to the latest issuance, so an older `issued` row
@@ -144,11 +187,14 @@ export function currentEdgeCertificates(input: {
  * through the lease policy (§3.2): only enabled, `ready` routes with a valid pin reach this point.
  * Before FD-11 an `sso` route is omitted (fail closed: there is no gate to render), as is a route
  * whose stored values fail validation; both are listed in `omitted` and served nowhere, so neither
- * Caddy nor the HAProxy 443 map names them.
+ * Caddy nor the HAProxy 443 map names them. The login origin (`gateHostname`, FD-10) is served like
+ * the admin hostname: only once its certificate is issued.
  */
 export function planEdge(input: {
   adminMode: AdminMode;
   adminHostname?: string | null;
+  /** The public gate login origin (`gate_login_mode = 'public'`), or none. */
+  gateHostname?: string | null;
   endpoints: Array<{ id: string; kind: string; hostname: string; exposure: string }>;
   certificates: Array<{ endpointId: string; status: string; lastDeployedAt: Date | null }>;
   certDir?: string;
@@ -171,8 +217,10 @@ export function planEdge(input: {
     })
     .toSorted((a, b) => a.hostname.localeCompare(b.hostname));
   const adminHostname = input.adminMode === "public" ? (input.adminHostname ?? undefined) : undefined;
+  const gateHostname = input.gateHostname ?? undefined;
   const wanted = new Set([
     ...(adminHostname ? [adminHostname] : []),
+    ...(gateHostname ? [gateHostname] : []),
     ...appRoutes.map((r) => r.hostname),
     ...httpRoutes.map((r) => r.hostname),
   ]);
@@ -183,6 +231,7 @@ export function planEdge(input: {
   return {
     adminMode: input.adminMode,
     adminHostname,
+    gateHostname,
     certificates,
     appRoutes,
     httpRoutes,
@@ -212,12 +261,17 @@ export function servedHttpHostnames(plan: { certificates: Array<{ hostname: stri
  * `# ark-tailnet-route <id> <ip:port>` marker. Rendering with `httpRoutes` omitted gives the closed
  * variant the Caddy launch guard starts from when the lease is not valid (§3.2). Any route that is not
  * `public` fails the render: before FD-11 there is no forward_auth to protect it.
+ *
+ * `gate` renders the public login origin (§3.5, FD-10, `gateLoginSiteBody`) when its certificate is
+ * issued. It is not a tailnet route, so the closed variant keeps it.
  */
 export function renderCaddyfile(input: {
   adminMode: AdminMode;
   adminHostname?: string;
   challengeDir: string;
   apiUpstream: string;
+  /** The public gate login origin (§3.9.1); rendered only with an issued certificate. */
+  gate?: { hostname: string };
   certificates?: EdgeCertificate[];
   appRoutes?: EdgeAppRoute[];
   httpRoutes?: EdgeHttpRoute[];
@@ -275,11 +329,12 @@ ${body}}
 `,
         )
       : "";
+  const gate = input.gate
+    ? site(input.gate.hostname, gateLoginSiteBody(input.apiUpstream), `${GATE_LOGIN_SITE_COMMENT}\n`)
+    : "";
   const routes = (input.appRoutes ?? [])
     .map((route) => {
-      if (route.upstream !== undefined && !UPSTREAM.test(route.upstream)) {
-        throw new ValidationError(`Edge upstream ${JSON.stringify(route.upstream)} is not host:port.`);
-      }
+      if (route.upstream !== undefined) checkedUpstream(route.upstream);
       return site(
         route.hostname,
         route.upstream
@@ -314,7 +369,7 @@ ${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
     )
     .filter(Boolean)
     .join("\n");
-  const sites = [admin, routes, http].filter(Boolean).join("\n");
+  const sites = [admin, gate, routes, http].filter(Boolean).join("\n");
   const known = served.length
     ? `  @known host ${served.join(" ")}
   handle @known {
@@ -322,7 +377,7 @@ ${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
   }
 `
     : "";
-  const snippets = http ? `${HTTP_ROUTE_SNIPPETS(errorsDir)}\n` : "";
+  const snippets = http || gate ? `${HTTP_ROUTE_SNIPPETS(errorsDir)}\n` : "";
   return `${CADDY_GLOBAL_BLOCK}
 
 ${snippets}:80 {

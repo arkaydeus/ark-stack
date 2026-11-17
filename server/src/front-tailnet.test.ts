@@ -46,7 +46,7 @@ async function signUp(role: Role): Promise<Actor> {
 }
 
 function call(actor: Actor, method: "GET" | "POST", path: string) {
-  return app.request(path, {
+  return app.request(`${origin}${path}`, {
     method,
     headers: {
       cookie: actor.cookie,
@@ -58,7 +58,7 @@ function call(actor: Actor, method: "GET" | "POST", path: string) {
 }
 
 function internal(token: string | null, path: string, init: RequestInit = {}) {
-  return app.request(path, {
+  return app.request(`${origin}${path}`, {
     ...init,
     headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), "content-type": "application/json" },
   });
@@ -83,7 +83,7 @@ describe("tailnet API", () => {
       const observe = await call(actors[role], "POST", "/api/front/tailnet/observe");
       expect([role, read.status, observe.status]).toEqual([role, 403, 403]);
     }
-    expect((await app.request("/api/front/tailnet")).status).toBe(401);
+    expect((await app.request(`${origin}/api/front/tailnet`)).status).toBe(401);
   });
 
   test("the owner reads the latest generation and route identity states", async () => {

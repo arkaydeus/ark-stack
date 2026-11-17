@@ -17,7 +17,12 @@ export function loadEnv() {
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean),
-    trustedProxies: (process.env.ARK_TRUSTED_PROXIES ?? "127.0.0.1/32,::1/128")
+    // Authenticates the edge's login-origin and gate calls (front door §3.9.3, §3.9.4). Empty means the
+    // API trusts no forwarded client address at all; enabling the login origin then fails (FD-10).
+    edgeGateToken: process.env.ARK_EDGE_GATE_TOKEN ?? "",
+    // Optional extra check, never a trust grant on its own: when set, a token-authenticated request
+    // must also come from one of these exact transport peer addresses (the edge-ts admin address).
+    edgePeerAddresses: (process.env.ARK_EDGE_PEER_ADDRESSES ?? "")
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean),

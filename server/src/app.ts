@@ -52,6 +52,8 @@ import {
   platformDbIngressLimits,
   frontRouteCreateInput,
   frontRouteUpdateInput,
+  gateSettingsInput,
+  isGateLoginPath,
   buildDomainPlan,
   nextBackupStatus,
   redactLogLine,
@@ -63,12 +65,21 @@ import {
 } from "@ark-stack/shared";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { and, desc, eq, isNull } from "drizzle-orm";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 
-import { auth } from "./auth.ts";
+import { AUTH_COOKIE_KEYS, auth, authCookieName } from "./auth.ts";
+import { CLIENT_IP_HEADER, EDGE_TOKEN_HEADER, transportPeer, trustedClientIp } from "./client-ip.ts";
+import { originForHost, refreshLoginHost, requestHost } from "./origin-hosts.ts";
+import type { SessionOrigin } from "./session-origin.ts";
+import {
+  GateSettingsError,
+  commitGateSettings,
+  gateSettingsSummary,
+  prepareGateSettings,
+} from "./modules/gate-settings.ts";
 import {
   assertSecretRevealable,
   grantAccess,
@@ -170,6 +181,8 @@ type AppEnv = {
     session: SessionValue;
     access: Access;
     worker: string;
+    /** The registered origin of this request's canonical host (origin-hosts.ts), when it has one. */
+    requestOrigin: { host: string; origin: SessionOrigin };
   };
 };
 
@@ -202,6 +215,7 @@ app.onError((error, c) => {
   if (error instanceof ValidationError) return c.json({ error: error.message }, 422);
   if (error instanceof DatabaseClientError) return c.json({ error: error.message }, error.status);
   if (error instanceof FrontRouteError) return c.json({ error: error.message }, error.status);
+  if (error instanceof GateSettingsError) return c.json({ error: error.message }, error.status);
   // CSR and CA policy refusals (CsrError included) describe the submitted input; no key material.
   if (error instanceof PkiPolicyError) return c.json({ error: error.message }, 422);
   console.error(error instanceof Error ? error.message : error);
@@ -246,6 +260,91 @@ function isApiError(error: unknown): error is Error & { status: number } {
   return typeof status === "number" && status >= 400 && status < 500;
 }
 
+// Paths served for any Host: they carry their own credentials (worker, watchdog, metrics bearer
+// tokens) or none at all (health, ACME), never a browser session, and Docker peers reach them by
+// service name (`api:3000`).
+function hostIndependent(path: string) {
+  return (
+    path.startsWith("/api/internal/") ||
+    path === "/api/health" ||
+    path === "/api/metrics/prometheus" ||
+    path.startsWith("/.well-known/acme-challenge/")
+  );
+}
+
+// Host guard (front door §3.5, §3.9.1, FD-10). The canonical Host must be a registered admin host or
+// the login host; unknown, malformed or contradictory hosts are refused before Better Auth runs,
+// with no fallback to the admin origin. On the login host only the login allowlist exists: every
+// other path, `/api/internal/*` and `/api/health` included, is 404 here as well as at the edge.
+app.use("*", async (c, next) => {
+  await refreshLoginHost();
+  const host = requestHost(c.req.raw);
+  const origin = originForHost(host);
+  const path = new URL(c.req.url).pathname;
+  if (origin === "gate") {
+    if (!isGateLoginPath(path)) return c.json({ error: "Not found." }, 404);
+  } else if (!origin && !hostIndependent(path)) {
+    return c.json({ error: "This host is not a registered Ark origin." }, 421);
+  }
+  if (host && origin) c.set("requestOrigin", { host, origin });
+  await next();
+});
+
+/** Refuses a Cookie header that names any Better Auth cookie more than once (§3.9.1). */
+function assertSingleAuthCookies(headers: Headers) {
+  const names = new Set(AUTH_COOKIE_KEYS.map(authCookieName));
+  const seen = new Set<string>();
+  for (const pair of (headers.get("cookie") ?? "").split(";")) {
+    const name = pair.split("=", 1)[0]!.trim();
+    if (!names.has(name)) continue;
+    if (seen.has(name)) {
+      throw new HTTPException(400, { message: "Duplicate authentication cookies were sent." });
+    }
+    seen.add(name);
+  }
+}
+
+/**
+ * The headers Better Auth sees for this request: the canonical registered Host (its dynamic base
+ * URL is built from it), the trusted client address in `X-Ark-Client-Ip` (client-ip.ts; any
+ * client-sent value is replaced or removed) and no edge token.
+ */
+function authHeaders(c: Context<AppEnv>) {
+  const requestOrigin = c.get("requestOrigin");
+  if (!requestOrigin) throw new HTTPException(421, { message: "This host is not a registered Ark origin." });
+  assertSingleAuthCookies(c.req.raw.headers);
+  const headers = new Headers(c.req.raw.headers);
+  const { ip } = trustedClientIp({
+    path: new URL(c.req.url).pathname,
+    origin: requestOrigin.origin,
+    headers: c.req.raw.headers,
+    peer: transportPeer(c.env, c.req.raw),
+    edgeToken: env.edgeGateToken,
+    edgePeers: env.edgePeerAddresses,
+  });
+  headers.delete(CLIENT_IP_HEADER);
+  if (ip) headers.set(CLIENT_IP_HEADER, ip);
+  headers.delete(EDGE_TOKEN_HEADER);
+  headers.set("host", requestOrigin.host);
+  return headers;
+}
+
+/** The request handed to `auth.handler`, with `authHeaders`. */
+function authRequest(c: Context<AppEnv>) {
+  const headers = authHeaders(c);
+  const requestOrigin = c.get("requestOrigin");
+  // The public login origin accepts browser mutations only from itself; Better Auth's own origin
+  // check also trusts the admin origins.
+  if (
+    requestOrigin.origin === "gate" &&
+    !["GET", "HEAD", "OPTIONS"].includes(c.req.method) &&
+    c.req.header("origin") !== `https://${requestOrigin.host}`
+  ) {
+    throw new HTTPException(403, { message: "The request origin is not trusted." });
+  }
+  return new Request(c.req.raw, { headers });
+}
+
 app.get("/api/health", async (c) => {
   await sql`SELECT 1`;
   return c.json({ status: "ok" });
@@ -281,7 +380,7 @@ app.post("/api/auth/sign-up/email", async (c) => {
     if (setup?.completed || !secureEqual(c.req.header("x-setup-token") ?? "", env.setupToken)) {
       throw new HTTPException(403, { message: "Administrator setup is closed or the token is invalid." });
     }
-    const response = await auth.handler(c.req.raw);
+    const response = await auth.handler(authRequest(c));
     if (response.ok) {
       await connection`INSERT INTO platform_access(user_id, role) SELECT id, 'owner' FROM "user" ON CONFLICT DO NOTHING`;
       await connection`UPDATE platform_setup SET completed=true, bootstrap_closed_at=now() WHERE id='default'`;
@@ -295,10 +394,11 @@ app.post("/api/auth/sign-up/email", async (c) => {
 
 app.all("/api/auth/*", async (c) => {
   const enrollmentVerification = c.req.path.endsWith("/two-factor/verify-totp");
+  const request = authRequest(c);
   const sessionBefore = enrollmentVerification
-    ? await auth.api.getSession({ headers: c.req.raw.headers })
+    ? await auth.api.getSession({ headers: request.headers })
     : null;
-  const response = await auth.handler(c.req.raw);
+  const response = await auth.handler(request);
   if (response.ok && enrollmentVerification && sessionBefore?.user.id) {
     const [verifiedUser] = await db.select().from(user).where(eq(user.id, sessionBefore.user.id));
     if (verifiedUser?.twoFactorEnabled && !verifiedUser.mfaEnrolledAt) {
@@ -624,8 +724,14 @@ app.use("/api/*", async (c, next) => {
   ) {
     return next();
   }
-  const sessionValue = await auth.api.getSession({ headers: c.req.raw.headers });
+  const sessionValue = await auth.api.getSession({ headers: authHeaders(c) });
   if (!sessionValue) throw new HTTPException(401, { message: "Sign in to continue." });
+  // Session separation (front door §3.9.1): the admin API accepts only sessions minted on an admin
+  // origin, presented on an admin origin. A gate session (login origin) gets 403 on every route.
+  const sessionOrigin = (sessionValue.session as { origin?: string }).origin;
+  if (sessionOrigin !== "admin" || c.get("requestOrigin").origin !== "admin") {
+    throw new HTTPException(403, { message: "This session cannot use the administration API." });
+  }
   // Better Auth's two-factor plugin owns `twoFactorEnabled`, while Ark owns the
   // enrollment boundary timestamp. Read both from the authoritative row rather
   // than relying on the plugin's deliberately narrow session serializer.
@@ -643,9 +749,11 @@ app.use("/api/*", async (c, next) => {
     .select()
     .from(platformAccess)
     .where(eq(platformAccess.userId, sessionValue.user.id));
+  // No platform_access row (a gate-only user, §3.9.6) means no administration access at all, not viewer.
+  if (!access) throw new HTTPException(403, { message: "This account has no administration access." });
   c.set("access", {
     userId: sessionValue.user.id,
-    role: (access?.role as Role) ?? "viewer",
+    role: access.role as Role,
     projectIds: access?.projectIds ?? [],
     domainIds: access?.domainIds ?? [],
   });
@@ -1101,7 +1209,7 @@ app.post("/api/step-up", async (c) => {
   // the account password to mint grants for secret reveal and credential rotation.
   assertStepUpAttemptAllowed(access.userId);
   try {
-    await auth.api.verifyPassword({ body: { password: body.password }, headers: c.req.raw.headers });
+    await auth.api.verifyPassword({ body: { password: body.password }, headers: authHeaders(c) });
   } catch (error) {
     recordStepUpFailure(access.userId);
     await audit(access.userId, "auth.step_up_failed", "session", sessionValue.session.id, {
@@ -2822,6 +2930,40 @@ app.put("/api/settings/db-ingress", async (c) => {
   return c.json({ ...dbIngressLimitsSummary(settings ?? null), operationId: operation.id });
 });
 
+// Gate login origin (front door §3.3, §3.9.1, FD-10). R1: public or disabled only. Enabling or moving
+// it needs an `exposure.public` step-up bound to the exact body; disabling tightens and needs none.
+app.get("/api/settings/gate", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(await gateSettingsSummary());
+});
+
+app.put("/api/settings/gate", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const request = (await c.req.json()) as Record<string, unknown>;
+  // Validate before consuming the single-use grant, so a typo does not burn a password+MFA round.
+  const plan = await prepareGateSettings(gateSettingsInput.parse(request));
+  const authorize =
+    plan.mode === "public"
+      ? (tx: import("./db.ts").DbTransaction) =>
+          requirePrivileged(
+            access,
+            c.get("session"),
+            "exposure.public",
+            privilegedRequestHash("exposure.public", request),
+            tx,
+          )
+      : undefined;
+  const result = await commitGateSettings(
+    plan,
+    { userId: access.userId, role: access.role },
+    enqueue,
+    authorize,
+  );
+  return c.json({ ...(await gateSettingsSummary()), ...result, records: plan.records });
+});
+
 // Tailscale policy snippets (front door §3.7, FD-07). Owner-only, like route management (R12):
 // the snippet maps the tailnet machines behind every public route. Ark never writes the policy.
 app.get("/api/front/acl", async (c) => {
@@ -3004,6 +3146,10 @@ app.get("/api/me", async (c) => {
     .where(eq(user.id, c.get("session").user.id));
   return c.json({ user: row, access: c.get("access") });
 });
+
+// Gate pages on the login origin (`/gate/login`, `/gate/authorize`, `/gate/logout`) arrive with FD-11.
+// Until then the namespace answers 404 on every host and never falls through to the admin SPA.
+app.all("/gate/*", (c) => c.json({ error: "Not found." }, 404));
 
 const webDist = new URL("../../web/dist", import.meta.url).pathname;
 if (existsSync(webDist)) {

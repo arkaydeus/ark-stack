@@ -45,6 +45,7 @@ import { and, desc, eq, isNull } from "drizzle-orm";
 import { db, sql } from "./db.ts";
 import { withPgbouncerLock } from "./modules/pgbouncer-lock.ts";
 import { loadEnv } from "./env.ts";
+import { canonicalHost, currentLoginHost, isAdminHost, refreshLoginHost } from "./origin-hosts.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
@@ -1450,9 +1451,19 @@ async function changeMode(operation: OperationRow) {
   if (adminMode === "public" && plan.adminHostname && plan.awaitingCertificate.includes(plan.adminHostname)) {
     throw new Error(`The admin certificate for ${plan.adminHostname} is not issued yet.`);
   }
-  if (new URL(destinationOrigin).origin !== new URL(env.authUrl).origin) {
+  // Better Auth's dynamic base URL (front door §3.9.1) serves only registered hosts, so the
+  // destination admin origin must be one of its admin `allowedHosts`, over the configured scheme,
+  // and never the public login origin.
+  const destination = new URL(destinationOrigin);
+  await refreshLoginHost(true);
+  const destinationHost = canonicalHost(destination.host);
+  if (
+    destination.protocol !== new URL(env.authUrl).protocol ||
+    !isAdminHost(destinationHost) ||
+    destinationHost === currentLoginHost()
+  ) {
     throw new Error(
-      `Better Auth is configured for ${env.authUrl}; restart with BETTER_AUTH_URL=${destinationOrigin} before switching ingress.`,
+      `Better Auth's admin hosts do not include ${destination.origin}; restart with BETTER_AUTH_URL=${destinationOrigin} before switching ingress.`,
     );
   }
   const edge = await writeEdge(plan);
@@ -2295,9 +2306,15 @@ export function startRolloverScheduler(
 // (front door §3.2, FD-06) and only in an implemented access mode (§3.5, FD-09: public).
 export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
   const policy = await edgePolicy();
+  const [settings] = await db
+    .select({ mode: platformSettings.gateLoginMode, hostname: platformSettings.gateLoginHostname })
+    .from(platformSettings)
+    .where(eq(platformSettings.id, "default"));
   return planEdge({
     adminMode,
     adminHostname,
+    // The public login origin (FD-10), served once its certificate is issued.
+    gateHostname: settings?.mode === "public" ? settings.hostname : null,
     endpoints: await db.select().from(endpoints),
     certificates: await db.select().from(certificates),
     httpRoutes: await edgeHttpRoutes(policy.routes),

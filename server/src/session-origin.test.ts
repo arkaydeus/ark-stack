@@ -4,7 +4,7 @@ import { createHmac } from "node:crypto";
 
 import { createId, parseEnvFile } from "@ark-stack/shared";
 
-import { resolveSessionOrigin } from "./session-origin.ts";
+import { resolveSessionOrigin, withSessionOrigin, type SessionOrigin } from "./session-origin.ts";
 
 if (!process.env.DATABASE_URL && existsSync(".env")) {
   Object.assign(process.env, parseEnvFile(await Bun.file(".env").text()));
@@ -13,22 +13,51 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
 const { auth } = await import("./auth.ts");
 const { sql } = await import("./db.ts");
 
-const request = new Request("http://127.0.0.1:3000/api/auth/sign-in/email");
+const adminRequest = new Request("https://admin.example.test/api/auth/sign-in/email");
+const loginRequest = new Request("https://login.example.test/api/auth/sign-in/email");
+const otherRequest = new Request("https://www.example.test/api/auth/sign-in/email");
+// Positive match only, as origin-hosts.ts does: any other host has no origin.
+const byHost = (request: Request): SessionOrigin | null =>
+  (({ "admin.example.test": "admin", "login.example.test": "gate" })[new URL(request.url).host] as
+    | SessionOrigin
+    | undefined) ?? null;
 
 describe("resolveSessionOrigin", () => {
-  test("a session minted while serving a request is an admin session", () => {
-    expect(resolveSessionOrigin({}, { request })).toBe("admin");
+  test("the request host decides: the login host mints gate sessions, an admin host admin ones", () => {
+    expect(resolveSessionOrigin({}, { request: adminRequest }, byHost)).toBe("admin");
+    expect(resolveSessionOrigin({}, { request: loginRequest }, byHost)).toBe("gate");
   });
 
-  test("an explicit server-side origin is kept", () => {
-    expect(resolveSessionOrigin({ origin: "gate" }, null)).toBe("gate");
-    expect(resolveSessionOrigin({ origin: "admin" }, { request })).toBe("admin");
+  test("a request for any other host is refused, never mapped to the admin origin", () => {
+    expect(() => resolveSessionOrigin({}, { request: otherRequest }, byHost)).toThrow(
+      /not a registered login origin/,
+    );
+    expect(() => resolveSessionOrigin({ origin: "admin" }, { request: otherRequest }, byHost)).toThrow(
+      /not a registered login origin/,
+    );
+  });
+
+  test("an explicit server-side origin is kept, and must agree with the request host", () => {
+    expect(resolveSessionOrigin({ origin: "gate" }, null, byHost)).toBe("gate");
+    expect(resolveSessionOrigin({ origin: "admin" }, { request: adminRequest }, byHost)).toBe("admin");
+    expect(() => resolveSessionOrigin({ origin: "admin" }, { request: loginRequest }, byHost)).toThrow(
+      /contradictory origins/,
+    );
+  });
+
+  test("withSessionOrigin supplies positive provenance to a context-free call", async () => {
+    expect(await withSessionOrigin("gate", async () => resolveSessionOrigin({}, null, byHost))).toBe("gate");
+    await expect(
+      withSessionOrigin("gate", async () => resolveSessionOrigin({}, { request: adminRequest }, byHost)),
+    ).rejects.toThrow(/contradictory origins/);
   });
 
   test("a context-free creation without an origin is refused, not guessed", () => {
-    expect(() => resolveSessionOrigin({}, null)).toThrow(/without a request or an explicit origin/);
-    expect(() => resolveSessionOrigin({}, {})).toThrow(/without a request or an explicit origin/);
-    expect(() => resolveSessionOrigin({ origin: "public" }, { request })).toThrow(/unknown origin/);
+    expect(() => resolveSessionOrigin({}, null, byHost)).toThrow(/without a request or an explicit origin/);
+    expect(() => resolveSessionOrigin({}, {}, byHost)).toThrow(/without a request or an explicit origin/);
+    expect(() => resolveSessionOrigin({ origin: "public" }, { request: adminRequest }, byHost)).toThrow(
+      /unknown origin/,
+    );
   });
 });
 
@@ -121,12 +150,27 @@ describe("Better Auth session insert paths set origin", () => {
 
   test("a server-side sign-in with no request context is refused and inserts nothing", async () => {
     const before = (await sessionsFor()).length;
+    // No host at all: the dynamic base URL has no fallback, so nothing is resolved for the admin origin.
     await expect(auth.api.signInEmail({ body: { email, password } })).rejects.toThrow(
-      /without a request or an explicit origin/,
+      /Dynamic baseURL could not be resolved/,
     );
+    // A registered host but no request and no explicit origin: the session hook refuses.
     await expect(
-      auth.api.signInEmail({ body: { email, password }, headers: new Headers({ Origin: authUrl }) }),
+      auth.api.signInEmail({
+        body: { email, password },
+        headers: new Headers({ Origin: authUrl, Host: new URL(authUrl).host }),
+      }),
     ).rejects.toThrow(/without a request or an explicit origin/);
     expect((await sessionsFor()).length).toBe(before);
+  });
+
+  test("a literal session insert that omits origin fails at the database", async () => {
+    const [owner] = await sql`SELECT id FROM "user" WHERE email = ${email}`;
+    await expect(
+      sql`
+        INSERT INTO session (id, user_id, token, expires_at, created_at, updated_at)
+        VALUES (${createId("ses")}, ${owner!.id}, ${createId("tok")}, now() + interval '1 hour', now(), now())
+      `,
+    ).rejects.toThrow(/null value in column "origin"/);
   });
 });

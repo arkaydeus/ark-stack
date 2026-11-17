@@ -13,6 +13,7 @@ export * from "./edge.ts";
 export * from "./edge-http.ts";
 export * from "./errors.ts";
 export * from "./front-routes.ts";
+export * from "./gate-login.ts";
 export * from "./hash.ts";
 export * from "./hostnames.ts";
 export * from "./install.ts";

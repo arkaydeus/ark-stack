@@ -10,8 +10,9 @@
 // - the Location policy below;
 // - or, for an apex route with `redirectTo`, a 308 to the canonical hostname and nothing else.
 //
-// Only `public` access is implemented. The login gate (FD-10, FD-11) does not exist yet, so an `sso`
-// route is never rendered: `planEdge` omits it and `renderCaddyfile` refuses it (fail closed).
+// Only `public` access is implemented. The login origin exists (FD-10, `gateLoginSiteBody` in edge.ts),
+// but the gate handshake and forward_auth (FD-11) do not yet, so an `sso` route is never rendered:
+// `planEdge` omits it and `renderCaddyfile` refuses it (fail closed).
 //
 // Location policy. Caddy evaluates it on the raw upstream value in `handle_response`, before the
 // `header_down` rewrite runs. In order:

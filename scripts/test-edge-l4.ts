@@ -25,6 +25,14 @@
 // rewriting; the static 502 for an unreachable upstream and for an unsupported Location, naming no
 // tailnet host; the apex redirect and the :80 list; an enabled SSO route absent from both configs;
 // and a WebSocket idle for more than 10 minutes that then survives one edge.apply.
+//
+// FD-10 (§3.5, §3.9.1) login origin, rendered by the production planner and renderer and reached
+// through 443: exactly the allowlisted Better Auth paths reach the API (here the fake upstream on the
+// `api` alias) with the genuine edge token, never a client-forged one, and with the real client
+// address carried by PROXY v2 in X-Forwarded-For; `/gate/*` reaches it without the token; every other
+// path (`/api/state`, `/api/internal/jobs`, `/api/gate/check`, ...) is a 404 that never reaches the API.
+//
+// `ARK_EDGE_L4_ONLY=<text>` runs only the named tests whose name contains <text> (setup always runs).
 import { randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
@@ -82,6 +90,9 @@ const wwwHost = "www.example.com";
 const apexHost = "example.com";
 const brokenHost = "broken.example.com";
 const ssoHost = "sso.example.com";
+// FD-10: the public gate login origin, and the edge token the edge service sends on its API requests.
+const loginHost = "login.example.com";
+const gateToken = randomBytes(24).toString("base64url");
 
 const webRoute: EdgePolicyRoute = {
   id: "rt_web1",
@@ -140,10 +151,12 @@ function fixturePlan() {
     { hostname: adminHost, kind: "admin" },
     { hostname: appHost, kind: "http" },
     ...fd09Routes.map((route) => ({ hostname: route.hostname, kind: "route" })),
+    { hostname: loginHost, kind: "gate" },
   ];
   return planEdge({
     adminMode: "public",
     adminHostname: adminHost,
+    gateHostname: loginHost,
     endpoints: rows.map((row) => ({ id: `end_${row.hostname}`, exposure: "public", ...row })),
     // Every hostname, sso included, has an issued certificate on disk.
     certificates: rows.map((row) => ({
@@ -254,8 +267,8 @@ async function prepareFiles() {
   await chmod(directory, 0o755);
   const script = [
     "set -e",
-    ...[adminHost, appHost, tailnetHost, wsHost, wwwHost, apexHost, brokenHost, ssoHost].map((host) =>
-      certificate(`/out/certs/${host}`, host),
+    ...[adminHost, appHost, tailnetHost, wsHost, wwwHost, apexHost, brokenHost, ssoHost, loginHost].map(
+      (host) => certificate(`/out/certs/${host}`, host),
     ),
     certificate("/out/peer-certs", mqttHost),
     "chmod 644 /out/peer-certs/privkey.pem",
@@ -291,6 +304,7 @@ async function startContainers() {
     edgeDir,
     validator: true,
     ports: ["127.0.0.1::80", "127.0.0.1::443", "127.0.0.1::41642/udp"],
+    edgeEnvironment: { ARK_EDGE_GATE_TOKEN: gateToken },
     edgeTsCommand: [
       "tailscaled",
       "--state=mem:",
@@ -1835,7 +1849,132 @@ async function fd09WithdrawalTest(report: Report) {
   expect(report, applied.applied && back, "allowed again, edge.apply serves it again", wwwHost);
 }
 
+// ---- FD-10: the login origin through the SNI router (§3.5, §3.9.1) -------------------------------------------
+
+const GATE_LOGIN_API = [
+  ["POST", "/api/auth/sign-in/email"],
+  ["POST", "/api/auth/sign-out"],
+  ["GET", "/api/auth/get-session"],
+  ["POST", "/api/auth/two-factor/verify-totp"],
+  ["POST", "/api/auth/two-factor/verify-backup-code"],
+  ["POST", "/api/auth/two-factor/enable"],
+  ["POST", "/api/auth/two-factor/get-totp-uri"],
+] as const;
+
+type Echo = { path?: string; method?: string; headers?: Record<string, string> };
+
+async function upstreamSeen() {
+  const reply = await secureRequest(adminHost, "/__seen");
+  return JSON.parse(reply.body || "[]") as string[];
+}
+
+async function fd10AllowlistTest(report: Report) {
+  const mapped = servedHttpHostnames(fixturePlan());
+  expect(
+    report,
+    mapped.includes(loginHost),
+    "edge.l4_apply puts the login host in the 443 map",
+    mapped.join(" "),
+  );
+  const active = (await caddyAdmin("/config/")).body;
+  expect(report, active.includes(loginHost), "the running Caddy config has the login-origin site", loginHost);
+  // A real client container on the admin network: the edge must forward its own address.
+  const admin = await edgeTsAddress(stack.networks.admin);
+  const forged = {
+    "X-Forwarded-For": "6.6.6.6",
+    "X-Ark-Edge-Token": "forged-by-the-client",
+    Origin: `https://${loginHost}`,
+  };
+  for (const [method, path] of GATE_LOGIN_API) {
+    const reply = await client<{
+      status: number;
+      body: string;
+      headers: Record<string, string>;
+      self: string[];
+    }>(stack.networks.admin, [
+      "https",
+      admin,
+      "443",
+      loginHost,
+      loginHost,
+      path,
+      JSON.stringify(forged),
+      method,
+    ]);
+    const echo = JSON.parse(reply.body || "{}") as Echo;
+    const seen = echo.headers ?? {};
+    expect(
+      report,
+      reply.status === 200 &&
+        echo.path === path &&
+        echo.method === method &&
+        seen["x-ark-edge-token"] === gateToken &&
+        reply.self.includes(seen["x-forwarded-for"] ?? "") &&
+        seen.host === loginHost,
+      `${method} ${path} reaches the API with the genuine edge token and the PROXY v2 client address`,
+      `status ${reply.status}; token ${seen["x-ark-edge-token"] === gateToken ? "genuine" : JSON.stringify(seen["x-ark-edge-token"])}; client ${reply.self.join(",")} -> X-Forwarded-For ${seen["x-forwarded-for"]}; Host ${seen.host}`,
+    );
+    expect(
+      report,
+      !reply.headers.server && reply.headers["strict-transport-security"] === "max-age=31536000",
+      `${path}: no Server header, HSTS set`,
+      `server ${reply.headers.server ?? "absent"}; hsts ${reply.headers["strict-transport-security"]}`,
+    );
+  }
+  const page = await secureRequest(loginHost, "/gate/login?next=%2Fgate%2Fauthorize", {
+    "X-Ark-Edge-Token": "forged-by-the-client",
+  });
+  const pageSeen = (JSON.parse(page.body || "{}") as Echo).headers ?? {};
+  expect(
+    report,
+    page.status === 200 && !("x-ark-edge-token" in pageSeen),
+    "/gate/* reaches the API without any edge token (a forged one is removed)",
+    `status ${page.status}; X-Ark-Edge-Token upstream: ${pageSeen["x-ark-edge-token"] ?? "absent"}`,
+  );
+  const outside = [
+    "/api/state",
+    "/api/me",
+    "/api/internal/jobs",
+    "/api/gate/check?route=rt_x",
+    "/api/gate/users",
+    "/api/health",
+    "/api/auth/sign-up/email",
+    "/api/auth/two-factor/disable",
+    "/api/auth/list-sessions",
+    "/api/auth/sign-in/email/",
+    "/api/settings/gate",
+    "/gate",
+    "/",
+    "/index.html",
+    "/.ark/gate/callback?code=x",
+  ];
+  const before = (await upstreamSeen()).length;
+  const statuses: string[] = [];
+  for (const path of outside) {
+    const reply = await secureRequest(loginHost, path, { "X-Ark-Edge-Token": gateToken });
+    statuses.push(`${path} ${reply.status}${reply.body ? " (body)" : ""}`);
+    expect(
+      report,
+      reply.status === 404 && reply.body === "",
+      `${path} is 404 at the edge`,
+      `${reply.status}`,
+    );
+  }
+  const after = await upstreamSeen();
+  expect(
+    report,
+    after.length === before,
+    "no path outside the allowlist reached the API",
+    after.slice(before).join(" ") || "none",
+  );
+}
+
 async function run(name: string, test: (report: Report) => Promise<unknown>) {
+  const only = process.env.ARK_EDGE_L4_ONLY;
+  if (only && !name.includes(only)) {
+    console.log(`${name}: skipped (ARK_EDGE_L4_ONLY=${only})`);
+    return;
+  }
   const report: Report = { name, lines: [] };
   const started = Date.now();
   await test(report);
@@ -1876,6 +2015,10 @@ try {
   await run("FD-09: apex redirect and the :80 list", fd09RedirectTest);
   await run("FD-09: WebSocket idle over 10 minutes, then one edge.apply", fd09WebsocketTest);
   await run("FD-09: withdrawal closes a route's WebSockets despite stream_close_delay", fd09WithdrawalTest);
+  await run(
+    "FD-10: login-origin path allowlist, edge token and client address through 443",
+    fd10AllowlistTest,
+  );
   await run("watchdog: identity failure across HAProxy workers", identityWithdrawalTest);
   await run("domain worker drain (edge.drain) across HAProxy workers", workerDrainTest);
   await run("watchdog: lease expiry across HAProxy workers", leaseExpiryTest);

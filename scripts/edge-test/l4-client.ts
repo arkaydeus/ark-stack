@@ -2,7 +2,8 @@
 // network attached to edge-ts (or in its namespace), so the edge sees this container's own address.
 // Every command prints one JSON line.
 //
-//   https <host> <port> <sni> <hostHeader> <path>   HTTPS GET; status, headers, body
+//   https <host> <port> <sni> <hostHeader> <path> [headersJSON] [method]
+//                                                   HTTPS request; status, headers, body
 //   tls <host> <port> <sni>                         TLS handshake without a PROXY header
 //   tcp <host> <port>                               plain TCP connect
 //   send <host> <port> <base64> <waitMs>            raw bytes; what came back and whether it closed
@@ -14,7 +15,7 @@ import { connect as tlsConnect } from "node:tls";
 const [command = "", host = "", portText = "", ...rest] = process.argv.slice(2);
 const port = Number(portText);
 
-function https(sni: string, hostHeader: string, path: string) {
+function https(sni: string, hostHeader: string, path: string, extra: Record<string, string>, method: string) {
   return new Promise((resolve) => {
     const req = request(
       {
@@ -22,7 +23,8 @@ function https(sni: string, hostHeader: string, path: string) {
         port,
         servername: sni,
         path,
-        headers: { host: hostHeader },
+        method,
+        headers: { ...extra, host: hostHeader },
         rejectUnauthorized: false,
         timeout: 5_000,
       },
@@ -39,7 +41,7 @@ function https(sni: string, hostHeader: string, path: string) {
     req.on("error", (error: NodeJS.ErrnoException) =>
       resolve({ status: 0, error: error.message, code: error.code ?? null }),
     );
-    req.end();
+    req.end(method === "GET" ? undefined : "{}");
   });
 }
 
@@ -101,7 +103,7 @@ function send(payload: Buffer, waitMs: number) {
 
 const result =
   command === "https"
-    ? await https(rest[0]!, rest[1]!, rest[2] ?? "/")
+    ? await https(rest[0]!, rest[1]!, rest[2] ?? "/", JSON.parse(rest[3] ?? "{}"), rest[4] ?? "GET")
     : command === "tls"
       ? await tls(rest[0]!)
       : command === "tcp"

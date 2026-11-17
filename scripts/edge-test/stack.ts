@@ -30,6 +30,8 @@ export type EdgeStackOptions = {
   ports: string[];
   /** Extra or replacement edge-ts environment. */
   edgeTsEnvironment?: Record<string, string>;
+  /** Extra or replacement environment for the `edge` (Caddy) service, such as ARK_EDGE_GATE_TOKEN. */
+  edgeEnvironment?: Record<string, string>;
   /**
    * Replaces edge-ts's entrypoint and command. containerboot exits after its 60 s boot timeout when
    * the node cannot log in, and the restart strands `edge`; long offline runs start tailscaled itself.
@@ -79,6 +81,7 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
     .filter(([, network]) => network?.external)
     .map(([name]) => name);
   const environment = Object.entries(options.edgeTsEnvironment ?? {});
+  const edgeEnvironment = Object.entries(options.edgeEnvironment ?? {});
   const l4Volume = `${project}_edge_l4_config`;
   const override = [
     "services:",
@@ -95,6 +98,9 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
         ]
       : []),
     "  edge:",
+    ...(edgeEnvironment.length
+      ? ["    environment:", ...edgeEnvironment.map(([key, value]) => `      ${key}: ${yamlString(value)}`)]
+      : []),
     // Compose merges volumes by target, so these replace the tmp/ bind mounts.
     "    volumes:",
     `      - ${yamlString(`${options.acmeDir}:/var/lib/ark/acme:ro`)}`,

@@ -92,7 +92,7 @@ async function signUp(role: Role, mfa: boolean): Promise<Actor> {
 type Json = Record<string, any>;
 
 async function call(actor: Actor | null, method: string, path: string, body?: unknown) {
-  const response = await app.request(path, {
+  const response = await app.request(`${origin}${path}`, {
     method,
     headers: {
       ...(actor ? { cookie: actor.cookie } : {}),
@@ -731,7 +731,9 @@ describe("lifecycle regression coverage", () => {
   async function authorize(action: "exposure.public" | "resource.delete", request: Record<string, unknown>) {
     const { requirePrivileged } = await import("./access.ts");
     const { privilegedRequestHash } = await import("@ark-stack/shared");
-    const session = await auth.api.getSession({ headers: new Headers({ cookie: actors.owner.cookie }) });
+    const session = await auth.api.getSession({
+      headers: new Headers({ cookie: actors.owner.cookie, host: new URL(origin).host }),
+    });
     if (!session) throw new Error("Missing fixture session");
     return (tx: import("./db.ts").DbTransaction) =>
       requirePrivileged(

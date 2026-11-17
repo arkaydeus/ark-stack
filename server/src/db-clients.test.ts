@@ -79,7 +79,7 @@ async function signUp(role: Role, mfa: boolean): Promise<Actor> {
 }
 
 function call(actor: Actor, path: string, init: { method?: string; body?: unknown } = {}) {
-  return app.request(path, {
+  return app.request(`${origin}${path}`, {
     method: init.method ?? "GET",
     headers: {
       cookie: actor.cookie,
