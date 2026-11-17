@@ -2193,3 +2193,7 @@ try {
   if (pgbouncerImage) await chownState(hostUid).catch(() => undefined);
   await rm(work, { recursive: true, force: true });
 }
+
+// All assertions and owned-resource cleanup have finished. Imported runtime handles must not
+// keep this one-shot CLI alive after success; errors above still propagate as a nonzero exit.
+process.exit(0);
