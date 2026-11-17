@@ -53,6 +53,10 @@ raw_args = true
 description = "Run fresh-volume browser onboarding against a disposable local database"
 run = "bun --env-file=.env scripts/test-e2e.ts"
 
+[tasks."test:e2e-gate"]
+description = "Run the login gate end to end in Chromium (FD-11): the real API on a disposable database behind the containerised edge, with a fake upstream (requires Docker)"
+run = "bun --env-file=.env scripts/test-e2e-gate.ts"
+
 [tasks."test:upgrade"]
 description = "Verify schema upgrade and startup nft policy activation (requires Docker)"
 run = "bun --env-file=.env scripts/test-upgrade-migrations.ts"

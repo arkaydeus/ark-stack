@@ -98,6 +98,8 @@ jobs:
       - run: bun scripts/test-edge-observer.ts
       - run: bun scripts/test-edge-l4.ts
       - run: bun scripts/test-edge-gate.ts
+      # FD-11: Chromium through the containerised edge to the real API (Playwright installed above).
+      - run: bun scripts/test-e2e-gate.ts
       - name: Off-VPS backups against MinIO (FD-21)
         run: |
           bunx tsc --noEmit -p scripts/tsconfig.backups.json

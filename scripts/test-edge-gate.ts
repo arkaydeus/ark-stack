@@ -26,38 +26,22 @@
 //
 // `ARK_EDGE_GATE_ONLY=<text>` runs only the tests whose name contains <text> (setup always runs).
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 
-import {
-  planEdge,
-  type EdgeHttpRoute,
-  type EdgeLeaseDocument,
-  type EdgePolicyRoute,
-  type WatchdogEvent,
-} from "@ark-stack/shared";
+import { planEdge, type EdgeHttpRoute } from "@ark-stack/shared";
 
+import { bunImage, cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from "./edge-test/gate-edge.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
-import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
 
-const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-gate-${suffix}-`));
-const network = `ark-edge-gate-${suffix}`;
-const runtime = new EdgeTestRuntime(directory, network, bunImage);
+const runName = `ark-edge-gate-${suffix}`;
+const runtime = new EdgeTestRuntime(directory, runName, bunImage);
 const removeSignalHandlers = runtime.installSignalHandlers();
-const docker = (...args: string[]) => runtime.docker(...args);
-
-const octet = 64 + (Number.parseInt(randomBytes(1).toString("hex"), 16) % 64);
-const third = 1 + (Number.parseInt(randomBytes(1).toString("hex"), 16) % 250);
-const peerSubnet = `100.${octet}.${third}.0/24`;
-const peerIp = `100.${octet}.${third}.10`;
-const peerNetwork = `ark-edge-gate-peer-${suffix}`;
 const gateToken = randomBytes(24).toString("base64url");
 
 // The §3.5 SSO example (www, with the /webhooks/* bypass) and a sibling SSO route on the same domain.
@@ -67,36 +51,30 @@ const streamCloseDelayMs = 8_000;
 const wwwHost = "www.example.com";
 const siblingHost = "b.example.com";
 const approvedOrigin = "https://approved.example.com";
-const routes: EdgeHttpRoute[] = [
-  {
-    id: "rt_k3x9",
-    hostname: wwwHost,
-    stableId: "nHOMEGATE",
-    ip: peerIp,
-    port: 3000,
-    access: "sso",
-    bypassPaths: ["/webhooks/*"],
-    options: { streamCloseDelay: `${streamCloseDelayMs / 1000}s` },
-    internalNames: ["home.tail1234.ts.net", "home"],
-  },
-  {
-    id: "rt_b1",
-    hostname: siblingHost,
-    stableId: "nHOMEGATE",
-    ip: peerIp,
-    port: 3000,
-    access: "sso",
-    options: { streamCloseDelay: `${streamCloseDelayMs / 1000}s` },
-  },
-];
-const policy: EdgePolicyRoute[] = routes.map(({ id, hostname, stableId, ip, port }) => ({
-  id,
-  kind: "http",
-  hostname,
-  stableId,
-  ip,
-  port,
-}));
+function fixtureRoutes(peerIp: string): EdgeHttpRoute[] {
+  return [
+    {
+      id: "rt_k3x9",
+      hostname: wwwHost,
+      stableId: "nHOMEGATE",
+      ip: peerIp,
+      port: 3000,
+      access: "sso",
+      bypassPaths: ["/webhooks/*"],
+      options: { streamCloseDelay: `${streamCloseDelayMs / 1000}s` },
+      internalNames: ["home.tail1234.ts.net", "home"],
+    },
+    {
+      id: "rt_b1",
+      hostname: siblingHost,
+      stableId: "nHOMEGATE",
+      ip: peerIp,
+      port: 3000,
+      access: "sso",
+      options: { streamCloseDelay: `${streamCloseDelayMs / 1000}s` },
+    },
+  ];
+}
 const aliceToken = randomBytes(32).toString("base64url");
 const gateRoutes = {
   rt_k3x9: { host: wwwHost, bypassPaths: ["/webhooks/*"], allowedOrigins: [] },
@@ -106,8 +84,9 @@ const gateSessions = {
   [aliceToken]: { user: "usr_alice", email: "alice@example.com", routes: ["rt_k3x9", "rt_b1"] },
 };
 
-function fixturePlan() {
+function fixturePlan(peerIp: string) {
   const at = new Date();
+  const routes = fixtureRoutes(peerIp);
   return planEdge({
     adminMode: "tailnet",
     endpoints: routes.map((route) => ({
@@ -132,273 +111,16 @@ function expect(report: Report, condition: boolean, claim: string, observed: str
   report.lines.push(`  ok  ${claim} [${observed}]`);
 }
 
-async function waitFor<T>(
-  what: string,
-  attempt: () => Promise<T | undefined>,
-  timeoutMs = 30_000,
-  stepMs = 200,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = await attempt().catch(() => undefined);
-    if (value !== undefined) return value;
-    await Bun.sleep(stepMs);
-  }
-  throw new Error(`Timed out after ${timeoutMs} ms waiting for ${what}.`);
-}
-
-async function bundle(entry: string, name: string) {
-  const outdir = join(directory, name);
-  const built = await Bun.build({ entrypoints: [entry], target: "bun", outdir });
-  if (!built.success) throw new Error(`Bundling ${entry} failed: ${built.logs.join("\n")}`);
-  await chmod(outdir, 0o755);
-  return outdir;
-}
-
-// ---- Lease API (the API's read-only lease endpoint, served by this process) ---------------------------
-
-const watchdogToken = randomBytes(24).toString("base64url");
-/** Route IDs the lease leaves out, as the API does for a revocation overdue by more than 5 s. */
-const overdue = new Set<string>();
-const events: WatchdogEvent[] = [];
-const leaseApi = Bun.serve({
-  hostname: "0.0.0.0",
-  port: 0,
-  async fetch(request) {
-    if (request.headers.get("authorization") !== `Bearer ${watchdogToken}`)
-      return new Response("no", { status: 401 });
-    const { pathname } = new URL(request.url);
-    if (pathname === "/api/internal/edge/lease") {
-      const now = Date.now();
-      const document: EdgeLeaseDocument = {
-        now: new Date(now).toISOString(),
-        lease: {
-          generation: "gen-gate",
-          completedAt: new Date(now - 1_000).toISOString(),
-          validUntil: new Date(now + 360_000).toISOString(),
-          valid: true,
-        },
-        routes: policy.filter((route) => !overdue.has(route.id)),
-        revocations: [...overdue].map((routeId) => ({
-          id: `grv_${routeId}`,
-          routeId,
-          createdAt: new Date(now - 6_000).toISOString(),
-          overdue: true,
-        })),
-      };
-      return Response.json(document);
-    }
-    if (pathname === "/api/internal/edge/watchdog-event") {
-      events.push((await request.json()) as WatchdogEvent);
-      return Response.json({ ok: true });
-    }
-    return new Response("not found", { status: 404 });
-  },
-});
-
-// ---- Containers -----------------------------------------------------------------------------------------
-
-let stack!: EdgeStack;
-const bundles = { watchdog: "", writeEdge: "", api: "" };
-const edgeDir = join(directory, "edge");
-const certDir = join(directory, "certs");
-const acmeDir = join(directory, "acme");
-const apiName = `ark-edge-gate-api-${suffix}`;
-const peerName = `ark-edge-gate-peer-${suffix}`;
-let watchdogName = "";
-
-function certificate(dir: string, host: string) {
-  return `mkdir -p ${dir} && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj "/CN=${host}" -addext "subjectAltName=DNS:${host}" -keyout ${dir}/privkey.pem -out ${dir}/fullchain.pem 2>/dev/null && chmod 600 ${dir}/privkey.pem`;
-}
-
-async function prepareFiles() {
-  await mkdir(join(acmeDir, ".well-known", "acme-challenge"), { recursive: true });
-  await mkdir(edgeDir);
-  // Start from a configuration without tailnet routes; edge.apply below loads the real one.
-  await Bun.write(
-    join(edgeDir, "Caddyfile"),
-    "{\n  admin edge-admin:2019\n  auto_https off\n}\n:80 {\n  respond 404\n}\n",
-  );
-  await Bun.write(join(edgeDir, "Caddyfile.closed"), await Bun.file(join(edgeDir, "Caddyfile")).text());
-  await chmod(directory, 0o755);
-  const script = [
-    "set -e",
-    ...routes.map((route) => certificate(`/out/certs/${route.hostname}`, route.hostname)),
-    "chown -R 1000:1000 /out/certs /out/edge",
-  ].join("\n");
-  await docker("run", "--rm", "--user", "0:0", "--volume", `${directory}:/out`, bunImage, "sh", "-c", script);
-}
-
-async function startContainers() {
-  runtime.networkCreated = true;
-  await docker("network", "create", network);
-  await docker("network", "create", "--subnet", peerSubnet, peerNetwork);
-  bundles.api = await bundle(join(fixtures, "gate-api.ts"), "gate-api");
-  bundles.watchdog = await bundle(join(root, "workers/src/edge-watchdog.ts"), "watchdog");
-  bundles.writeEdge = await bundle(join(fixtures, "write-edge.ts"), "write-edge");
-  runtime.containers.push(apiName);
-  await docker(
-    "run",
-    "--detach",
-    "--name",
-    apiName,
-    "--network",
-    network,
-    "--env",
-    `ARK_EDGE_GATE_TOKEN=${gateToken}`,
-    "--env",
-    `GATE_ROUTES=${JSON.stringify(gateRoutes)}`,
-    "--env",
-    `GATE_SESSIONS=${JSON.stringify(gateSessions)}`,
-    "--volume",
-    `${bundles.api}:/api:ro`,
-    bunImage,
-    "bun",
-    "/api/gate-api.js",
-  );
-  stack = await startEdgeStack({
-    runtime,
-    project: `ark-edge-gate-${suffix}`,
-    directory,
-    acmeDir,
-    certDir,
-    edgeDir,
-    ports: ["127.0.0.1::80", "127.0.0.1::443", "127.0.0.1::41643/udp"],
-    edgeEnvironment: { ARK_EDGE_GATE_TOKEN: gateToken },
-    edgeTsCommand: [
-      "tailscaled",
-      "--state=mem:",
-      "--socket=/var/run/tailscale/tailscaled.sock",
-      "--port=41643",
-      "--tun=tailscale0",
-    ],
-  });
-  await docker("network", "connect", "--alias", "api", stack.networks.admin, apiName);
-  await docker("network", "connect", peerNetwork, stack.edgeTs);
-  runtime.containers.push(peerName);
-  await docker(
-    "run",
-    "--detach",
-    "--name",
-    peerName,
-    "--network",
-    peerNetwork,
-    "--ip",
-    peerIp,
-    "--volume",
-    `${join(fixtures, "upstream.ts")}:/fixture/app.ts:ro`,
-    bunImage,
-    "bun",
-    "/fixture/app.ts",
-  );
-  await startWatchdog();
-}
-
-/** The edge watchdog as shipped (uid 1000, read-only root, no capabilities), Caddy only. */
-async function startWatchdog() {
-  watchdogName = `ark-edge-gate-watchdog-${suffix}`;
-  runtime.containers.push(watchdogName);
-  await docker(
-    "run",
-    "--detach",
-    "--name",
-    watchdogName,
-    "--user",
-    "1000:1000",
-    "--group-add",
-    "4400",
-    "--read-only",
-    "--tmpfs",
-    "/tmp",
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges:true",
-    "--network",
-    network,
-    "--add-host",
-    "host.docker.internal:host-gateway",
-    "--env",
-    `ARK_API_URL=http://host.docker.internal:${leaseApi.port}`,
-    "--env",
-    `ARK_EDGE_WATCHDOG_TOKEN=${watchdogToken}`,
-    "--env",
-    "ARK_EDGE_ADMIN_URL=http://edge-admin:2019",
-    "--env",
-    "ARK_EDGE_DIR=/var/lib/ark/edge",
-    "--volume",
-    `${edgeDir}:/var/lib/ark/edge`,
-    "--volume",
-    `${bundles.watchdog}:/watchdog:ro`,
-    "--workdir",
-    "/tmp",
-    bunImage,
-    "bun",
-    "/watchdog/edge-watchdog.js",
-  );
-  await docker("network", "connect", "--alias", "edge-watchdog", stack.networks.edgeControl, watchdogName);
-  await waitFor(
-    "verified watchdog enforcement on Caddy",
-    async () => {
-      const status = await docker(
-        "exec",
-        watchdogName,
-        "bun",
-        "--eval",
-        'const r = await fetch("http://127.0.0.1:2021/v1/supervise?proxy=caddy"); console.log(r.ok ? "ready" : "no")',
-      );
-      return status === "ready" ? true : undefined;
-    },
-    30_000,
-    500,
-  );
-}
-
-/** `edge.apply` as the domain worker runs it: the production writeEdge on edge-control (forced /load). */
-async function edgeApply() {
-  const output = await docker(
-    "run",
-    "--rm",
-    "--network",
-    stack.networks.edgeControl,
-    "--user",
-    "1000:1000",
-    "--env",
-    "HOME=/tmp",
-    "--env",
-    "ARK_EDGE_DIR=/edge",
-    "--env",
-    "ARK_EDGE_RELOAD_URL=http://edge-admin:2019",
-    "--env",
-    "ARK_ACME_WEBROOT=/var/lib/ark/acme",
-    "--volume",
-    `${bundles.writeEdge}:/harness:ro`,
-    "--volume",
-    `${edgeDir}:/edge`,
-    "--workdir",
-    "/tmp",
-    bunImage,
-    "bun",
-    "/harness/write-edge.js",
-    "write",
-    JSON.stringify(fixturePlan()),
-  );
-  return JSON.parse(output) as { applied: boolean; httpRoutes: string[]; stoppedForStreams?: string[] };
-}
+let edge!: GateEdge;
+const edgeApply = () => edge.edgeApply(fixturePlan(edge.peerIp));
+const overdue = {
+  add: (id: string) => edge.overdue.add(id),
+  delete: (id: string) => edge.overdue.delete(id),
+};
 
 type Seen = { method: string; uri: string; host: string; token: boolean; headers: Record<string, string> };
-async function seenBy(container: string) {
-  const output = await docker(
-    "exec",
-    container,
-    "bun",
-    "--eval",
-    'console.log(JSON.stringify(await (await fetch("http://127.0.0.1:3000/__seen")).json()))',
-  );
-  return JSON.parse(output) as unknown[];
-}
-const apiSeen = async () => (await seenBy(apiName)) as Seen[];
-const upstreamSeen = async () => (await seenBy(peerName)) as string[];
+const apiSeen = async () => (await edge.seen(edge.apiName)) as Seen[];
+const upstreamSeen = async () => (await edge.seen(edge.peerName)) as string[];
 
 let httpsPort = 0;
 
@@ -640,7 +362,7 @@ async function forwardAuthTest(report: Report) {
     "with a session the upstream sees X-Ark-User and its own cookies, never the gate cookies, the edge token or a forged identity",
     `${headers.status} user=${seen["x-ark-user"]} cookie=${JSON.stringify(seen.cookie)} token=${"x-ark-edge-token" in seen}`,
   );
-  const check = (await apiSeen()).filter((item) => item.uri.startsWith("/api/gate/check")).at(-1);
+  const check = (await apiSeen()).findLast((item) => item.uri.startsWith("/api/gate/check"));
   expect(
     report,
     Boolean(check?.token) && check?.headers["x-forwarded-uri"] === "/headers",
@@ -837,9 +559,9 @@ async function watchdogFailClosedTest(report: Report) {
   );
   expect(
     report,
-    events.some((event) => event.event === "withdrawn"),
+    edge.events.some((event) => event.event === "withdrawn"),
     "the watchdog reports the withdrawal (the API raises the critical alert)",
-    events.map((event) => event.event).join(",") || "none",
+    edge.events.map((event) => event.event).join(",") || "none",
   );
   // The durable retry's forced reload succeeds: the API marks the revocation applied.
   overdue.delete("rt_k3x9");
@@ -880,9 +602,31 @@ async function run(name: string, test: (report: Report) => Promise<void>) {
 
 let failed = false;
 try {
-  await prepareFiles();
-  await startContainers();
-  httpsPort = await stack.hostPort(443);
+  edge = await startGateEdge({
+    runtime,
+    directory,
+    name: runName,
+    gateToken,
+    hostnames: [wwwHost, siblingHost],
+    policy: (peerIp) =>
+      fixtureRoutes(peerIp).map(({ id, hostname, stableId, ip, port }) => ({
+        id,
+        kind: "http",
+        hostname,
+        stableId,
+        ip,
+        port,
+      })),
+    api: {
+      entry: join(fixtures, "gate-api.ts"),
+      env: {
+        ARK_EDGE_GATE_TOKEN: gateToken,
+        GATE_ROUTES: JSON.stringify(gateRoutes),
+        GATE_SESSIONS: JSON.stringify(gateSessions),
+      },
+    },
+  });
+  httpsPort = edge.httpsPort;
   const applied = await edgeApply();
   if (!applied.applied || applied.httpRoutes.join() !== "rt_b1,rt_k3x9")
     throw new Error(`edge.apply did not load both SSO routes: ${JSON.stringify(applied)}`);
@@ -902,8 +646,7 @@ try {
   console.error(`\n${(error as Error).stack ?? error}`);
   await runtime.dumpLogs();
 } finally {
-  leaseApi.stop(true);
-  await runtime.cleanup();
   removeSignalHandlers();
+  await cleanupGateEdge(runtime, runName, edge);
 }
 process.exit(failed ? 1 : 0);
