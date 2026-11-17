@@ -339,6 +339,6 @@ test("generation and explicit config-file hides survive both full and closed ren
   const input = { ...base, adminMode: "tailnet" as const, generation: "test-generation" };
   const closed = renderCaddyfile(input);
   expect(closed).toContain("vars ark_edge_generation test-generation");
-  expect(closed).toContain("hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed");
+  expect(closed).toContain("hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed ./Caddyfile");
   expect(() => renderCaddyfile({ ...input, generation: "unsafe\nvalue" })).toThrow("Invalid edge generation");
 });

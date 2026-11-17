@@ -331,7 +331,7 @@ ${input.generation ? `  vars ark_edge_generation ${input.generation}\n` : ""}  @
     root * ${input.challengeDir}
     # Explicit hides keep CLI and admin-API adaptation identical for guarded restoration.
     file_server {
-      hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed
+      hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed ./Caddyfile
     }
   }
 ${known}  handle {
