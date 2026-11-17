@@ -705,7 +705,7 @@ export const clientCertificates = pgTable(
     keySecretId: text("key_secret_id").references(() => secrets.id),
     status: text("status").$type<"issued" | "revoked" | "expired">().notNull().default("issued"),
     rolloverState: text("rollover_state")
-      .$type<"current" | "pending" | "delivered" | "superseded">()
+      .$type<"current" | "pending" | "delivered" | "superseded" | "retired">()
       .notNull()
       .default("current"),
     supersededBy: text("superseded_by").references((): AnyPgColumn => clientCertificates.id),
@@ -713,17 +713,62 @@ export const clientCertificates = pgTable(
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     revokedReason: text("revoked_reason"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    // 0020 (FD-28): one-time reveal of a rollover successor, and retirement completion.
+    trustAppliedAt: timestamp("trust_applied_at", { withTimezone: true }),
+    revealedAt: timestamp("revealed_at", { withTimezone: true }),
+    retiredAt: timestamp("retired_at", { withTimezone: true }),
   },
   (table) => [
     check("client_certificates_status_check", sql`${table.status} IN ('issued', 'revoked', 'expired')`),
     check(
       "client_certificates_rollover_state_check",
-      sql`${table.rolloverState} IN ('current', 'pending', 'delivered', 'superseded')`,
+      sql`${table.rolloverState} IN ('current', 'pending', 'delivered', 'superseded', 'retired')`,
     ),
     unique("client_certificates_ca_id_serial_key").on(table.caId, table.serial),
     uniqueIndex("client_certificates_successor_unique")
       .on(table.supersededBy)
       .where(sql`superseded_by IS NOT NULL`),
+    index("client_certificates_issued_not_after_idx")
+      .on(table.notAfter)
+      .where(sql`status = 'issued'`),
+  ],
+);
+
+/**
+ * 0020 (FD-28): the durable retirement task of one certificate generation (§3.10.4 step 4).
+ * The timestamps are the measured fence → reload → drain → reopen timeline.
+ */
+export const clientCertificateRetirements = pgTable(
+  "client_certificate_retirements",
+  {
+    certificateId: text("certificate_id")
+      .primaryKey()
+      .references(() => clientCertificates.id, { onDelete: "cascade" }),
+    clientId: text("client_id")
+      .notNull()
+      .references(() => databaseClients.id, { onDelete: "cascade" }),
+    role: text("role").notNull(),
+    databaseName: text("database_name").notNull(),
+    notAfter: timestamp("not_after", { withTimezone: true }).notNull(),
+    deadline: timestamp("deadline", { withTimezone: true }).notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    lastError: text("last_error"),
+    fencedAt: timestamp("fenced_at", { withTimezone: true }),
+    reloadedAt: timestamp("reloaded_at", { withTimezone: true }),
+    drainedAt: timestamp("drained_at", { withTimezone: true }),
+    reopenedAt: timestamp("reopened_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    deadlineMissed: boolean("deadline_missed").notNull().default(false),
+    watchdogAt: timestamp("watchdog_at", { withTimezone: true }),
+    evidence: jsonb("evidence").$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("client_certificate_retirements_open_idx")
+      .on(table.deadline)
+      .where(sql`completed_at IS NULL`),
   ],
 );
 

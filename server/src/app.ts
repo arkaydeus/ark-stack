@@ -35,6 +35,10 @@ import {
   databaseInput,
   databaseClientInput,
   defaultClientRoleKind,
+  earlyRolloverInput,
+  rolloverConfirmInput,
+  RETIREMENT_ALERT_PREFIX,
+  ROLLOVER_ALERT_PREFIX,
   projectInput,
   serviceInput,
   sqlInput,
@@ -46,6 +50,8 @@ import {
   dbIngressLimitsInput,
   dbIngressLimitsSummary,
   platformDbIngressLimits,
+  frontRouteCreateInput,
+  frontRouteUpdateInput,
   buildDomainPlan,
   nextBackupStatus,
   redactLogLine,
@@ -90,6 +96,19 @@ import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
 import { frontAclSnippet } from "./modules/front-acl.ts";
+import {
+  FrontRouteError,
+  commitRouteCreate,
+  commitRouteDelete,
+  commitRouteEnable,
+  commitRouteUpdate,
+  disableRoute,
+  listFrontRoutes,
+  prepareRouteCreate,
+  prepareRouteDelete,
+  prepareRouteEnable,
+  prepareRouteUpdate,
+} from "./modules/front-routes.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, tailnetOverview } from "./modules/edge-observe.ts";
 import { raiseAlert } from "./modules/alerts.ts";
 import {
@@ -104,6 +123,12 @@ import {
   consumeClientIssueAttempt,
   revealDatabaseClient,
 } from "./modules/db-clients.ts";
+import {
+  confirmRolloverDelivery,
+  queueEarlyRollover,
+  revealRolloverSuccessor,
+  rolloverStatus,
+} from "./modules/db-client-rollover.ts";
 import { CLIENT_KEY_SECRET_KIND, PkiPolicyError, validateCsr } from "./modules/pki.ts";
 import { cancelWorkspaceQuery } from "./modules/database.ts";
 import { writeApprovedCompose } from "./modules/docker.ts";
@@ -176,6 +201,7 @@ app.onError((error, c) => {
   // server fault, so they belong in the response rather than only in the log.
   if (error instanceof ValidationError) return c.json({ error: error.message }, 422);
   if (error instanceof DatabaseClientError) return c.json({ error: error.message }, error.status);
+  if (error instanceof FrontRouteError) return c.json({ error: error.message }, error.status);
   // CSR and CA policy refusals (CsrError included) describe the submitted input; no key material.
   if (error instanceof PkiPolicyError) return c.json({ error: error.message }, 422);
   console.error(error instanceof Error ? error.message : error);
@@ -546,12 +572,17 @@ app.get("/api/metrics/prometheus", async (c) => {
   if (!secureEqual(c.req.header("authorization") ?? "", `Bearer ${env.metricsToken}`)) {
     throw new HTTPException(401, { message: "Invalid metrics credential." });
   }
-  const [opRows, backupRows, certRows, heartbeatRows] = await Promise.all([
+  const [opRows, backupRows, certRows, heartbeatRows, openAlerts] = await Promise.all([
     db.select().from(operations),
     db.select().from(backups),
     db.select().from(certificates),
     db.select().from(workerHeartbeats),
+    db
+      .select({ dedupKey: alerts.dedupKey, severity: alerts.severity })
+      .from(alerts)
+      .where(isNull(alerts.resolvedAt)),
   ]);
+  const rolloverAlerts = openAlerts.filter((item) => item.dedupKey.startsWith(ROLLOVER_ALERT_PREFIX));
   const lines = [
     "# TYPE ark_operations gauge",
     `ark_operations{status="failed"} ${opRows.filter((item) => item.status === "failed").length}`,
@@ -567,6 +598,16 @@ app.get("/api/metrics/prometheus", async (c) => {
       const item = heartbeatRows.find((row) => row.identity === identity);
       return `ark_worker_heartbeat_stale{identity="${identity}"} ${!item || Date.now() - item.lastSeenAt.getTime() > 90_000 ? 1 : 0}`;
     }),
+    // Database client certificate rollover (front door §3.10.4, FD-28): open rollover-pending
+    // alerts by severity (info at T−30, warning at T−14, critical at T−7) and open retirement
+    // (drain) failures, which are always critical.
+    "# TYPE ark_db_client_rollover_pending gauge",
+    ...(["info", "warning", "critical"] as const).map(
+      (severity) =>
+        `ark_db_client_rollover_pending{severity="${severity}"} ${rolloverAlerts.filter((item) => item.severity === severity).length}`,
+    ),
+    "# TYPE ark_db_client_retirement_failures gauge",
+    `ark_db_client_retirement_failures ${openAlerts.filter((item) => item.dedupKey.startsWith(RETIREMENT_ALERT_PREFIX)).length}`,
     // nft drop counters for the public database port (front door §3.11, FD-18), written by the
     // host-namespace database-ingress reconciler. A missing or unreadable snapshot reports 0.
     ...dbIngressCounterMetrics(await readDbIngressCounters()),
@@ -1957,6 +1998,104 @@ app.get("/api/databases/:id/clients/:clientId/vercel", async (c) => {
   return c.json(await databaseClientVercelGuide(c.req.param("id"), c.req.param("clientId")));
 });
 
+// ---- Database client certificate rollover (front door §3.10.4, FD-28) ---------------------------
+// Owner-only. The early rollover needs MFA plus a single-use `credential.rotate` grant bound to
+// the request; revealing the successor needs `secret.reveal`; confirming delivery needs MFA.
+
+app.get("/api/databases/:id/clients/:clientId/rollover", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(
+    await rolloverStatus({
+      databaseId: c.req.param("id"),
+      clientId: c.req.param("clientId"),
+      now: new Date(),
+    }),
+  );
+});
+
+app.post("/api/databases/:id/clients/:clientId/rollover", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const databaseId = c.req.param("id");
+  const clientId = c.req.param("clientId");
+  const request = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const input = earlyRolloverInput.parse(request);
+  if (input.csrPem !== undefined) validateCsr(input.csrPem);
+  const client = await getDatabaseClient(databaseId, clientId);
+  if (!client) throw new HTTPException(404, { message: "Database client not found." });
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", { databaseId, clientId, rollover: true, ...request }),
+  );
+  const { operation, predecessor } = await queueEarlyRollover({
+    databaseId,
+    clientId,
+    actorId: access.userId,
+    csrPem: input.csrPem,
+  });
+  await audit(
+    access.userId,
+    "database.client_rollover",
+    "database",
+    databaseId,
+    {
+      clientId,
+      early: true,
+      predecessorId: predecessor.id,
+      predecessorNotAfter: predecessor.notAfter.toISOString(),
+      keySource: input.csrPem === undefined ? "generated" : "csr",
+    },
+    operation.id,
+    access.role,
+  );
+  return c.json({ clientId, operationId: operation.id, predecessorId: predecessor.id }, 202);
+});
+
+app.post("/api/databases/:id/clients/:clientId/rollover/reveal", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const databaseId = c.req.param("id");
+  const clientId = c.req.param("clientId");
+  const client = await getDatabaseClient(databaseId, clientId);
+  if (!client) throw new HTTPException(404, { message: "Database client not found." });
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "secret.reveal",
+    privilegedRequestHash("secret.reveal", { databaseId, clientId, rollover: true }),
+  );
+  const bundle = await revealRolloverSuccessor({
+    databaseId,
+    clientId,
+    actorId: access.userId,
+    actorRole: access.role,
+  });
+  c.header("cache-control", "no-store");
+  return c.json(bundle);
+});
+
+app.post("/api/databases/:id/clients/:clientId/rollover/confirm", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const input = rolloverConfirmInput.parse(await c.req.json());
+  return c.json(
+    await confirmRolloverDelivery({
+      databaseId: c.req.param("id"),
+      clientId: c.req.param("clientId"),
+      certificateId: input.certificateId,
+      actorId: access.userId,
+      actorRole: access.role,
+      source: "manual",
+      now: new Date(),
+    }),
+  );
+});
+
 app.get("/api/mail/queue", async (c) => {
   const access = c.get("access");
   requireOperator(access);
@@ -2712,6 +2851,134 @@ app.get("/api/front/routes/:id/acl", async (c) => {
   const snippet = await frontAclSnippet({ kind: "route", routeId: c.req.param("id") });
   if (!snippet) throw new HTTPException(404, { message: "Route not found." });
   return c.json(snippet);
+});
+
+// HTTP route lifecycle (front door §3.3, §3.13, §3.14, FD-08). Every role may list routes; every
+// change is owner-only (R12) with MFA. Creating, enabling and loosening need a single-use
+// `exposure.public` grant bound to the exact request, deleting a `resource.delete` grant, and
+// disabling (a tightening) none. Final validation, grant consumption and mutation commit together.
+app.get("/api/front/routes", async (c) => {
+  return c.json({ routes: await listFrontRoutes() });
+});
+
+app.get("/api/front/routes/:id", async (c) => {
+  const [route] = await listFrontRoutes(c.req.param("id"));
+  if (!route) throw new HTTPException(404, { message: "Route not found." });
+  return c.json({ route });
+});
+
+app.post("/api/front/routes", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const request = (await c.req.json()) as Record<string, unknown>;
+  const plan = await prepareRouteCreate(frontRouteCreateInput.parse(request));
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "exposure.public",
+      privilegedRequestHash("exposure.public", request),
+      tx,
+    );
+  const actor = { userId: access.userId, role: access.role };
+  const { routeId, observeOperationId } = await commitRouteCreate(plan, actor, enqueue, authorize);
+  const [route] = await listFrontRoutes(routeId);
+  return c.json(
+    {
+      route,
+      records: plan.records.map((record) => ({
+        type: record.type,
+        name: record.name,
+        relativeName: record.relativeName,
+        value: record.value,
+        ttl: record.ttl,
+        required: record.required,
+      })),
+      acl: await frontAclSnippet({ kind: "route", routeId }),
+      operationId: observeOperationId,
+    },
+    201,
+  );
+});
+
+app.patch("/api/front/routes/:id", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  const request = (await c.req.json()) as Record<string, unknown>;
+  const plan = await prepareRouteUpdate(routeId, frontRouteUpdateInput.parse(request));
+  const authorize = plan.loosening.length
+    ? (tx: import("./db.ts").DbTransaction) =>
+        requirePrivileged(
+          access,
+          c.get("session"),
+          "exposure.public",
+          privilegedRequestHash("exposure.public", { routeId, ...request }),
+          tx,
+        )
+    : undefined;
+  const { status } = await commitRouteUpdate(
+    plan,
+    { userId: access.userId, role: access.role },
+    enqueue,
+    authorize,
+  );
+  const [route] = await listFrontRoutes(routeId);
+  return c.json({ route, status, loosening: plan.loosening });
+});
+
+app.post("/api/front/routes/:id/enable", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  const plan = await prepareRouteEnable(routeId);
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "exposure.public",
+      privilegedRequestHash("exposure.public", { routeId }),
+      tx,
+    );
+  await commitRouteEnable(plan, { userId: access.userId, role: access.role }, enqueue, authorize);
+  const [route] = await listFrontRoutes(routeId);
+  return c.json({ route });
+});
+
+app.post("/api/front/routes/:id/disable", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  await disableRoute(routeId, { userId: access.userId, role: access.role }, enqueue);
+  const [route] = await listFrontRoutes(routeId);
+  return c.json({ route });
+});
+
+app.delete("/api/front/routes/:id", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  const plan = await prepareRouteDelete(routeId);
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "resource.delete",
+      privilegedRequestHash("resource.delete", { routeId }),
+      tx,
+    );
+  const result = await commitRouteDelete(
+    plan,
+    { userId: access.userId, role: access.role },
+    enqueue,
+    authorize,
+  );
+  return c.json({ id: routeId, ...result });
 });
 
 app.get("/api/metrics", async (c) => {

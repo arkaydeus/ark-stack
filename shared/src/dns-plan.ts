@@ -150,6 +150,63 @@ function addressRecords(
   return records;
 }
 
+export type Ipv6Status = "unchecked" | "passed" | "failed" | "not_present";
+
+/** Effective AAAA for a domain (R9): the IPv6 preflight passed and the domain's switch is on. */
+export function aaaaAllowed(input: {
+  publicIpv6?: string | null;
+  ipv6Status: Ipv6Status | string;
+  aaaaEnabled: boolean;
+}) {
+  return Boolean(input.publicIpv6) && input.ipv6Status === "passed" && input.aaaaEnabled;
+}
+
+/**
+ * Address records for a front-door route hostname (§3.13.1): an A record for the public IPv4,
+ * always, and an AAAA record only when `aaaaAllowed`. A published AAAA is required, because a
+ * broken one breaks IPv6 clients and Let's Encrypt (which prefers IPv6). Apex and `www` need no
+ * special casing: Ark only writes A/AAAA, never a CNAME at the apex.
+ */
+export function routeAddressRecords(input: {
+  hostname: string;
+  zone: string;
+  publicIpv4: string;
+  publicIpv6?: string | null;
+  ipv6Status: Ipv6Status | string;
+  aaaaEnabled: boolean;
+  purpose: string;
+}): DnsRecordPlan[] {
+  const hostname = normalizeHostname(input.hostname);
+  const zone = normalizeHostname(input.zone);
+  if (hostname !== zone && !hostname.endsWith(`.${zone}`)) {
+    throw new Error(`${hostname} is not inside the domain ${zone}.`);
+  }
+  const relativeName = relativeDnsName(hostname, zone);
+  const records: DnsRecordPlan[] = [
+    {
+      type: "A",
+      name: hostname,
+      relativeName,
+      value: input.publicIpv4,
+      ttl: 300,
+      purpose: input.purpose,
+      required: true,
+    },
+  ];
+  if (aaaaAllowed(input)) {
+    records.push({
+      type: "AAAA",
+      name: hostname,
+      relativeName,
+      value: input.publicIpv6!,
+      ttl: 300,
+      purpose: `${input.purpose} (IPv6)`,
+      required: true,
+    });
+  }
+  return records;
+}
+
 export function mergeSpf(existing: string | null | undefined, proposed: string) {
   if (!existing) return proposed;
   const mechanisms = new Set(

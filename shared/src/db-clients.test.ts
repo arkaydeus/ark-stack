@@ -9,8 +9,14 @@ import {
   clientRoleSql,
   databaseClientGuide,
   databaseClientInput,
+  databaseClientRolloverGuide,
+  clientRolloverStatus,
   defaultClientRoleKind,
+  earlyRolloverInput,
   revokedClientRoleSql,
+  rolloverAlertLevel,
+  rolloverAlertTitle,
+  rolloverDue,
 } from "./db-clients.ts";
 import { platformRegions, regionProfiles } from "./region.ts";
 
@@ -159,5 +165,88 @@ describe("Vercel guide (§3.12)", () => {
     expect(values.ARK_DB_PASSWORD?.sensitive).toBe(true);
     expect(values.ARK_DB_HOST?.sensitive).toBe(false);
     expect(filled.vercelRegion).toBe("fra1");
+  });
+});
+
+const rolloverCert = (
+  id: string,
+  rolloverState: string,
+  status = "issued",
+  supersededBy: string | null = null,
+) => ({
+  id,
+  status,
+  rolloverState,
+  supersededBy,
+});
+
+describe("automatic rollover (§3.10.4, FD-28)", () => {
+  const DAY = 86_400_000;
+  const notAfter = new Date("2027-04-01T00:00:00Z");
+  const before = (days: number, ms = 0) => new Date(notAfter.getTime() - days * DAY + ms);
+
+  test("the successor is due from T−30", () => {
+    expect(rolloverDue(notAfter, before(31))).toBe(false);
+    expect(rolloverDue(notAfter, before(30, -1))).toBe(false);
+    expect(rolloverDue(notAfter, before(30))).toBe(true);
+    expect(rolloverDue(notAfter, before(1))).toBe(true);
+  });
+
+  test("the pending alert is info at T−30, warning at T−14, critical at T−7 and after expiry", () => {
+    expect(rolloverAlertLevel(notAfter, before(31))).toBeNull();
+    expect(rolloverAlertLevel(notAfter, before(30))).toBe("info");
+    expect(rolloverAlertLevel(notAfter, before(15))).toBe("info");
+    expect(rolloverAlertLevel(notAfter, before(14))).toBe("warning");
+    expect(rolloverAlertLevel(notAfter, before(8))).toBe("warning");
+    expect(rolloverAlertLevel(notAfter, before(7))).toBe("critical");
+    expect(rolloverAlertLevel(notAfter, before(-3))).toBe("critical");
+    expect(rolloverAlertTitle({ role: "a_b_production", notAfter, now: before(14) })).toMatch(
+      /expires in 14 day\(s\)/,
+    );
+    expect(rolloverAlertTitle({ role: "a_b_production", notAfter, now: before(-1), needsCsr: true })).toMatch(
+      /expired .* before its successor was delivered\. submit a CSR/,
+    );
+  });
+
+  test("client rollover status: none → pending → delivered → retired", () => {
+    expect(clientRolloverStatus([rolloverCert("n", "current")])).toBe("none");
+    expect(
+      clientRolloverStatus([rolloverCert("n", "current", "issued", "n1"), rolloverCert("n1", "pending")]),
+    ).toBe("pending");
+    expect(
+      clientRolloverStatus([rolloverCert("n", "superseded", "issued", "n1"), rolloverCert("n1", "current")]),
+    ).toBe("delivered");
+    expect(
+      clientRolloverStatus([rolloverCert("n", "retired", "expired", "n1"), rolloverCert("n1", "current")]),
+    ).toBe("retired");
+  });
+
+  test("the guided rollover step changes only the certificate and key values (§3.12)", () => {
+    const placeholder = databaseClientRolloverGuide({ environment: "production" });
+    expect(placeholder.env.map((item) => item.name)).toEqual([
+      "ARK_DB_CLIENT_CERT_B64",
+      "ARK_DB_CLIENT_KEY_B64",
+    ]);
+    expect(placeholder.commands).toBe(
+      [
+        "# Reveal the new bundle once in Ark (step-up), then:",
+        "base64 -i client-next.crt | tr -d '\\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive --force",
+        "base64 -i client-next.key | tr -d '\\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive --force",
+        "vercel deploy --prod        # or redeploy from the dashboard",
+        '# Then press "Confirm rollover" in Ark.',
+        "",
+      ].join("\n"),
+    );
+    // §3.12's manual rollover block, as documented.
+    for (const line of placeholder.commands.trim().split("\n").slice(1, 3)) expect(design).toContain(line);
+    const real = databaseClientRolloverGuide({
+      environment: "preview",
+      secrets: { certPem: "CERT", keyPem: "KEY" },
+    });
+    expect(real.env.map((item) => Buffer.from(item.value, "base64").toString())).toEqual(["CERT", "KEY"]);
+    expect(real.commands).toContain("vercel deploy        #");
+    expect(earlyRolloverInput.safeParse({}).success).toBe(true);
+    expect(earlyRolloverInput.safeParse({ csrPem: "nope" }).success).toBe(false);
+    expect(earlyRolloverInput.safeParse({ extra: 1 }).success).toBe(false);
   });
 });

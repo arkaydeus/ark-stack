@@ -9,6 +9,8 @@ import { PGBOUNCER_FILES } from "@ark-stack/shared";
 
 import {
   PgbouncerReloadError,
+  RetirementError,
+  assertDrainedByDeadline,
   denyAllCaPem,
   normalizeFingerprint,
   killRoleClients,
@@ -17,6 +19,7 @@ import {
   roleClientIds,
   reloadAndVerify,
   renderPgbouncerFiles,
+  retireGeneration,
   writePgbouncerFiles,
   type PlanClient,
 } from "./pgbouncer.ts";
@@ -240,10 +243,17 @@ describe("reloadAndVerify", () => {
     expect(normalizeFingerprint("AB:CD:EF")).toBe("abcdef");
   });
 
-  test("the console client refuses anything but RELOAD, SHOW and KILL_CLIENT <id>", async () => {
+  test("the console client refuses anything but RELOAD, SHOW, KILL_CLIENT <id> and the FD-28 fence", async () => {
     for (const command of [
       "SHUTDOWN",
       "KILL appdb",
+      "DISABLE",
+      "DISABLE appdb; SHUTDOWN",
+      "ENABLE Appdb",
+      "PAUSE appdb",
+      "SET client_login_timeout = 0",
+      "SET client_login_timeout = 1; SHUTDOWN",
+      "SET max_client_conn = 1",
       "RELOAD; SHUTDOWN",
       "set x = 1",
       "KILL_CLIENT",
@@ -259,5 +269,237 @@ describe("reloadAndVerify", () => {
   test("revocation kills only a valid login role, never the console administrator", async () => {
     await expect(roleClientIds("bad role'; --", { password: "x" })).rejects.toThrow(/Invalid PgBouncer role/);
     await expect(killRoleClients("ark_pgbouncer_admin", { password: "x" })).rejects.toThrow(/administrator/);
+  });
+});
+
+// ---- FD-28 generation retirement (fence, reload, role and pre-auth drain, reopen) ---------------
+
+const stamp = (ms: number) =>
+  new Date(ms)
+    .toISOString()
+    .replace("T", " ")
+    .replace(/\.\d+Z$/, " UTC");
+
+/** A console that behaves like PgBouncer 1.26's: SHOW CLIENTS omits pre-auth (login) clients. */
+function fakeConsole(input: {
+  clients: Array<{ id: string; user: string }>;
+  logins?: Array<{ connectAt: number }>;
+  clock: { now: number };
+  /** Role whose sessions KILL_CLIENT cannot close (a stuck socket). */
+  stuckRole?: string;
+}) {
+  const commands: string[] = [];
+  let clients = [...input.clients];
+  let logins = [...(input.logins ?? [])];
+  let loginTimeout = 10;
+  let disabled = false;
+  const admin = async (command: string) => {
+    commands.push(command);
+    // The janitor closes logins older than client_login_timeout (it runs every ~1/3 s).
+    logins = logins.filter((item) => input.clock.now - item.connectAt <= loginTimeout * 1000);
+    if (command.startsWith("DISABLE ")) disabled = true;
+    else if (command.startsWith("ENABLE ")) disabled = false;
+    else if (command.startsWith("SET client_login_timeout = ")) loginTimeout = Number(command.split("= ")[1]);
+    else if (command === "SHOW CLIENTS") return clients.map((item) => ({ ...item, state: "active" }));
+    else if (command === "SHOW SOCKETS")
+      return [
+        ...clients.map((item) => ({ ...item, state: "cl_active", connect_time: stamp(0) })),
+        ...logins.map((item, index) => ({
+          id: String(900 + index),
+          user: "",
+          state: "cl_login",
+          connect_time: stamp(item.connectAt),
+        })),
+      ];
+    else if (command.startsWith("KILL_CLIENT ")) {
+      const id = command.split(" ")[1];
+      clients = clients.filter((item) => item.id !== id || item.user === input.stuckRole);
+    }
+    return [];
+  };
+  return { admin, commands, state: () => ({ clients, logins, disabled, loginTimeout }) };
+}
+
+async function refusingConsole(): Promise<never> {
+  throw new Error("must not be called");
+}
+
+describe("retireGeneration (§3.10.4 step 4)", () => {
+  const start = Date.parse("2027-04-01T00:00:00Z");
+
+  test("fences, reloads, kills the role and waits out pre-reload logins, then reopens by the deadline", async () => {
+    const clock = { now: start };
+    const pgb = fakeConsole({
+      clients: [
+        { id: "11", user: "appdb_shop_production" },
+        { id: "12", user: "appdb_shop_production" },
+        { id: "13", user: "appdb_other_production" },
+      ],
+      // A handshake completed with the old certificate just before the reload, still logging in.
+      logins: [{ connectAt: start - 400 }],
+      clock,
+    });
+    let applied = false;
+    const result = await retireGeneration({
+      database: "appdb",
+      role: "appdb_shop_production",
+      deadline: new Date(start + 5_000),
+      admin: pgb.admin,
+      apply: async () => {
+        expect(pgb.commands).toEqual(["DISABLE appdb"]); // fenced before the reduced bundle loads
+        applied = true;
+        clock.now += 15;
+      },
+      clock: () => clock.now,
+      sleep: async (ms) => {
+        clock.now += Math.max(ms, 340);
+      },
+    });
+    expect(applied).toBe(true);
+    expect(pgb.commands[0]).toBe("DISABLE appdb");
+    expect(pgb.commands[1]).toBe("SET client_login_timeout = 1");
+    expect(pgb.commands).toContain("KILL_CLIENT 11");
+    expect(pgb.commands).toContain("KILL_CLIENT 12");
+    expect(pgb.commands).not.toContain("KILL_CLIENT 13");
+    expect(pgb.commands.slice(-2)).toEqual(["SET client_login_timeout = 10", "ENABLE appdb"]);
+    expect(pgb.state()).toMatchObject({ disabled: false, loginTimeout: 10, logins: [] });
+    expect(pgb.state().clients).toEqual([{ id: "13", user: "appdb_other_production" }]);
+    expect(result.killedRoleClients).toBe(2);
+    expect(result.preAuthWaited).toBe(1);
+    expect(result.withinDeadline).toBe(true);
+    expect(result.fencedAt).toBeLessThanOrEqual(result.reloadedAt);
+    expect(result.drainedAt).toBeLessThan(start + 5_000);
+    expect(result.reopenedAt).toBeGreaterThanOrEqual(result.drainedAt);
+  });
+
+  test("logins that start after the reload do not hold the fence", async () => {
+    const clock = { now: start };
+    const pgb = fakeConsole({ clients: [], clock });
+    const result = await retireGeneration({
+      database: "appdb",
+      role: "appdb_shop_production",
+      deadline: new Date(start + 5_000),
+      admin: async (command) => {
+        if (command === "SHOW SOCKETS")
+          return [{ id: "1", user: "", state: "cl_login", connect_time: "2027-04-01 00:00:03 UTC" }];
+        return pgb.admin(command);
+      },
+      apply: async () => undefined,
+      clock: () => clock.now,
+      sleep: async (ms) => {
+        clock.now += ms;
+      },
+    });
+    expect(result.preAuthWaited).toBe(0);
+    expect(result.iterations).toBe(1);
+  });
+
+  test("a session that survives KILL_CLIENT fails the deadline and leaves the fence in place", async () => {
+    const clock = { now: start };
+    const pgb = fakeConsole({
+      clients: [{ id: "21", user: "appdb_shop_production" }],
+      clock,
+      stuckRole: "appdb_shop_production",
+    });
+    const failure = await retireGeneration({
+      database: "appdb",
+      role: "appdb_shop_production",
+      deadline: new Date(start + 5_000),
+      admin: pgb.admin,
+      apply: async () => undefined,
+      clock: () => clock.now,
+      sleep: async () => {
+        clock.now += 500;
+      },
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RetirementError);
+    expect((failure as Error).message).toMatch(/exhausted its recovery budget/);
+    expect((failure as RetirementError).timeline.withinDeadline).toBe(false);
+    expect((failure as RetirementError).timeline.reloadedAt).toBe(start);
+    expect(pgb.commands).not.toContain("ENABLE appdb");
+    expect(pgb.state().disabled).toBe(true);
+  });
+
+  test("a verified late drain returns its timeline and still reopens", async () => {
+    const clock = { now: start + 6_000 };
+    const pgb = fakeConsole({ clients: [{ id: "9", user: "appdb_shop_production" }], clock });
+    const result = await retireGeneration({
+      database: "appdb",
+      role: "appdb_shop_production",
+      deadline: new Date(start + 5_000),
+      admin: pgb.admin,
+      apply: async () => undefined,
+      clock: () => clock.now,
+      sleep: async (ms) => {
+        clock.now += ms;
+      },
+    });
+    expect(result.withinDeadline).toBe(false);
+    expect(result.drainedAt).toBeGreaterThan(start + 5_000);
+    expect(pgb.state().disabled).toBe(false);
+    expect(pgb.commands).toContain("ENABLE appdb");
+  });
+
+  test("an unresolved admin command or apply has a bounded attempt and never reopens", async () => {
+    for (const hangApply of [false, true]) {
+      const commands: string[] = [];
+      const error = await retireGeneration({
+        database: "appdb",
+        role: "appdb_shop_production",
+        deadline: new Date(Date.now() - 10),
+        recoveryBudgetMs: 20,
+        admin: async (command) => {
+          commands.push(command);
+          return hangApply ? [] : new Promise(() => {});
+        },
+        apply: async () => new Promise(() => {}),
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(RetirementError);
+      expect((error as Error).message).toMatch(/timed out/);
+      expect(commands).not.toContain("ENABLE appdb");
+    }
+  });
+
+  test("ENABLE is best-effort when the database left [databases] with the reload", async () => {
+    const clock = { now: start };
+    const pgb = fakeConsole({ clients: [], clock });
+    const result = await retireGeneration({
+      database: "appdb",
+      role: "appdb_shop_production",
+      deadline: new Date(start + 5_000),
+      admin: async (command) => {
+        if (command.startsWith("ENABLE")) throw new Error("no such database: appdb");
+        return pgb.admin(command);
+      },
+      apply: async () => ({ databaseMapped: false }),
+      clock: () => clock.now,
+    });
+    expect(result.reopenSkipped).toBe("database no longer mapped");
+  });
+
+  test("refuses the administrator and malformed names before touching the console", async () => {
+    const base = { deadline: new Date(start), admin: refusingConsole, apply: async () => undefined };
+    await expect(
+      retireGeneration({ ...base, database: "appdb", role: "ark_pgbouncer_admin" }),
+    ).rejects.toThrow(/administrator/);
+    await expect(retireGeneration({ ...base, database: "appdb", role: "bad role" })).rejects.toThrow(
+      /Invalid/,
+    );
+    await expect(retireGeneration({ ...base, database: "app db", role: "appdb_x_y" })).rejects.toThrow(
+      /Invalid/,
+    );
+  });
+
+  test("expiry without a drain is a failure", () => {
+    const deadline = new Date(start + 5_000);
+    expect(() =>
+      assertDrainedByDeadline({ role: "r", deadline, observedAt: new Date(start + 6_000), sessions: 1 }),
+    ).toThrow(/still open after the retirement deadline/);
+    expect(
+      assertDrainedByDeadline({ role: "r", deadline, observedAt: new Date(start + 6_000), sessions: 0 }),
+    ).toBe(true);
+    expect(() =>
+      assertDrainedByDeadline({ role: "r", deadline, observedAt: new Date(start + 1_000), sessions: 0 }),
+    ).toThrow(/has not passed/);
   });
 });

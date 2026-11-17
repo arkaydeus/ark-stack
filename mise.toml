@@ -58,7 +58,7 @@ run = [
 ]
 
 [tasks."test:pgbouncer"]
-description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM, admin-socket reloads and database clients (connect, read-only preview, revoke)"
+description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM, admin-socket reloads, database clients (connect, read-only preview, revoke) and certificate rollover (two-CA overlap, emergency removal, retirement drain by not_after + 5 s; needs the migrated platform database)"
 run = "bun scripts/test-pgbouncer-public.ts"
 
 [tasks."test:db-ingress"]
@@ -80,13 +80,14 @@ run = "ARK_DOCKER_INTEGRATION=1 go test -run TestDisposableDockerDeploymentAndDu
 dir = "agent"
 
 [tasks.typecheck]
-description = "Typecheck every TypeScript workspace and the image publisher"
+description = "Typecheck every TypeScript workspace, the image publisher and PgBouncer probes"
 run = [
   "bunx tsc --noEmit -p shared/tsconfig.json",
   "bunx tsc --noEmit -p server/tsconfig.json",
   "bunx tsc --noEmit -p web/tsconfig.json",
   "bunx tsc --noEmit -p workers/tsconfig.json",
   "bunx tsc --noEmit -p scripts/tsconfig.publish.json",
+  "bunx tsc --noEmit -p scripts/tsconfig.pgbouncer.json",
 ]
 
 [tasks.lint]

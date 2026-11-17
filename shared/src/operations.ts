@@ -81,6 +81,7 @@ export type OperationKind =
   | "integration.vercel_push"
   | "database.client_issue"
   | "database.client_rollover"
+  | "database.client_retire"
   | "database.client_revoke"
   | "backup.observe"
   | "backup.verify_target"
