@@ -4,8 +4,9 @@
 // The policy is an allowlist: a backend is allowed only while the persisted lease is fresh, the
 // route is enabled and `ready`, and its pinned identity still matches the latest complete
 // observation. Every tailnet backend in the active proxy config that is not on the list is withdrawn.
-// If the withdrawal cannot be applied and verified, the proxy is stopped: stale configuration must
-// not keep serving. Each proxy has an adapter; Caddy's is here, HAProxy's arrives with FD-25.
+// If withdrawal cannot be verified, the stop fallback fences protected traffic: stale routes must
+// not keep serving. Each proxy has an adapter; Caddy's is here, HAProxy's (FD-25) is in
+// haproxy-control.ts.
 
 import { inTailscaleRange, parseIpLiteral } from "./tailnet.ts";
 import { backendKey } from "./tailnet-observe.ts";
@@ -36,7 +37,7 @@ export type WithdrawalResult = {
   active: string[];
   /** Backends removed by this pass. */
   withdrawn: string[];
-  /** Set when withdrawal could not be applied or verified; the caller must stop the proxy. */
+  /** Set when withdrawal could not be applied or verified; the caller must invoke the stop fallback. */
   error?: string;
   /** The proxy could not be inspected at all (it may be stopped or restarting). */
   unreachable?: boolean;
@@ -44,9 +45,10 @@ export type WithdrawalResult = {
 
 /**
  * What every proxy adapter provides. `enforce` withdraws tailnet handlers whose route identity
- * key is not in `allowed` and verifies the result; `stop` closes all of the proxy's listeners and sessions.
- * FD-25 implements this for HAProxy (master CLI: disable servers, shut down sessions across every
- * worker generation, `stop` as the fallback).
+ * key is not in `allowed` and verifies the result; `stop` fences protected traffic. Caddy stops its
+ * HTTP app; HAProxy fences tailnet servers and sessions while preserving unrelated HTTP.
+ * `HaproxyWithdrawalAdapter` (haproxy-control.ts, FD-25) implements it for HAProxy: master CLI,
+ * admission first, sessions shut down across current and leaving workers, `stop` as the fallback.
  */
 export interface EdgeWithdrawalAdapter {
   readonly proxy: string;
@@ -271,10 +273,15 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
   }
 }
 
-/** Allowed HTTP route identity keys (including the pinned backend), or none without a fresh lease. */
+/**
+ * Allowed route identity keys (route ID, hostname, StableID and pinned backend), or none without a
+ * fresh lease. Every route kind is included: Caddy matches only its HTTP handlers' identities and
+ * HAProxy only the server names derived from L4 routes (`haproxyServerName`), so a key never
+ * authorises a different proxy's handler.
+ */
 export function allowedBackends(document: Pick<EdgeLeaseDocument, "lease" | "routes">) {
   if (!document.lease?.valid) return new Set<string>();
-  return new Set(document.routes.filter((route) => route.kind === "http").map(routeIdentityKey));
+  return new Set(document.routes.map(routeIdentityKey));
 }
 
 /** Tailnet `ip:port` literals in a rendered Caddyfile (`reverse_proxy 100.x.y.z:port`, `[fd7a:…]:port`). */

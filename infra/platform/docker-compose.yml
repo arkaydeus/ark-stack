@@ -186,10 +186,22 @@ services:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       # edge.observe reads the edge node's LocalAPI status through this socket (front door §3.6).
       ARK_EDGE_TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      # edge.l4_apply (front door §3.8.6, FD-25): writes immutable generations, has the restricted
+      # validator check them, swaps `current` and reloads edge-l4 through the master CLI. The worker
+      # reaches these sockets through the shared group 4400 only; it has no Docker access.
+      ARK_EDGE_L4_DIR: /usr/local/etc/haproxy
+      ARK_HAPROXY_VALIDATOR_SOCKET: /var/run/haproxy-validator/validate.sock
+      ARK_HAPROXY_MASTER_SOCKET: /var/run/haproxy/master.sock
+      ARK_HAPROXY_ADMIN_SOCKET: /var/run/haproxy/admin.sock
+    group_add: ["4400"]
     volumes:
       - ../../tmp/certs:/var/lib/ark/certs
       - ../../tmp/edge:/var/lib/ark/edge
       - ../../tmp/acme:/var/lib/ark/acme
+      # Generations are written as bun:4400, directories 2750 and files 0640 (installer-initialised).
+      - ../../tmp/edge-l4:/usr/local/etc/haproxy
+      - ark_haproxy_validator_run:/var/run/haproxy-validator
+      - ark_haproxy_run:/var/run/haproxy
       # Read-only, and the worker runs as the non-root `bun` user: tailscaled grants it read access
       # only (status, whois, dial), and refuses every state-changing endpoint with 403. Shown by
       # the FD-06 deployment test in `mise run test:edge`; no observer sidecar is needed.
@@ -365,7 +377,7 @@ services:
     security_opt: [no-new-privileges:true]
     ports:
       - "80:80" # Caddy: ACME HTTP-01 and HTTPS redirects
-      - "443:443" # Caddy HTTPS
+      - "443:443" # edge-l4: HAProxy SNI router in front of Caddy (127.0.0.1:8443)
       - "41642:41642/udp" # direct WireGuard paths for the edge node
     volumes:
       - ark_edge_ts_state:/var/lib/tailscale
@@ -388,7 +400,8 @@ services:
     user: "1000:1000"
     # Ports, networks and the edge-admin alias belong to edge-ts. A restarted or recreated edge-ts
     # leaves this container in a dead namespace until it is recreated: `mise run maintain` and
-    # `mise run edge:rejoin` do that (docs/operating.md, "Edge Tailscale node").
+    # `mise run edge:rejoin` do that (docs/operating.md, "Edge Tailscale node"). Caddy serves :80
+    # publicly; its HTTPS sites listen on 127.0.0.1:8443 only, behind edge-l4 with PROXY v2 (FD-25).
     network_mode: service:edge-ts
     # The launch guard asks edge-watchdog whether the lease allows every tailnet route in the
     # Caddyfile, and otherwise starts the official binary from Caddyfile.closed (front door §3.2).
@@ -429,11 +442,72 @@ services:
       ARK_EDGE_ADMIN_URL: http://edge-admin:2019
       ARK_EDGE_DIR: /var/lib/ark/edge
       ARK_EDGE_WATCHDOG_PORT: "2021"
+      # HAProxy withdrawal (FD-25): master CLI across current and leaving workers, and the generations
+      # the edge-l4 launch guard asks about.
+      ARK_EDGE_L4_DIR: /usr/local/etc/haproxy
+      ARK_HAPROXY_MASTER_SOCKET: /var/run/haproxy/master.sock
+    group_add: ["4400"]
     volumes:
       - ../../tmp/edge:/var/lib/ark/edge:ro
+      - ../../tmp/edge-l4:/usr/local/etc/haproxy:ro
+      - ark_haproxy_run:/var/run/haproxy
     expose: ["2021"]
     depends_on: [api]
     networks: [control, edge-control]
+
+  # HAProxy SNI router on 443 (docs/design/front-door.md §3.8, FD-25). It owns public 443 in the edge-ts
+  # namespace and sends HTTP, admin and login hostnames (and unknown SNI) to Caddy on 127.0.0.1:8443
+  # with PROXY v2; non-TLS is rejected after 5 s. The launch guard asks the edge watchdog before
+  # serving any tailnet backend and supervises HAProxy while one exists (front door §3.2).
+  edge-l4:
+    image: haproxy:3.2.26-alpine@sha256:1c3568e520453cc8ba98c39501febcf450429c80e6cc27ecad779961d76e597c
+    # Binds 443 as the image's uid 99 with no capabilities: Docker sets ip_unprivileged_port_start=0 in
+    # the namespace. Recreated with edge by `mise run edge:rejoin` when edge-ts is replaced.
+    network_mode: service:edge-ts
+    # Runs `haproxy -W -db -S /var/run/haproxy/master.sock,gid,4400,mode,660 -f <guard link>`, where the
+    # link points at current/haproxy.cfg or, without a valid lease, current/haproxy.closed.cfg.
+    entrypoint: [/bin/sh, /usr/local/bin/ark-edge-l4-launch-guard]
+    group_add: ["4400"]
+    environment:
+      ARK_EDGE_L4_DIR: /usr/local/etc/haproxy
+      ARK_EDGE_WATCHDOG_URL: http://edge-watchdog:2021
+      ARK_HAPROXY_MASTER_SOCKET: /var/run/haproxy/master.sock
+    volumes:
+      # Immutable generations and the `current` symlink, written by the domain worker.
+      - ../../tmp/edge-l4:/usr/local/etc/haproxy:ro
+      - ./edge-l4-launch-guard.sh:/usr/local/bin/ark-edge-l4-launch-guard:ro
+      # Master and admin sockets (0660, group 4400), shared with domain-worker and edge-watchdog.
+      - ark_haproxy_run:/var/run/haproxy
+    tmpfs: ["/run/ark-l4:rw,noexec,nosuid,nodev,size=64k,uid=99,gid=99,mode=0700"]
+    depends_on: [edge-ts, edge-watchdog]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  # Restricted HAProxy validator (docs/design/front-door.md §3.8.6, FD-25): the edge-l4 image digest plus
+  # a socket daemon that runs only `haproxy -c -f <root>/generations/<id>/haproxy.cfg` for a hashed
+  # generation ID. No network, no Docker, read-only configuration at the same absolute path.
+  haproxy-validator:
+    image: ark-haproxy-validator:${ARK_VERSION:-local}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: haproxy-validator
+    network_mode: none
+    group_add: ["4400"]
+    environment:
+      ARK_EDGE_L4_DIR: /usr/local/etc/haproxy
+      ARK_HAPROXY_VALIDATOR_SOCKET: /var/run/haproxy-validator/validate.sock
+    volumes:
+      - ../../tmp/edge-l4:/usr/local/etc/haproxy:ro
+      - ark_haproxy_validator_run:/var/run/haproxy-validator
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    pids_limit: 64
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: unless-stopped
 
   tailscale:
     image: tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2
@@ -479,6 +553,21 @@ volumes:
       type: tmpfs
       device: tmpfs
       o: uid=1000,gid=1000,mode=0700,size=1m
+  # edge-l4 master and admin sockets (front door §3.8.6): owned by HAProxy's uid 99 and the shared group
+  # 4400, setgid so the sockets inherit the group. Mounted into edge-l4, domain-worker and edge-watchdog.
+  ark_haproxy_run:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: uid=99,gid=4400,mode=2770,size=1m
+  # The validator's socket directory, shared only with domain-worker.
+  ark_haproxy_validator_run:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: uid=99,gid=4400,mode=2770,size=1m
 
 networks:
   control: { internal: true }

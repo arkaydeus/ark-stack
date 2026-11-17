@@ -7,6 +7,7 @@ import { generateInstallSecrets, mergeInstallEnv } from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
 import { configureEdgeAuthKey } from "./install-edge-auth.ts";
+import { chownEdgeL4, composeImages, seedEdgeL4, verifyImageIds } from "./install-edge-l4.ts";
 import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 
 const root = join(import.meta.dir, "..");
@@ -39,10 +40,14 @@ for (const path of [
   "pgbouncer",
   "db-ingress",
   "edge",
+  "edge-l4",
   "mail-state",
 ]) {
   await mkdir(join(root, "tmp", path), { recursive: true });
 }
+// edge-l4 (HAProxy SNI router on 443) starts from an initial generation that sends every hostname to
+// Caddy; the domain worker's edge.l4_apply replaces it (docs/design/front-door.md §3.8.6).
+await seedEdgeL4(join(root, "tmp", "edge-l4"));
 await mkdir(join(root, "tmp", "certs", "database"), { recursive: true });
 const databaseCert = join(root, "tmp", "certs", "database");
 if (!existsSync(join(databaseCert, "fullchain.pem")) || !existsSync(join(databaseCert, "privkey.pem"))) {
@@ -110,9 +115,18 @@ if (process.platform === "linux" && process.getuid?.() === 0) {
   ]) {
     await chownRecursive(join(root, "tmp", path), containerUid, containerGid);
   }
+  // Generations are readable by the shared group 4400 (edge-l4, the validator and the watchdog).
+  await chownEdgeL4(join(root, "tmp", "edge-l4"), containerUid);
 }
 
 if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
+  // Numeric IDs, not names: HAProxy must be uid 99 and GID 4400 must be free in the pinned images.
+  await verifyImageIds(
+    composeImages(
+      await Bun.file(join(root, "infra/platform/docker-compose.yml")).text(),
+      await Bun.file(join(root, "Dockerfile")).text(),
+    ),
+  );
   for (const network of ["ark_mail_management", "ark_monitoring"]) {
     await run("docker", ["network", "inspect", "--format", "{{.Name}}", network]).catch(() =>
       run("docker", ["network", "create", network]),
@@ -128,6 +142,7 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "mail-worker",
     "domain-worker",
     "edge-watchdog",
+    "haproxy-validator",
     "backup-worker",
     "agent",
     "database-ingress",
@@ -167,11 +182,13 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "agent",
     "edge-ts",
     "edge-watchdog",
+    "haproxy-validator",
     "edge",
+    "edge-l4",
     "pgbouncer-public",
     "database-ingress",
   ]);
-  // A re-run that restarted edge-ts in place would otherwise leave edge in its old namespace.
+  // A re-run that restarted edge-ts in place would otherwise leave edge and edge-l4 in its old namespace.
   await rejoinNamespaceDependents({
     project: "ark-platform",
     composeArgs: ["-f", join(root, "infra/platform/docker-compose.yml"), "-p", "ark-platform"],
@@ -198,7 +215,7 @@ if (edgeAuthKey === "missing") {
   console.log(`TS_EDGE_AUTHKEY is empty. That is expected once the edge node (edge-ts) has joined. If it has
 not, the edge still serves but cannot reach tailnet services: create a one-off, pre-approved key for tag:ark-edge, put it in .env as
 TS_EDGE_AUTHKEY (or re-run this installer with it in the environment), then run
-\`docker compose --env-file .env -f infra/platform/docker-compose.yml up -d edge-ts edge\` and \`mise run edge:rejoin\`.
+\`docker compose --env-file .env -f infra/platform/docker-compose.yml up -d edge-ts edge edge-l4\` and \`mise run edge:rejoin\`.
 See docs/operating.md, "Edge Tailscale node".
 `);
 }

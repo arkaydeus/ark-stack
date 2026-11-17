@@ -59,7 +59,8 @@ supervise() {
       if [ -z "$active" ] || printf '%s' "$active" | grep -Eq 'ark_tailnet_route|"dial"[[:space:]]*:[[:space:]]*"(tcp/)?(100\.|\[fd7a:)'; then guarded=1; fi
     fi
     if [ "$guarded" -eq 1 ]; then
-      heartbeat="$(wget -q -T 1 -O - "$watchdog/v1/supervise" 2>/dev/null || true)"
+      # Caddy's own enforcement status: an HAProxy withdrawal failure stops HAProxy, not Caddy.
+      heartbeat="$(wget -q -T 1 -O - "$watchdog/v1/supervise?proxy=caddy" 2>/dev/null || true)"
       if [ "$heartbeat" != "ok" ]; then
         echo "ark launch guard: watchdog enforcement unavailable; terminating Caddy" >&2
         # No graceful wait: existing upgraded sessions must close as well as listeners.

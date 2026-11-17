@@ -36,6 +36,53 @@ export type EdgeAppRoute = { hostname: string; upstream?: string };
  */
 export type EdgeTailnetRoute = { id: string; hostname: string; stableId: string; ip: string; port: number };
 
+/**
+ * The Caddyfile global block (docs/design/front-door.md §3.5, FD-25). HAProxy (`edge-l4`) owns public
+ * 443 and forwards HTTP hostnames to Caddy's loopback HTTPS listener with PROXY v2. That listener
+ * requires a PROXY header (`fallback_policy require`, no `allow` list, which would select optional
+ * USE instead); the loopback bind is what restricts who can send one. The scoped server block keeps
+ * the public `:80` server from ever parsing PROXY headers. HTTP/3 is off: UDP 443 is not behind the
+ * router, and `Alt-Svc` would advertise the internal port.
+ */
+export const CADDY_GLOBAL_BLOCK = `{
+  admin edge-admin:2019
+  # Ark issues every certificate with lego and loads it per site with \`tls\`. Caddy must never
+  # obtain certificates itself, and the :80 block below owns the HTTP-to-HTTPS redirects.
+  auto_https off
+  # A reload (route withdrawal included) gives in-flight requests on the old server 5 s, so a
+  # withdrawn route stops serving promptly (docs/design/front-door.md §3.2).
+  grace_period 5s
+  # HTTPS is reached only through the HAProxy SNI router on 443 (PROXY v2 over loopback).
+  # https_port is internal only; it does not change the port clients use.
+  https_port 8443
+  servers {
+    timeouts {
+      read_header 10s
+      idle 2m
+    }
+    # HTTP/3 off: UDP 443 is not behind the SNI router, and Alt-Svc would advertise 8443.
+    protocols h1 h2
+  }
+  # Scoped to the loopback HTTPS listener so the public :80 server never parses PROXY headers.
+  # No trusted_proxies: the PROXY header already sets the real client address.
+  servers 127.0.0.1:8443 {
+    # Caddy applies only the most specific servers block, so the timeouts are repeated here.
+    timeouts {
+      read_header 10s
+      idle 2m
+    }
+    listener_wrappers {
+      proxy_protocol {
+        # No allow list: it would select optional USE instead of REQUIRE.
+        fallback_policy require
+      }
+      tls
+    }
+    strict_sni_host on
+    protocols h1 h2
+  }
+}`;
+
 /** Marks a tailnet route's site so the launch guard and audits can find it in the Caddyfile. */
 export const TAILNET_ROUTE_MARKER = "# ark-tailnet-route";
 
@@ -180,7 +227,9 @@ export function renderCaddyfile(input: {
     const certificate = issued.get(checkedHostname(hostname));
     if (!certificate || served.includes(hostname)) return "";
     served.push(hostname);
+    // HTTPS sites listen on loopback only, behind the HAProxy SNI router on 443 (§3.5, §3.8).
     return `${marker}${hostname} {
+  bind 127.0.0.1
   ${tlsLine(certificate)}
 ${body}}
 `;
@@ -247,15 +296,7 @@ ${body}}
   }
 `
     : "";
-  return `{
-  admin edge-admin:2019
-  # Ark issues every certificate with lego and loads it per site with \`tls\`. Caddy must never
-  # obtain certificates itself, and the :80 block below owns the HTTP-to-HTTPS redirects.
-  auto_https off
-  # A reload (route withdrawal included) gives in-flight requests on the old server 5 s, so a
-  # withdrawn route stops serving promptly (docs/design/front-door.md §3.2).
-  grace_period 5s
-}
+  return `${CADDY_GLOBAL_BLOCK}
 
 :80 {
   @challenge path /.well-known/acme-challenge/*

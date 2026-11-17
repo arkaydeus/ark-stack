@@ -736,7 +736,7 @@ describe("lifecycle regression coverage", () => {
     return (tx: import("./db.ts").DbTransaction) =>
       requirePrivileged(
         { ...actor(), role: "owner", projectIds: [], domainIds: [] },
-        session,
+        { ...session, user: { ...session.user, twoFactorEnabled: session.user.twoFactorEnabled ?? false } },
         action,
         privilegedRequestHash(action, request),
         tx,

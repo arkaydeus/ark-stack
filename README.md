@@ -31,9 +31,9 @@ Useful commands:
 | `mise run test:e2e`               | disposable real-browser signup/MFA/wizard   |
 | `mise run test:upgrade`           | schema and host nft policy upgrade (Docker) |
 | `mise run test:stalwart`          | disposable native Stalwart lifecycle test   |
-| `mise run test:edge`              | Caddy, edge, observer and harness tests     |
+| `mise run test:edge`              | Caddy, HAProxy, observer and harness tests  |
 | `mise run test:edge-tailnet`      | opt-in edge node checks on a real tailnet   |
-| `mise run edge:rejoin`            | put `edge` back in a restarted `edge-ts`    |
+| `mise run edge:rejoin`            | put `edge` and `edge-l4` back in `edge-ts`  |
 | `mise run test:pgbouncer`         | PgBouncer mTLS/SCRAM, DB client, rollover   |
 | `mise run recover -- status`      | local lockout / bootstrap inspection        |
 | `mise run recover:mfa -- …`       | token- and confirmation-gated MFA reset     |
@@ -47,7 +47,7 @@ PgBouncer runtime probes also have a dedicated TypeScript check in CI and `mise 
 
 ## Publishing images
 
-`mise run images:publish` builds all eight Bake targets for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing.
+`mise run images:publish` builds all nine Bake targets for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing.
 
 Set both `GHCR_TOKEN` and `GHCR_USER` to use an explicit token without a GitHub CLI login. Otherwise, log in with `gh` and grant its token package access using `gh auth refresh -h github.com -s write:packages`. Login and push use a temporary Docker configuration, removed on success or failure; the existing Docker context and Buildx builder are preserved.
 

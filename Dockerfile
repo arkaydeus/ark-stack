@@ -12,6 +12,8 @@ COPY web web
 COPY workers workers
 COPY scripts scripts
 RUN bun run --cwd web build
+# The restricted HAProxy validator runs on the HAProxy (Alpine) image, so it ships as one bundle.
+RUN bun build workers/src/haproxy-validator.ts --target=bun --outfile=/app/dist/haproxy-validator.js
 
 FROM oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61 AS runtime
 WORKDIR /app
@@ -51,4 +53,19 @@ USER bun
 # added. It runs as `bun` with no capabilities, database credential or socket mounts.
 FROM runtime AS edge-watchdog
 
+# Restricted HAProxy configuration validator (docs/design/front-door.md §3.8.6, FD-25). The base is the
+# exact edge-l4 image digest, so `haproxy -c` runs the same HAProxy and OpenSSL build that serves.
+# Bun (musl build) runs the socket daemon as the image's non-root `haproxy` user (uid 99).
+FROM oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS bun-alpine
+
+FROM haproxy:3.2.26-alpine@sha256:1c3568e520453cc8ba98c39501febcf450429c80e6cc27ecad779961d76e597c AS haproxy-validator
+USER root
+RUN apk add --no-cache libstdc++ libgcc
+COPY --from=bun-alpine /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=build /app/dist/haproxy-validator.js /opt/ark/haproxy-validator.js
+USER haproxy
+ENTRYPOINT ["/usr/local/bin/bun", "/opt/ark/haproxy-validator.js"]
+CMD []
+
+# Keep mail-worker last: Compose services that build without a target (api, migrate) use the last stage.
 FROM runtime AS mail-worker

@@ -19,7 +19,7 @@
 //    - hostnames sharing a backend remain independently revocable, including stale-file restarts;
 //    - stopping or freezing the watchdog while serving closes listeners and existing sessions;
 //    - when config inspection or withdrawal fails, Caddy stops and a critical alert is raised.
-// HAProxy withdrawal is an FD-25 integration gate. It needs a local PostgreSQL (DATABASE_URL), like
+// HAProxy withdrawal is covered by scripts/test-edge-l4.ts (FD-25). It needs a local PostgreSQL (DATABASE_URL), like
 // `mise run test`; it creates and drops its own database.
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -1060,7 +1060,7 @@ try {
   if (failed) await runtime.dumpLogs();
   else
     console.log(
-      "\nAll edge observer tests passed. HAProxy-generation withdrawal is an FD-25 integration gate.",
+      "\nAll edge observer tests passed. HAProxy-generation withdrawal runs in scripts/test-edge-l4.ts.",
     );
 } catch (error) {
   failed = true;

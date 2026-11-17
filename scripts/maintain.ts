@@ -45,6 +45,36 @@ for (const image of validated.images) {
   });
 }
 
+// Stop writers and the old public listener before converting persisted Caddy files. The approved
+// domain-worker image contains the initializer; only this one-shot process gets ownership capabilities.
+if (/^  edge-l4:/m.test(composeSource)) {
+  const prefix = ["compose", "-f", compose, "-p", project];
+  for (const args of [
+    [...prefix, "stop", "domain-worker", "edge", "edge-l4", "edge-watchdog"],
+    [
+      ...prefix,
+      "run",
+      "--rm",
+      "--no-deps",
+      "--user",
+      "0:0",
+      "--cap-add",
+      "CHOWN",
+      "--cap-add",
+      "FOWNER",
+      "--cap-add",
+      "DAC_OVERRIDE",
+      "--entrypoint",
+      "bun",
+      "domain-worker",
+      "scripts/prepare-edge-upgrade.ts",
+    ],
+  ]) {
+    const code = await Bun.spawn(["docker", ...args], { stdio: ["ignore", "inherit", "inherit"] }).exited;
+    if (code !== 0) throw new Error(`Edge maintenance initialization failed (${code})`);
+  }
+}
+
 await new Promise<void>((resolve, reject) => {
   const child = spawn(argv[0], argv.slice(1), { stdio: "inherit" });
   child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`maintain exited ${code}`))));

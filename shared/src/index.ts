@@ -36,4 +36,6 @@ export * from "./tailnet.ts";
 export * from "./tailnet-acl.ts";
 export * from "./tailnet-observe.ts";
 export * from "./edge-withdrawal.ts";
+export * from "./edge-l4.ts";
+export * from "./haproxy-control.ts";
 export * from "./update-policy.ts";
