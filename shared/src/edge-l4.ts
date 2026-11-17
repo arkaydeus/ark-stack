@@ -21,6 +21,11 @@ export const HAPROXY_IMAGE_UID = 99;
 export const EDGE_L4_DIR = "/usr/local/etc/haproxy";
 /** Caddy's HTTPS listener: loopback only, behind the PROXY v2 wrapper (§3.5). */
 export const CADDY_TLS_LISTENER = "127.0.0.1:8443";
+/**
+ * Connect timeout for the HAProxy -> Caddy loopback hop. A live loopback listener accepts at once, so
+ * this only bounds a stalled accept queue; together with `retries 0` a closed listener fails at once.
+ */
+export const CADDY_CONNECT_TIMEOUT = "1s";
 export const HAPROXY_ADMIN_SOCKET = "/var/run/haproxy/admin.sock";
 export const HAPROXY_MASTER_SOCKET = "/var/run/haproxy/master.sock";
 export const HAPROXY_VALIDATOR_SOCKET = "/var/run/haproxy-validator/validate.sock";
@@ -175,6 +180,11 @@ ${[...routeRules, ...httpRule].join("\n")}${routeRules.length || httpRule.length
 
 backend be_caddy
     # PROXY v2 carries the real client address; Caddy requires it on this loopback listener.
+    # Fail fast on the loopback hop: a refused connect means Caddy's listener is down (fail-closed
+    # stop, restart), and retrying it only delays the client's reset by about a second per attempt.
+    # Caddy reloads keep the listener open, so they need no retry; no redispatch (one server).
+    retries 0
+    timeout connect ${CADDY_CONNECT_TIMEOUT}
     server caddy ${CADDY_TLS_LISTENER} send-proxy-v2
 
 ${backends.join("\n")}`;

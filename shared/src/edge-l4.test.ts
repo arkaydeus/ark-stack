@@ -38,6 +38,13 @@ const route: EdgeL4TlsRoute = {
   sourceCidrs: ["203.0.113.0/24"],
 };
 
+/** One `backend` section of a rendered configuration, up to the next blank line. */
+function section(text: string, name: string) {
+  const start = text.indexOf(`\nbackend ${name}\n`);
+  const end = text.indexOf("\n\n", start + 1);
+  return text.slice(start + 1, end < 0 ? undefined : end);
+}
+
 describe("edge-l4 rendering (§3.8.5 fe_tls443)", () => {
   const generation = renderEdgeL4Generation({
     httpHostnames: ["www.example.com", "example.com", "login.example.com", "example.com"],
@@ -57,6 +64,24 @@ describe("edge-l4 rendering (§3.8.5 fe_tls443)", () => {
     expect(config).toContain("    default_backend be_caddy\n");
     expect(config).toContain("backend be_caddy\n");
     expect(config).toContain("    server caddy 127.0.0.1:8443 send-proxy-v2\n");
+  });
+
+  test("the Caddy loopback hop fails fast: no retries, no redispatch and a short connect timeout", () => {
+    const withRoute = renderEdgeL4Generation({ httpHostnames: ["www.example.com"], tlsRoutes: [route] });
+    for (const text of [config, withRoute.files["haproxy.cfg"]!, withRoute.files["haproxy.closed.cfg"]!]) {
+      const caddy = section(text, "be_caddy");
+      expect(caddy).toContain("\n    retries 0\n");
+      expect(caddy).toContain("\n    timeout connect 1s\n");
+      expect(caddy).toEndWith("    server caddy 127.0.0.1:8443 send-proxy-v2");
+      // A single server: redispatch would have nowhere else to go and must not be enabled anywhere.
+      expect(text).not.toMatch(/^\s+option redispatch/m);
+      // The fast-fail settings are scoped to Caddy; defaults keep the 5 s connect timeout.
+      expect(text.match(/^\s+retries /gm)).toHaveLength(1);
+      expect(text).toContain(
+        "defaults\n    mode tcp\n    log global\n    option tcplog\n    timeout connect 5s\n",
+      );
+    }
+    expect(section(withRoute.files["haproxy.cfg"]!, "be_rt_p7q2_tls")).not.toContain("retries");
   });
 
   test("the global section shares the admin socket with group 4400 and bounds old workers", () => {
