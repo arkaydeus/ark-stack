@@ -11,8 +11,10 @@ import {
   PgbouncerReloadError,
   denyAllCaPem,
   normalizeFingerprint,
+  killRoleClients,
   pgbouncerAdminCommand,
   planPgbouncer,
+  roleClientIds,
   reloadAndVerify,
   renderPgbouncerFiles,
   writePgbouncerFiles,
@@ -238,9 +240,24 @@ describe("reloadAndVerify", () => {
     expect(normalizeFingerprint("AB:CD:EF")).toBe("abcdef");
   });
 
-  test("the console client refuses anything but RELOAD and SHOW", async () => {
-    for (const command of ["SHUTDOWN", "KILL appdb", "RELOAD; SHUTDOWN", "set x = 1"]) {
+  test("the console client refuses anything but RELOAD, SHOW and KILL_CLIENT <id>", async () => {
+    for (const command of [
+      "SHUTDOWN",
+      "KILL appdb",
+      "RELOAD; SHUTDOWN",
+      "set x = 1",
+      "KILL_CLIENT",
+      "KILL_CLIENT 0",
+      "KILL_CLIENT 1; SHUTDOWN",
+      "KILL_CLIENT abc",
+      "KILL_CLIENT 12345678901234567890",
+    ]) {
       await expect(pgbouncerAdminCommand(command, { password: "x" })).rejects.toThrow(/Refusing/);
     }
+  });
+
+  test("revocation kills only a valid login role, never the console administrator", async () => {
+    await expect(roleClientIds("bad role'; --", { password: "x" })).rejects.toThrow(/Invalid PgBouncer role/);
+    await expect(killRoleClients("ark_pgbouncer_admin", { password: "x" })).rejects.toThrow(/administrator/);
   });
 });

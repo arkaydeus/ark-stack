@@ -1,3 +1,4 @@
+import { testOpenSsl } from "./test-openssl.ts";
 // Private CA module tests (docs/design/front-door.md §3.10.1, ticket FD-13).
 //
 // OpenSSL is the independent check: every chain is verified with `openssl verify -x509_strict`,
@@ -57,8 +58,10 @@ afterAll(async () => {
   if (dir) await rm(dir, { recursive: true, force: true });
 });
 
+const opensslBin = testOpenSsl();
+
 function openssl(args: string[], stdin?: string) {
-  const result = Bun.spawnSync(["openssl", ...args], {
+  const result = Bun.spawnSync([opensslBin, ...args], {
     stdin: stdin === undefined ? "ignore" : Buffer.from(stdin),
   });
   return { code: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() };

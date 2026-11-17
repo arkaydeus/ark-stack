@@ -175,12 +175,27 @@ export type Node = {
   content: Buffer;
 };
 
-export class DerError extends Error {}
+/**
+ * Every decoding failure. Parsing is iterative and schema-driven (no generic recursion), every
+ * length is bounded by the input, and the caps below bound the work any single value can cause,
+ * so hostile input is rejected in time and memory linear in its size (FD-17 CSR hardening).
+ */
+export class DerError extends Error {
+  override name = "DerError";
+}
+
+/** OBJECT IDENTIFIER contents longer than this are refused (real OIDs are well under 40 bytes). */
+export const MAX_OID_BYTES = 64;
+/** INTEGERs Ark reads as numbers (versions, path lengths, CRL numbers) fit in 20 bytes (RFC 5280). */
+export const MAX_SMALL_INTEGER_BYTES = 20;
+/** More extensions than this in one certificate or request is refused. */
+export const MAX_EXTENSIONS = 32;
 
 export function readNode(buffer: Buffer, offset = 0): Node {
   if (offset + 2 > buffer.length) throw new DerError("Truncated DER header.");
   const tag = buffer[offset]!;
   if ((tag & 0x1f) === 0x1f) throw new DerError("Multi-byte DER tags are not supported.");
+  if (tag === 0x00) throw new DerError("End-of-contents octets are not DER.");
   let length = buffer[offset + 1]!;
   let header = 2;
   if (length & 0x80) {
@@ -206,6 +221,7 @@ export function decode(buffer: Buffer) {
 }
 
 export function children(node: Node) {
+  if (!(node.tag & 0x20)) throw new DerError("Expected a constructed DER value.");
   const items: Node[] = [];
   for (let offset = 0; offset < node.content.length;) {
     const child = readNode(node.content, offset);
@@ -215,23 +231,78 @@ export function children(node: Node) {
   return items;
 }
 
+/** "a CSR version" -> "CSR version", for messages that start with an adjective. */
+const noun = (what: string) => what.replace(/^(?:a|an) /, "");
+
 export function expectTag(node: Node | undefined, tag: number, what: string): Node {
   if (!node || node.tag !== tag) throw new DerError(`Expected ${what}.`);
   return node;
 }
 
-export function decodeOid(node: Node) {
+/** A DER BOOLEAN: exactly one byte, 0x00 or 0xFF. */
+export function decodeBoolean(node: Node | undefined, what = "a BOOLEAN") {
+  expectTag(node, 0x01, what);
+  if (node!.content.length !== 1 || (node!.content[0] !== 0x00 && node!.content[0] !== 0xff))
+    throw new DerError(`Malformed ${noun(what)}.`);
+  return node!.content[0] === 0xff;
+}
+
+/**
+ * A minimally encoded INTEGER of at most `maxBytes` content bytes. `nonNegative` refuses values
+ * with the sign bit set.
+ */
+export function decodeInteger(
+  node: Node | undefined,
+  what = "an INTEGER",
+  options: { maxBytes?: number; nonNegative?: boolean } = {},
+) {
+  expectTag(node, 0x02, what);
+  const content = node!.content;
+  if (!content.length) throw new DerError(`Empty ${noun(what)}.`);
+  if (content.length > (options.maxBytes ?? MAX_SMALL_INTEGER_BYTES))
+    throw new DerError(`Oversized ${noun(what)}.`);
+  if (
+    content.length > 1 &&
+    ((content[0] === 0x00 && !(content[1]! & 0x80)) || (content[0] === 0xff && content[1]! & 0x80))
+  )
+    throw new DerError(`Non-minimal ${noun(what)}.`);
+  const negative = (content[0]! & 0x80) !== 0;
+  if (negative && options.nonNegative) throw new DerError(`Negative ${noun(what)}.`);
+  let value = BigInt(`0x${content.toString("hex")}`);
+  if (negative) value -= 1n << BigInt(content.length * 8);
+  return value;
+}
+
+/** A DER BIT STRING: unused-bit count 0-7, zero when empty, and zero padding bits. */
+export function decodeBitString(node: Node | undefined, what = "a BIT STRING") {
+  expectTag(node, 0x03, what);
+  const content = node!.content;
+  if (!content.length) throw new DerError(`Empty ${noun(what)}.`);
+  const unused = content[0]!;
+  if (unused > 7 || (content.length === 1 && unused !== 0)) throw new DerError(`Malformed ${noun(what)}.`);
+  if (unused && content[content.length - 1]! & ((1 << unused) - 1))
+    throw new DerError(`Non-zero padding bits in ${noun(what)}.`);
+  return { unused, bytes: content.subarray(1) };
+}
+
+export function decodeOid(node: Node | undefined) {
   expectTag(node, 0x06, "an OBJECT IDENTIFIER");
+  const content = node!.content;
+  if (!content.length) throw new DerError("Empty OBJECT IDENTIFIER.");
+  if (content.length > MAX_OID_BYTES) throw new DerError("Oversized OBJECT IDENTIFIER.");
+  if (content[content.length - 1]! & 0x80) throw new DerError("Truncated OBJECT IDENTIFIER arc.");
   const arcs: bigint[] = [];
   let value = 0n;
-  for (const byte of node.content) {
+  let start = true;
+  for (const byte of content) {
+    if (start && byte === 0x80) throw new DerError("Non-minimal OBJECT IDENTIFIER arc.");
     value = (value << 7n) | BigInt(byte & 0x7f);
-    if (!(byte & 0x80)) {
+    start = !(byte & 0x80);
+    if (start) {
       arcs.push(value);
       value = 0n;
     }
   }
-  if (!arcs.length) throw new DerError("Empty OBJECT IDENTIFIER.");
   const first = arcs[0]!;
   const head = first < 40n ? [0n, first] : first < 80n ? [1n, first - 40n] : [2n, first - 80n];
   return [...head, ...arcs.slice(1)].join(".");
@@ -278,12 +349,26 @@ export function toPem(label: string, der: Buffer) {
   return `-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n`;
 }
 
+/**
+ * Decode exactly one PEM block with one of `labels` (RFC 7468 strict form). Only whitespace may
+ * surround the block; the body must be canonical base64 with padding only at the end. A lenient
+ * decoder would silently skip junk, so anything else is refused rather than guessed at.
+ */
 export function fromPem(pem: string, labels: string[]) {
-  const match = /-----BEGIN ([A-Z0-9 ]+)-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END \1-----/.exec(pem);
-  if (!match || !labels.includes(match[1]!)) throw new DerError(`Expected a PEM ${labels.join(" or ")}.`);
-  const rest = pem.slice((match.index ?? 0) + match[0].length).trim();
-  if (rest) throw new DerError("Expected exactly one PEM block.");
-  return Buffer.from(match[2]!.replace(/\s+/g, ""), "base64");
+  if (typeof pem !== "string") throw new DerError(`Expected a PEM ${labels.join(" or ")}.`);
+  const match =
+    /^\s*-----BEGIN ([A-Z0-9 ]{1,40})-----\r?\n([A-Za-z0-9+/=\r\n\t ]*?)-----END \1-----\s*$/.exec(pem);
+  if (!match) {
+    if ((pem.match(/-----BEGIN /g) ?? []).length > 1) throw new DerError("Expected exactly one PEM block.");
+    throw new DerError(`Expected a PEM ${labels.join(" or ")}.`);
+  }
+  if (!labels.includes(match[1]!)) throw new DerError(`Expected a PEM ${labels.join(" or ")}.`);
+  const body = match[2]!.replace(/\s+/g, "");
+  if (!body || !/^[A-Za-z0-9+/]*={0,2}$/.test(body) || body.length % 4 !== 0)
+    throw new DerError("The PEM body is not canonical base64.");
+  const der = Buffer.from(body, "base64");
+  if (der.toString("base64") !== body) throw new DerError("The PEM body is not canonical base64.");
+  return der;
 }
 
 // ---- Keys, signatures, structure helpers --------------------------------------------------------
@@ -297,8 +382,8 @@ export function spkiDer(key: KeyObject) {
 /** RFC 7093 §2 method 1: leftmost 160 bits of SHA-256 over the subjectPublicKey BIT STRING value. */
 export function keyIdentifier(spki: Buffer) {
   const parts = children(decode(spki));
-  const subjectPublicKey = expectTag(parts[1], 0x03, "a subjectPublicKey BIT STRING");
-  return createHash("sha256").update(subjectPublicKey.content.subarray(1)).digest().subarray(0, 20);
+  const subjectPublicKey = decodeBitString(parts[1], "a subjectPublicKey BIT STRING");
+  return createHash("sha256").update(subjectPublicKey.bytes).digest().subarray(0, 20);
 }
 
 /** ecdsa-with-SHA256: the AlgorithmIdentifier has no parameters (RFC 5758 §3.2). */
@@ -319,13 +404,17 @@ export type ParsedExtension = { id: string; critical: boolean; value: Buffer };
 
 export function parseExtensions(node: Node): ParsedExtension[] {
   expectTag(node, 0x30, "an Extensions SEQUENCE");
-  return children(node).map((item) => {
+  const items = children(node);
+  // RFC 5280: Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension.
+  if (!items.length) throw new DerError("Empty Extensions SEQUENCE.");
+  if (items.length > MAX_EXTENSIONS) throw new DerError("Too many extensions.");
+  return items.map((item) => {
     const parts = children(expectTag(item, 0x30, "an Extension"));
-    const id = decodeOid(parts[0]!);
+    const id = decodeOid(parts[0]);
     let index = 1;
     let critical = false;
     if (parts[index]?.tag === 0x01) {
-      critical = parts[index]!.content[0] !== 0;
+      critical = decodeBoolean(parts[index], "an Extension critical flag");
       index += 1;
     }
     const value = expectTag(parts[index], 0x04, "an extnValue OCTET STRING").content;
@@ -336,8 +425,8 @@ export function parseExtensions(node: Node): ParsedExtension[] {
 
 /** The named bits set in a DER KeyUsage BIT STRING. */
 export function decodeKeyUsage(value: Buffer): KeyUsage[] {
-  const node = expectTag(decode(value), 0x03, "a KeyUsage BIT STRING");
-  const bytes = node.content.subarray(1);
+  const { bytes } = decodeBitString(decode(value), "a KeyUsage BIT STRING");
+  if (bytes.length > 2) throw new DerError("Oversized KeyUsage BIT STRING.");
   return (Object.entries(KEY_USAGE_BITS) as [KeyUsage, number][])
     .filter(([, bit]) => ((bytes[Math.floor(bit / 8)] ?? 0) & (0x80 >> (bit % 8))) !== 0)
     .map(([usage]) => usage);
@@ -348,16 +437,24 @@ export function decodeBasicConstraints(value: Buffer) {
   let index = 0;
   let ca = false;
   if (parts[index]?.tag === 0x01) {
-    ca = parts[index]!.content[0] !== 0;
+    ca = decodeBoolean(parts[index], "a BasicConstraints cA flag");
     index += 1;
   }
-  const pathLength =
-    parts[index]?.tag === 0x02 ? Number(BigInt(`0x${parts[index]!.content.toString("hex")}`)) : undefined;
+  let pathLength: number | undefined;
+  if (parts[index]?.tag === 0x02) {
+    const length = decodeInteger(parts[index], "a pathLenConstraint", { maxBytes: 4, nonNegative: true });
+    pathLength = Number(length);
+    index += 1;
+  }
+  if (parts.length !== index) throw new DerError("Malformed BasicConstraints.");
   return { ca, pathLength };
 }
 
 export function decodeExtendedKeyUsage(value: Buffer) {
-  return children(expectTag(decode(value), 0x30, "an ExtKeyUsageSyntax SEQUENCE")).map(decodeOid);
+  const purposes = children(expectTag(decode(value), 0x30, "an ExtKeyUsageSyntax SEQUENCE"));
+  if (!purposes.length) throw new DerError("Empty ExtKeyUsageSyntax.");
+  if (purposes.length > MAX_EXTENSIONS) throw new DerError("Too many extended key usages.");
+  return purposes.map((purpose) => decodeOid(purpose));
 }
 
 export function decodeSubjectKeyIdentifier(value: Buffer) {
@@ -378,7 +475,7 @@ export function parseCertificate(der: Buffer) {
   let index = 0;
   let version = 1;
   if (fields[0]?.tag === 0xa0) {
-    version = Number(children(fields[0])[0]!.content[0]) + 1;
+    version = Number(decodeInteger(children(fields[0])[0], "a certificate version", { maxBytes: 1 })) + 1;
     index = 1;
   }
   const serial = serialHex(fields[index]!);
@@ -398,8 +495,8 @@ export function parseCertificate(der: Buffer) {
     spki: Buffer.from(spki.raw),
     extensions,
     tbs: Buffer.from(tbs!.raw),
-    signatureAlgorithm: decodeOid(children(algorithm!)[0]!),
-    signature: Buffer.from(expectTag(signature, 0x03, "a signature BIT STRING").content.subarray(1)),
+    signatureAlgorithm: decodeOid(children(algorithm!)[0]),
+    signature: Buffer.from(decodeBitString(signature, "a signature BIT STRING").bytes),
   };
 }
 
@@ -433,9 +530,7 @@ export function parseCrl(der: Buffer) {
   const extensions = extensionsWrapper ? parseExtensions(children(extensionsWrapper)[0]!) : [];
   const numberExtension = extensions.find((item) => item.id === OID.crlNumber);
   const crlNumber = numberExtension
-    ? BigInt(
-        `0x${expectTag(decode(numberExtension.value), 0x02, "a CRLNumber").content.toString("hex") || "0"}`,
-      )
+    ? decodeInteger(decode(numberExtension.value), "a CRLNumber", { nonNegative: true })
     : null;
   return {
     issuerDer: Buffer.from(issuer.raw),
