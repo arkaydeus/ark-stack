@@ -7,7 +7,7 @@ import {
   type Access,
   type PrivilegedAction,
 } from "@ark-stack/shared";
-import { eq } from "drizzle-orm";
+import { eq, sql as statement } from "drizzle-orm";
 import { HTTPException } from "hono/http-exception";
 
 import { db, sql } from "./db.ts";
@@ -58,13 +58,16 @@ export function requireMfa(session: SessionValue) {
   }
 }
 
-export async function consumePrivilegedGrant(input: {
-  userId: string;
-  sessionId: string;
-  action: PrivilegedAction;
-  expectedPlanHash: string;
-}) {
-  const rows = await sql`
+export async function consumePrivilegedGrant(
+  input: {
+    userId: string;
+    sessionId: string;
+    action: PrivilegedAction;
+    expectedPlanHash: string;
+  },
+  executor: Pick<typeof db, "execute"> = db,
+) {
+  const rows = await executor.execute(statement`
     UPDATE step_up_grants
     SET consumed_at = now()
     WHERE id = (
@@ -82,7 +85,7 @@ export async function consumePrivilegedGrant(input: {
     AND consumed_at IS NULL
     AND expires_at > now()
     RETURNING *
-  `;
+  `);
   return rows[0] ?? null;
 }
 
@@ -91,6 +94,7 @@ export async function requirePrivileged(
   session: SessionValue,
   action: PrivilegedAction,
   expectedPlanHash: string,
+  executor: Pick<typeof db, "execute"> = db,
 ) {
   requireOperator(access);
   requireMfa(session);
@@ -99,12 +103,15 @@ export async function requirePrivileged(
       message: `Verify your password and MFA for ${action} before continuing.`,
     });
   }
-  const grant = await consumePrivilegedGrant({
-    userId: access.userId,
-    sessionId: session.session.id,
-    action,
-    expectedPlanHash,
-  });
+  const grant = await consumePrivilegedGrant(
+    {
+      userId: access.userId,
+      sessionId: session.session.id,
+      action,
+      expectedPlanHash,
+    },
+    executor,
+  );
   if (!grant) {
     throw new HTTPException(403, {
       message: `Verify your password and MFA for ${action} before continuing.`,

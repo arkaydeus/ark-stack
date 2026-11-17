@@ -45,7 +45,18 @@ import { loadEnv } from "./env.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
-import { edgePolicy, observeEdgeTailnet, startEdgeObserveSchedule } from "./modules/edge-observe.ts";
+import {
+  EDGE_OBSERVE_TARGET,
+  edgePolicy,
+  observeEdgeTailnet,
+  startEdgeObserveSchedule,
+} from "./modules/edge-observe.ts";
+import {
+  routesAfterCertificate,
+  routesAfterDnsCheck,
+  reconcileRouteRecords,
+  routesCertificateFailed,
+} from "./modules/front-routes.ts";
 import { edgeLocalApi, edgeSocketPath } from "./modules/tailnet-localapi.ts";
 import {
   executeWorkspaceQuery,
@@ -710,7 +721,16 @@ async function verifyDomain(operation: OperationRow) {
   const domainId = operation.targetIds[0];
   const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, domainId));
   if (!domain) throw new Error("Domain not found.");
-  const records = await db.select().from(dnsRecords).where(eq(dnsRecords.domainId, domainId));
+  const routeEndpointsOnly = operation.payload?.routeEndpointsOnly === true;
+  await reconcileRouteRecords(domainId);
+  const endpointRows = (await db.select().from(endpoints).where(eq(endpoints.domainId, domainId))).filter(
+    (endpoint) => !routeEndpointsOnly || endpoint.kind === "route",
+  );
+  const routeHostnames = new Set(endpointRows.map((endpoint) => endpoint.hostname));
+  const records = (await db.select().from(dnsRecords).where(eq(dnsRecords.domainId, domainId))).filter(
+    (record) =>
+      !routeEndpointsOnly || record.name === `_ark-stack.${domain.name}` || routeHostnames.has(record.name),
+  );
   if (!records.length) throw new Error("Domain has no stored DNS ownership challenge.");
   const ownership = records.find(
     (record) =>
@@ -723,6 +743,7 @@ async function verifyDomain(operation: OperationRow) {
   if (!ownership)
     throw new Error("Domain ownership challenge is missing or does not match this installation.");
   const verifiedRecordIds = new Set<string>();
+  const observedById = new Map<string, string>();
   for (const record of records) {
     const stub = process.env.ARK_DNS_STUB === "1";
     let observed = stub ? record.expectedValue : "";
@@ -740,6 +761,7 @@ async function verifyDomain(operation: OperationRow) {
       .update(dnsRecords)
       .set({ observedValue: observed, status: ok ? "verified" : "error" })
       .where(eq(dnsRecords.id, record.id));
+    observedById.set(record.id, observed);
     if (ok) verifiedRecordIds.add(record.id);
   }
   if (!verifiedRecordIds.has(ownership.id)) {
@@ -749,7 +771,6 @@ async function verifyDomain(operation: OperationRow) {
     .update(domainClaims)
     .set({ status: "verified", lastError: null, updatedAt: new Date() })
     .where(eq(domainClaims.id, domainId));
-  const endpointRows = await db.select().from(endpoints).where(eq(endpoints.domainId, domainId));
   const verifiedEndpointIds = new Set<string>();
   for (const endpoint of endpointRows) {
     const endpointRecords = records.filter((record) => record.name === endpoint.hostname && record.required);
@@ -760,16 +781,34 @@ async function verifyDomain(operation: OperationRow) {
       .update(endpoints)
       .set({ status: verified ? "verified" : "awaiting_dns", lastVerifiedAt: verified ? new Date() : null })
       .where(eq(endpoints.id, endpoint.id));
-    if (verified) {
-      verifiedEndpointIds.add(endpoint.id);
-      await enqueue({
-        kind: "certificate.issue",
-        actorId: operation.actorId ?? undefined,
-        targetIds: [endpoint.id],
+    if (verified) verifiedEndpointIds.add(endpoint.id);
+    // Front-door routes (FD-08): a certificate is requested only once the route has passed its
+    // edge probe and every required address record resolves to this server (§3.13.1, §3.14).
+    if (endpoint.kind === "route") {
+      const { issueCertificate: requested } = await routesAfterDnsCheck({
+        endpointId: endpoint.id,
+        verified,
+        pending: endpointRecords
+          .filter((record) => !verifiedRecordIds.has(record.id))
+          .map((record) => ({
+            type: record.type,
+            name: record.name,
+            expected: record.expectedValue,
+            observed: observedById.get(record.id) ?? "",
+          })),
+        operationId: operation.id,
+        routeEndpointsOnly,
       });
-    }
+      if (!verified || !requested) continue;
+    } else if (!verified) continue;
+    await enqueue({
+      kind: "certificate.issue",
+      actorId: operation.actorId ?? undefined,
+      targetIds: [endpoint.id],
+    });
   }
   await addStep(operation.id, "dns-verified", { records: records.length });
+  if (routeEndpointsOnly) return;
   const clusters = await db.select().from(databaseClusters);
   for (const database of await db.select().from(managedDatabases)) {
     const cluster = clusters.find((item) => item.id === database.clusterId);
@@ -809,7 +848,13 @@ async function issueCertificate(operation: OperationRow) {
   const [endpoint] = await db.select().from(endpoints).where(eq(endpoints.id, endpointId));
   if (!endpoint) throw new Error("Endpoint not found.");
   const action = operation.kind === "certificate.renew" ? "renew" : "run";
-  const issued = await issueCertificateFiles(endpoint.hostname, action);
+  let issued: Awaited<ReturnType<typeof issueCertificateFiles>>;
+  try {
+    issued = await issueCertificateFiles(endpoint.hostname, action);
+  } catch (error) {
+    if (endpoint.kind === "route") await routesCertificateFailed(endpoint.id, (error as Error).message);
+    throw error;
+  }
   if (!issued.fingerprint || !issued.expiresAt) {
     throw new Error("Certificate metadata is missing; refusing to store invented expiry or fingerprint.");
   }
@@ -819,6 +864,7 @@ async function issueCertificate(operation: OperationRow) {
   // files after a RELOAD. It is not marked as serving until the reload operation has confirmed
   // the new fingerprint on the public listener (§3.14).
   const servedByPgbouncer = endpoint.kind === "database";
+  const certificateStatus = servedByPgbouncer ? "awaiting_reload" : publiclyTrusted ? "issued" : "untrusted";
   await db.insert(certificates).values({
     id: certificateId,
     endpointId,
@@ -826,7 +872,7 @@ async function issueCertificate(operation: OperationRow) {
     issuer: issued.issuer,
     fingerprint: issued.fingerprint,
     expiresAt: issued.expiresAt,
-    status: servedByPgbouncer ? "awaiting_reload" : publiclyTrusted ? "issued" : "untrusted",
+    status: certificateStatus,
     lastDeployedAt: servedByPgbouncer ? null : new Date(),
   });
   if (servedByPgbouncer) {
@@ -850,6 +896,16 @@ async function issueCertificate(operation: OperationRow) {
   // action the actor requested. Carrying their id over would fail the owner-only platform check
   // for an operator who is allowed to verify their own domain.
   await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
+  if (endpoint.kind === "route") {
+    // FD-08: the route becomes `ready` only after a fresh edge-netns probe, which edge.observe runs.
+    const { observe } = await routesAfterCertificate({
+      endpointId,
+      status: certificateStatus,
+      issuer: issued.issuer,
+      operationId: operation.id,
+    });
+    if (observe) await enqueue({ kind: "edge.observe", targetIds: [EDGE_OBSERVE_TARGET] });
+  }
 }
 
 async function provisionDatabase(operation: OperationRow) {

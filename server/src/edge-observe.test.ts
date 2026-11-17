@@ -65,17 +65,18 @@ async function addRoute(input: {
   port: number;
   status: string;
   certificate?: boolean;
+  domainId?: string;
 }) {
   const endpointId = createId("end");
   const routeId = `rt_${createId("x").slice(2, 18)}`;
-  await sql`INSERT INTO endpoints (id, kind, hostname) VALUES (${endpointId}, 'route', ${`${routeId.slice(3)}.example.com`})`;
+  await sql`INSERT INTO endpoints (id, kind, hostname, domain_id) VALUES (${endpointId}, 'route', ${`${routeId.slice(3)}.example.com`}, ${input.domainId ?? null})`;
   await sql`
     INSERT INTO front_routes (id, kind, endpoint_id, listen_port, target_input, target_node_stable_id,
       target_ip, target_port, access_mode, status, enabled)
     VALUES (${routeId}, 'http', ${endpointId}, 443, ${input.target}, ${input.stableId}, ${input.ip},
       ${input.port}, 'public', ${input.status}, true)
   `;
-  if (input.certificate)
+  if (input.certificate ?? ["ready", "observation_expired"].includes(input.status))
     await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
     VALUES (${createId("crt")}, ${endpointId}, ${JSON.stringify([`${routeId.slice(3)}.example.com`])}::jsonb, 'issued', now())`;
   endpointIds.push(endpointId);
@@ -228,6 +229,7 @@ describe("identity pinning and the edge-netns probe", () => {
       ip: "100.101.102.103",
       port: 3000,
       status: "awaiting_acl",
+      certificate: true,
     });
     await observe();
     expect((await route(id)).status).toBe("awaiting_acl");
@@ -393,6 +395,7 @@ describe("lease expiry", () => {
       ip: "100.101.102.103",
       port: 3000,
       status: "awaiting_acl",
+      certificate: true,
     });
     await observe();
     const overview = await tailnetOverview();
@@ -483,11 +486,12 @@ describe("coordinator wiring", () => {
         const result = (await runOperation("edge.observe", operation)) as {
           reconcile: { missing: string[] };
         };
-        expect((await route(id)).status).toBe("ready");
+        expect((await route(id)).status).toBe(certificate ? "ready" : "awaiting_dns");
         expect(result.reconcile.missing).toEqual(certificate ? [id] : []);
         const applies = await sql`SELECT id FROM operations WHERE kind = 'edge.apply' AND status = 'queued'`;
         created.push(...applies.map((row) => String(row.id)));
-        expect(applies).toHaveLength(certificate ? 1 : 0);
+        // Missing certificates now withdraw the formerly-ready route and queue a render too.
+        expect(applies).toHaveLength(1);
       } finally {
         caddy.stop(true);
         if (previous.socket === undefined) delete process.env.ARK_EDGE_TS_SOCKET;
@@ -573,6 +577,81 @@ describe("lifecycle recovery", () => {
   });
 });
 
+describe("route lifecycle (FD-08)", () => {
+  const domainId = createId("dom");
+  beforeEach(async () => {
+    await sql`
+      INSERT INTO domain_claims (id, name, ownership_token, status)
+      VALUES (${domainId}, ${`${suffix}.example.com`}, 'ark-own-test', 'verified')
+      ON CONFLICT (id) DO NOTHING
+    `;
+  });
+  afterAll(async () => {
+    await removeRoutes();
+    await sql`DELETE FROM domain_claims WHERE id = ${domainId}`;
+  });
+
+  test("a passing probe moves a new route on to awaiting_dns and queues domain.verify, not ready", async () => {
+    mock.state.reachable.add("100.101.102.103:3000");
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "awaiting_acl",
+      domainId,
+    });
+    const result = await observe();
+    expect((await route(id)).status).toBe("awaiting_dns");
+    expect(result.routes.find((item) => item.id === id)).toMatchObject({
+      from: "awaiting_acl",
+      to: "awaiting_dns",
+    });
+    expect(queued).toContainEqual({
+      kind: "domain.verify",
+      targetIds: [domainId],
+      payload: { routeEndpointsOnly: true },
+    });
+    expect((await edgePolicy()).routes.map((item) => item.id)).not.toContain(id);
+    // DNS is re-checked on every observation until it resolves.
+    queued = [];
+    await observe();
+    expect((await route(id)).status).toBe("awaiting_dns");
+    expect(queued).toContainEqual({
+      kind: "domain.verify",
+      targetIds: [domainId],
+      payload: { routeEndpointsOnly: true },
+    });
+  });
+
+  test("issuing_certificate becomes ready only with an issued certificate and a passing probe", async () => {
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "issuing_certificate",
+      domainId,
+    });
+    mock.state.reachable.add("100.101.102.103:3000");
+    await observe();
+    expect((await route(id)).status).toBe("issuing_certificate");
+    const [row] = await sql`SELECT endpoint_id FROM front_routes WHERE id = ${id}`;
+    await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
+      VALUES (${createId("crt")}, ${row!.endpoint_id}, '[]'::jsonb, 'untrusted', now())`;
+    await observe();
+    expect((await route(id)).status).toBe("issuing_certificate");
+    await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
+      VALUES (${createId("crt")}, ${row!.endpoint_id}, '[]'::jsonb, 'issued', now() + interval '1 second')`;
+    mock.state.reachable.clear();
+    await observe();
+    expect((await route(id)).status).toBe("awaiting_acl");
+    mock.state.reachable.add("100.101.102.103:3000");
+    await observe();
+    expect((await route(id)).status).toBe("ready");
+  });
+});
+
 describe("coordinator drain failure", () => {
   test.each(["load", "read"])("%s failure attempts a stop and raises a critical alert", async (failure) => {
     const { enqueue: realEnqueue, runOperation } = await import("./coordinator.ts");
@@ -608,5 +687,63 @@ describe("coordinator drain failure", () => {
       await sql`DELETE FROM operations WHERE id = ${operation.id}`;
       await sql`DELETE FROM alerts WHERE dedup_key = 'edge-withdrawal'`;
     }
+  });
+});
+
+describe("stale probes", () => {
+  test("a delayed passing probe cannot promote a changed target port", async () => {
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "awaiting_acl",
+      certificate: true,
+    });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const ports: number[] = [];
+    const pending = observeEdgeTailnet({
+      api: {
+        status: () => api.status(),
+        probe: async (_ip, port) => {
+          ports.push(port);
+          entered.resolve();
+          await release.promise;
+          return { ok: true, detail: "connected" };
+        },
+      },
+      enqueue,
+    });
+    await entered.promise;
+    try {
+      await sql`UPDATE front_routes SET target_port = 3001, status = 'awaiting_acl' WHERE id = ${id}`;
+    } finally {
+      release.resolve();
+    }
+    await pending;
+    expect(ports).toEqual([3000]);
+    expect((await route(id)).status).toBe("awaiting_acl");
+    expect(queued).toEqual([]);
+    mock.state.reachable.add("100.101.102.103:3001");
+    await observe();
+    expect(mock.calls).toContain("dial 100.101.102.103:3001");
+    expect((await route(id)).status).toBe("ready");
+  });
+
+  test("a ready route with an expired certificate re-enters repair", async () => {
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "ready",
+    });
+    await sql`UPDATE certificates SET expires_at = now() - interval '1 day'
+      WHERE endpoint_id = (SELECT endpoint_id FROM front_routes WHERE id = ${id})`;
+    mock.state.reachable.add("100.101.102.103:3000");
+    await observe();
+    expect((await route(id)).status).toBe("awaiting_dns");
+    expect(queued.some((item) => item.kind === "edge.drain")).toBe(true);
   });
 });

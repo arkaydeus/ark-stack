@@ -50,6 +50,8 @@ import {
   dbIngressLimitsInput,
   dbIngressLimitsSummary,
   platformDbIngressLimits,
+  frontRouteCreateInput,
+  frontRouteUpdateInput,
   buildDomainPlan,
   nextBackupStatus,
   redactLogLine,
@@ -94,6 +96,19 @@ import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
 import { frontAclSnippet } from "./modules/front-acl.ts";
+import {
+  FrontRouteError,
+  commitRouteCreate,
+  commitRouteDelete,
+  commitRouteEnable,
+  commitRouteUpdate,
+  disableRoute,
+  listFrontRoutes,
+  prepareRouteCreate,
+  prepareRouteDelete,
+  prepareRouteEnable,
+  prepareRouteUpdate,
+} from "./modules/front-routes.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, tailnetOverview } from "./modules/edge-observe.ts";
 import { raiseAlert } from "./modules/alerts.ts";
 import {
@@ -186,6 +201,7 @@ app.onError((error, c) => {
   // server fault, so they belong in the response rather than only in the log.
   if (error instanceof ValidationError) return c.json({ error: error.message }, 422);
   if (error instanceof DatabaseClientError) return c.json({ error: error.message }, error.status);
+  if (error instanceof FrontRouteError) return c.json({ error: error.message }, error.status);
   // CSR and CA policy refusals (CsrError included) describe the submitted input; no key material.
   if (error instanceof PkiPolicyError) return c.json({ error: error.message }, 422);
   console.error(error instanceof Error ? error.message : error);
@@ -2835,6 +2851,134 @@ app.get("/api/front/routes/:id/acl", async (c) => {
   const snippet = await frontAclSnippet({ kind: "route", routeId: c.req.param("id") });
   if (!snippet) throw new HTTPException(404, { message: "Route not found." });
   return c.json(snippet);
+});
+
+// HTTP route lifecycle (front door §3.3, §3.13, §3.14, FD-08). Every role may list routes; every
+// change is owner-only (R12) with MFA. Creating, enabling and loosening need a single-use
+// `exposure.public` grant bound to the exact request, deleting a `resource.delete` grant, and
+// disabling (a tightening) none. Final validation, grant consumption and mutation commit together.
+app.get("/api/front/routes", async (c) => {
+  return c.json({ routes: await listFrontRoutes() });
+});
+
+app.get("/api/front/routes/:id", async (c) => {
+  const [route] = await listFrontRoutes(c.req.param("id"));
+  if (!route) throw new HTTPException(404, { message: "Route not found." });
+  return c.json({ route });
+});
+
+app.post("/api/front/routes", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const request = (await c.req.json()) as Record<string, unknown>;
+  const plan = await prepareRouteCreate(frontRouteCreateInput.parse(request));
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "exposure.public",
+      privilegedRequestHash("exposure.public", request),
+      tx,
+    );
+  const actor = { userId: access.userId, role: access.role };
+  const { routeId, observeOperationId } = await commitRouteCreate(plan, actor, enqueue, authorize);
+  const [route] = await listFrontRoutes(routeId);
+  return c.json(
+    {
+      route,
+      records: plan.records.map((record) => ({
+        type: record.type,
+        name: record.name,
+        relativeName: record.relativeName,
+        value: record.value,
+        ttl: record.ttl,
+        required: record.required,
+      })),
+      acl: await frontAclSnippet({ kind: "route", routeId }),
+      operationId: observeOperationId,
+    },
+    201,
+  );
+});
+
+app.patch("/api/front/routes/:id", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  const request = (await c.req.json()) as Record<string, unknown>;
+  const plan = await prepareRouteUpdate(routeId, frontRouteUpdateInput.parse(request));
+  const authorize = plan.loosening.length
+    ? (tx: import("./db.ts").DbTransaction) =>
+        requirePrivileged(
+          access,
+          c.get("session"),
+          "exposure.public",
+          privilegedRequestHash("exposure.public", { routeId, ...request }),
+          tx,
+        )
+    : undefined;
+  const { status } = await commitRouteUpdate(
+    plan,
+    { userId: access.userId, role: access.role },
+    enqueue,
+    authorize,
+  );
+  const [route] = await listFrontRoutes(routeId);
+  return c.json({ route, status, loosening: plan.loosening });
+});
+
+app.post("/api/front/routes/:id/enable", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  const plan = await prepareRouteEnable(routeId);
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "exposure.public",
+      privilegedRequestHash("exposure.public", { routeId }),
+      tx,
+    );
+  await commitRouteEnable(plan, { userId: access.userId, role: access.role }, enqueue, authorize);
+  const [route] = await listFrontRoutes(routeId);
+  return c.json({ route });
+});
+
+app.post("/api/front/routes/:id/disable", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  await disableRoute(routeId, { userId: access.userId, role: access.role }, enqueue);
+  const [route] = await listFrontRoutes(routeId);
+  return c.json({ route });
+});
+
+app.delete("/api/front/routes/:id", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  const plan = await prepareRouteDelete(routeId);
+  const authorize = (tx: import("./db.ts").DbTransaction) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "resource.delete",
+      privilegedRequestHash("resource.delete", { routeId }),
+      tx,
+    );
+  const result = await commitRouteDelete(
+    plan,
+    { userId: access.userId, role: access.role },
+    enqueue,
+    authorize,
+  );
+  return c.json({ id: routeId, ...result });
 });
 
 app.get("/api/metrics", async (c) => {

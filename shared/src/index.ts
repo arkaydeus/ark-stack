@@ -11,6 +11,7 @@ export * from "./db-ingress.ts";
 export * from "./dns-plan.ts";
 export * from "./edge.ts";
 export * from "./errors.ts";
+export * from "./front-routes.ts";
 export * from "./hash.ts";
 export * from "./hostnames.ts";
 export * from "./install.ts";

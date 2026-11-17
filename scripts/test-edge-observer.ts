@@ -730,13 +730,24 @@ async function identityWithdrawalTest(report: Report) {
   await sql`UPDATE operations SET status = 'cancelled' WHERE kind IN ('edge.apply', 'edge.drain') AND status = 'queued'`;
 }
 
-/** The owner re-confirms the original machine (FD-08 will do this with step-up); the route is live again. */
+/** The owner re-confirms the original machine (FD-08 does this through PATCH /api/front/routes/:id with step-up); the route is live again. */
 async function restoreRoute(report: Report) {
   mock.state.peers = [home];
   await sql`UPDATE front_routes SET enabled = true, status = 'awaiting_acl', target_node_stable_id = ${home.id} WHERE id = ${routeId}`;
+  // The preceding fault may have stopped Caddy. Keep the short fixture lease renewed throughout
+  // restart and reload, and wait for its admin listener rather than racing /adapt against startup.
   await observe();
-  await edgeApply();
-  await waitUntilServing(report, "after re-confirmation the route serves again");
+  const stopObserving = keepObserving();
+  try {
+    await waitFor("Caddy admin API after re-confirmation", async () => {
+      await activeBackends();
+      return true;
+    });
+    await edgeApply();
+    await waitUntilServing(report, "after re-confirmation the route serves again");
+  } finally {
+    await stopObserving();
+  }
   // Start the expiry measurement after the last apply and its container startup have finished.
   return observe();
 }
