@@ -56,7 +56,7 @@ const fixtures = join(import.meta.dir, "edge-test");
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-observer-${suffix}-`));
 const network = `ark-edge-observer-${suffix}`;
-const runtime = new EdgeTestRuntime(directory, network);
+const runtime = new EdgeTestRuntime(directory, network, bunImage);
 const removeSignalHandlers = runtime.installSignalHandlers();
 const docker = (...args: string[]) => runtime.docker(...args);
 const leaseMs = 8_000;
@@ -409,10 +409,14 @@ async function readActiveBackends() {
 
 type Reply = { status: number; body: string };
 
+// Each probe opens a new connection (`agent: false`). With the default pooled keep-alive agent, a
+// poll kept reusing a connection accepted by the pre-reload Caddy, which kept answering with the
+// old configuration, so waitUntilServing() could time out although new clients were served.
 function secureGet(path = "/", hostname = routeHost) {
   return new Promise<Reply>((resolveReply, reject) => {
     const request = httpsRequest(
       {
+        agent: false,
         host: "127.0.0.1",
         port: ports.https,
         servername: hostname,
@@ -437,7 +441,7 @@ function secureGet(path = "/", hostname = routeHost) {
 function plainGet(host: string, path: string) {
   return new Promise<Reply>((resolveReply, reject) => {
     const request = httpRequest(
-      { host: "127.0.0.1", port: ports.http, path, headers: { host }, timeout: 3_000 },
+      { agent: false, host: "127.0.0.1", port: ports.http, path, headers: { host }, timeout: 3_000 },
       (response) => {
         let body = "";
         response.setEncoding("utf8");
@@ -834,7 +838,21 @@ async function leaseExpiryTest(report: Report) {
 
 async function expiredStartTest(report: Report) {
   // The lease is expired and the on-disk Caddyfile still names the route (nothing re-applied it).
-  const caddyfile = await Bun.file(join(edgeDir, "Caddyfile")).text();
+  // The worker stand-in (uid 1000) wrote it with mode 0600. Read it as uid 1000: on a Linux host
+  // whose user is not uid 1000 (a CI runner is 1001), a direct read fails with EACCES.
+  const caddyfile = await docker(
+    "run",
+    "--rm",
+    "--network",
+    "none",
+    "--user",
+    "1000:1000",
+    "--volume",
+    `${edgeDir}:/edge:ro`,
+    bunImage,
+    "cat",
+    "/edge/Caddyfile",
+  );
   expect(
     report,
     caddyfile.includes(`# ark-tailnet-route ${routeId} ${peerBackend}`),
@@ -862,16 +880,20 @@ async function expiredStartTest(report: Report) {
   );
   // Without the watchdog at all, the guard cannot obtain a lease and stays closed too.
   await docker("stop", watchdogName);
-  await restart();
-  const unreachable = (await edgeLogs()).match(/ark launch guard: [^\n]+/g)?.at(-1) ?? "";
-  expect(
-    report,
-    /Caddyfile\.closed: no valid lease \(watchdog: unreachable\)/.test(unreachable) &&
-      (await outcome()) !== "upstream",
-    "with the watchdog unreachable, the guard also starts closed",
-    unreachable,
-  );
-  await startWatchdog("http://edge-admin:2019");
+  try {
+    await restart();
+    const unreachable = (await edgeLogs()).match(/ark launch guard: [^\n]+/g)?.at(-1) ?? "";
+    expect(
+      report,
+      /Caddyfile\.closed: no valid lease \(watchdog: unreachable\)/.test(unreachable) &&
+        (await outcome()) !== "upstream",
+      "with the watchdog unreachable, the guard also starts closed",
+      unreachable,
+    );
+  } finally {
+    // Later cases need a running watchdog even if this one failed.
+    await startWatchdog("http://edge-admin:2019");
+  }
 }
 
 async function withdrawalFailureTest(report: Report, failure: "load" | "read" = "load") {

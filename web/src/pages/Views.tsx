@@ -8,6 +8,7 @@ import type { PlatformState } from "@/lib/types";
 import { act, api, formatDate } from "@/lib/utils";
 
 import { InlineError } from "./Auth";
+import { BackupTargetsPanel } from "./BackupTargets";
 
 export function Overview({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   return (
@@ -921,6 +922,7 @@ export function ActivityView({ state }: { state: PlatformState }) {
 export function BackupsView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   return (
     <div className="space-y-5">
+      {state.user.role === "owner" && <BackupTargetsPanel />}
       <div className="flex flex-wrap gap-2">
         <Button
           onClick={() =>
@@ -942,7 +944,10 @@ export function BackupsView({ state, reload }: { state: PlatformState; reload: (
             <div>
               <strong>{item.kind}</strong>
               <p className="text-sm text-muted-foreground">
-                Upload {item.status}. Restore proof {item.restoreVerified ? "verified" : "not yet run"}.
+                {item.status === "local"
+                  ? "On the VPS only; exported off-VPS with the next snapshot."
+                  : `Upload ${item.status}.`}{" "}
+                Restore proof {item.restoreVerified ? "verified" : "not yet run"}.
               </p>
             </div>
             {/* The restore test runs against one exact backup, so the action belongs on the row

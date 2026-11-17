@@ -33,7 +33,9 @@ watchdog="${ARK_EDGE_WATCHDOG_URL:-http://edge-watchdog:2021}"
 export ARK_EDGE_L4_GENERATION="$root/current"
 
 guarded() { grep -q '^# ark-tailnet-route ' "$full" 2>/dev/null; }
-ask() { wget -q -T 1 -O - "$watchdog/v1/launch?proxy=haproxy$1" 2>/dev/null || true; }
+# `wget -T` bounds reads, not name resolution: once the watchdog container is gone, resolving its
+# name can take the resolver's 5 s timeout (Docker behind systemd-resolved). Bound the whole request.
+ask() { timeout 1 wget -q -T 1 -O - "$watchdog/v1/launch?proxy=haproxy$1" 2>/dev/null || true; }
 point() {
   ln -s "$1" "$link.next"
   mv -f "$link.next" "$link"
@@ -91,7 +93,7 @@ supervise() {
   while kill -0 "$haproxy_pid" 2>/dev/null; do
     if guarded || protected_generation; then latched=1; fi
     if [ "$latched" = 1 ]; then
-      heartbeat="$(wget -q -T 1 -O - "$watchdog/v1/supervise?proxy=haproxy" 2>/dev/null || true)"
+      heartbeat="$(timeout 1 wget -q -T 1 -O - "$watchdog/v1/supervise?proxy=haproxy" 2>/dev/null || true)"
       if [ "$heartbeat" = "ok" ]; then
         misses=0
       else

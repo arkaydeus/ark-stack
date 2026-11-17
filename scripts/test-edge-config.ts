@@ -42,7 +42,7 @@ const directory = await mkdtemp(join(tmpdir(), `ark-edge-${suffix}-`));
 // Match the production worker and edge identity, independent of the host uid.
 const productionUser = "1000:1000";
 const network = `ark-edge-${suffix}`;
-const runtime = new EdgeTestRuntime(directory, network);
+const runtime = new EdgeTestRuntime(directory, network, bunImage);
 const containers = runtime.containers;
 const removeSignalHandlers = runtime.installSignalHandlers();
 
@@ -1114,7 +1114,8 @@ async function namespaceTest(report: Report) {
     const text = await tailscaledLog(stack.edgeTs);
     return /Switching ipn state|Received error/.test(text) ? text : undefined;
   });
-  const denied = /can't initialize ip6?tables table/.test(logs);
+  const deniedLines = logs.split("\n").filter((line) => /can't initialize ip6?tables table/.test(line));
+  const denied = deniedLines.length > 0;
   const iptables = await docker("exec", stack.edgeTs, "iptables", "-S").then(
     (rules) => `ok (${rules.split("\n").length} rules)`,
     (error: Error) => `failed: ${error.message.split("\n")[0]}`,
@@ -1123,7 +1124,7 @@ async function namespaceTest(report: Report) {
     report,
     !denied && iptables.startsWith("ok"),
     "edge-ts can run iptables, and tailscaled logs no netfilter permission error",
-    `iptables -S ${iptables}; permission errors in log: ${denied}`,
+    `iptables -S ${iptables}; permission errors in log: ${denied}${denied ? ` (${[...new Set(deniedLines.map((line) => line.replace(/^\S+ \S+ /, "")))].slice(0, 3).join(" | ")})` : ""}`,
   );
   const control = `ark-edge-ts-control-${suffix}`;
   containers.push(control);

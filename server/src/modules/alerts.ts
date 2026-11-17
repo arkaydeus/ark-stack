@@ -133,7 +133,8 @@ export async function evaluateAlerts() {
   const recentBackups = await db.select().from(backups);
   const newestPerTarget = new Map<string, (typeof recentBackups)[number]>();
   for (const item of recentBackups) {
-    if (item.status === "failed" || item.status === "planned") continue;
+    // A `local` PostgreSQL backup has not left the VPS yet (FD-21), so it is not freshness evidence.
+    if (item.status === "failed" || item.status === "planned" || item.status === "local") continue;
     const key = `${item.kind}:${item.targetId}`;
     const held = newestPerTarget.get(key);
     if (!held || item.createdAt.getTime() > held.createdAt.getTime()) newestPerTarget.set(key, item);
@@ -149,6 +150,11 @@ export async function evaluateAlerts() {
       dedupKey: "backup-stale",
     });
   }
+  // Per-target and per-source off-VPS backup alerts (FD-21, front door §3.18.4). Imported lazily:
+  // offsite-backups raises its alerts through this module.
+  await import("./offsite-backups.ts")
+    .then((module) => module.evaluateBackupAlerts())
+    .catch((error: Error) => console.error(`backup alert evaluation failed: ${error.message}`));
   const managedAlerts = await db.select().from(alerts).where(isNull(alerts.resolvedAt));
   for (const alert of managedAlerts) {
     if (alert.dedupKey.startsWith("op-failed:")) {

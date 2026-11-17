@@ -207,7 +207,9 @@ Switching public and tailnet administration is a durable operation that rewrites
 
 ## Backups
 
-Upload, integrity, and restore-test are three statuses. A successful upload is not a verified restore. Set `ARK_BACKUP_EXECUTE=1` only when pgBackRest or Restic should run. Mail jobs additionally require `ARK_MAIL_SNAPSHOT_READY=1` from a completed native snapshot/quiesce step. Plan-only execution fails the operation instead of reporting success.
+Upload, integrity, and restore-test are three statuses. File restore tests use an exact successful export and its sealed target credentials. PostgreSQL application restore tests refuse worker-local execution; use the off-VPS recovery tool for database recovery. A successful upload is not a verified restore. Set `ARK_BACKUP_EXECUTE=1` only when pgBackRest or Restic should run. Mail jobs additionally require `ARK_MAIL_SNAPSHOT_READY=1` from a completed native snapshot/quiesce step. Plan-only execution fails the operation instead of reporting success.
+
+PostgreSQL backups run inside each cluster's container (`ark-postgres`, `ark-app-postgres`) into an encrypted local pgBackRest repo2, and leave the VPS as restic snapshots to the S3-compatible targets configured under **Backups** (FD-21). A PostgreSQL backup row is `local` until a snapshot containing it reaches a target. The installer generates `ARK_PLATFORM_PG_EXECUTOR_TOKEN`, `ARK_APP_PG_EXECUTOR_TOKEN`, `ARK_PLATFORM_PG_REPO_CIPHER_PASS` and `ARK_APP_PG_REPO_CIPHER_PASS`; without a cipher pass and an executor token of at least 24 characters WAL archiving stays off and backup health says so. Copy both cipher passes and every target's restic password off-host. `pgbackrest expire` is never run on the VPS. Provider recipes, the append-only canary, alerts and the off-VPS restore runbook (`scripts/offsite-restore.ts`) are in [docs/guides/backups.md](guides/backups.md).
 
 ## Maintenance
 
@@ -231,7 +233,7 @@ Third-party images (Caddy, HAProxy, Tailscale, PgBouncer, PostgreSQL, Stalwart a
 
    For the edge namespace (FD-05), the run then checks the following:
 
-   - `edge-ts` has exactly `NET_ADMIN` and `NET_RAW` and `/dev/net/tun`. A control shows that tailscaled's iptables calls fail with `NET_ADMIN` alone.
+   - `edge-ts` has exactly `NET_ADMIN` and `NET_RAW` and `/dev/net/tun`. A control shows that tailscaled's iptables calls fail with `NET_ADMIN` alone. tailscaled uses legacy `ip6tables`, and a container cannot load kernel modules, so on a Linux host the `ip6table_filter` and `ip6table_nat` modules must already be loaded. Otherwise tailscaled logs `Table does not exist` and the check fails. CI loads them with `modprobe` first.
    - `tailscale0` is in the namespace Caddy runs in. `--shields-up` and `TS_ACCEPT_DNS=false` reach tailscaled, and UDP 41642 is published.
    - A container on `edge-control` reaches `edge-admin:2019`. A container on `admin` aliased `api` cannot reach it by alias or by either `edge-ts` address.
    - `edge` comes back serving after `edge-ts` is changed through `docker compose up`, restarted in place, or recreated on its own. The last two go through the rejoin step that `mise run maintain` runs.
@@ -264,5 +266,7 @@ The snippet's syntax and tests can be checked against a real tailnet with an opt
 `mise run import -- inventory.json` compares domains, databases, and services. Owners are never imported. Stop the old reconcilers before transferring a live mail domain.
 
 ## Local acceptance
+
+`mise run test:db` runs the DB-backed server tests against a throwaway `postgres:17.6` container that it migrates as `ark_migration` and removes on completion or interruption (cleanup failure returns nonzero). `mise run test:db:up` keeps one running and prints shell exports plus the `ark_test_db <file>` helper, which isolates follow-up tests from inherited provider settings (see the README).
 
 `mise run test:e2e` refuses non-loopback PostgreSQL, creates a uniquely named disposable database, migrates it from empty, drives Chromium through owner creation, pre-MFA denial, invalid and valid TOTP, recovery-code acknowledgement, custom domain setup and one-time recovery-code use, then removes the database. The provider/Linux release checks in `security-review.md` remain separate opt-in acceptance work.
