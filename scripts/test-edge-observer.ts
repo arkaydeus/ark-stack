@@ -108,12 +108,6 @@ await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
 const watchdogToken = randomBytes(24).toString("base64url");
 const socket = join(tmpdir(), `ark-edge-observer-${suffix}.sock`);
 const edgeDir = join(directory, "edge");
-/**
- * How long a launch guard may take to start closed when the watchdog is unreachable: five attempts,
- * each up to the resolver timeout (~5 s) for the stopped container's name, the wget timeout and a
- * 1 s pause.
- */
-const guardUnreachableStartMs = 60_000;
 const certDir = join(directory, "certs");
 const acmeDir = join(directory, "acme");
 Object.assign(process.env, {
@@ -827,16 +821,10 @@ async function expiredStartTest(report: Report) {
   const restart = async () => {
     await docker("restart", stack.edge);
     await refreshPorts();
-    // With the watchdog unreachable, the guard asks it five times before starting closed, and
-    // `wget -T` does not bound resolving the stopped container's name. On the Linux CI runner that
-    // took about 30 s in all, so allow the guard's full retry budget rather than a fixed 30 s.
-    await waitFor(
-      "edge to serve :80 again",
-      async () =>
-        (await plainGet("example.com", "/.well-known/acme-challenge/obs-token")).status === 200
-          ? true
-          : undefined,
-      guardUnreachableStartMs,
+    await waitFor("edge to serve :80 again", async () =>
+      (await plainGet("example.com", "/.well-known/acme-challenge/obs-token")).status === 200
+        ? true
+        : undefined,
     );
   };
   await restart();
