@@ -248,6 +248,6 @@ The snippet's syntax and tests can be checked against a real tailnet with an opt
 
 ## Local acceptance
 
-`mise run test:db` runs the DB-backed server tests against a throwaway `postgres:17.6` container that it migrates as `ark_migration` and always removes; `mise run test:db:up` keeps one running and prints its `DATABASE_URL` (see the README).
+`mise run test:db` runs the DB-backed server tests against a throwaway `postgres:17.6` container that it migrates as `ark_migration` and removes on completion or interruption (cleanup failure returns nonzero). `mise run test:db:up` keeps one running and prints shell exports plus the `ark_test_db <file>` helper, which isolates follow-up tests from inherited provider settings (see the README).
 
 `mise run test:e2e` refuses non-loopback PostgreSQL, creates a uniquely named disposable database, migrates it from empty, drives Chromium through owner creation, pre-MFA denial, invalid and valid TOTP, recovery-code acknowledgement, custom domain setup and one-time recovery-code use, then removes the database. The provider/Linux release checks in `security-review.md` remain separate opt-in acceptance work.

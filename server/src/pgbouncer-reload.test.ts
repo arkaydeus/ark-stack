@@ -349,7 +349,7 @@ test("revoking the last client closes the live ingress before a failed admin rel
   await Bun.write(nft, "#!/bin/sh\ncat >/dev/null\necho ark_db_ingress\n");
   await chmod(nft, 0o700);
   await Bun.write(join(overrides.ARK_PGBOUNCER_DIR!, "expose"), "1\n");
-  const ingress = Bun.spawn([process.execPath, resolve("scripts/database-ingress.ts")], {
+  const ingress = Bun.spawn([process.execPath, "--no-env-file", resolve("scripts/database-ingress.ts")], {
     env: {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,

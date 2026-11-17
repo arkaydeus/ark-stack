@@ -37,16 +37,16 @@ run = "bun --env-file=.env test shared server workers tests scripts/publish-imag
 
 [tasks."test:db"]
 description = "Run the DB-backed server tests (or the bun test arguments given) against a throwaway, migrated postgres:17.6 container that is always removed"
-run = "bun scripts/test-db.ts"
+run = "bun --no-env-file scripts/test-db.ts"
 raw_args = true
 
 [tasks."test:db:up"]
-description = "Start and migrate a throwaway test PostgreSQL container and print its DATABASE_URL and test environment as shell exports"
-run = "bun scripts/test-db.ts up"
+description = "Start and migrate a throwaway test PostgreSQL container and print shell exports plus an isolated ark_test_db test helper"
+run = "bun --no-env-file scripts/test-db.ts up"
 
 [tasks."test:db:down"]
 description = "Remove a throwaway test PostgreSQL container started by test:db:up"
-run = "bun scripts/test-db.ts down"
+run = "bun --no-env-file scripts/test-db.ts down"
 raw_args = true
 
 [tasks."test:e2e"]
@@ -102,6 +102,7 @@ run = [
   "bunx tsc --noEmit -p workers/tsconfig.json",
   "bunx tsc --noEmit -p scripts/tsconfig.publish.json",
   "bunx tsc --noEmit -p scripts/tsconfig.pgbouncer.json",
+  "bunx tsc --noEmit -p scripts/tsconfig.test-db.json",
 ]
 
 [tasks.lint]

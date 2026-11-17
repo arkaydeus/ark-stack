@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "types": ["bun"] },
+  "include": ["test-db.ts", "test-db.test.ts", "edge-test/runtime-cleanup.test.ts"]
+}

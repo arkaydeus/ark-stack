@@ -2040,14 +2040,9 @@ try {
       // Loopback is the host-side published port, not an address inside the worker container.
       // Join the platform Postgres container's network without modifying that container. This
       // works on shared Docker hosts whose isolated bridges cannot resolve host.docker.internal.
-      const containers = await run([
-        "docker",
-        "ps",
-        "--filter",
-        `publish=${platformUrl.port || "5432"}`,
-        "--format",
-        "{{.ID}}",
-      ]);
+      // Docker's publish filter matches the container port, not the published host port.
+      // Inspect the bindings below instead, including Docker-assigned ephemeral host ports.
+      const containers = await run(["docker", "ps", "--format", "{{.ID}}"]);
       let found = false;
       for (const id of containers.stdout.split("\n").filter(Boolean)) {
         const inspected = await run(["docker", "inspect", id]);
