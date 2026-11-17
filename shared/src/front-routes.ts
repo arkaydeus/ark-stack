@@ -1,19 +1,20 @@
 // HTTP route lifecycle inputs and policy (docs/design/front-door.md §3.3, §3.13, FD-08).
 //
-// Pure helpers shared by the API and its tests: request schemas, the access-mode guard that holds
-// until the login gate ships (FD-11), the domain claim a hostname belongs to, and which updates
-// loosen exposure and therefore need an `exposure.public` step-up grant.
+// Pure helpers shared by the API and its tests: request schemas, the access-mode guard, the domain
+// claim a hostname belongs to, and which updates loosen exposure and therefore need an
+// `exposure.public` step-up grant. `sso` routes are served behind the login gate (FD-11, §3.9).
 
 import { z } from "zod";
 
 import { ValidationError } from "./errors.ts";
+import { checkAllowedOrigins, checkBypassPaths } from "./gate.ts";
 import { normalizeHostname } from "./hostnames.ts";
 
 /** Kinds this release can create. TLS, TCP and Postgres routes arrive with FD-14 and FD-26. */
 export const SUPPORTED_ROUTE_KINDS = ["http"] as const;
 
-/** Access modes this release can serve. `sso` needs the login gate (FD-10, FD-11). */
-export const SUPPORTED_ACCESS_MODES = ["public"] as const;
+/** Access modes this release can serve. `sso` is served behind the login gate (FD-10, FD-11). */
+export const SUPPORTED_ACCESS_MODES = ["public", "sso"] as const;
 
 /** The lifecycle a new route moves through before it may be enabled. */
 export const ROUTE_LIFECYCLE = [
@@ -47,9 +48,13 @@ export const frontRouteCreateInput = z
     hostname: routeHostname,
     target,
     targetPort: port,
-    // No default: the schema default (`sso`) cannot be served before FD-11, so it is refused.
+    // Omitted means the schema default, `sso` (behind the login gate, FD-11).
     accessMode: z.enum(["public", "sso"]).optional(),
     allowSensitivePort: z.boolean().optional(),
+    // SSO only: path prefixes that skip the session check (§3.9.5), and owner-approved Origin
+    // exceptions for cookie-authenticated WebSockets and unsafe methods (§3.9.4).
+    bypassPaths: z.array(z.string()).optional(),
+    allowedOrigins: z.array(z.string()).optional(),
     // Apex `www` canonicalisation (§3.5): answer with a redirect to this hostname instead.
     redirectTo: routeHostname.nullable().optional(),
   })
@@ -62,10 +67,13 @@ export const frontRouteUpdateInput = z
     accessMode: z.enum(["public", "sso"]).optional(),
     allowSensitivePort: z.boolean().optional(),
     redirectTo: routeHostname.nullable().optional(),
+    bypassPaths: z.array(z.string()).optional(),
+    allowedOrigins: z.array(z.string()).optional(),
   })
   .strict()
   .refine((value) => Object.values(value).some((item) => item !== undefined), {
-    message: "Change at least one of target, targetPort, accessMode or redirectTo.",
+    message:
+      "Change at least one of target, targetPort, accessMode, redirectTo, bypassPaths or allowedOrigins.",
   });
 
 export type FrontRouteCreateInput = z.infer<typeof frontRouteCreateInput>;
@@ -80,20 +88,24 @@ export function assertSupportedRouteKind(kind: string | undefined) {
 }
 
 /**
- * Until FD-11 ships there is no login gate, so an `sso` route would be served ungated. Creating,
- * enabling or switching a route into `sso`, or omitting the mode (whose schema default is `sso`),
- * is refused rather than silently treated as public.
+ * Refuses an access mode this release cannot serve. An omitted mode is the schema default, `sso`,
+ * served behind the login gate (FD-11); nothing is ever silently treated as public.
  */
 export function assertSupportedAccessMode(mode: string | undefined, action: "create" | "enable" | "update") {
-  if (mode !== undefined && (SUPPORTED_ACCESS_MODES as readonly string[]).includes(mode)) return;
-  const reason =
-    mode === undefined
-      ? 'accessMode is required. The default, "sso", is not supported yet.'
-      : `Access mode ${JSON.stringify(mode)} is not supported yet.`;
+  if (mode === undefined || (SUPPORTED_ACCESS_MODES as readonly string[]).includes(mode)) return;
   const verb = action === "enable" ? "enabled" : action === "create" ? "created" : "switched into it";
   throw new UnsupportedRouteError(
-    `${reason} The login gate (FD-11) has not shipped, so an SSO route cannot be ${verb}. Choose accessMode "public".`,
+    `Access mode ${JSON.stringify(mode)} is not supported, so the route cannot be ${verb}. Choose "sso" or "public".`,
   );
+}
+
+/** Validated SSO settings: bypass paths (§3.9.5) and allowed Origin exceptions (§3.9.4). */
+export function checkGateRouteSettings(input: { bypassPaths?: unknown; allowedOrigins?: unknown }) {
+  return {
+    bypassPaths: input.bypassPaths === undefined ? undefined : checkBypassPaths(input.bypassPaths),
+    allowedOrigins:
+      input.allowedOrigins === undefined ? undefined : checkAllowedOrigins(input.allowedOrigins),
+  };
 }
 
 /** Normalises a public route hostname; tailnet names can never be public hostnames. */
@@ -132,6 +144,10 @@ export type RouteExposure = {
   redirectTo: string | null;
   /** Re-confirming a pin after an identity change re-exposes whatever the name now points at. */
   status: string;
+  /** SSO bypass paths (§3.9.5): each new one skips the session check. */
+  bypassPaths?: string[];
+  /** Owner-approved Origin exceptions (§3.9.4): each new one widens the browser contract. */
+  allowedOrigins?: string[];
 };
 
 /**
@@ -156,5 +172,9 @@ export function looseningChanges(
   if (next.accessMode === "public" && current.accessMode !== "public") changes.push("accessMode");
   if (next.redirectTo === null && current.redirectTo !== null) changes.push("redirectRemoved");
   if (next.allowSensitivePort === true) changes.push("allowSensitivePort");
+  if (next.bypassPaths?.some((path) => !(current.bypassPaths ?? []).includes(path)))
+    changes.push("bypassPaths");
+  if (next.allowedOrigins?.some((origin) => !(current.allowedOrigins ?? []).includes(origin)))
+    changes.push("allowedOrigins");
   return changes;
 }

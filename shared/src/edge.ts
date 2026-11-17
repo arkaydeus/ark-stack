@@ -185,9 +185,9 @@ export function currentEdgeCertificates(input: {
  * What the edge should serve, from the endpoint and certificate rows. Public `http` endpoints have
  * no upstream yet, so they are rendered as unrouted. Front-door HTTP routes come from `front_routes`
  * through the lease policy (§3.2): only enabled, `ready` routes with a valid pin reach this point.
- * Before FD-11 an `sso` route is omitted (fail closed: there is no gate to render), as is a route
- * whose stored values fail validation; both are listed in `omitted` and served nowhere, so neither
- * Caddy nor the HAProxy 443 map names them. The login origin (`gateHostname`, FD-10) is served like
+ * A route whose stored values fail validation (for example an SSO bypass of `/`, or an SSO
+ * `streamCloseDelay` over 5m) is listed in `omitted` and served nowhere, so neither Caddy nor the
+ * HAProxy 443 map names it. The login origin (`gateHostname`, FD-10) is served like
  * the admin hostname: only once its certificate is issued.
  */
 export function planEdge(input: {
@@ -259,8 +259,9 @@ export function servedHttpHostnames(plan: { certificates: Array<{ hostname: stri
  * headers, static error pages from `errorsDir`, Location and Set-Cookie rewriting, WebSocket and
  * timeout settings, HSTS, a body limit, or the apex redirect. Proxying routes are preceded by a
  * `# ark-tailnet-route <id> <ip:port>` marker. Rendering with `httpRoutes` omitted gives the closed
- * variant the Caddy launch guard starts from when the lease is not valid (§3.2). Any route that is not
- * `public` fails the render: before FD-11 there is no forward_auth to protect it.
+ * variant the Caddy launch guard starts from when the lease is not valid (§3.2). `sso` routes (FD-11)
+ * add the exact gate handlers, the guarded bypass paths and `forward_auth` to `apiUpstream`; an
+ * unknown access mode fails the render.
  *
  * `gate` renders the public login origin (§3.5, FD-10, `gateLoginSiteBody`) when its certificate is
  * issued. It is not a tailnet route, so the closed variant keeps it.
@@ -365,12 +366,12 @@ ${body}}
     .map((route) =>
       site(
         route.hostname,
-        httpRouteSiteBody(route),
+        httpRouteSiteBody(route, checkedUpstream(input.apiUpstream)),
         // Redirect-only routes dial nothing, so they carry no tailnet marker.
         route.redirectTo
           ? `# ${route.id} ${route.hostname}: canonical redirect to ${route.redirectTo}
 `
-          : `# ${route.id} ${route.hostname}: public access
+          : `# ${route.id} ${route.hostname}: ${route.access === "sso" ? "SSO" : "public access"}
 ${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
 `,
       ),

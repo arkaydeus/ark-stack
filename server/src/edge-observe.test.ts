@@ -771,7 +771,7 @@ async function renderedConfigs() {
 const hostOf = (id: string) => `${id.slice(3)}.example.com`;
 
 describe("edge rendering of HTTP routes (FD-09)", () => {
-  test("unservable states and SSO routes are absent from both rendered configs", async () => {
+  test("unservable states are absent from both rendered configs; SSO routes are gated", async () => {
     mock.state.reachable.add("100.101.102.103:3000");
     const target = { target: `home${tailnet}`, stableId: home.id, ip: "100.101.102.103", port: 3000 };
     const live = await addRoute({ ...target, status: "ready" });
@@ -799,16 +799,20 @@ describe("edge rendering of HTTP routes (FD-09)", () => {
     expect(caddyfile).toContain(`redir https://${hostOf(live)}{uri} 308`);
     expect(caddyfile).not.toContain(`# ark-tailnet-route ${apex}`);
     expect(haproxy).toContain(hostOf(apex));
-    // SSO before FD-11: omitted with a reason, served nowhere.
-    expect(plan.omitted.map((item) => item.id)).toEqual([sso]);
-    expect(plan.omitted[0]?.reason).toMatch(/access mode "sso"/);
-    for (const id of [sso, switchedOff, ...unservable.values()]) {
+    // SSO (FD-11): served behind forward_auth, with the route identity on its proxying handler.
+    expect(plan.omitted).toEqual([]);
+    expect(caddyfile).toContain(
+      `# ${sso} ${hostOf(sso)}: SSO\n# ark-tailnet-route ${sso} 100.101.102.103:3000\n`,
+    );
+    expect(caddyfile).toContain(`uri /api/gate/check?route=${sso}`);
+    expect(haproxy).toContain(hostOf(sso));
+    for (const id of [switchedOff, ...unservable.values()]) {
       expect(caddyfile).not.toContain(hostOf(id));
       expect(haproxy).not.toContain(hostOf(id));
     }
   });
 
-  test("an enabled SSO route can never be rendered, even if handed straight to the renderer", async () => {
+  test("an enabled SSO route is rendered only behind forward_auth, with its bypass paths guarded", async () => {
     mock.state.reachable.add("100.101.102.103:3000");
     const sso = await addRoute({
       target: `home${tailnet}`,
@@ -818,19 +822,32 @@ describe("edge rendering of HTTP routes (FD-09)", () => {
       status: "ready",
       accessMode: "sso",
     });
+    await sql`UPDATE front_routes SET bypass_paths = '["/webhooks/*"]'::jsonb WHERE id = ${sso}`;
     await observe();
     const { edgeHttpRoutes } = await import("./modules/edge-routes.ts");
     const routes = await edgeHttpRoutes((await edgePolicy()).routes);
-    expect(routes.map((item) => [item.id, item.access])).toEqual([[sso, "sso"]]);
-    expect(() =>
-      renderCaddyfile({
-        adminMode: "tailnet",
-        challengeDir: "/var/lib/ark/acme",
-        apiUpstream: "api:3000",
-        certificates: [{ hostname: hostOf(sso), status: "issued", fullchain: "/c.pem", privkey: "/k.pem" }],
-        httpRoutes: routes,
-      }),
-    ).toThrow(/cannot serve/);
+    expect(routes.map((item) => [item.id, item.access, item.bypassPaths])).toEqual([
+      [sso, "sso", ["/webhooks/*"]],
+    ]);
+    const caddyfile = renderCaddyfile({
+      adminMode: "tailnet",
+      challengeDir: "/var/lib/ark/acme",
+      apiUpstream: "api:3000",
+      certificates: [{ hostname: hostOf(sso), status: "issued", fullchain: "/c.pem", privkey: "/k.pem" }],
+      httpRoutes: routes,
+    });
+    const site = caddyfile.slice(caddyfile.indexOf(`${hostOf(sso)} {`));
+    // Nothing reaches the tailnet upstream except through the bypass guard or the session check.
+    const handles = site.split("\n  handle ").slice(1);
+    for (const handle of handles.filter((item) => item.includes("reverse_proxy 100.101.102.103:3000")))
+      expect(handle.indexOf("forward_auth api:3000")).toBeLessThan(
+        handle.indexOf("reverse_proxy 100.101.102.103"),
+      );
+    expect(site).toContain("uri /api/gate/bypass-check?route=");
+    // A bypass of the whole site is refused at render time, so the route is omitted.
+    await sql`UPDATE front_routes SET bypass_paths = '["/*"]'::jsonb WHERE id = ${sso}`;
+    const { plan } = await renderedConfigs();
+    expect(plan.omitted.map((item) => item.id)).toEqual([sso]);
   });
 
   test("invalid stored HTTP options omit the route instead of failing every edge apply", async () => {

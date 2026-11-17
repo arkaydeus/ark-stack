@@ -60,6 +60,11 @@ import { issueCertificateFiles } from "./modules/certificates.ts";
 import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import {
+  ensureGateRevocationDrain,
+  markGateRevocationsApplied,
+  pendingGateRevocations,
+} from "./modules/gate-revocations.ts";
+import {
   EDGE_OBSERVE_TARGET,
   edgePolicy,
   observeEdgeTailnet,
@@ -376,6 +381,11 @@ export async function claimQueued(
 ) {
   const limit = input.limit ?? 8;
   const token = createId("claim");
+  // Durable retry for gate revocations (FD-11, §3.9.3): a failed or lost forced-reload drain is
+  // queued again while any revocation is pending.
+  await ensureGateRevocationDrain().catch((error) =>
+    console.error(`gate revocation drain check failed: ${(error as Error).message}`),
+  );
   const prefixes = input.kindPrefixes ?? (input.kindPrefix ? [input.kindPrefix] : []);
   const patterns = prefixes.map((item) => `${item}%`);
   const unlike = input.excludePrefix ? `${input.excludePrefix}%` : null;
@@ -2397,7 +2407,7 @@ export function startRolloverScheduler(
 // The edge serves only hostnames whose current certificate is `issued`. Public `http` endpoints
 // have no upstream yet, so they are rendered as unrouted (a fixed 503 naming no internal host).
 // Front-door HTTP routes are read from `front_routes` and rendered only while the lease allows them
-// (front door §3.2, FD-06) and only in an implemented access mode (§3.5, FD-09: public).
+// (front door §3.2, FD-06): `public` routes directly, `sso` routes behind the login gate (FD-11).
 export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
   const policy = await edgePolicy();
   const [settings] = await db
@@ -2416,18 +2426,34 @@ export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: s
 }
 
 async function applyEdge(operation: OperationRow) {
+  // Every edge.apply forces a Caddy /load (`Cache-Control: must-revalidate`), so it also applies the
+  // gate revocations that committed before it began (FD-11, §3.9.3). Snapshot them first: a
+  // revocation that commits during this apply waits for the next forced reload.
+  const revocations = await pendingGateRevocations();
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
     settings?.adminHostname,
   );
-  const written = await writeEdge(plan);
+  const written = await writeEdge({
+    ...plan,
+    revokedRouteIds: [...new Set(revocations.map((item) => item.routeId))],
+  });
+  // Without an edge to reload (development, tests) there is no socket to close either.
+  const applied =
+    written.applied || (!process.env.ARK_EDGE_RELOAD_URL && process.env.NODE_ENV !== "production")
+      ? await markGateRevocationsApplied(
+          revocations.map((item) => item.id),
+          written.applied ? operation.id : `${operation.id}:no-edge`,
+        )
+      : 0;
   await addStep(operation.id, "edge-apply", {
     ...written,
     unrouted: plan.appRoutes.map((route) => route.hostname),
     awaitingCertificate: plan.awaitingCertificate,
-    // Routes the lease allows but this release cannot serve (sso before FD-11, invalid options).
+    // Routes the lease allows but this release cannot serve (invalid stored values).
     omitted: plan.omitted,
+    gateRevocationsApplied: applied,
   });
   // The SNI router names every hostname Caddy serves; a queued edge.l4_apply is reused.
   if (edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
@@ -2530,6 +2556,10 @@ export const EDGE_WITHDRAWAL_ALERT = "edge-withdrawal";
 // Caddy is enforced through its admin API and HAProxy through its master CLI (every current and
 // leaving worker, admission first), here and by the edge-local watchdog every second.
 async function drainEdge(operation: OperationRow) {
+  // Gate revocations (FD-11, §3.9.3): the drain is a forced reload of the current configuration, even
+  // when its text is unchanged; applyEdge marks the revocations applied only once it succeeded. A
+  // failure leaves them pending: the watchdog withdraws the route after 5 s and the work is retried.
+  if (operation.payload.reason === "gate_revocation") return applyEdge(operation);
   const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
   const backends = Array.isArray(operation.payload.backends) ? operation.payload.backends : [];
   if (!adminUrl) {

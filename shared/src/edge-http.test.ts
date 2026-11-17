@@ -1,5 +1,5 @@
-// FD-09 (docs/design/front-door.md §3.5): HTTP route options, input validation, the rendered site
-// blocks, the Location policy and an injection fuzz test. The runtime behaviour of the same rendered
+// FD-09 and FD-11 (docs/design/front-door.md §3.5, §3.9): HTTP route options, input validation, the
+// rendered site blocks (public and SSO), the Location policy and an injection fuzz test. The runtime behaviour of the same rendered
 // config on Caddy 2.11.9 behind the HAProxy SNI router is in scripts/test-edge-routes.ts.
 import { describe, expect, test } from "bun:test";
 
@@ -124,7 +124,11 @@ describe("HTTP route options (§3.5 defaults)", () => {
 
 describe("route validation (§3.5: every interpolated value)", () => {
   test.each<[string, Partial<EdgeHttpRoute>]>([
-    ["SSO before FD-11", { access: "sso" }],
+    ["an SSO bypass of the whole site", { access: "sso", bypassPaths: ["/*"] }],
+    ["an SSO bypass of /", { access: "sso", bypassPaths: ["/"] }],
+    ["an SSO bypass shadowing the gate", { access: "sso", bypassPaths: ["/.ark/gate/callback"] }],
+    ["an SSO bypass prefix shadowing the gate", { access: "sso", bypassPaths: ["/.ar*"] }],
+    ["an SSO stream close delay over 5m", { access: "sso", options: { streamCloseDelay: "301s" } }],
     ["an unknown access mode", { access: "open" as "public" }],
     ["an upper-case id", { id: "rt_K3X9" }],
     ["an id with a newline", { id: "rt_k3x9\nreverse_proxy 10.0.0.1:80" }],
@@ -313,20 +317,91 @@ describe("rendered site blocks (§3.5 example)", () => {
   });
 });
 
-describe("fail closed on unimplemented access modes (FD-11 not shipped)", () => {
-  const sso: EdgeHttpRoute = { ...www, id: "rt_sso1", hostname: "sso.example.com", access: "sso" };
+describe("SSO routes (§3.5, §3.9, FD-11)", () => {
+  const sso: EdgeHttpRoute = { ...www, access: "sso", bypassPaths: ["/webhooks/*"] };
+  const caddyfile = render([sso]);
+  const body = site(caddyfile, "www.example.com");
 
-  test("planEdge omits an enabled SSO route and never asks for its certificate", () => {
-    const plan = planEdge({ adminMode: "tailnet", endpoints: [], certificates: [], httpRoutes: [www, sso] });
+  test("planEdge serves an SSO route and omits one with an invalid bypass", () => {
+    const bad: EdgeHttpRoute = { ...sso, id: "rt_bad1", hostname: "bad.example.com", bypassPaths: ["/*"] };
+    const plan = planEdge({ adminMode: "tailnet", endpoints: [], certificates: [], httpRoutes: [sso, bad] });
     expect(plan.httpRoutes.map((route) => route.id)).toEqual(["rt_k3x9"]);
     expect(plan.omitted).toEqual([
-      { id: "rt_sso1", hostname: "sso.example.com", reason: expect.stringMatching(/access mode "sso"/) },
+      { id: "rt_bad1", hostname: "bad.example.com", reason: expect.stringMatching(/whole site/) },
     ]);
-    expect(plan.awaitingCertificate).toEqual(["www.example.com"]);
   });
 
-  test("renderCaddyfile refuses it outright", () => {
-    expect(() => render([www, sso])).toThrow(/cannot serve/);
+  test("renders the §3.5 literal: exact callback and logout rewrites, wildcard 404, guarded bypass, forward_auth", () => {
+    expect(caddyfile).toContain(
+      "# rt_k3x9 www.example.com: SSO\n# ark-tailnet-route rt_k3x9 100.101.102.103:3000\nwww.example.com {\n",
+    );
+    const callback = body.indexOf("  handle /.ark/gate/callback {\n");
+    const logout = body.indexOf("  handle /.ark/gate/logout {\n");
+    const wildcard = body.indexOf("  handle /.ark/gate/* {\n    respond 404\n  }\n");
+    const bypass = body.indexOf("  handle @ark_bypass {\n");
+    const main = body.indexOf("  handle {\n");
+    expect([callback, logout, wildcard, bypass, main].every((index) => index > 0)).toBe(true);
+    expect(callback < logout && logout < wildcard && wildcard < bypass && bypass < main).toBe(true);
+    expect(body).toContain(
+      "  handle /.ark/gate/callback {\n    @ark_gate_callback_method not method GET\n    respond @ark_gate_callback_method 405\n    rewrite * /api/gate/callback\n    reverse_proxy api:3000 {\n      header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}\n      header_up X-Ark-Route rt_k3x9\n    }\n  }\n",
+    );
+    expect(body).toContain(
+      "  handle /.ark/gate/logout {\n    @ark_gate_logout_method not method POST\n    respond @ark_gate_logout_method 405\n    rewrite * /api/gate/logout-route\n",
+    );
+    expect(body).toContain("  @ark_bypass path /webhooks/*\n");
+    expect(body).toContain(
+      "    forward_auth api:3000 {\n      uri /api/gate/bypass-check?route=rt_k3x9\n      header_up X-Ark-Original-Uri {http.request.orig_uri}\n      header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}\n    }\n",
+    );
+    expect(body).toContain(
+      "    forward_auth api:3000 {\n      uri /api/gate/check?route=rt_k3x9\n      header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}\n      header_up X-Ark-Upgrade {http.request.header.Upgrade}\n      copy_headers X-Ark-User X-Ark-Email\n    }\n",
+    );
+    // The prefix is never mapped onto /api/gate/*, and the token never goes to the tailnet upstream.
+    expect(body).not.toContain("/api/gate/users");
+    expect(body.match(/rewrite \* \S+/g)).toEqual([
+      "rewrite * /api/gate/callback",
+      "rewrite * /api/gate/logout-route",
+    ]);
+    const upstreams = body.split("reverse_proxy 100.101.102.103:3000 {").slice(1);
+    expect(upstreams).toHaveLength(2);
+    for (const block of upstreams) expect(block.split("\n    }\n")[0]).not.toContain("X-Ark-Edge-Token");
+  });
+
+  test("every proxying handler carries the route identity, so withdrawal and the launch guard see it", () => {
+    expect(body.split(`vars ark_tailnet_route ${routeIdentityKey(www)}`)).toHaveLength(3);
+    expect(launchDecision(caddyfile, new Set([routeIdentityKey(www)])).open).toBe(true);
+    expect(launchDecision(caddyfile, new Set()).open).toBe(false);
+  });
+
+  test("without bypass paths there is no bypass handler", () => {
+    const plain = site(render([{ ...sso, bypassPaths: [] }]), "www.example.com");
+    expect(plain).not.toContain("@ark_bypass");
+    expect(plain).not.toContain("bypass-check");
+  });
+
+  test("a public route never renders forward_auth or bypasses", () => {
+    const publicBody = site(render([{ ...www, bypassPaths: ["/webhooks/*"] }]), "www.example.com");
+    expect(publicBody).not.toContain("forward_auth");
+    expect(publicBody).not.toContain("ARK_EDGE_GATE_TOKEN");
+    expect(publicBody).toContain("  handle /.ark/gate/* {\n    respond 404\n  }\n");
+  });
+
+  test("SSO stream close delay is capped at 5m (revocation + 305 s, §3.9.3)", () => {
+    expect(() => checkedHttpRoute({ ...sso, options: { streamCloseDelay: "5m" } })).not.toThrow();
+    expect(() => checkedHttpRoute({ ...sso, options: { streamCloseDelay: "6m" } })).toThrow(/5m/);
+    // A public route keeps the FD-09 range.
+    expect(() => checkedHttpRoute({ ...www, options: { streamCloseDelay: "1h" } })).not.toThrow();
+  });
+
+  test("an invalid API upstream is refused", () => {
+    expect(() =>
+      renderCaddyfile({
+        ...base,
+        apiUpstream: "api:3000 {\n respond pwned",
+        adminMode: "tailnet",
+        certificates: issued("www.example.com"),
+        httpRoutes: [sso],
+      }),
+    ).toThrow(ValidationError);
   });
 });
 
@@ -481,6 +556,8 @@ describe("injection fuzz (§3.5)", () => {
     access: (route) => ({ ...route, access: mutate(route.access) as "public" }),
     redirectTo: (route) => ({ ...route, redirectTo: mutate("www.example.net") }),
     bypassPaths: (route) => ({ ...route, bypassPaths: [mutate("/webhooks/*")] }),
+    ssoBypassPaths: (route) => ({ ...route, access: "sso", bypassPaths: [mutate("/webhooks/*")] }),
+    ssoId: (route) => ({ ...route, access: "sso", id: mutate(route.id) }),
     internalNames: (route) => ({ ...route, internalNames: [mutate("home.tail1234.ts.net")] }),
     internalIps: (route) => ({ ...route, internalIps: [mutate("fd7a:115c:a1e0::1")] }),
     responseHeaderTimeout: (route) => ({ ...route, options: { responseHeaderTimeout: mutate("60s") } }),
@@ -515,7 +592,8 @@ describe("injection fuzz (§3.5)", () => {
         }
         rendered++;
         expect(caddyfile).not.toContain("INJECTED");
-        expect(caddyfile).not.toMatch(/\{\$|\{env\./);
+        // The only runtime placeholder is the gate's edge token, on SSO routes.
+        expect(caddyfile.replaceAll("{env.ARK_EDGE_GATE_TOKEN}", "")).not.toMatch(/\{\$|\{env\./);
         expect(caddyfile.includes("\u0000") || caddyfile.includes("\r")).toBe(false);
         // Braces stay balanced outside quoted tokens, so no block can be closed or opened early.
         let depth = 0;
