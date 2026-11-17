@@ -527,3 +527,12 @@ describe("injection fuzz (§3.5)", () => {
     });
   }
 });
+
+test("tailnet apex redirect targets fail closed in validation, planning and direct rendering", () => {
+  const bad = { ...www, redirectTo: "home.tail1234.ts.net" };
+  expect(() => checkedHttpRoute(bad)).toThrow("tailnet name");
+  expect(() => renderCaddyfile({ ...base, adminMode: "tailnet", httpRoutes: [bad] })).toThrow("tailnet name");
+  const plan = planEdge({ adminMode: "tailnet", endpoints: [], certificates: [], httpRoutes: [bad] });
+  expect(plan.httpRoutes).toEqual([]);
+  expect(plan.omitted[0]?.reason).toContain("tailnet name");
+});

@@ -1,11 +1,12 @@
 import { resolve4, resolve6, resolveCname, resolveMx, resolveTxt } from "node:dns/promises";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import {
   allowedBackends,
   routeIdentityKey,
   assertCidrs,
   CaddyWithdrawalAdapter,
+  caddyState,
   backupProofAllowed,
   buildProvisionPlan,
   candidateRequiresApproval,
@@ -2396,7 +2397,12 @@ async function reconcileServedRoutes() {
   if (!allowed.length) return { checked: true, missing: [] };
   let active: string[];
   try {
-    active = await new CaddyWithdrawalAdapter(adminUrl).activeRoutes();
+    active = await new CaddyWithdrawalAdapter(
+      adminUrl,
+      fetch,
+      3_000,
+      caddyState(process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform")),
+    ).activeRoutes();
   } catch (error) {
     return { checked: false, error: (error as Error).message };
   }
@@ -2427,7 +2433,12 @@ async function drainEdge(operation: OperationRow) {
     return;
   }
   const allowed = allowedBackends(await edgePolicy());
-  const adapter = new CaddyWithdrawalAdapter(adminUrl);
+  const adapter = new CaddyWithdrawalAdapter(
+    adminUrl,
+    fetch,
+    3_000,
+    caddyState(process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform")),
+  );
   const result = await adapter.enforce(allowed);
   if (result.error) {
     let outcome = "Caddy was stopped";
@@ -2443,13 +2454,13 @@ async function drainEdge(operation: OperationRow) {
     });
     throw new Error(`Caddy withdrawal failed; ${outcome}: ${result.error}`);
   }
-  if (result.unreachable) throw new Error(result.error);
+  // An unreachable result without an error is an expected, bounded restart. HAProxy still drains.
   const haproxy = await drainHaproxy(allowed);
   await addStep(operation.id, "edge-drain", {
     reason: operation.payload.reason ?? null,
     routeIds: operation.payload.routeIds ?? [],
     backends,
-    caddy: { active: result.active, withdrawn: result.withdrawn },
+    caddy: { active: result.active, withdrawn: result.withdrawn, restarting: !!result.unreachable },
     haproxy,
   });
 }

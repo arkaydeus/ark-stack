@@ -380,7 +380,7 @@ async function startWatchdog() {
     "--env",
     "ARK_HAPROXY_MASTER_SOCKET=/var/run/haproxy/master.sock",
     "--volume",
-    `${edgeDir}:/var/lib/ark/edge:ro`,
+    `${edgeDir}:/var/lib/ark/edge`,
     "--volume",
     `${stack.volumes.edgeL4}:/usr/local/etc/haproxy:ro`,
     "--volume",

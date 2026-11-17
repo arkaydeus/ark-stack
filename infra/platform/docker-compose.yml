@@ -450,7 +450,8 @@ services:
       ARK_HAPROXY_MASTER_SOCKET: /var/run/haproxy/master.sock
     group_add: ["4400"]
     volumes:
-      - ../../tmp/edge:/var/lib/ark/edge:ro
+      # Shared stop intent and restart markers are written by every Caddy adapter.
+      - ../../tmp/edge:/var/lib/ark/edge
       - ../../tmp/edge-l4:/usr/local/etc/haproxy:ro
       - ark_haproxy_run:/var/run/haproxy
     expose: ["2021"]

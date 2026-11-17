@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
@@ -9,7 +10,7 @@ import {
   cloudflareRecordBody,
   compareInventory,
   digestFromHeaders,
-  CADDY_STOP_MARKER,
+  caddyState,
   CaddyWithdrawalAdapter,
   EDGE_CERT_DIR,
   EDGE_ERRORS_DIR,
@@ -559,8 +560,10 @@ export async function writeEdge(input: {
 }) {
   const dir = process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform");
   await mkdir(dir, { recursive: true });
+  const generation = randomUUID();
   const render = (httpRoutes: EdgeHttpRoute[]) =>
     renderCaddyfile({
+      generation,
       adminMode: input.adminMode,
       adminHostname: input.adminHostname,
       challengeDir: process.env.ARK_ACME_WEBROOT ?? join(dir, "acme"),
@@ -593,15 +596,22 @@ export async function writeEdge(input: {
   const reloadUrl = process.env.ARK_EDGE_RELOAD_URL;
   let applied = false;
   let lingering: string[] = [];
+  const state = caddyState(dir);
+  const adapter = reloadUrl ? new CaddyWithdrawalAdapter(reloadUrl, fetch, 3_000, state) : null;
   if (reloadUrl) {
-    // Routes this apply removes keep their upgraded streams for the old handler's
-    // stream_close_delay (5 min, FD-09). Read which ones hold streams before the reload; Caddy that
-    // cannot be read (stopped or restarting) holds none.
-    const adapter = new CaddyWithdrawalAdapter(reloadUrl);
+    // A prior apply may have loaded/renamed its files but failed to stop the old streams.
+    // Retry that durable stop before inspection can mistake the new config for an empty census.
+    const pending = await state.pendingStreams();
+    if (pending.length) {
+      await adapter!.stopForStreams();
+      throw new Error("Caddy is restarting after a pending stream stop; retry edge.apply.");
+    }
     const next = new Set(
       [...caddy.matchAll(/^\s*vars ark_tailnet_route (\S+)\s*$/gm)].map((match) => match[1]!),
     );
-    lingering = await adapter.lingeringStreams(next).catch(() => []);
+    // An unreadable config is unknown, never evidence of absent streams. Abort before /load.
+    lingering = await adapter!.lingeringStreams(next);
+    if (lingering.length) await adapter!.markPendingStreams(lingering);
     await loadCaddyfile(reloadUrl, caddy);
     applied = true;
   } else if (process.env.NODE_ENV === "production") {
@@ -615,8 +625,7 @@ export async function writeEdge(input: {
   // in place, so its launch guard restarts it from them (front door §3.2, §3.5). The marker tells
   // the edge watchdog that the restart is expected, not a failed withdrawal.
   if (reloadUrl && lingering.length) {
-    await writeFile(join(dir, CADDY_STOP_MARKER), String(Date.now()), { mode: 0o640 });
-    await new CaddyWithdrawalAdapter(reloadUrl).stop();
+    await adapter!.stopForStreams();
   }
   return {
     dir,

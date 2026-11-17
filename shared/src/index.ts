@@ -40,3 +40,5 @@ export * from "./edge-withdrawal.ts";
 export * from "./edge-l4.ts";
 export * from "./haproxy-control.ts";
 export * from "./update-policy.ts";
+
+export * from "./caddy-state.ts";

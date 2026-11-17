@@ -73,9 +73,9 @@ describe("tailscaled socket policy", () => {
 
   test("the edge watchdog holds no tailscaled or Docker socket, database credential or root key", () => {
     const watchdog = services["edge-watchdog"]!;
-    // Only HAProxy's master CLI socket (group 4400, FD-25) and read-only rendered configuration.
+    // HAProxy's master CLI socket and configs, plus Caddy's shared stop/restart state.
     expect(mounts(watchdog)).toEqual([
-      "../../tmp/edge:/var/lib/ark/edge:ro",
+      "../../tmp/edge:/var/lib/ark/edge",
       "../../tmp/edge-l4:/usr/local/etc/haproxy:ro",
       "ark_haproxy_run:/var/run/haproxy",
     ]);

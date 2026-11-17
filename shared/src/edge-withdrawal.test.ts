@@ -154,7 +154,13 @@ function fakeCaddy(
     const path = new URL(url).pathname;
     calls.push(`${init.method ?? "GET"} ${path}`);
     if (stopped) throw new Error("connection refused");
-    if (path === "/config/") return Response.json(active);
+    if (path === "/adapt") return Response.json({ result: JSON.parse(String(init.body)) });
+    if (path === "/config/" && init.method === "PATCH") {
+      expect(new Headers(init.headers).get("if-match")).toBe(JSON.stringify(active));
+      active = JSON.parse(String(init.body));
+      return new Response("");
+    }
+    if (path === "/config/") return Response.json(active, { headers: { etag: JSON.stringify(active) } });
     if (path === "/load") {
       expect(new Headers(init.headers).get("cache-control")).toBe("must-revalidate");
       if (options.failLoad) return new Response("load failed", { status: 500 });
@@ -229,16 +235,10 @@ describe("withdrawal with stream_close_delay (FD-09)", () => {
     const result = await adapter.enforce(allowed(1));
     expect(result).toMatchObject({ withdrawn: ["100.101.102.103:3000"], stopped: ["100.101.102.103:3000"] });
     expect(result.error).toBeUndefined();
-    expect(caddy.calls).toEqual([
-      "GET /config/",
-      "GET /reverse_proxy/upstreams",
-      "POST /load",
-      "GET /config/",
-      "POST /stop",
-    ]);
+    expect(caddy.calls).toEqual(["GET /config/", "POST /load", "GET /config/", "POST /stop"]);
   });
 
-  test("no stream on the withdrawn backend: reload only; unreadable upstreams count as busy", async () => {
+  test("idle or unreadable upstreams still require a stop for every removed delayed handler", async () => {
     const idle = fakeCaddy({
       initial: delayedConfig(),
       upstreams: [{ address: "[fd7a:115c:a1e0::103]:8080", num_requests: 3, fails: 0 }],
@@ -246,8 +246,8 @@ describe("withdrawal with stream_close_delay (FD-09)", () => {
     const quiet = await new CaddyWithdrawalAdapter("http://edge-admin:2019", idle.fetcher).enforce(
       allowed(1),
     );
-    expect(quiet.stopped).toBeUndefined();
-    expect(idle.stopped()).toBe(false);
+    expect(quiet.stopped).toEqual(["100.101.102.103:3000"]);
+    expect(idle.stopped()).toBe(true);
     const unknown = fakeCaddy({ initial: delayedConfig(), failUpstreams: true });
     const result = await new CaddyWithdrawalAdapter("http://edge-admin:2019", unknown.fetcher).enforce(
       allowed(1),
@@ -274,40 +274,110 @@ describe("withdrawal with stream_close_delay (FD-09)", () => {
     expect((await adapter.enforce(allowed(1))).error).toMatch(/unreachable/);
   });
 
-  test("after the restart from the closed config, the withdrawn config comes back, lease-checked", async () => {
-    let clock = 0;
-    const caddy = fakeCaddy({
-      initial: delayedConfig(),
-      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
-    });
-    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3_000, {
-      now: () => clock,
-    });
-    expect((await adapter.enforce(allowed(1))).stopped).toEqual(["100.101.102.103:3000"]);
-    const closed = { apps: { http: { servers: { srv0: { routes: [] } } } } };
+  const closed = {
+    apps: {
+      http: {
+        servers: {
+          srv0: { routes: [{ handle: [{ handler: "vars", ark_edge_generation: "generation-old" }] }] },
+        },
+      },
+    },
+  };
+  const full = () => ({
+    ...delayedConfig(),
+    generationMarker: { handler: "vars", ark_edge_generation: "generation-old" },
+  });
+  const configFiles = async () => ({ full: JSON.stringify(full()), closed: JSON.stringify(closed) });
+
+  test("a fresh adapter restores only the current generation's exact closed config, lease-checked", async () => {
+    const caddy = fakeCaddy({ initial: full() });
+    await new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher).enforce(allowed(1));
     caddy.restart(closed);
-    clock += 3_000;
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3000, {
+      configFiles,
+    });
     const result = await adapter.enforce(allowed(1));
     expect(result.error).toBeUndefined();
-    // The other route serves again without waiting for edge.apply; the withdrawn one does not.
     expect(caddyTailnetBackends(caddy.active())).toEqual(["[fd7a:115c:a1e0::103]:8080"]);
     expect(JSON.stringify(caddy.active())).toContain(JSON.stringify(WITHDRAWN_HANDLER));
-    // One-shot, and never over a config that already has routes (a newer edge.apply).
-    caddy.restart(closed);
+  });
+
+  test("a newer zero-tailnet apply cannot resurrect public admin or superseded route settings", async () => {
+    const caddy = fakeCaddy({ initial: full() });
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3000, {
+      configFiles,
+    });
     await adapter.enforce(allowed(1));
-    expect(caddy.active()).toEqual(closed);
+    const newer = { apps: {}, marker: { handler: "vars", ark_edge_generation: "generation-new" } };
+    caddy.restart(newer);
+    await adapter.enforce(new Set());
+    expect(caddy.active()).toEqual(newer);
+    expect(caddy.calls).not.toContain("PATCH /config/");
+  });
+
+  test("restore rejects a route-free config that is not the exact generated closed config", async () => {
+    const newer = { ...closed, adminChanged: true };
+    const caddy = fakeCaddy({ initial: newer });
+    await new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3000, { configFiles }).enforce(
+      allowed(1),
+    );
+    expect(caddy.active()).toEqual(newer);
+    expect(caddy.calls).not.toContain("PATCH /config/");
+  });
+
+  test("an apply racing restoration wins the conditional PATCH", async () => {
+    const caddy = fakeCaddy({ initial: closed });
+    const newer = { apps: {}, marker: { handler: "vars", ark_edge_generation: "generation-new" } };
+    const fetcher = async (url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        caddy.restart(newer);
+        return new Response(null, { status: 412 });
+      }
+      return caddy.fetcher(url, init);
+    };
+    await new CaddyWithdrawalAdapter("http://edge-admin:2019", fetcher, 3000, { configFiles }).enforce(
+      allowed(1),
+    );
+    expect(caddy.active()).toEqual(newer);
   });
 
   test("a restore is re-checked against the lease at restore time", async () => {
-    const caddy = fakeCaddy({
-      initial: delayedConfig(),
-      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
-    });
-    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher);
-    await adapter.enforce(allowed(1));
-    caddy.restart({ apps: { http: { servers: { srv0: { routes: [] } } } } });
-    await adapter.enforce(new Set());
+    const caddy = fakeCaddy({ initial: closed });
+    await new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3000, { configFiles }).enforce(
+      new Set(),
+    );
     expect(caddyTailnetBackends(caddy.active())).toEqual([]);
+  });
+
+  test("an upgrade accepted during /load is closed even if the old census was idle", async () => {
+    const caddy = fakeCaddy({ initial: delayedConfig(), upstreams: [] });
+    let streamOpen = false;
+    const fetcher = async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/load")) streamOpen = true;
+      const response = await caddy.fetcher(url, init);
+      if (url.endsWith("/stop")) streamOpen = false;
+      return response;
+    };
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", fetcher);
+    expect((await adapter.enforce(allowed(1))).stopped).toHaveLength(1);
+    expect(streamOpen).toBe(false);
+    await adapter.enforce(allowed(1));
+    expect(streamOpen).toBe(false);
+    expect(caddy.calls).not.toContain("GET /reverse_proxy/upstreams");
+  });
+
+  test("a failed post-reload stop is retried even after its handler disappeared", async () => {
+    const caddy = fakeCaddy({ initial: delayedConfig() });
+    let fails = true;
+    const fetcher = async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/stop") && fails) return new Response(null, { status: 500 });
+      return caddy.fetcher(url, init);
+    };
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", fetcher);
+    expect((await adapter.enforce(allowed(1))).error).toContain("stop failed");
+    fails = false;
+    expect((await adapter.enforce(allowed(1))).stopped).toHaveLength(1);
+    expect(caddy.stopped()).toBe(true);
   });
 
   test("a stop made by edge.apply (the marker) is a restart, not a failure", async () => {

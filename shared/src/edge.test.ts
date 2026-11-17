@@ -269,6 +269,23 @@ describe("tailnet routes (front door §3.2, FD-06)", () => {
     }
   });
 
+  test("refuses duplicate route hostnames and collisions with admin or app sites", () => {
+    const input = {
+      ...base,
+      adminMode: "public" as const,
+      adminHostname: "admin.example.com",
+      certificates: [...certificates, certificate("admin.example.com", "issued")],
+    };
+    for (const httpRoutes of [
+      [route, { ...route, id: "rt_second" }],
+      [{ ...route, hostname: "admin.example.com" }],
+    ])
+      expect(() => renderCaddyfile({ ...input, httpRoutes })).toThrow("listed more than once");
+    expect(() =>
+      renderCaddyfile({ ...input, appRoutes: [{ hostname: route.hostname }], httpRoutes: [route] }),
+    ).toThrow("listed more than once");
+  });
+
   test("planEdge waits for the route's certificate", () => {
     const plan = planEdge({ adminMode: "tailnet", endpoints: [], certificates: [], httpRoutes: [route] });
     expect(plan.httpRoutes).toEqual([route]);
@@ -316,4 +333,12 @@ describe("Caddyfile global block behind the HAProxy SNI router (§3.5, FD-25)", 
     expect(bodies.length).toBe(1);
     for (const [, body] of bodies) expect(body.startsWith("  bind 127.0.0.1\n")).toBe(true);
   });
+});
+
+test("generation and explicit config-file hides survive both full and closed rendering", () => {
+  const input = { ...base, adminMode: "tailnet" as const, generation: "test-generation" };
+  const closed = renderCaddyfile(input);
+  expect(closed).toContain("vars ark_edge_generation test-generation");
+  expect(closed).toContain("hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed");
+  expect(() => renderCaddyfile({ ...input, generation: "unsafe\nvalue" })).toThrow("Invalid edge generation");
 });

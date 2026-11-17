@@ -312,7 +312,7 @@ async function startWatchdog(adminUrl: string) {
     "--env",
     "ARK_EDGE_DIR=/var/lib/ark/edge",
     "--volume",
-    `${edgeDir}:/var/lib/ark/edge:ro`,
+    `${edgeDir}:/var/lib/ark/edge`,
     "--volume",
     `${watchdogBundle}:/watchdog:ro`,
     "--workdir",
@@ -373,7 +373,7 @@ async function edgeApply() {
 
 /**
  * Tailnet backends in Caddy's active config, read through the admin API from edge-control. A
- * withdrawal that finds upgraded streams on the withdrawn route stops Caddy (FD-09:
+ * withdrawal of a delayed handler stops Caddy conservatively (FD-09:
  * stream_close_delay), so this waits for the launch guard's restart instead of racing it.
  */
 async function activeBackends() {
@@ -760,6 +760,35 @@ async function restoreRoute(report: Report) {
   return observe();
 }
 
+async function disabledStreamTest(report: Report) {
+  await restoreRoute(report);
+  const stopObserving = keepObserving();
+  try {
+    await sql`DELETE FROM alerts WHERE dedup_key = 'edge-withdrawal'`;
+    const session = await openSession();
+    const at = Date.now();
+    await sql`UPDATE front_routes SET enabled = false, status = 'disabled' WHERE id = ${routeId}`;
+    const closedAt = await Promise.race([session.closed, Bun.sleep(7_000).then(() => 0)]);
+    expect(
+      report,
+      closedAt > 0 && closedAt - at <= 5_000,
+      "disabling a route closes its WebSocket within five seconds",
+      `closed after ${closedAt - at} ms`,
+    );
+    await activeBackends();
+    const [alert] =
+      await sql`SELECT title FROM alerts WHERE dedup_key = 'edge-withdrawal' AND resolved_at IS NULL`;
+    expect(
+      report,
+      !alert,
+      "a deliberate stream stop does not raise a critical withdrawal alert",
+      String(alert?.title),
+    );
+  } finally {
+    await stopObserving();
+  }
+}
+
 async function leaseExpiryTest(report: Report) {
   const last = await restoreRoute(report);
   const session = await openSession();
@@ -1065,6 +1094,7 @@ try {
     await run("localapi read-only deployment (FD-06)", localApiTest),
     await run("identity withdrawal within detection + 5 s", identityWithdrawalTest),
     await run("shared backend per-route withdrawal and restart", sharedBackendTest),
+    await run("disable with a WebSocket has no critical withdrawal alert", disabledStreamTest),
     await run("watchdog loss while Caddy is serving", watchdogLossTest),
     await run("lease expiry with observation stopped", leaseExpiryTest),
     await run("start with an expired lease", expiredStartTest),

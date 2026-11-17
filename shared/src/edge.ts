@@ -223,8 +223,12 @@ export function renderCaddyfile(input: {
   httpRoutes?: EdgeHttpRoute[];
   /** Static 502/503/504 pages inside the edge container (infra/platform/edge-errors). */
   errorsDir?: string;
+  /** Binds the full and closed files to one apply, including route-free configurations. */
+  generation?: string;
 }) {
   const errorsDir = checkedPath(input.errorsDir ?? EDGE_ERRORS_DIR);
+  if (input.generation && !/^[a-zA-Z0-9-]+$/.test(input.generation))
+    throw new ValidationError("Invalid edge generation.");
   const issued = new Map<string, EdgeCertificate>();
   const seen = new Set<string>();
   for (const certificate of input.certificates ?? []) {
@@ -237,8 +241,11 @@ export function renderCaddyfile(input: {
   }
   const served: string[] = [];
   const site = (hostname: string, body: string, marker = "") => {
-    const certificate = issued.get(checkedHostname(hostname));
-    if (!certificate || served.includes(hostname)) return "";
+    hostname = checkedHostname(hostname);
+    const certificate = issued.get(hostname);
+    if (!certificate) return "";
+    if (served.includes(hostname))
+      throw new ValidationError(`Edge hostname ${hostname} is listed more than once.`);
     served.push(hostname);
     // HTTPS sites listen on loopback only, behind the HAProxy SNI router on 443 (§3.5, §3.8).
     return `${marker}${hostname} {
@@ -319,10 +326,13 @@ ${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
   return `${CADDY_GLOBAL_BLOCK}
 
 ${snippets}:80 {
-  @challenge path /.well-known/acme-challenge/*
+${input.generation ? `  vars ark_edge_generation ${input.generation}\n` : ""}  @challenge path /.well-known/acme-challenge/*
   handle @challenge {
     root * ${input.challengeDir}
-    file_server
+    # Explicit hides keep CLI and admin-API adaptation identical for guarded restoration.
+    file_server {
+      hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed
+    }
   }
 ${known}  handle {
     respond "Ark Stack challenge edge" 404

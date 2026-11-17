@@ -45,7 +45,7 @@ async function prepare(
       return Response.json({ result: adapted, warnings: [] }, { status: adaptStatus });
     }
     if (url.endsWith("/config/")) {
-      return running.config ? Response.json(running.config) : new Response("down", { status: 502 });
+      return Response.json(running.config ?? { apps: {} });
     }
     if (url.endsWith("/reverse_proxy/upstreams")) return Response.json(running.upstreams ?? []);
     return new Response(null, { status: loadStatus });
@@ -147,7 +147,6 @@ describe("writeEdge", () => {
     expect(result).toMatchObject({ applied: true, stoppedForStreams: ["100.101.102.103:3000"] });
     expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
       "/config/",
-      "/reverse_proxy/upstreams",
       "/adapt",
       "/load",
       "/stop",
@@ -159,14 +158,79 @@ describe("writeEdge", () => {
     );
   });
 
-  test("removing a route without streams in flight is an ordinary reload", async () => {
+  test("removing an idle delayed handler also stops Caddy to cover late upgrades", async () => {
     const { directory, requests } = await prepare(200, 200, {
       config: runningConfig,
       upstreams: [{ address: "100.101.102.103:3000", num_requests: 0, fails: 0 }],
     });
     const result = await writeEdge({ adminMode: "tailnet" });
-    expect(result).not.toHaveProperty("stoppedForStreams");
-    expect(requests.map((request) => new URL(request.url).pathname)).not.toContain("/stop");
-    expect(await Bun.file(join(directory, CADDY_STOP_MARKER)).exists()).toBe(false);
+    expect(result.stoppedForStreams).toEqual(["100.101.102.103:3000"]);
+    expect(requests.map((request) => new URL(request.url).pathname)).toContain("/stop");
+    expect(await Bun.file(join(directory, CADDY_STOP_MARKER)).exists()).toBe(true);
+  });
+  test("failed active-config inspection aborts before adapt/load and preserves the current files", async () => {
+    const { directory, requests } = await prepare();
+    await Bun.write(join(directory, "Caddyfile"), "old configuration");
+    const fetcher = globalThis.fetch;
+    globalThis.fetch = (async (url, init) =>
+      String(url).endsWith("/config/")
+        ? new Response(null, { status: 502 })
+        : fetcher(url, init)) as typeof fetch;
+    await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow("GET /config/ returned 502");
+    expect(requests).toEqual([]);
+    expect(await Bun.file(join(directory, "Caddyfile")).text()).toBe("old configuration");
+  });
+
+  test("late upgrades during load close even when the old upstream count was zero", async () => {
+    const { requests } = await prepare(200, 200, { config: runningConfig, upstreams: [] });
+    const fetcher = globalThis.fetch;
+    let streamOpen = false;
+    globalThis.fetch = (async (url, init) => {
+      if (String(url).endsWith("/load")) streamOpen = true;
+      const result = await fetcher(url, init);
+      if (String(url).endsWith("/stop")) streamOpen = false;
+      return result;
+    }) as typeof fetch;
+    await writeEdge({ adminMode: "tailnet" });
+    expect(streamOpen).toBe(false);
+    expect(requests.some((r) => r.url.endsWith("/reverse_proxy/upstreams"))).toBe(false);
+  });
+
+  test("a failed stop after rename persists intent; a fresh apply retries the stop", async () => {
+    const { directory } = await prepare(200, 200, { config: runningConfig });
+    const fetcher = globalThis.fetch;
+    let fail = true;
+    let stops = 0;
+    let streamOpen = true;
+    globalThis.fetch = (async (url, init) => {
+      if (String(url).endsWith("/stop")) {
+        stops++;
+        if (fail) return new Response(null, { status: 500 });
+        streamOpen = false;
+      }
+      // After /load no handler for the removed route remains to inspect.
+      if (String(url).endsWith("/config/") && stops) return Response.json({ apps: {} });
+      return fetcher(url, init);
+    }) as typeof fetch;
+    await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow("POST /stop returned 500");
+    expect(await Bun.file(join(directory, "Caddyfile")).exists()).toBe(true);
+    expect(streamOpen).toBe(true);
+    fail = false;
+    await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow(
+      "restarting after a pending stream stop",
+    );
+    expect(stops).toBe(2);
+    expect(streamOpen).toBe(false);
+  });
+
+  test("apply during an expected restart aborts safely before changing active config", async () => {
+    await prepare();
+    globalThis.fetch = Object.assign(
+      async (): Promise<Response> => {
+        throw new Error("ECONNREFUSED");
+      },
+      { preconnect: originalFetch.preconnect },
+    );
+    await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow("ECONNREFUSED");
   });
 });

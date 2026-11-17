@@ -201,6 +201,8 @@ export function checkedHttpRoute(route: EdgeHttpRoute) {
       throw new ValidationError(`Bypass path ${JSON.stringify(path)} is invalid.`);
   }
   const redirectTo = route.redirectTo ? checkedName(route.redirectTo, "redirectTo") : null;
+  if (redirectTo?.endsWith(".ts.net"))
+    throw new ValidationError(`redirectTo ${redirectTo} is a tailnet name.`);
   if (redirectTo === hostname) throw new ValidationError(`Route ${route.id} redirects to itself.`);
   const options = httpRouteOptions(route.options as Record<string, unknown> | undefined);
   const ips = new Map([[ip.canonical, ip]]);

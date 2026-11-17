@@ -21,7 +21,7 @@
 import { join } from "node:path";
 
 import {
-  CADDY_STOP_MARKER,
+  caddyState,
   CaddyWithdrawalAdapter,
   HaproxyWithdrawalAdapter,
   haproxyLaunchDecision,
@@ -70,17 +70,8 @@ async function report(event: WatchdogEvent) {
   if (!response.ok) throw new Error(`watchdog-event returned ${response.status}`);
 }
 
-/** When edge.apply last stopped Caddy to close removed routes' streams (written next to Caddyfile). */
-async function appliedStopAt() {
-  const text = await Bun.file(join(edgeDir, CADDY_STOP_MARKER))
-    .text()
-    .catch(() => "");
-  const at = Number(text.trim());
-  return Number.isFinite(at) && at > 0 ? at : null;
-}
-
 const adapters: EdgeWithdrawalAdapter[] = [
-  new CaddyWithdrawalAdapter(adminUrl, fetch, 3_000, { appliedStopAt }),
+  new CaddyWithdrawalAdapter(adminUrl, fetch, 3_000, caddyState(edgeDir)),
 ];
 if (haproxyMaster) adapters.push(new HaproxyWithdrawalAdapter(haproxyMaster));
 const proxies = new Map(
