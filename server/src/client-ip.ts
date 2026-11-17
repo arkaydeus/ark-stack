@@ -4,10 +4,11 @@
 // No Docker subnet is trusted any more. The address is:
 //
 // - the edge's `X-Forwarded-For`, only when the request carries the genuine `X-Ark-Edge-Token`, is
-//   for the login host and is one of the exact allowlisted login API paths. Caddy has no
-//   `trusted_proxies`, so it replaces whatever the client sent with exactly the PROXY v2 client
-//   address that HAProxy passed on, and its `ark_route_base` removes a client-forged token before
-//   adding its own. When `ARK_EDGE_PEER_ADDRESSES` is set, the transport peer must also be one of
+//   for a registered admin or login host and is one of that origin's exact auth API paths. Public
+//   Caddy has no `trusted_proxies`: it replaces client input with HAProxy's PROXY v2 address. The
+//   loopback-only tailnet gateway trusts only local Tailscale Serve and sends its resolved client IP.
+//   Both proxies remove client-forged identity headers before adding their own. When
+//   `ARK_EDGE_PEER_ADDRESSES` is set, the transport peer must also be one of
 //   those exact addresses (an additional check, never a trust grant on its own);
 // - otherwise the transport peer address of the connection, ignoring every forwarding header.
 //
@@ -17,7 +18,7 @@
 
 import { isIP } from "node:net";
 
-import { isGateLoginAuthPath, secureEqual } from "@ark-stack/shared";
+import { ADMIN_CLIENT_IP_AUTH_PATHS, isGateLoginAuthPath, secureEqual } from "@ark-stack/shared";
 
 import type { SessionOrigin } from "./session-origin.ts";
 
@@ -52,9 +53,13 @@ export type ClientIpInput = {
   edgePeers: string[];
 };
 
-/** Whether the request is a genuine edge-authenticated login API request (exact paths only). */
+/** Whether the request is a genuine proxy-authenticated auth request (exact paths only). */
 export function edgeAuthenticated(input: ClientIpInput) {
-  if (!input.edgeToken || input.origin !== "gate" || !isGateLoginAuthPath(input.path)) return false;
+  const allowed =
+    input.origin === "gate"
+      ? isGateLoginAuthPath(input.path)
+      : (ADMIN_CLIENT_IP_AUTH_PATHS as readonly string[]).includes(input.path);
+  if (!input.edgeToken || !allowed) return false;
   if (!secureEqual(input.headers.get(EDGE_TOKEN_HEADER) ?? "", input.edgeToken)) return false;
   return input.edgePeers.length === 0 || Boolean(input.peer && input.edgePeers.includes(input.peer));
 }

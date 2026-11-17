@@ -157,16 +157,32 @@ export async function commitGateSettings(
       ).length;
     }
     if (plan.mode === "public" && plan.domain) {
-      const [endpoint] = await tx.select().from(endpoints).where(eq(endpoints.hostname, plan.hostname));
+      const [endpoint] = await tx
+        .select()
+        .from(endpoints)
+        .where(eq(endpoints.hostname, plan.hostname))
+        .for("update");
+      if (endpoint && (endpoint.kind !== GATE_ENDPOINT_KIND || endpoint.domainId !== plan.domain.id)) {
+        throw new GateSettingsError(409, `${plan.hostname} is already owned by another endpoint.`);
+      }
       if (!endpoint) {
-        await tx.insert(endpoints).values({
-          id: createId("ep"),
-          kind: GATE_ENDPOINT_KIND,
-          hostname: plan.hostname,
-          domainId: plan.domain.id,
-          exposure: "public",
-          status: "awaiting_dns",
-        });
+        const inserted = await tx
+          .insert(endpoints)
+          .values({
+            id: createId("ep"),
+            kind: GATE_ENDPOINT_KIND,
+            hostname: plan.hostname,
+            domainId: plan.domain.id,
+            exposure: "public",
+            status: "awaiting_dns",
+          })
+          .onConflictDoNothing({ target: endpoints.hostname })
+          .returning({ id: endpoints.id });
+        // A route can reserve the hostname after our SELECT. The unique constraint arbitrates;
+        // abort the entire transaction (including authorization and session revocation) on loss.
+        if (inserted.length === 0) {
+          throw new GateSettingsError(409, `${plan.hostname} was reserved by another endpoint.`);
+        }
       }
       const existing = await tx
         .select()

@@ -34,11 +34,10 @@ describe("trustedClientIp", () => {
     }
   });
 
-  test("a forged or missing token, the admin origin or no configured token all key on the peer", () => {
+  test("a forged or missing token or no configured token all key on the peer", () => {
     for (const overrides of [
       { forwarded: "203.0.113.9", supplied: "forged" },
       { forwarded: "203.0.113.9" },
-      { forwarded: "203.0.113.9", supplied: token, origin: "admin" as const },
       { forwarded: "203.0.113.9", supplied: "", edgeToken: "" },
     ]) {
       expect(trustedClientIp(input(overrides)), JSON.stringify(overrides)).toEqual({
@@ -46,6 +45,25 @@ describe("trustedClientIp", () => {
         source: "peer",
       });
     }
+  });
+
+  test("admin auth paths use the same token and peer checks, including MFA management", () => {
+    for (const path of [
+      "/api/auth/sign-in/email",
+      "/api/auth/two-factor/disable",
+      "/api/auth/two-factor/generate-backup-codes",
+    ]) {
+      const admin = { origin: "admin" as const, path, forwarded: "203.0.113.9", edgePeers: ["172.18.0.5"] };
+      expect(trustedClientIp(input({ ...admin, supplied: token })).source).toBe("edge");
+      expect(trustedClientIp(input({ ...admin, supplied: "forged" })).source).toBe("peer");
+      expect(trustedClientIp(input({ ...admin, supplied: token, peer: "172.18.0.6" })).source).toBe("peer");
+      expect(trustedClientIp(input({ ...admin, path: `${path}/`, supplied: token })).source).toBe("peer");
+    }
+    expect(
+      trustedClientIp(
+        input({ origin: "admin", path: "/api/state", forwarded: "203.0.113.9", supplied: token }),
+      ).source,
+    ).toBe("peer");
   });
 
   test("a recorded edge peer is an additional check, never a grant on its own", () => {

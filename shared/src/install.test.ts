@@ -112,7 +112,7 @@ describe("startup gate token guard", () => {
   test("rejects a supplied public gate token and accepts the generated token", () => {
     const env = generateInstallSecrets();
     expect(() => assertNoPlaceholderSecrets(env)).not.toThrow();
-    for (const value of ["dev-edge-gate-token", "", "change-me-now"]) {
+    for (const value of ["dev-edge-gate-token", "change-me-now"]) {
       expect(() => assertNoPlaceholderSecrets({ ...env, ARK_EDGE_GATE_TOKEN: value })).toThrow(
         /ARK_EDGE_GATE_TOKEN/,
       );
@@ -123,5 +123,6 @@ describe("startup gate token guard", () => {
     const env: Record<string, string> = generateInstallSecrets();
     delete env.ARK_EDGE_GATE_TOKEN;
     expect(() => assertNoPlaceholderSecrets(env)).not.toThrow();
+    expect(() => assertNoPlaceholderSecrets({ ...env, ARK_EDGE_GATE_TOKEN: "" })).not.toThrow();
   });
 });

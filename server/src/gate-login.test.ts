@@ -11,6 +11,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import postgres from "postgres";
+import {
+  ADMIN_CLIENT_IP_AUTH_PATHS,
+  assertNoPlaceholderSecrets,
+  generateInstallSecrets,
+} from "@ark-stack/shared";
 
 const root = resolve(import.meta.dir, "../..");
 
@@ -23,6 +28,59 @@ async function run(args: string[], env: Record<string, string | undefined>) {
   ]);
   return { code, output: `${stdout}\n${stderr}` };
 }
+
+test("Compose propagates exact peer pins and allows API startup without an optional gate token", async () => {
+  const compose = await Bun.file(join(root, "infra/platform/docker-compose.yml")).text();
+  const required = [...new Set([...compose.matchAll(/\$\{([A-Z0-9_]+):\?/g)].map((match) => match[1]!))];
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    ...Object.fromEntries(required.map((key) => [key, "contract-test-unused"])),
+    ...generateInstallSecrets(),
+    ARK_EDGE_PEER_ADDRESSES: "192.0.2.10,192.0.2.11",
+  };
+  const gateway = await Bun.file(join(root, "infra/platform/TailnetCaddyfile")).text();
+  expect(gateway.match(/@adminAuth path (.*)/)?.[1]?.split(" ")).toEqual([...ADMIN_CLIENT_IP_AUTH_PATHS]);
+  expect(gateway).toContain("bind 127.0.0.1 ::1");
+  expect(gateway).toContain("trusted_proxies static 127.0.0.1 ::1");
+  for (const supplied of [undefined, "", "generated-contract-token"]) {
+    env.ARK_EDGE_GATE_TOKEN = supplied;
+    const rendered = await run(
+      [
+        "docker",
+        "compose",
+        "--env-file",
+        "/dev/null",
+        "--profile",
+        "tailnet",
+        "-f",
+        "infra/platform/docker-compose.yml",
+        "config",
+        "--format",
+        "json",
+      ],
+      env,
+    );
+    expect(rendered.code, rendered.output).toBe(0);
+    const config = JSON.parse(rendered.output);
+    const api = config.services.api.environment as Record<string, string>;
+    expect(api.ARK_EDGE_PEER_ADDRESSES).toBe(env.ARK_EDGE_PEER_ADDRESSES!);
+    expect(api.ARK_EDGE_GATE_TOKEN).toBe(supplied ?? "");
+    expect(config.services["tailnet-gateway"].environment.ARK_EDGE_GATE_TOKEN).toBe(supplied ?? "");
+    // Supply the other startup secrets from the installer fixture; the contract under test is
+    // the rendered token and peer-pin values, not unrelated deployment secret provisioning.
+    const startup = { ...generateInstallSecrets(), ...api };
+    expect(() => assertNoPlaceholderSecrets(startup)).not.toThrow();
+    if (!supplied) {
+      const started = await run(["bun", "server/src/index.ts"], {
+        ...startup,
+        PATH: process.env.PATH,
+        DATABASE_URL: process.env.DATABASE_URL,
+        ARK_SKIP_LISTEN: "1",
+      });
+      expect(started.code, started.output).toBe(0);
+    }
+  }
+}, 30_000);
 
 test("gate login origin and session separation (FD-10), in an isolated database and process", async () => {
   const source = process.env.DATABASE_URL;

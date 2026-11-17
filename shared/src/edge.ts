@@ -7,7 +7,7 @@ import {
   type EdgeHttpRoute,
 } from "./edge-http.ts";
 import { ValidationError } from "./errors.ts";
-import { GATE_LOGIN_AUTH_PATHS } from "./gate-login.ts";
+import { ADMIN_CLIENT_IP_AUTH_PATHS, GATE_LOGIN_AUTH_PATHS } from "./gate-login.ts";
 import { normalizeHostname } from "./hostnames.ts";
 
 /** Where the `edge` container mounts Ark's lego certificates (read-only), one directory per hostname. */
@@ -314,8 +314,16 @@ ${body}}
           input.adminHostname,
           `  encode gzip
   route {
+    request_header -X-Ark-*
     @internal path /api/internal/* /api/metrics/prometheus /api/platform/maintain
     respond @internal 404
+    @adminAuth path ${ADMIN_CLIENT_IP_AUTH_PATHS.join(" ")}
+    reverse_proxy @adminAuth ${input.apiUpstream} {
+      header_up -X-Forwarded-Host
+      header_up X-Forwarded-Proto https
+      header_up Host ${input.adminHostname}
+      header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}
+    }
     @browserApi path /api/auth/* /api/setup/status /api/state /api/me /api/wizard /api/step-up /api/domains* /api/projects* /api/databases* /api/mailboxes* /api/aliases* /api/services* /api/sql/* /api/mail/* /api/devices/* /api/secrets/* /api/backups* /api/ses/* /api/updates/* /api/import/* /api/alerts/* /api/settings* /api/front/* /api/metrics
     reverse_proxy @browserApi ${input.apiUpstream} {
       header_up -X-Forwarded-Host

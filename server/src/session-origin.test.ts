@@ -170,7 +170,7 @@ describe("Better Auth session insert paths set origin", () => {
       sql`
         INSERT INTO session (id, user_id, token, expires_at, created_at, updated_at)
         VALUES (${createId("ses")}, ${owner!.id}, ${createId("tok")}, now() + interval '1 hour', now(), now())
-      `,
+      `.then((rows) => rows),
     ).rejects.toThrow(/null value in column "origin"/);
   });
 });

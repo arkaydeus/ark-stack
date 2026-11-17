@@ -9,7 +9,7 @@ import { z } from "zod";
 
 /**
  * Better Auth endpoints the login origin forwards, as exact paths. The edge adds `X-Ark-Edge-Token`
- * only on these requests, and the API trusts the edge's `X-Forwarded-For` only on these paths.
+ * only on these requests on the login origin. Admin paths are listed separately below.
  */
 export const GATE_LOGIN_AUTH_PATHS = [
   "/api/auth/sign-in/email",
@@ -19,6 +19,13 @@ export const GATE_LOGIN_AUTH_PATHS = [
   "/api/auth/two-factor/verify-backup-code",
   "/api/auth/two-factor/enable",
   "/api/auth/two-factor/get-totp-uri",
+] as const;
+
+/** Exact admin auth paths that receive a proxy-authenticated client address, including MFA management. */
+export const ADMIN_CLIENT_IP_AUTH_PATHS = [
+  ...GATE_LOGIN_AUTH_PATHS,
+  "/api/auth/two-factor/disable",
+  "/api/auth/two-factor/generate-backup-codes",
 ] as const;
 
 /** Gate pages (FD-11: `/gate/login`, `/gate/authorize`, `/gate/logout`), forwarded without the token. */

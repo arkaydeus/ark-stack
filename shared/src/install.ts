@@ -171,7 +171,7 @@ export function assertNoPlaceholderSecrets(env: Record<string, string | undefine
     // The API and edge read the gate token (FD-10); enabling the login origin requires it. Older
     // deployments without it keep running with no edge-trusted client address; refuse a published
     // value when supplied, without requiring it.
-    if (key === "ARK_EDGE_GATE_TOKEN" && env[key] === undefined) continue;
+    if (key === "ARK_EDGE_GATE_TOKEN" && !env[key]) continue;
     // Optional for the API: without it the watchdog cannot read the lease and tailnet routes stay
     // withdrawn. A published placeholder is still refused.
     if (key === "ARK_EDGE_WATCHDOG_TOKEN" && !env[key]) continue;

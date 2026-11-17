@@ -1885,40 +1885,54 @@ async function fd10AllowlistTest(report: Report) {
     "X-Ark-Edge-Token": "forged-by-the-client",
     Origin: `https://${loginHost}`,
   };
-  for (const [method, path] of GATE_LOGIN_API) {
-    const reply = await client<{
-      status: number;
-      body: string;
-      headers: Record<string, string>;
-      self: string[];
-    }>(stack.networks.admin, [
-      "https",
-      admin,
-      "443",
-      loginHost,
-      loginHost,
-      path,
-      JSON.stringify(forged),
-      method,
-    ]);
-    const echo = JSON.parse(reply.body || "{}") as Echo;
-    const seen = echo.headers ?? {};
+  for (const host of [loginHost, adminHost]) {
+    for (const [method, path] of GATE_LOGIN_API) {
+      const reply = await client<{
+        status: number;
+        body: string;
+        headers: Record<string, string>;
+        self: string[];
+      }>(stack.networks.admin, [
+        "https",
+        admin,
+        "443",
+        host,
+        host,
+        path,
+        JSON.stringify({ ...forged, Origin: `https://${host}`, "X-Ark-Client-Ip": "6.6.6.6" }),
+        method,
+      ]);
+      const echo = JSON.parse(reply.body || "{}") as Echo;
+      const seen = echo.headers ?? {};
+      expect(
+        report,
+        reply.status === 200 &&
+          echo.path === path &&
+          echo.method === method &&
+          seen["x-ark-edge-token"] === gateToken &&
+          reply.self.includes(seen["x-forwarded-for"] ?? "") &&
+          seen.host === host &&
+          !seen["x-ark-client-ip"],
+        `${host} ${method} ${path} reaches the API with the genuine edge token and the PROXY v2 client address`,
+        `status ${reply.status}; token ${seen["x-ark-edge-token"] === gateToken ? "genuine" : JSON.stringify(seen["x-ark-edge-token"])}; client ${reply.self.join(",")} -> X-Forwarded-For ${seen["x-forwarded-for"]}; Host ${seen.host}`,
+      );
+      if (host === loginHost)
+        expect(
+          report,
+          !reply.headers.server && reply.headers["strict-transport-security"] === "max-age=31536000",
+          `${path}: no Server header, HSTS set`,
+          `server ${reply.headers.server ?? "absent"}; hsts ${reply.headers["strict-transport-security"]}`,
+        );
+    }
+  }
+  for (const path of ["/api/state", "/api/auth/sign-in/email/"]) {
+    const reply = await secureRequest(adminHost, path, forged);
+    const headers = (JSON.parse(reply.body || "{}") as Echo).headers ?? {};
     expect(
       report,
-      reply.status === 200 &&
-        echo.path === path &&
-        echo.method === method &&
-        seen["x-ark-edge-token"] === gateToken &&
-        reply.self.includes(seen["x-forwarded-for"] ?? "") &&
-        seen.host === loginHost,
-      `${method} ${path} reaches the API with the genuine edge token and the PROXY v2 client address`,
-      `status ${reply.status}; token ${seen["x-ark-edge-token"] === gateToken ? "genuine" : JSON.stringify(seen["x-ark-edge-token"])}; client ${reply.self.join(",")} -> X-Forwarded-For ${seen["x-forwarded-for"]}; Host ${seen.host}`,
-    );
-    expect(
-      report,
-      !reply.headers.server && reply.headers["strict-transport-security"] === "max-age=31536000",
-      `${path}: no Server header, HSTS set`,
-      `server ${reply.headers.server ?? "absent"}; hsts ${reply.headers["strict-transport-security"]}`,
+      reply.status === 200 && !headers["x-ark-edge-token"],
+      `admin ${path} strips the token outside exact auth paths`,
+      JSON.stringify(headers),
     );
   }
   const page = await secureRequest(loginHost, "/gate/login?next=%2Fgate%2Fauthorize", {

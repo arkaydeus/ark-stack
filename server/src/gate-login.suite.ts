@@ -5,11 +5,15 @@
 //
 // Requests go over TCP so the API sees a real transport peer: 127.0.0.1 is the recorded edge peer,
 // and ::1 stands in for any other container on the admin bridge.
+// Admin proxy cases also require Docker and run the pinned Caddy configuration with two clients.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { createId, privilegedRequestHash } from "@ark-stack/shared";
+import { createId, privilegedRequestHash, renderCaddyfile } from "@ark-stack/shared";
 import { createAuthEndpoint } from "better-auth/api";
 import { makeSignature } from "better-auth/crypto";
 import { betterAuth } from "better-auth/minimal";
@@ -19,6 +23,7 @@ const { auth, authBaseURL, authCookieName, AUTH_COOKIE_KEYS } = await import("./
 const { sql } = await import("./db.ts");
 const { refreshLoginHost } = await import("./origin-hosts.ts");
 const { enqueue, runOperation } = await import("./coordinator.ts");
+const { prepareGateSettings, commitGateSettings } = await import("./modules/gate-settings.ts");
 
 const adminHost = new URL(process.env.BETTER_AUTH_URL!).host;
 const loginHost = "login.gate.example.com";
@@ -260,7 +265,7 @@ describe("unknown and malformed hosts", () => {
       sql`
         INSERT INTO session (id, user_id, token, expires_at, created_at, updated_at)
         VALUES (${createId("ses")}, ${user.id}, ${createId("tok")}, now() + interval '1 hour', now(), now())
-      `,
+      `.then((rows) => rows),
     ).rejects.toThrow(/null value in column "origin"/);
     const [rows] = await sql`SELECT count(*)::int AS count FROM session WHERE user_id = ${user.id}`;
     expect(rows!.count).toBe(0);
@@ -545,7 +550,153 @@ describe("cookie tossing", () => {
   });
 });
 
+async function proxyDocker(...args: string[]) {
+  const child = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (code !== 0) throw new Error(`docker ${args[0]}: ${err || out}`);
+  return out.trim();
+}
+
 describe("trusted client address and sign-in rate limit", () => {
+  // Keep subnets allocated until both proxy modes have run: Docker otherwise reuses the first
+  // client's address immediately, carrying its deliberately exhausted in-memory rate bucket over.
+  const proxyNetworks: string[] = [];
+  afterAll(async () => {
+    for (const network of proxyNetworks) await proxyDocker("network", "rm", network);
+  });
+  for (const mode of ["public", "tailnet"] as const) {
+    test(`${mode} admin Caddy keeps two clients' sign-in and MFA buckets and session addresses separate`, async () => {
+      const directory = await mkdtemp(join(tmpdir(), "ark-admin-proxy-"));
+      const network = `ark-admin-proxy-${crypto.randomUUID()}`;
+      const containers: string[] = [];
+      // A byte-preserving HTTP relay makes the Caddy->API transport peer the recorded loopback
+      // address on both Docker Desktop and Linux. Only Caddy supplies the authentication headers.
+      const relay = Bun.serve({
+        hostname: "0.0.0.0",
+        port: 0,
+        fetch: (request) =>
+          fetch(new Request(`http://127.0.0.1:${server.port}${new URL(request.url).pathname}`, request)),
+      });
+      try {
+        const rendered = renderCaddyfile({
+          adminMode: "public",
+          adminHostname: adminHost,
+          apiUpstream: `host.docker.internal:${relay.port}`,
+          challengeDir: "/unused",
+          certificates: [{ hostname: adminHost, status: "issued", fullchain: "/unused", privkey: "/unused" }],
+        });
+        const start = rendered.indexOf(`${adminHost} {\n`) + `${adminHost} {\n`.length;
+        const siteBody = rendered
+          .slice(start, rendered.indexOf("\n}\n", start))
+          .replace(/^  (bind|tls) .*\n/gm, "");
+        const publicConfig = `{\n  admin off\n  auto_https off\n}\n:8080 {\n${siteBody}\n}\n`;
+        // Stand in for Tailscale Serve in the gateway's loopback namespace. The outer proxy
+        // overwrites forged forwarding headers, as Serve does, and the shipped gateway resolves
+        // its strict chain before writing a single authenticated address to the API.
+        const tailnetConfig = (
+          await Bun.file(join(import.meta.dir, "../../infra/platform/TailnetCaddyfile")).text()
+        )
+          .replaceAll("api:3000", `host.docker.internal:${relay.port}`)
+          .concat("\n:8081 {\n  reverse_proxy 127.0.0.1:8080\n}\n");
+        await Bun.write(join(directory, "Caddyfile"), mode === "public" ? publicConfig : tailnetConfig);
+        const compose = Bun.YAML.parse(
+          await Bun.file(join(import.meta.dir, "../../infra/platform/docker-compose.yml")).text(),
+        ) as { services: { edge: { image: string } } };
+        await proxyDocker("network", "create", network);
+        proxyNetworks.push(network);
+        const proxy = `${network}-caddy`;
+        containers.push(proxy);
+        await proxyDocker(
+          "run",
+          "-d",
+          "--name",
+          proxy,
+          "--network",
+          network,
+          "--network-alias",
+          "proxy",
+          "--add-host",
+          "host.docker.internal:host-gateway",
+          "-e",
+          `ARK_EDGE_GATE_TOKEN=${edgeToken}`,
+          "-v",
+          `${directory}/Caddyfile:/etc/caddy/Caddyfile:ro`,
+          compose.services.edge.image,
+        );
+        for (const label of ["a", "b"]) {
+          const name = `${network}-${label}`;
+          containers.push(name);
+          await proxyDocker(
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--network",
+            network,
+            "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61",
+            "bun",
+            "-e",
+            "setInterval(() => {}, 1000)",
+          );
+        }
+        const request = async (client: string, path: string, body?: unknown, cookie?: string) =>
+          JSON.parse(
+            await proxyDocker(
+              "exec",
+              `${network}-${client}`,
+              "bun",
+              "-e",
+              `const i=JSON.parse(process.argv[1]); const r=await fetch('http://proxy:'+i.port+i.path,{method:i.body===undefined?'GET':'POST',headers:{host:i.host,origin:'https://'+i.host,'content-type':'application/json','x-forwarded-for':'6.6.6.6','x-ark-edge-token':'forged','x-ark-client-ip':'6.6.6.6',...(i.cookie?{cookie:i.cookie}:{})},body:i.body===undefined?undefined:JSON.stringify(i.body)});console.log(JSON.stringify({status:r.status,body:await r.text(),cookies:r.headers.getSetCookie()}));`,
+              JSON.stringify({ host: adminHost, path, body, cookie, port: mode === "public" ? 8080 : 8081 }),
+            ),
+          ) as { status: number; body: string; cookies: string[] };
+        // Wait for the proxy using a session lookup, which does not touch sign-in/MFA limits.
+        for (let i = 0; ; i++) {
+          try {
+            expect((await request("b", "/api/auth/get-session")).status).toBe(200);
+            break;
+          } catch (error) {
+            if (i === 30) throw error;
+            await Bun.sleep(100);
+          }
+        }
+        const user = await createUser("admin-proxy", "viewer");
+        for (let i = 0; i < 6; i++)
+          expect(
+            (await request("a", "/api/auth/sign-in/email", { email: user.email, password: "wrong" })).status,
+          ).toBe(i === 5 ? 429 : 401);
+        const signed = await request("b", "/api/auth/sign-in/email", { email: user.email, password });
+        expect(signed.status).toBe(200);
+        const address = await proxyDocker(
+          "inspect",
+          "-f",
+          `{{(index .NetworkSettings.Networks "${network}").IPAddress}}`,
+          `${network}-b`,
+        );
+        const [record] =
+          await sql`SELECT ip_address FROM session WHERE token = ${JSON.parse(signed.body).token}`;
+        expect(record?.ip_address).toBe(address);
+        // MFA management uses the same authenticated address channel.
+        const cookie = signed.cookies.map((value) => value.split(";")[0]).join("; ");
+        const existing = await sessionCookie(user.id, "admin");
+        for (let i = 0; i < 6; i++)
+          expect(
+            (await request("a", "/api/auth/two-factor/enable", { password: "wrong" }, existing.cookie))
+              .status,
+          ).toBe(i === 5 ? 429 : 400);
+        expect((await request("b", "/api/auth/two-factor/enable", { password }, cookie)).status).toBe(200);
+      } finally {
+        for (const name of containers.toReversed()) await proxyDocker("rm", "-f", name);
+        relay.stop(true);
+        await rm(directory, { recursive: true, force: true });
+      }
+    }, 120_000);
+  }
+
   const failedSignIn = (input: Partial<Call>) =>
     call({
       host: loginHost,
@@ -579,7 +730,7 @@ describe("trusted client address and sign-in rate limit", () => {
     expect(statuses).toEqual([401, 401, 401, 401, 401, 429]);
     // The genuine token from a peer that is not the recorded edge peer is not trusted either.
     expect((await failedSignIn({ peer: "other", edge: { client: "198.18.1.1" } })).status).toBe(429);
-    // Nor on the admin origin, where no request is edge-authenticated.
+    // A genuine token from an unpinned peer is refused on the admin origin too.
     expect(
       (
         await call({
@@ -639,6 +790,100 @@ describe("PUT /api/settings/gate", () => {
     });
     expect(response.status).toBe(200);
   };
+
+  const gateState = async () => ({
+    settings: [...(await sql`SELECT * FROM platform_settings ORDER BY id`)],
+    sessions: [...(await sql`SELECT * FROM session ORDER BY id`)],
+    dns: [...(await sql`SELECT * FROM dns_records ORDER BY id`)],
+    audit: [...(await sql`SELECT * FROM audit_events ORDER BY id`)],
+    grants: [...(await sql`SELECT * FROM step_up_grants ORDER BY id`)],
+    gates: [...(await sql`SELECT * FROM endpoints WHERE kind = 'gate' ORDER BY id`)],
+  });
+
+  test("commit rejects a hostname reserved after prepare, including a gate endpoint owned by another domain, without writes", async () => {
+    for (const kind of ["route", "gate"]) {
+      const hostname = `collision-${kind}.${zone}`;
+      const plan = await prepareGateSettings({ mode: "public", hostname });
+      const id = createId("ep");
+      // A gate with no matching domain ownership must also be refused.
+      await sql`INSERT INTO endpoints (id, kind, hostname, domain_id) VALUES (${id}, ${kind}, ${hostname}, ${kind === "route" ? plan.domain!.id : null})`;
+      const before = await gateState();
+      const queued: unknown[] = [];
+      try {
+        await expect(
+          commitGateSettings(
+            plan,
+            { userId: owner.id, role: "owner" },
+            async (input) => {
+              queued.push(input);
+              return { id: "unexpected" };
+            },
+            async (tx) => {
+              // Stand-in for transactional authorization consumption: this must roll back too.
+              await tx.delete((await import("./schema.ts")).session);
+            },
+          ),
+        ).rejects.toMatchObject({ status: 409 });
+        expect(await gateState()).toEqual(before);
+        expect(queued).toEqual([]);
+        expect((await sql`SELECT kind FROM endpoints WHERE id = ${id}`)[0]?.kind).toBe(kind);
+      } finally {
+        await sql`DELETE FROM endpoints WHERE id = ${id}`;
+      }
+    }
+  });
+
+  test("a concurrent route reservation wins the unique-hostname race and rolls gate commit back with 409", async () => {
+    const hostname = `concurrent.${zone}`;
+    const plan = await prepareGateSettings({ mode: "public", hostname });
+    const before = await gateState();
+    let reserved!: () => void;
+    let release!: () => void;
+    const inserted = new Promise<void>((resolve) => {
+      reserved = resolve;
+    });
+    const proceed = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const id = createId("ep");
+    const route = sql.begin(async (tx) => {
+      await tx`INSERT INTO endpoints (id, kind, hostname, domain_id) VALUES (${id}, 'route', ${hostname}, ${plan.domain!.id})`;
+      reserved();
+      await proceed;
+    });
+    await inserted;
+    const gate = commitGateSettings(plan, { userId: owner.id, role: "owner" }, async () => {
+      throw new Error("must not enqueue on conflict");
+    }).then(
+      () => ({ status: 200 }),
+      (error: unknown) => error,
+    );
+    try {
+      // The route insert is still invisible to the SELECT. Wait until the gate INSERT is blocked
+      // on its unique index, then commit the route, exercising the insert-race conflict branch.
+      let waiting = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const rows =
+          await sql`SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query ILIKE '%insert into "endpoints"%'`;
+        if (rows.length) {
+          waiting = true;
+          break;
+        }
+        await Bun.sleep(20);
+      }
+      expect(waiting).toBe(true);
+      release();
+      await route;
+      expect(await gate).toMatchObject({ status: 409 });
+      expect(await gateState()).toEqual(before);
+      expect((await sql`SELECT kind FROM endpoints WHERE id = ${id}`)[0]?.kind).toBe("route");
+    } finally {
+      release();
+      await route;
+      await gate;
+      await sql`DELETE FROM endpoints WHERE id = ${id}`;
+    }
+  });
 
   test("only public or disabled (R1), owner only, and public needs an exposure.public step-up", async () => {
     expect((await put({ mode: "tailnet", hostname: movedLoginHost })).status).toBe(422);
