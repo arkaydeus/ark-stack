@@ -27,6 +27,7 @@ import {
   PGBOUNCER_PORT,
   PGBOUNCER_SOCKET_DIR,
   planEdge,
+  servedHttpHostnames,
   planHash,
   platformDbIngressLimits,
   validateMaintenanceBundle,
@@ -47,6 +48,7 @@ import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
 import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
+import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import {
   EDGE_OBSERVE_TARGET,
   edgePolicy,
@@ -2288,7 +2290,8 @@ export function startRolloverScheduler(
 
 // The edge serves only hostnames whose current certificate is `issued`. Public `http` endpoints
 // have no upstream yet, so they are rendered as unrouted (a fixed 503 naming no internal host).
-// Tailnet HTTP routes are rendered only while the lease allows them (front door §3.2, FD-06).
+// Front-door HTTP routes are read from `front_routes` and rendered only while the lease allows them
+// (front door §3.2, FD-06) and only in an implemented access mode (§3.5, FD-09: public).
 export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
   const policy = await edgePolicy();
   return planEdge({
@@ -2296,15 +2299,7 @@ export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: s
     adminHostname,
     endpoints: await db.select().from(endpoints),
     certificates: await db.select().from(certificates),
-    tailnetRoutes: policy.routes
-      .filter((route) => route.kind === "http")
-      .map((route) => ({
-        id: route.id,
-        hostname: route.hostname,
-        stableId: route.stableId,
-        ip: route.ip,
-        port: route.port,
-      })),
+    httpRoutes: await edgeHttpRoutes(policy.routes),
   });
 }
 
@@ -2319,6 +2314,8 @@ async function applyEdge(operation: OperationRow) {
     ...written,
     unrouted: plan.appRoutes.map((route) => route.hostname),
     awaitingCertificate: plan.awaitingCertificate,
+    // Routes the lease allows but this release cannot serve (sso before FD-11, invalid options).
+    omitted: plan.omitted,
   });
   // The SNI router names every hostname Caddy serves; a queued edge.l4_apply is reused.
   if (edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
@@ -2337,17 +2334,20 @@ export async function withEdgeLock<T>(work: () => Promise<T>) {
 
 // HAProxy SNI router on 443 (front door §3.8.5, FD-25): HTTP, admin and login hostnames go to Caddy
 // over PROXY v2; unknown SNI goes to Caddy too; non-TLS is rejected after 5 s. TLS-TCP routes arrive
-// with FD-14, so no tailnet backend is rendered here yet.
+// with FD-14, so no tailnet backend is rendered here yet. The HTTP hostnames are exactly the ones the
+// same plan gives Caddy a site for (FD-09): servable routes with an issued certificate, never an
+// omitted or unservable route.
+export function edgeL4Input(plan: Pick<Awaited<ReturnType<typeof edgePlan>>, "certificates">) {
+  return { httpHostnames: servedHttpHostnames(plan), tlsRoutes: [] };
+}
+
 async function applyEdgeL4(operation: OperationRow) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
     settings?.adminHostname,
   );
-  const httpHostnames = plan.certificates
-    .filter((certificate) => certificate.status === "issued")
-    .map((certificate) => certificate.hostname);
-  const written = await withEdgeLock(() => writeEdgeL4({ httpHostnames, tlsRoutes: [] }));
+  const written = await withEdgeLock(() => writeEdgeL4(edgeL4Input(plan)));
   await addStep(operation.id, "edge-l4-apply", written);
   return written;
 }
@@ -2391,7 +2391,8 @@ async function reconcileServedRoutes() {
       .filter((certificate) => certificate.status === "issued")
       .map((certificate) => certificate.hostname),
   );
-  const allowed = plan.tailnetRoutes.filter((route) => issued.has(route.hostname));
+  // Redirect-only routes dial no backend, so they carry no identity to look for.
+  const allowed = plan.httpRoutes.filter((route) => issued.has(route.hostname) && !route.redirectTo);
   if (!allowed.length) return { checked: true, missing: [] };
   let active: string[];
   try {

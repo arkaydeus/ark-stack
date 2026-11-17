@@ -3,6 +3,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { CADDY_STOP_MARKER, routeIdentityKey } from "@ark-stack/shared";
+
 import { writeEdge } from "./providers.ts";
 
 const originalFetch = globalThis.fetch;
@@ -24,7 +26,11 @@ afterEach(async () => {
 
 type Captured = { url: string; headers: Headers; body: string };
 
-async function prepare(adaptStatus = 200, loadStatus = 200) {
+async function prepare(
+  adaptStatus = 200,
+  loadStatus = 200,
+  running: { config?: unknown; upstreams?: unknown } = {},
+) {
   const directory = await mkdtemp(join(tmpdir(), "ark-edge-write-"));
   temporaryDirectories.push(directory);
   process.env.ARK_EDGE_DIR = directory;
@@ -38,6 +44,10 @@ async function prepare(adaptStatus = 200, loadStatus = 200) {
     if (url.endsWith("/adapt")) {
       return Response.json({ result: adapted, warnings: [] }, { status: adaptStatus });
     }
+    if (url.endsWith("/config/")) {
+      return running.config ? Response.json(running.config) : new Response("down", { status: 502 });
+    }
+    if (url.endsWith("/reverse_proxy/upstreams")) return Response.json(running.upstreams ?? []);
     return new Response(null, { status: loadStatus });
   }) as typeof fetch;
   return { directory, requests, adapted };
@@ -56,11 +66,13 @@ describe("writeEdge", () => {
       appRoutes: [{ hostname: "app.example.com" }],
     });
     expect(result.applied).toBe(true);
+    // The running config is read first: removed routes may hold WebSockets (FD-09).
     expect(requests.map((request) => request.url)).toEqual([
+      "http://edge-admin:2019/config/",
       "http://edge-admin:2019/adapt",
       "http://edge-admin:2019/load",
     ]);
-    const [adapt, load] = requests;
+    const [, adapt, load] = requests;
     expect(adapt?.headers.get("content-type")).toBe("text/caddyfile");
     expect(adapt?.headers.get("cache-control")).toBeNull();
     expect(load?.headers.get("cache-control")).toBe("must-revalidate");
@@ -88,6 +100,73 @@ describe("writeEdge", () => {
     await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow(
       "Caddy rejected candidate configuration: 400",
     );
-    expect(requests.map((request) => request.url)).toEqual(["http://edge-admin:2019/adapt"]);
+    expect(requests.map((request) => request.url)).toEqual([
+      "http://edge-admin:2019/config/",
+      "http://edge-admin:2019/adapt",
+    ]);
+  });
+
+  // A running route the new render drops, with stream_close_delay (as FD-09 renders it).
+  const removed = {
+    id: "rt_gone",
+    hostname: "gone.example.com",
+    stableId: "nGONE",
+    ip: "100.101.102.103",
+    port: 3000,
+  };
+  const runningConfig = {
+    apps: {
+      http: {
+        servers: {
+          srv0: {
+            routes: [
+              {
+                match: [{ host: [removed.hostname] }],
+                handle: [
+                  { handler: "vars", ark_tailnet_route: routeIdentityKey(removed) },
+                  {
+                    handler: "reverse_proxy",
+                    stream_close_delay: 300_000_000_000,
+                    upstreams: [{ dial: "100.101.102.103:3000" }],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    },
+  };
+
+  test("removing a route that holds a WebSocket stops Caddy after the new files are in place", async () => {
+    const { directory, requests } = await prepare(200, 200, {
+      config: runningConfig,
+      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
+    });
+    const result = await writeEdge({ adminMode: "tailnet" });
+    expect(result).toMatchObject({ applied: true, stoppedForStreams: ["100.101.102.103:3000"] });
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+      "/config/",
+      "/reverse_proxy/upstreams",
+      "/adapt",
+      "/load",
+      "/stop",
+    ]);
+    // The launch guard restarts from the new file; the marker tells the watchdog the stop is expected.
+    expect(await Bun.file(join(directory, "Caddyfile")).text()).not.toContain(removed.hostname);
+    expect(Number(await readFile(join(directory, CADDY_STOP_MARKER), "utf8"))).toBeGreaterThan(
+      Date.now() - 10_000,
+    );
+  });
+
+  test("removing a route without streams in flight is an ordinary reload", async () => {
+    const { directory, requests } = await prepare(200, 200, {
+      config: runningConfig,
+      upstreams: [{ address: "100.101.102.103:3000", num_requests: 0, fails: 0 }],
+    });
+    const result = await writeEdge({ adminMode: "tailnet" });
+    expect(result).not.toHaveProperty("stoppedForStreams");
+    expect(requests.map((request) => new URL(request.url).pathname)).not.toContain("/stop");
+    expect(await Bun.file(join(directory, CADDY_STOP_MARKER)).exists()).toBe(false);
   });
 });

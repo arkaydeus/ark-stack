@@ -113,6 +113,8 @@ try {
         candidate = await request.text();
         return Response.json({ result: { apps: {} } });
       }
+      // edge.apply reads the running config first (routes it removes may hold WebSockets, FD-09).
+      if (new URL(request.url).pathname === "/config/") return Response.json({ apps: {} });
       assert.equal(request.headers.get("cache-control"), "must-revalidate");
       return new Response("");
     },
@@ -208,7 +210,7 @@ try {
   assert(candidate.includes("admin.edge.example.com {"));
   assert(candidate.includes("app.edge.example.com {"));
   assert(!candidate.includes("waiting.edge.example.com {"));
-  assert.deepEqual(calls, ["/adapt", "/load"]);
+  assert.deepEqual(calls, ["/config/", "/adapt", "/load"]);
   const apply = await operation("edge.apply");
   await runOperation("edge.apply", apply);
   const [step] = await db.select().from(operationSteps).where(eq(operationSteps.operationId, apply.id));

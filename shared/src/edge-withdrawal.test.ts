@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  CADDY_RESTART_GRACE_MS,
   CaddyWithdrawalAdapter,
   EdgeWatchdog,
+  caddyBusyBackends,
+  identityBackend,
   WITHDRAWN_HANDLER,
   caddyTailnetBackends,
   caddyfileTailnetBackends,
@@ -140,9 +143,11 @@ admin.example.com {
   });
 });
 
-/** A fake Caddy admin API: GET /config/, POST /load (optionally failing), POST /stop. */
-function fakeCaddy(options: { failLoad?: boolean } = {}) {
-  let active: unknown = config();
+/** A fake Caddy admin API: GET /config/, POST /load (optionally failing), POST /stop, upstreams. */
+function fakeCaddy(
+  options: { failLoad?: boolean; initial?: unknown; upstreams?: unknown; failUpstreams?: boolean } = {},
+) {
+  let active: unknown = options.initial ?? config();
   const calls: string[] = [];
   let stopped = false;
   const fetcher = async (url: string, init: RequestInit = {}) => {
@@ -160,10 +165,209 @@ function fakeCaddy(options: { failLoad?: boolean } = {}) {
       stopped = true;
       return new Response("");
     }
+    if (path === "/reverse_proxy/upstreams") {
+      if (options.failUpstreams) return new Response("nope", { status: 500 });
+      return Response.json(options.upstreams ?? []);
+    }
     return new Response("not found", { status: 404 });
   };
-  return { fetcher, calls, active: () => active, stopped: () => stopped };
+  return {
+    fetcher,
+    calls,
+    active: () => active,
+    stopped: () => stopped,
+    /** The launch guard's restart, from the given config (the closed variant by default). */
+    restart: (from: unknown) => {
+      active = from;
+      stopped = false;
+    },
+  };
 }
+
+/** An admin API that refuses every connection (Caddy stopped or restarting). */
+async function down(): Promise<Response> {
+  throw new Error("ECONNREFUSED");
+}
+
+/** The FD-09 shape: the route's reverse_proxy keeps upgraded streams for 5 minutes after a reload. */
+const delayedConfig = () => {
+  const value = config();
+  const v6 = value.apps.http.servers.srv0.routes[2]!.handle[1] as Record<string, unknown>;
+  const www = (value.apps.http.servers.srv0.routes[1]!.handle[0] as { routes: Array<{ handle: unknown[] }> })
+    .routes[0]!.handle[1] as Record<string, unknown>;
+  www.stream_close_delay = 300_000_000_000;
+  v6.stream_close_delay = 300_000_000_000;
+  return value;
+};
+
+describe("withdrawal with stream_close_delay (FD-09)", () => {
+  test("reports withdrawn handlers whose streams outlive a reload", () => {
+    expect(withdrawCaddyBackends(delayedConfig(), allowed(1)).delayed).toEqual(["100.101.102.103:3000"]);
+    expect(withdrawCaddyBackends(config(), allowed(1)).delayed).toEqual([]);
+  });
+
+  test("reads busy tailnet backends from /reverse_proxy/upstreams", () => {
+    expect(
+      [
+        ...caddyBusyBackends([
+          { address: "100.101.102.103:3000", num_requests: 1, fails: 0 },
+          { address: "[fd7a:115c:a1e0:0::103]:8080", num_requests: 2, fails: 0 },
+          { address: "100.88.1.20:80", num_requests: 0, fails: 0 },
+          { address: "api:3000", num_requests: 5, fails: 0 },
+        ]),
+      ].toSorted(),
+    ).toEqual(["100.101.102.103:3000", "[fd7a:115c:a1e0::103]:8080"]);
+    expect(() => caddyBusyBackends({})).toThrow();
+  });
+
+  test("a withdrawn handler holding a WebSocket stops Caddy after the verified reload", async () => {
+    const caddy = fakeCaddy({
+      initial: delayedConfig(),
+      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
+    });
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher);
+    const result = await adapter.enforce(allowed(1));
+    expect(result).toMatchObject({ withdrawn: ["100.101.102.103:3000"], stopped: ["100.101.102.103:3000"] });
+    expect(result.error).toBeUndefined();
+    expect(caddy.calls).toEqual([
+      "GET /config/",
+      "GET /reverse_proxy/upstreams",
+      "POST /load",
+      "GET /config/",
+      "POST /stop",
+    ]);
+  });
+
+  test("no stream on the withdrawn backend: reload only; unreadable upstreams count as busy", async () => {
+    const idle = fakeCaddy({
+      initial: delayedConfig(),
+      upstreams: [{ address: "[fd7a:115c:a1e0::103]:8080", num_requests: 3, fails: 0 }],
+    });
+    const quiet = await new CaddyWithdrawalAdapter("http://edge-admin:2019", idle.fetcher).enforce(
+      allowed(1),
+    );
+    expect(quiet.stopped).toBeUndefined();
+    expect(idle.stopped()).toBe(false);
+    const unknown = fakeCaddy({ initial: delayedConfig(), failUpstreams: true });
+    const result = await new CaddyWithdrawalAdapter("http://edge-admin:2019", unknown.fetcher).enforce(
+      allowed(1),
+    );
+    expect(result.stopped).toEqual(["100.101.102.103:3000"]);
+    expect(unknown.stopped()).toBe(true);
+  });
+
+  test("after a deliberate stop, an unreachable Caddy is restarting, not a failure, for a bounded time", async () => {
+    let clock = 0;
+    const caddy = fakeCaddy({
+      initial: delayedConfig(),
+      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
+    });
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3_000, {
+      now: () => clock,
+    });
+    await adapter.enforce(allowed(1));
+    clock += 10_000;
+    const restarting = await adapter.enforce(allowed(1));
+    expect(restarting).toMatchObject({ unreachable: true });
+    expect(restarting.error).toBeUndefined();
+    clock += CADDY_RESTART_GRACE_MS;
+    expect((await adapter.enforce(allowed(1))).error).toMatch(/unreachable/);
+  });
+
+  test("after the restart from the closed config, the withdrawn config comes back, lease-checked", async () => {
+    let clock = 0;
+    const caddy = fakeCaddy({
+      initial: delayedConfig(),
+      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
+    });
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3_000, {
+      now: () => clock,
+    });
+    expect((await adapter.enforce(allowed(1))).stopped).toEqual(["100.101.102.103:3000"]);
+    const closed = { apps: { http: { servers: { srv0: { routes: [] } } } } };
+    caddy.restart(closed);
+    clock += 3_000;
+    const result = await adapter.enforce(allowed(1));
+    expect(result.error).toBeUndefined();
+    // The other route serves again without waiting for edge.apply; the withdrawn one does not.
+    expect(caddyTailnetBackends(caddy.active())).toEqual(["[fd7a:115c:a1e0::103]:8080"]);
+    expect(JSON.stringify(caddy.active())).toContain(JSON.stringify(WITHDRAWN_HANDLER));
+    // One-shot, and never over a config that already has routes (a newer edge.apply).
+    caddy.restart(closed);
+    await adapter.enforce(allowed(1));
+    expect(caddy.active()).toEqual(closed);
+  });
+
+  test("a restore is re-checked against the lease at restore time", async () => {
+    const caddy = fakeCaddy({
+      initial: delayedConfig(),
+      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
+    });
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher);
+    await adapter.enforce(allowed(1));
+    caddy.restart({ apps: { http: { servers: { srv0: { routes: [] } } } } });
+    await adapter.enforce(new Set());
+    expect(caddyTailnetBackends(caddy.active())).toEqual([]);
+  });
+
+  test("a stop made by edge.apply (the marker) is a restart, not a failure", async () => {
+    const marked = new CaddyWithdrawalAdapter("http://edge-admin:2019", down, 3_000, {
+      appliedStopAt: async () => Date.now() - 5_000,
+    });
+    expect(await marked.enforce(new Set())).toEqual({
+      proxy: "caddy",
+      active: [],
+      withdrawn: [],
+      unreachable: true,
+    });
+    const stale = new CaddyWithdrawalAdapter("http://edge-admin:2019", down, 3_000, {
+      appliedStopAt: async () => Date.now() - CADDY_RESTART_GRACE_MS - 1,
+    });
+    expect((await stale.enforce(new Set())).error).toMatch(/unreachable/);
+  });
+
+  test("lingeringStreams names removed, delayed, busy backends for edge.apply", async () => {
+    const caddy = fakeCaddy({
+      initial: delayedConfig(),
+      upstreams: [
+        { address: "100.101.102.103:3000", num_requests: 1, fails: 0 },
+        { address: "[fd7a:115c:a1e0::103]:8080", num_requests: 1, fails: 0 },
+      ],
+    });
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher);
+    expect(await adapter.lingeringStreams(allowed(0, 1))).toEqual([]);
+    expect(await adapter.lingeringStreams(allowed(1))).toEqual(["100.101.102.103:3000"]);
+    expect(await adapter.lingeringStreams(new Set())).toEqual([
+      "100.101.102.103:3000",
+      "[fd7a:115c:a1e0::103]:8080",
+    ]);
+    expect(identityBackend(routeIdentityKey(routes[1]!))).toBe("[fd7a:115c:a1e0::103]:8080");
+  });
+
+  test("the watchdog reports a stream stop as a withdrawal, not a failure", async () => {
+    const caddy = fakeCaddy({
+      initial: delayedConfig(),
+      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
+    });
+    const events: WatchdogEvent[] = [];
+    let clock = 0;
+    const watchdog = new EdgeWatchdog({
+      fetchLease: async () => lease(clock, 60_000, [{ ip: "fd7a:115c:a1e0::103", port: 8080 }]),
+      adapters: [
+        new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3_000, { now: () => clock }),
+      ],
+      report: async (event) => {
+        events.push(event);
+      },
+      now: () => clock,
+    });
+    await watchdog.tick();
+    clock += 1_000;
+    await watchdog.tick();
+    expect(events.map((event) => event.event)).toEqual(["withdrawn"]);
+    expect(events[0]!.detail).toMatch(/stopped caddy to close upgraded streams/);
+  });
+});
 
 describe("CaddyWithdrawalAdapter", () => {
   test("loads the withdrawn config with must-revalidate and verifies it", async () => {
@@ -436,7 +640,7 @@ describe("route identity and fail-closed regressions", () => {
         fullchain: "/cert.pem",
         privkey: "/key.pem",
       })),
-      tailnetRoutes: [keep, revoke],
+      httpRoutes: [keep, revoke].map((route) => ({ ...route, access: "public" as const })),
     });
     expect(launchDecision(stale, new Set([routeIdentityKey(keep)])).open).toBe(false);
     expect(launchDecision(stale, new Set([routeIdentityKey(keep), routeIdentityKey(revoke)])).open).toBe(

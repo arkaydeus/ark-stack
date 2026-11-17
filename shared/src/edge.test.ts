@@ -19,7 +19,7 @@ function certificate(hostname: string, status: string): EdgeCertificate {
 function sites(caddyfile: string) {
   return new Map(
     [...caddyfile.matchAll(/^(\S+) \{\n([\s\S]*?)^\}$/gm)]
-      .filter(([, address]) => address !== "{")
+      .filter(([, address]) => address !== "{" && !address.startsWith("("))
       .map(([, address, body]) => [address, body]),
   );
 }
@@ -211,6 +211,7 @@ describe("tailnet routes (front door §3.2, FD-06)", () => {
     hostname: "www.example.com",
     ip: "100.101.102.103",
     port: 3000,
+    access: "public" as const,
   };
   const v6 = {
     id: "rt_v6",
@@ -218,6 +219,7 @@ describe("tailnet routes (front door §3.2, FD-06)", () => {
     hostname: "v6.example.com",
     ip: "fd7a:115c:a1e0::103",
     port: 8080,
+    access: "public" as const,
   };
   const certificates = [certificate("www.example.com", "issued"), certificate("v6.example.com", "issued")];
 
@@ -226,7 +228,7 @@ describe("tailnet routes (front door §3.2, FD-06)", () => {
       ...base,
       adminMode: "tailnet",
       certificates,
-      tailnetRoutes: [route, v6],
+      httpRoutes: [route, v6],
     });
     expect(caddyfile).toContain("# ark-tailnet-route rt_k3x9 100.101.102.103:3000\nwww.example.com {");
     expect(sites(caddyfile).get("www.example.com")).toContain("reverse_proxy 100.101.102.103:3000");
@@ -247,7 +249,7 @@ describe("tailnet routes (front door §3.2, FD-06)", () => {
       ...base,
       adminMode: "tailnet",
       certificates: [],
-      tailnetRoutes: [route],
+      httpRoutes: [route],
     });
     expect(caddyfile).not.toContain("100.101.102.103");
   });
@@ -262,14 +264,14 @@ describe("tailnet routes (front door §3.2, FD-06)", () => {
       { ...route, id: "rt_K3X9\nreverse_proxy 10.0.0.1:80" },
     ]) {
       expect(() =>
-        renderCaddyfile({ ...base, adminMode: "tailnet", certificates, tailnetRoutes: [bad] }),
+        renderCaddyfile({ ...base, adminMode: "tailnet", certificates, httpRoutes: [bad] }),
       ).toThrow();
     }
   });
 
   test("planEdge waits for the route's certificate", () => {
-    const plan = planEdge({ adminMode: "tailnet", endpoints: [], certificates: [], tailnetRoutes: [route] });
-    expect(plan.tailnetRoutes).toEqual([route]);
+    const plan = planEdge({ adminMode: "tailnet", endpoints: [], certificates: [], httpRoutes: [route] });
+    expect(plan.httpRoutes).toEqual([route]);
     expect(plan.awaitingCertificate).toEqual(["www.example.com"]);
   });
 });

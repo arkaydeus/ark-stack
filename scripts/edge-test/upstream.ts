@@ -32,6 +32,14 @@ Bun.serve({
         headers.append("Set-Cookie", "pref=dark; domain=.tail1234.ts.net; Secure; SameSite=Lax");
         return new Response(null, { status: 302, headers });
       }
+      case "/redirect-to": {
+        // FD-09 Location fixtures: `?l=<base64url Location>`, plus tailnet-scoped cookies.
+        const headers = new Headers(leakyHeaders);
+        headers.set("Location", Buffer.from(url.searchParams.get("l") ?? "", "base64url").toString("utf8"));
+        headers.append("Set-Cookie", "sid=1; Path=/; Domain=home.tail1234.ts.net; HttpOnly");
+        headers.append("Set-Cookie", "pref=dark; domain=.tail1234.ts.net; Secure; SameSite=Lax");
+        return new Response("redirecting", { status: 302, headers });
+      }
       case "/redirect-ip":
         return new Response(null, {
           status: 302,

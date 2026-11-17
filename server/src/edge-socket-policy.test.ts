@@ -100,6 +100,7 @@ describe("tailscaled socket policy", () => {
     expect(edge.entrypoint).toEqual(["/bin/sh", "/usr/local/bin/ark-edge-launch-guard"]);
     expect(mounts(edge)).toContain("../../tmp/edge:/etc/caddy/ark:ro");
     expect(mounts(edge)).toContain("./edge-launch-guard.sh:/usr/local/bin/ark-edge-launch-guard:ro");
+    expect(mounts(edge)).toContain("./edge-errors:/etc/caddy/errors:ro");
     expect(mounts(edge).filter(socketMount)).toEqual([]);
     expect(edge.environment?.ARK_EDGE_WATCHDOG_URL).toBe("http://edge-watchdog:2021");
   });

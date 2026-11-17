@@ -417,6 +417,8 @@ services:
       # renamed (atomically replaced) file is what a restart reads.
       - ../../tmp/edge:/etc/caddy/ark:ro
       - ./edge-launch-guard.sh:/usr/local/bin/ark-edge-launch-guard:ro
+      # Static 502/503/504 pages for front-door HTTP routes; they name no internal host (FD-09).
+      - ./edge-errors:/etc/caddy/errors:ro
       - ark_edge_data:/data
     # Start order only: without the watchdog the guard starts closed rather than not at all.
     depends_on: [edge-ts, api, edge-watchdog]

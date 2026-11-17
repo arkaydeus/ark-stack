@@ -368,11 +368,19 @@ async function edgeApply() {
     "write",
     JSON.stringify(plan),
   );
-  return JSON.parse(output) as { applied: boolean; tailnetRoutes: string[] };
+  return JSON.parse(output) as { applied: boolean; httpRoutes: string[] };
 }
 
-/** Tailnet backends in Caddy's active config, read through the admin API from edge-control. */
+/**
+ * Tailnet backends in Caddy's active config, read through the admin API from edge-control. A
+ * withdrawal that finds upgraded streams on the withdrawn route stops Caddy (FD-09:
+ * stream_close_delay), so this waits for the launch guard's restart instead of racing it.
+ */
 async function activeBackends() {
+  return waitFor("Caddy admin API", () => readActiveBackends(), 30_000);
+}
+
+async function readActiveBackends() {
   const script = `
     const config = await (await fetch("http://edge-admin:2019/config/", { signal: AbortSignal.timeout(3000) })).json();
     const found = new Set();
@@ -678,7 +686,7 @@ async function identityWithdrawalTest(report: Report) {
   const applied = await edgeApply();
   expect(
     report,
-    applied.tailnetRoutes.includes(routeId),
+    applied.httpRoutes.includes(routeId),
     "edge.apply renders the route with its pinned address",
     JSON.stringify(applied),
   );
@@ -994,11 +1002,20 @@ async function sharedBackendTest(report: Report) {
       "revoking one hostname closes its handler and session on a shared backend",
       `withdrawn +${gone - revokedAt} ms; closed +${closed - revokedAt} ms`,
     );
+    // The revoked route held a WebSocket, which a reload cannot close before stream_close_delay
+    // (5 min, FD-09), so the watchdog stopped Caddy. The launch guard restarts it from the closed
+    // file (it still names the revoked route) and the watchdog restores its lease-checked config,
+    // without any edge.apply being processed.
+    const restoredAt = await waitFor(
+      "the other hostname after the withdrawal restart",
+      async () => ((await outcome(sharedHost)) === "upstream" ? Date.now() : undefined),
+      20_000,
+    );
     expect(
       report,
-      (await outcome(sharedHost)) === "upstream",
-      "the other hostname still reaches the same backend",
-      await outcome(sharedHost),
+      (await outcome(sharedHost)) === "upstream" && (await outcome()) !== "upstream",
+      "the other hostname reaches the same backend again without an edge.apply; the revoked one does not",
+      `restored +${restoredAt - revokedAt} ms; revoked: ${await outcome()}`,
     );
     await docker("restart", stack.edge);
     await refreshPorts();

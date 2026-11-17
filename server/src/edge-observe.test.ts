@@ -15,6 +15,7 @@ import {
   parseEnvFile,
   planEdge,
   renderCaddyfile,
+  renderEdgeL4Generation,
   type OperationKind,
 } from "@ark-stack/shared";
 
@@ -66,15 +67,19 @@ async function addRoute(input: {
   status: string;
   certificate?: boolean;
   domainId?: string;
+  accessMode?: "public" | "sso";
+  enabled?: boolean;
+  httpOptions?: Record<string, unknown>;
 }) {
   const endpointId = createId("end");
   const routeId = `rt_${createId("x").slice(2, 18)}`;
   await sql`INSERT INTO endpoints (id, kind, hostname, domain_id) VALUES (${endpointId}, 'route', ${`${routeId.slice(3)}.example.com`}, ${input.domainId ?? null})`;
   await sql`
     INSERT INTO front_routes (id, kind, endpoint_id, listen_port, target_input, target_node_stable_id,
-      target_ip, target_port, access_mode, status, enabled)
+      target_ip, target_port, access_mode, status, enabled, http_options)
     VALUES (${routeId}, 'http', ${endpointId}, 443, ${input.target}, ${input.stableId}, ${input.ip},
-      ${input.port}, 'public', ${input.status}, true)
+      ${input.port}, ${input.accessMode ?? "public"}, ${input.status}, ${input.enabled ?? true},
+      ${JSON.stringify(input.httpOptions ?? {})}::jsonb)
   `;
   if (input.certificate ?? ["ready", "observation_expired"].includes(input.status))
     await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
@@ -116,12 +121,13 @@ async function rendered(now = new Date()) {
     hostname: item.hostname,
     ip: item.ip,
     port: item.port,
+    access: "public" as const,
   }));
   const plan = planEdge({
     adminMode: "tailnet",
     endpoints: [],
     certificates: [],
-    tailnetRoutes: routes,
+    httpRoutes: routes,
   });
   return renderCaddyfile({
     adminMode: "tailnet",
@@ -133,7 +139,7 @@ async function rendered(now = new Date()) {
       fullchain: `/certs/${item.hostname}/fullchain.pem`,
       privkey: `/certs/${item.hostname}/privkey.pem`,
     })),
-    tailnetRoutes: plan.tailnetRoutes,
+    httpRoutes: plan.httpRoutes,
   });
 }
 
@@ -745,5 +751,104 @@ describe("stale probes", () => {
     await observe();
     expect((await route(id)).status).toBe("awaiting_dns");
     expect(queued.some((item) => item.kind === "edge.drain")).toBe(true);
+  });
+});
+
+/** Both rendered configs as edge.apply and edge.l4_apply produce them from the database. */
+async function renderedConfigs() {
+  const { edgePlan, edgeL4Input } = await import("./coordinator.ts");
+  const plan = await edgePlan("tailnet", null);
+  const caddyfile = renderCaddyfile({
+    ...plan,
+    challengeDir: "/var/lib/ark/acme",
+    apiUpstream: "api:3000",
+    adminHostname: plan.adminHostname,
+  });
+  const haproxy = renderEdgeL4Generation(edgeL4Input(plan)).files["haproxy.cfg"]!;
+  return { plan, caddyfile, haproxy };
+}
+
+const hostOf = (id: string) => `${id.slice(3)}.example.com`;
+
+describe("edge rendering of HTTP routes (FD-09)", () => {
+  test("unservable states and SSO routes are absent from both rendered configs", async () => {
+    mock.state.reachable.add("100.101.102.103:3000");
+    const target = { target: `home${tailnet}`, stableId: home.id, ip: "100.101.102.103", port: 3000 };
+    const live = await addRoute({ ...target, status: "ready" });
+    const sso = await addRoute({ ...target, status: "ready", accessMode: "sso" });
+    const apex = await addRoute({ ...target, status: "ready", httpOptions: { redirectTo: hostOf(live) } });
+    const unservable = new Map<string, string>();
+    for (const status of ["awaiting_acl", "identity_mismatch", "observation_expired", "disabled"]) {
+      unservable.set(status, await addRoute({ ...target, status: "ready", certificate: true }));
+    }
+    // An enabled flag of false keeps even a ready route out.
+    const switchedOff = await addRoute({ ...target, status: "ready", enabled: false });
+    await observe();
+    for (const [status, id] of unservable) {
+      await sql`UPDATE front_routes SET status = ${status}, enabled = ${status !== "disabled"} WHERE id = ${id}`;
+    }
+
+    const { plan, caddyfile, haproxy } = await renderedConfigs();
+    expect(caddyfile).toContain(`# ark-tailnet-route ${live} 100.101.102.103:3000\n${hostOf(live)} {`);
+    expect(haproxy).toContain(hostOf(live));
+    // The Location policy knows the target's MagicDNS name and its IPv6 address from the observation.
+    expect(caddyfile).toContain("home\\.tail1234\\.ts\\.net\\.?");
+    expect(caddyfile).toContain("\\[fd7a:115c:a1e0::103\\]");
+    // Apex canonicalisation: a redirect site in both configs, but no tailnet marker or dial.
+    expect(caddyfile).toContain(`${hostOf(apex)} {`);
+    expect(caddyfile).toContain(`redir https://${hostOf(live)}{uri} 308`);
+    expect(caddyfile).not.toContain(`# ark-tailnet-route ${apex}`);
+    expect(haproxy).toContain(hostOf(apex));
+    // SSO before FD-11: omitted with a reason, served nowhere.
+    expect(plan.omitted.map((item) => item.id)).toEqual([sso]);
+    expect(plan.omitted[0]?.reason).toMatch(/access mode "sso"/);
+    for (const id of [sso, switchedOff, ...unservable.values()]) {
+      expect(caddyfile).not.toContain(hostOf(id));
+      expect(haproxy).not.toContain(hostOf(id));
+    }
+  });
+
+  test("an enabled SSO route can never be rendered, even if handed straight to the renderer", async () => {
+    mock.state.reachable.add("100.101.102.103:3000");
+    const sso = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "ready",
+      accessMode: "sso",
+    });
+    await observe();
+    const { edgeHttpRoutes } = await import("./modules/edge-routes.ts");
+    const routes = await edgeHttpRoutes((await edgePolicy()).routes);
+    expect(routes.map((item) => [item.id, item.access])).toEqual([[sso, "sso"]]);
+    expect(() =>
+      renderCaddyfile({
+        adminMode: "tailnet",
+        challengeDir: "/var/lib/ark/acme",
+        apiUpstream: "api:3000",
+        certificates: [{ hostname: hostOf(sso), status: "issued", fullchain: "/c.pem", privkey: "/k.pem" }],
+        httpRoutes: routes,
+      }),
+    ).toThrow(/cannot serve/);
+  });
+
+  test("invalid stored HTTP options omit the route instead of failing every edge apply", async () => {
+    mock.state.reachable.add("100.101.102.103:3000");
+    const target = { target: `home${tailnet}`, stableId: home.id, ip: "100.101.102.103", port: 3000 };
+    const live = await addRoute({ ...target, status: "ready", httpOptions: { maxBodyMb: 5, hsts: false } });
+    const broken = await addRoute({
+      ...target,
+      status: "ready",
+      httpOptions: { responseHeaderTimeout: '60s"\n}\nimport evil' },
+    });
+    await observe();
+    const { plan, caddyfile, haproxy } = await renderedConfigs();
+    expect(plan.omitted.map((item) => item.id)).toEqual([broken]);
+    expect(caddyfile).toContain("max_size 5MB");
+    expect(caddyfile).not.toContain(hostOf(broken));
+    expect(caddyfile).not.toContain("import evil");
+    expect(haproxy).toContain(hostOf(live));
+    expect(haproxy).not.toContain(hostOf(broken));
   });
 });
