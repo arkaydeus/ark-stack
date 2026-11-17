@@ -13,7 +13,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createId, privilegedRequestHash, renderCaddyfile } from "@ark-stack/shared";
+import { GATE_EDGE_API_PATHS, createId, privilegedRequestHash, renderCaddyfile } from "@ark-stack/shared";
 import { createAuthEndpoint } from "better-auth/api";
 import { makeSignature } from "better-auth/crypto";
 import { betterAuth } from "better-auth/minimal";
@@ -120,10 +120,12 @@ function totp(uri: string) {
   };
 }
 
-// Routes that take no browser session: worker, metrics, health, setup status and Better Auth itself.
+// Routes that take no browser session: worker, metrics, health, setup status, Better Auth itself, and
+// the gate's edge handlers (FD-11), which answer 401 to anything without the edge token.
 const sessionFree = (path: string) =>
   path.startsWith("/api/internal/") ||
   path.startsWith("/api/auth/") ||
+  (GATE_EDGE_API_PATHS as readonly string[]).includes(path) ||
   ["/api/health", "/api/setup/status", "/api/metrics/prometheus", "/api/*"].includes(path);
 
 type User = { id: string; email: string };
@@ -504,13 +506,16 @@ describe("cookie tossing", () => {
       expect(response.status, name).toBe(200);
       expect(await response.json(), name).toBeNull();
     }
-    // The gate pages (FD-11's /gate/authorize included) exist on no other cookie either.
+    // FD-11's /gate/authorize does not honor it either: the browser is treated as signed out and
+    // sent to the sign-in page, and no handoff code is minted.
     const authorize = await call({
       host: loginHost,
       path: "/gate/authorize?route=rt_x",
       cookie: `__Secure-ark_stack.session_token=${value}`,
     });
-    expect(authorize.status).toBe(404);
+    expect(authorize.status).toBe(303);
+    expect(authorize.headers.get("location")).toStartWith("/gate/login?next=");
+    expect((await sql`SELECT count(*)::int AS n FROM gate_handoffs`)[0]!.n).toBe(0);
   });
 
   test("a duplicated authentication cookie name is refused", async () => {

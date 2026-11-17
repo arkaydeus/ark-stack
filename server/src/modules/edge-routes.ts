@@ -6,7 +6,7 @@
 // from both the Caddyfile and the HAProxy 443 map. This module adds what the renderer needs from
 // `front_routes` (access mode, bypass paths, HTTP options, apex redirect) and from the latest edge
 // observation (the target's other tailnet names and addresses, for the Location policy). `planEdge`
-// then omits anything it cannot serve, such as `sso` before FD-11.
+// then omits anything it cannot serve, such as an SSO bypass of the whole site.
 
 import type { EdgePolicyRoute } from "@ark-stack/shared";
 import { and, eq, inArray } from "drizzle-orm";
