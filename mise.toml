@@ -87,6 +87,18 @@ run = [
   "bun scripts/test-backups.ts",
 ]
 
+[tasks."test:backups-tailnet"]
+description = "Home-machine backups over the tailnet (FD-30): the shipped backup-ts service (offline tailscaled, userspace, SOCKS5), rest-server --append-only --private-repos on a simulated tailnet, MinIO and a throwaway control database: LocalAPI uid/write denial, pinning from backup-ts's own observation, REST through SOCKS5 only (S3/API unproxied), the canary and V-18, transfers stopped within 5 s on identity replacement, removal or lease expiry, and two-destination health (requires Docker)"
+run = [
+  "bunx tsc --noEmit -p scripts/tsconfig.backups.json",
+  "bun test scripts/backup-test/tailnet-compose.test.ts",
+  "bun scripts/test-backups-tailnet.ts",
+]
+
+[tasks."test:backups-tailnet-live"]
+description = "Opt-in: a backup to a real home rest-server through backup-ts with only the tag:ark-backup -> home:8000 grant, and the live edge deny check; skips without ARK_TEST_TS_BACKUP_AUTHKEY and ARK_TEST_TS_HOME_AUTHKEY"
+run = "bun scripts/test-backups-tailnet-live.ts"
+
 [tasks."test:backups-hosted"]
 description = "Opt-in: the same backup and off-VPS restore against AWS S3, B2 or R2 (virtual-host style); skips without ARK_TEST_S3_* credentials"
 run = "bun scripts/test-backups-hosted.ts"

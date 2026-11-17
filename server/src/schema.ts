@@ -870,6 +870,8 @@ export const backupTargets = pgTable(
     pathStyle: boolean("path_style").notNull().default(false),
     restUrl: text("rest_url"),
     targetNodeStableId: text("target_node_stable_id"), // tailnet_rest: pinned like routes (§3.2)
+    // FD-30 (0025): the pinned address from backup-ts's observation; the only address dialled.
+    targetIp: text("target_ip"),
     credentialSecretId: text("credential_secret_id")
       .notNull()
       .references(() => secrets.id),
@@ -879,7 +881,10 @@ export const backupTargets = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     // FD-21 (0023): provider recipe, recovery window, sealed restic password, optional read-only
     // verifier, and canary/attempt state.
-    provider: text("provider").$type<"aws" | "b2" | "r2" | "minio" | "other">().notNull().default("other"),
+    provider: text("provider")
+      .$type<"aws" | "b2" | "r2" | "minio" | "other" | "rest_server">()
+      .notNull()
+      .default("other"),
     enabled: boolean("enabled").notNull().default(true),
     recoveryWindowDays: integer("recovery_window_days").notNull().default(30),
     repositorySecretId: text("repository_secret_id").references(() => secrets.id),
@@ -898,7 +903,14 @@ export const backupTargets = pgTable(
   },
   (table) => [
     check("backup_targets_kind_check", sql`${table.kind} IN ('s3', 'tailnet_rest')`),
-    check("backup_targets_provider_check", sql`${table.provider} IN ('aws', 'b2', 'r2', 'minio', 'other')`),
+    check(
+      "backup_targets_provider_check",
+      sql`${table.provider} IN ('aws', 'b2', 'r2', 'minio', 'other', 'rest_server')`,
+    ),
+    check(
+      "backup_targets_tailnet_rest_shape_check",
+      sql`${table.kind} <> 'tailnet_rest' OR (${table.restUrl} IS NOT NULL AND ${table.targetNodeStableId} IS NOT NULL AND ${table.targetIp} IS NOT NULL AND ${table.provider} = 'rest_server')`,
+    ),
     check("backup_targets_recovery_window_check", sql`${table.recoveryWindowDays} BETWEEN 1 AND 3650`),
     check(
       "backup_targets_append_only_status_check",

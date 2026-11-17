@@ -5,7 +5,13 @@
 // current view (not logged in, no self, malformed or duplicate peers) rejects the whole read, so a
 // failed or partial observation can never renew the lease or leave absent peers behind.
 
-import { SNAPSHOT_VALIDITY_MS, parseIpLiteral, inTailscaleRange, type TailnetNode } from "./tailnet.ts";
+import {
+  SNAPSHOT_VALIDITY_MS,
+  parseIpLiteral,
+  inTailscaleRange,
+  type TailnetNode,
+  type TailnetSource,
+} from "./tailnet.ts";
 
 /** `edge.observe` runs this often; the lease (§3.2) lasts `SNAPSHOT_VALIDITY_MS` from completion. */
 export const EDGE_OBSERVE_INTERVAL_MS = 5 * 60_000;
@@ -13,12 +19,21 @@ export const EDGE_OBSERVE_INTERVAL_MS = 5 * 60_000;
 /** The Host the LocalAPI expects on its unix socket (`apitype.LocalAPIHost`). */
 export const LOCALAPI_HOST = "local-tailscaled.sock";
 
+/** `backup.observe` (FD-30) reads backup-ts on the same schedule and lease as the edge. */
+export const BACKUP_OBSERVE_INTERVAL_MS = EDGE_OBSERVE_INTERVAL_MS;
+
 /**
  * The lease length for a new generation. Tests may shorten it (never lengthen it) with
- * `ARK_EDGE_LEASE_VALIDITY_MS`; the validator rejects anything longer than six minutes.
+ * `ARK_EDGE_LEASE_VALIDITY_MS` (edge) or `ARK_BACKUP_LEASE_VALIDITY_MS` (backup); the validator
+ * rejects anything longer than six minutes.
  */
-export function leaseValidityMs(env: Record<string, string | undefined> = process.env) {
-  const requested = Number(env.ARK_EDGE_LEASE_VALIDITY_MS ?? "");
+export function leaseValidityMs(
+  env: Record<string, string | undefined> = process.env,
+  source: TailnetSource = "edge",
+) {
+  const requested = Number(
+    (source === "backup" ? env.ARK_BACKUP_LEASE_VALIDITY_MS : env.ARK_EDGE_LEASE_VALIDITY_MS) ?? "",
+  );
   if (Number.isInteger(requested) && requested >= 1_000 && requested < SNAPSHOT_VALIDITY_MS) return requested;
   return SNAPSHOT_VALIDITY_MS;
 }
@@ -76,7 +91,10 @@ function tags(value: unknown) {
   return [...(value as string[])].toSorted();
 }
 
-function node(raw: StatusNode, input: { generation: string; isSelf: boolean }): TailnetNode | string {
+function node(
+  raw: StatusNode,
+  input: { generation: string; isSelf: boolean; source: TailnetSource },
+): TailnetNode | string {
   const stableId = text(raw.ID)?.trim() ?? "";
   if (!stableId) return "a node has no StableNodeID";
   const name = dnsName(raw.DNSName);
@@ -89,7 +107,7 @@ function node(raw: StatusNode, input: { generation: string; isSelf: boolean }): 
     return `node ${stableId} has an invalid online flag`;
   }
   return {
-    source: "edge",
+    source: input.source,
     generation: input.generation,
     stableId,
     dnsName: name ?? "",
@@ -103,10 +121,16 @@ function node(raw: StatusNode, input: { generation: string; isSelf: boolean }): 
 }
 
 /**
- * Parses a LocalAPI status document into one complete `edge` generation. Every rejection is a
- * failed observation: the caller must not touch the stored snapshot.
+ * Parses a LocalAPI status document into one complete generation of `input.source` (default
+ * `edge`; FD-30's backup-ts observation passes `backup`). Every rejection is a failed observation:
+ * the caller must not touch the stored snapshot.
  */
-export function parseLocalApiStatus(status: unknown, input: { generation: string }): ParsedObservation {
+export function parseLocalApiStatus(
+  status: unknown,
+  input: { generation: string; source?: TailnetSource },
+): ParsedObservation {
+  const source = input.source ?? "edge";
+  const label = source === "edge" ? "edge node" : "backup node";
   if (!status || typeof status !== "object" || Array.isArray(status)) {
     return fail("The LocalAPI status is not a JSON object.");
   }
@@ -119,14 +143,14 @@ export function parseLocalApiStatus(status: unknown, input: { generation: string
   };
   if (document.BackendState !== "Running") {
     return fail(
-      `The edge node is not running on the tailnet (state ${JSON.stringify(document.BackendState ?? null)}).`,
+      `The ${label} is not running on the tailnet (state ${JSON.stringify(document.BackendState ?? null)}).`,
     );
   }
   if (!document.Self || typeof document.Self !== "object") return fail("The status has no self node.");
-  const self = node(document.Self as StatusNode, { generation: input.generation, isSelf: true });
+  const self = node(document.Self as StatusNode, { generation: input.generation, isSelf: true, source });
   if (typeof self === "string") return fail(`Self: ${self}.`);
   if (!self.dnsName || (!self.ipv4 && !self.ipv6)) {
-    return fail("The edge node has no MagicDNS name or Tailscale address yet.");
+    return fail(`The ${label} has no MagicDNS name or Tailscale address yet.`);
   }
   const suffixSource =
     dnsName(document.CurrentTailnet?.MagicDNSSuffix) ||
@@ -134,7 +158,7 @@ export function parseLocalApiStatus(status: unknown, input: { generation: string
     self.dnsName.split(".").slice(1).join(".");
   const tailnetSuffix = `.${suffixSource.replace(/^\./, "")}`;
   if (tailnetSuffix.split(".").length < 3 || !self.dnsName.endsWith(tailnetSuffix)) {
-    return fail("The tailnet's MagicDNS suffix does not match the edge node's name.");
+    return fail(`The tailnet's MagicDNS suffix does not match the ${label}'s name.`);
   }
 
   const rawPeers = document.Peer ?? {};
@@ -143,7 +167,7 @@ export function parseLocalApiStatus(status: unknown, input: { generation: string
   const seen = new Set([self.stableId]);
   for (const raw of Object.values(rawPeers as Record<string, unknown>)) {
     if (!raw || typeof raw !== "object") return fail("A peer entry is malformed.");
-    const peer = node(raw as StatusNode, { generation: input.generation, isSelf: false });
+    const peer = node(raw as StatusNode, { generation: input.generation, isSelf: false, source });
     if (typeof peer === "string") return fail(`Peer: ${peer}.`);
     if (seen.has(peer.stableId)) return fail(`StableNodeID ${peer.stableId} appears more than once.`);
     seen.add(peer.stableId);

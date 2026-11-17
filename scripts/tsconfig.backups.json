@@ -1,5 +1,12 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": { "types": ["bun"] },
-  "include": ["test-backups.ts", "test-backups-hosted.ts", "offsite-restore.ts", "backup-test/*.ts"]
+  "include": [
+    "test-backups.ts",
+    "test-backups-hosted.ts",
+    "test-backups-tailnet.ts",
+    "test-backups-tailnet-live.ts",
+    "offsite-restore.ts",
+    "backup-test/*.ts"
+  ]
 }

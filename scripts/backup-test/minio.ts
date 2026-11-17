@@ -16,6 +16,9 @@ export const MC_IMAGE =
   "pgsty/mc:RELEASE.2026-11-12T00-00-00Z@sha256:b532278b7a3747dbab6fe45eebb40a653efa704e6758e24e9d9ec54fc96c1800";
 export const RESTIC_IMAGE =
   "restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510";
+/** FD-30: the home machine's server, as docs/guides/backups.md recommends (V-18 used 0.14.0). */
+export const REST_SERVER_IMAGE =
+  "restic/rest-server:0.14.0@sha256:d2aff06f47eb38637dff580c3e6bce4af98f386c396a25d32eb6727ec96214a5";
 
 export type Run = { status: number; stdout: string; stderr: string };
 

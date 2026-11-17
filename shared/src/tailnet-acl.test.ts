@@ -1152,3 +1152,53 @@ describe("policy isolation and composable assertions", () => {
     );
   });
 });
+
+// FD-30 (front door §3.18.3): the home backup server is reachable by tag:ark-backup on its REST port
+// only, and the edge node has no path to it under the generated snippet, in any section.
+describe("edge isolation from the home backup server (FD-30)", () => {
+  const policy = generateTailnetAcl(sample).policy;
+  const homeIp = backup.ip;
+  const alias = Object.entries(policy.hosts ?? {}).find(([, ip]) => ip === homeIp)?.[0] ?? "";
+
+  test("tag:ark-backup -> home:8000 is the only grant to the home server", () => {
+    expect(alias).toBe("ark-backup-home");
+    const toHome = (policy.grants ?? []).filter((grant) => grant.dst.includes(alias));
+    expect(toHome).toEqual([{ src: [ARK_BACKUP_TAG], dst: [alias], ip: ["tcp:8000"] }]);
+    expect(policyAllows(policy, ARK_BACKUP_TAG, alias, 8000, "tcp")).toBe(true);
+    expect(policyAllows(policy, ARK_BACKUP_TAG, homeIp, 8000, "tcp")).toBe(true);
+    expect(policyAllows(policy, ARK_BACKUP_TAG, alias, 22, "tcp")).toBe(false);
+    expect(policyAllows(policy, ARK_BACKUP_TAG, alias, 8000, "udp")).toBe(false);
+  });
+
+  test("the edge node has no path to the home server on any port or protocol", () => {
+    for (const port of [8000, 22, 80, 443, 3000, 8080, 65535])
+      for (const proto of ["tcp", "udp"]) {
+        expect(policyAllows(policy, ARK_EDGE_TAG, alias, port, proto)).toBe(false);
+        expect(policyAllows(policy, ARK_EDGE_TAG, homeIp, port, proto)).toBe(false);
+      }
+    // Nor does the backup node reach any route target, or the edge node itself.
+    for (const route of routes)
+      expect(policyAllows(policy, ARK_BACKUP_TAG, route.targetIp, route.targetPort, "tcp")).toBe(false);
+    expect(policyAllows(policy, ARK_BACKUP_TAG, ARK_EDGE_TAG, 443, "tcp")).toBe(false);
+  });
+
+  test("the snippet's own tests assert the edge deny and the backup accept, and Tailscale-side tests catch a leak", () => {
+    const edgeTcp = (policy.tests ?? []).find((item) => item.src === ARK_EDGE_TAG && item.proto !== "udp");
+    const edgeUdp = (policy.tests ?? []).find((item) => item.src === ARK_EDGE_TAG && item.proto === "udp");
+    expect(edgeTcp?.deny).toContain(`${alias}:8000`);
+    expect(edgeUdp?.deny).toContain(`${alias}:8000`);
+    const backupAccept = (policy.tests ?? []).find(
+      (item) => item.src === ARK_BACKUP_TAG && item.accept?.length,
+    );
+    expect(backupAccept?.accept).toContain(`${alias}:8000`);
+    expect(evaluatePolicyTests(policy)).toEqual([]);
+    // Granting the edge the backup port (even narrowly) is caught by the snippet's own tests.
+    const leaked: TailnetPolicy = {
+      ...policy,
+      grants: [...(policy.grants ?? []), { src: [ARK_EDGE_TAG], dst: [alias], ip: ["tcp:8000"] }],
+    };
+    expect(evaluatePolicyTests(leaked)).toContainEqual(
+      expect.objectContaining({ src: ARK_EDGE_TAG, destination: `${alias}:8000`, expected: "deny" }),
+    );
+  });
+});

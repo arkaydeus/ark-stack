@@ -117,15 +117,30 @@ beforeAll(async () => {
     INSERT INTO secrets (id, kind, key_id, ciphertext, iv, auth_tag)
     VALUES (${secretId}, 'backup-target', 'k1', 'ciphertext', 'iv', 'tag')
   `;
+  // FD-30 pins tailnet backup targets (0025): the identity comes from backup-ts's own observation.
+  // A legacy URL with embedded credentials must still never leak into the snippet.
   await sql`
-    INSERT INTO backup_targets (id, kind, name, rest_url, credential_secret_id)
-    VALUES (${backupId}, 'tailnet_rest', ${`home-${suffix}`},
-      ${`http://ark:${SECRET_PASSWORD}@100.66.2.9:8000/ark`}, ${secretId})
+    INSERT INTO tailnet_snapshots (source, generation, completed_at, valid_until)
+    VALUES ('backup', 'gen_acl_test', now(), now() + interval '6 minutes')
+    ON CONFLICT (source) DO NOTHING
+  `;
+  await sql`
+    INSERT INTO tailnet_nodes (source, generation, stable_id, dns_name, host_name, ipv4, observed_at)
+    VALUES ('backup', 'gen_acl_test', ${`nBAK${suffix}`}, 'backup-home.tail1234.ts.net', 'backup-home',
+      '100.66.2.9', now())
+  `;
+  await sql`
+    INSERT INTO backup_targets (id, kind, provider, name, rest_url, target_node_stable_id, target_ip,
+      credential_secret_id)
+    VALUES (${backupId}, 'tailnet_rest', 'rest_server', ${`home-${suffix}`},
+      ${`http://ark:${SECRET_PASSWORD}@100.66.2.9:8000/ark`}, ${`nBAK${suffix}`}, '100.66.2.9', ${secretId})
   `;
 });
 
 afterAll(async () => {
   if (backupId) await sql`DELETE FROM backup_targets WHERE id = ${backupId}`;
+  await sql`DELETE FROM tailnet_nodes WHERE source = 'backup' AND stable_id = ${`nBAK${suffix}`}`;
+  await sql`DELETE FROM tailnet_snapshots WHERE source = 'backup' AND generation = 'gen_acl_test'`;
   if (secretId) await sql`DELETE FROM secrets WHERE id = ${secretId}`;
   if (routeIds.length) await sql`DELETE FROM front_routes WHERE id IN ${sql(routeIds)}`;
   if (endpointIds.length) await sql`DELETE FROM endpoints WHERE id IN ${sql(endpointIds)}`;
