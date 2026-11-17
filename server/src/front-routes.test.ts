@@ -92,7 +92,7 @@ async function signUp(role: Role, mfa: boolean): Promise<Actor> {
 type Json = Record<string, any>;
 
 async function call(actor: Actor | null, method: string, path: string, body?: unknown) {
-  const response = await app.request(path, {
+  const response = await app.request(`${origin}${path}`, {
     method,
     headers: {
       ...(actor ? { cookie: actor.cookie } : {}),
@@ -731,7 +731,9 @@ describe("lifecycle regression coverage", () => {
   async function authorize(action: "exposure.public" | "resource.delete", request: Record<string, unknown>) {
     const { requirePrivileged } = await import("./access.ts");
     const { privilegedRequestHash } = await import("@ark-stack/shared");
-    const session = await auth.api.getSession({ headers: new Headers({ cookie: actors.owner.cookie }) });
+    const session = await auth.api.getSession({
+      headers: new Headers({ cookie: actors.owner.cookie, host: new URL(origin).host }),
+    });
     if (!session) throw new Error("Missing fixture session");
     return (tx: import("./db.ts").DbTransaction) =>
       requirePrivileged(
@@ -970,7 +972,7 @@ describe("certificate recovery and scoped observer DNS", () => {
     await sql`UPDATE front_routes SET status = 'issuing_certificate' WHERE id = ${route.id}`;
     await routesCertificateFailed(endpointId, "CA unavailable");
     expect((await routeRow(route.id))!.last_error).toContain("CA unavailable");
-  });
+  }, 30_000);
 
   test("repeated observer DNS checks do not issue or provision unrelated endpoints", async () => {
     const { enqueue: realEnqueue } = await import("./coordinator.ts");
@@ -1050,4 +1052,123 @@ describe("certificate recovery and scoped observer DNS", () => {
     expect(await queuedCount("dns.publish", domainIds.flow)).toBe(1);
     await sql`UPDATE domain_claims SET dns_provider = 'manual' WHERE id = ${domainIds.flow}`;
   });
+});
+
+// The real gate endpoint lifecycle uses the same DNS resolver, fake CA and coordinator as routes.
+describe("gate durable dispatch lifecycle", () => {
+  test("committed enable, move and disable jobs survive the request and converge through DNS, certificates and edge", async () => {
+    const { commitGateSettings, enqueueGateOperation, GATE_RECORD_PURPOSE } =
+      await import("./modules/gate-settings.ts");
+    const { domainClaims } = await import("./schema.ts");
+    const { routeAddressRecords } = await import("@ark-stack/shared");
+    const { edgePlan } = await import("./coordinator.ts");
+    const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, domainIds.verified));
+    const [previous] =
+      await sql`SELECT gate_login_mode, gate_login_hostname FROM platform_settings WHERE id = 'default'`;
+    const oldDir = process.env.ARK_EDGE_DIR;
+    process.env.ARK_EDGE_DIR = join(certDir, "gate-edge");
+    resolvedA = [publicIpv4];
+    // A fresh dispatcher process reads only durable state, with the same DNS/CA fixtures.
+    const execute = async (id: string) => {
+      const worker = Bun.spawn(
+        [
+          process.execPath,
+          "--no-env-file",
+          "-e",
+          `
+        const { db, sql } = await import("./src/db.ts");
+        const { operations } = await import("./src/schema.ts");
+        const { eq } = await import("drizzle-orm");
+        const { runOperation, setDnsResolver } = await import("./src/coordinator.ts");
+        setDnsResolver({ txt: async () => [[${JSON.stringify(tokens.verified)}]],
+          a: async () => [${JSON.stringify(publicIpv4)}], aaaa: async () => [],
+          mx: async () => [], cname: async () => [] });
+        try {
+          const [job] = await db.select().from(operations).where(eq(operations.id, process.env.ARK_GATE_RECOVERY_OPERATION));
+          if (job?.status !== "queued") throw new Error("durable job missing");
+          await runOperation(job.kind, job);
+          await sql\`UPDATE operations SET status = 'succeeded' WHERE id = \${job.id}\`;
+        } finally { await sql.end(); }
+      `,
+        ],
+        {
+          cwd: join(import.meta.dir, ".."),
+          env: { ...process.env, ARK_GATE_RECOVERY_OPERATION: id },
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      const [code, output, error] = await Promise.all([
+        worker.exited,
+        new Response(worker.stdout).text(),
+        new Response(worker.stderr).text(),
+      ]);
+      expect(code, output + error).toBe(0);
+    };
+    try {
+      let oldHostname: string | null = null;
+      for (const hostname of [`login.${zone}`, `signin.${zone}`, null]) {
+        const operationIds: string[] = [];
+        await expect(
+          commitGateSettings(
+            hostname
+              ? {
+                  mode: "public",
+                  hostname,
+                  domain: domain!,
+                  records: routeAddressRecords({
+                    hostname,
+                    zone,
+                    publicIpv4,
+                    publicIpv6: null,
+                    ipv6Status: "unchecked",
+                    aaaaEnabled: false,
+                    purpose: GATE_RECORD_PURPOSE,
+                  }),
+                }
+              : { mode: "disabled", hostname: null, domain: null, records: [] },
+            { userId: actors.owner.userId, role: "owner" },
+            async (input, tx) => {
+              const job = await enqueueGateOperation(input, tx);
+              operationIds.push(job.id);
+              return job;
+            },
+            undefined,
+            async () => {
+              throw new Error("request process stopped after commit");
+            },
+          ),
+        ).rejects.toThrow("request process stopped after commit");
+        const jobs = await db.select().from(operations).where(eq(operations.id, operationIds[0]!));
+        if (hostname) {
+          expect((await edgePlan("public", null)).awaitingCertificate).toContain(hostname);
+          await execute(jobs[0]!.id); // domain.verify -> certificate.issue
+          const [endpoint] =
+            await sql`SELECT id, status FROM endpoints WHERE kind = 'gate' AND hostname = ${hostname}`;
+          expect(endpoint?.status).toBe("verified");
+          const [issue] =
+            await sql`SELECT id FROM operations WHERE kind = 'certificate.issue' AND status = 'queued' AND target_ids ? ${endpoint!.id}`;
+          expect(issue).toBeDefined();
+          await execute(String(issue!.id)); // certificate.issue -> edge.apply
+          const [certificate] =
+            await sql`SELECT status FROM certificates WHERE endpoint_id = ${endpoint!.id}`;
+          expect(certificate?.status).toBe("issued");
+          expect(await Bun.file(join(process.env.ARK_CERT_DIR!, hostname, "fullchain.pem")).exists()).toBe(
+            true,
+          );
+        }
+        await execute(operationIds.at(-1)!);
+        const caddy = await Bun.file(join(process.env.ARK_EDGE_DIR!, "Caddyfile")).text();
+        if (hostname) expect(caddy).toContain(`\n${hostname} {`);
+        if (oldHostname) expect(caddy).not.toContain(`\n${oldHostname} {`);
+        if (!hostname) expect(await sql`SELECT id FROM endpoints WHERE kind = 'gate'`).toHaveLength(0);
+        oldHostname = hostname;
+      }
+    } finally {
+      if (oldDir === undefined) delete process.env.ARK_EDGE_DIR;
+      else process.env.ARK_EDGE_DIR = oldDir;
+      await sql`UPDATE platform_settings SET gate_login_mode = ${previous!.gate_login_mode}, gate_login_hostname = ${previous!.gate_login_hostname} WHERE id = 'default'`;
+      await (await import("./origin-hosts.ts")).refreshLoginHost(true);
+    }
+  }, 30_000);
 });

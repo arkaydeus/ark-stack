@@ -7,7 +7,10 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
   Object.assign(process.env, parseEnvFile(await Bun.file(".env").text()));
 }
 
-const { app } = await import("../../server/src/app.ts");
+const { app: server } = await import("../../server/src/app.ts");
+// Requests go to the configured admin origin: the API refuses hosts that are not registered origins.
+const origin = new URL(process.env.BETTER_AUTH_URL ?? "http://localhost:3000").origin;
+const app = { request: (path: string, init?: RequestInit) => server.request(`${origin}${path}`, init) };
 
 describe("high-risk HTTP flows", () => {
   test("setup status is public and state requires a session", async () => {

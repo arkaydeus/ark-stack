@@ -755,11 +755,26 @@ async function restoreRoute(report: Report) {
   await observe();
   const stopObserving = keepObserving();
   try {
-    await waitFor("Caddy admin API after re-confirmation", async () => {
-      await activeBackends();
-      return true;
-    });
-    await edgeApply();
+    // Setup, not an assertion: the launch guard or watchdog can still restart Caddy between the admin
+    // check and the apply (the preceding case's stop-and-restart), and writeEdge then refuses to /load
+    // over an unreadable config. The domain worker retries edge.apply; so does this setup, up to 3 times.
+    for (let attempt = 1; ; attempt++) {
+      await waitFor("Caddy admin API after re-confirmation", async () => {
+        await activeBackends();
+        return true;
+      });
+      try {
+        await edgeApply();
+        break;
+      } catch (error) {
+        if (attempt >= 3) throw error;
+        const reason = (error as Error).message.match(/ConnectionRefused|retry edge\.apply/)?.[0];
+        if (!reason) throw error;
+        console.error(
+          `restoreRoute: edge.apply attempt ${attempt} hit a Caddy restart (${reason}); retrying`,
+        );
+      }
+    }
     await waitUntilServing(report, "after re-confirmation the route serves again");
   } finally {
     await stopObserving();

@@ -2,6 +2,9 @@
 // disposable edge-test network (alias `upstream`) and stands in for a tailnet service.
 // It deliberately emits headers that the edge must strip or rewrite (§3.5 of docs/design/front-door.md).
 
+// Every path this upstream answered, so a test can prove a request never reached it (FD-10).
+const seen: string[] = [];
+
 const leakyHeaders = {
   Server: "ark-test-upstream",
   "X-Powered-By": "ark-test-upstream",
@@ -12,6 +15,23 @@ Bun.serve({
   port: 3000,
   fetch(request, server) {
     const url = new URL(request.url);
+    if (url.pathname === "/__seen") return Response.json(seen);
+    seen.push(url.pathname);
+    // As the API behind the login origin (FD-10): echo what the edge forwarded.
+    if (
+      url.pathname === "/api/state" ||
+      url.pathname.startsWith("/api/auth/") ||
+      url.pathname.startsWith("/gate/")
+    ) {
+      return Response.json(
+        {
+          path: `${url.pathname}${url.search}`,
+          method: request.method,
+          headers: Object.fromEntries(request.headers),
+        },
+        { headers: leakyHeaders },
+      );
+    }
     switch (url.pathname) {
       case "/ws":
         if (server.upgrade(request)) return undefined;

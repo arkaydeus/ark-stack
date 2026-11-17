@@ -16,7 +16,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { connect } from "node:tls";
 
-import { EDGE_CERT_DIR, edgeCertificatePaths, planEdge, renderCaddyfile } from "@ark-stack/shared";
+import {
+  EDGE_CERT_DIR,
+  GATE_LOGIN_SITE_COMMENT,
+  edgeCertificatePaths,
+  planEdge,
+  renderCaddyfile,
+} from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
 import { checkReleasePins } from "./edge-test/pins.ts";
@@ -135,7 +141,8 @@ async function generateFixtureCertificates() {
   const hostnames = [...issuedHostnames, ...Object.keys(unissued)];
   const script = [
     "set -e",
-    `for name in ${hostnames.map((name) => `certs/${name}`).join(" ")} renewed/www.example.com; do`,
+    // login.example.com: the FD-10 login origin of the rendered §3.5 example (validation only).
+    `for name in ${hostnames.map((name) => `certs/${name}`).join(" ")} certs/login.example.com renewed/www.example.com; do`,
     '  host="${name#*/}"; mkdir -p "/out/$name"',
     '  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj "/CN=$host" -addext "subjectAltName=DNS:$host" -keyout "/out/$name/privkey.pem" -out "/out/$name/fullchain.pem" 2>/dev/null',
     '  chmod 600 "/out/$name/privkey.pem"',
@@ -243,7 +250,8 @@ async function validateConfigurations() {
     throw new Error(`Generated app-route config should load 3 Ark certificates, found ${tlsSites?.length}.`);
   }
   // FD-09: the §3.5 example, rendered by the production planner (www proxies to the tailnet target,
-  // the apex redirects to www; an enabled SSO route is omitted before FD-11).
+  // the apex redirects to www; an enabled SSO route is omitted before FD-11). FD-10 adds the login
+  // origin (login.example.com) and its path allowlist.
   const route = {
     stableId: "nHOME",
     ip: "100.101.102.103",
@@ -255,13 +263,14 @@ async function validateConfigurations() {
   const routePlan = planEdge({
     adminMode: "public",
     adminHostname: "admin.example.com",
-    endpoints: issuedHostnames.map((hostname) => ({
+    gateHostname: "login.example.com",
+    endpoints: [...issuedHostnames, "login.example.com"].map((hostname) => ({
       id: `end_${hostname}`,
-      kind: hostname === "admin.example.com" ? "admin" : "route",
+      kind: hostname === "admin.example.com" ? "admin" : hostname === "login.example.com" ? "gate" : "route",
       hostname,
       exposure: "public",
     })),
-    certificates: issuedHostnames.map((hostname) => ({
+    certificates: [...issuedHostnames, "login.example.com"].map((hostname) => ({
       endpointId: `end_${hostname}`,
       status: "issued",
       lastDeployedAt: new Date(),
@@ -277,9 +286,13 @@ async function validateConfigurations() {
   }
   const routeConfig = renderCaddyfile({
     ...routePlan,
+    gate: routePlan.gateHostname ? { hostname: routePlan.gateHostname } : undefined,
     challengeDir: "/var/lib/ark/acme",
     apiUpstream: "api:3000",
   });
+  if (!routeConfig.includes(`${GATE_LOGIN_SITE_COMMENT}\nlogin.example.com {`)) {
+    throw new Error("The rendered §3.5 example must include the login-origin site block (FD-10).");
+  }
   console.log("Validating rendered and static Caddyfiles (tls files from fixture certificates):");
   await validate("generated-public-with-http-routes", routeConfig);
   await validate("generated-public", publicConfig);

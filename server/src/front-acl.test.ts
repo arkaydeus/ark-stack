@@ -54,7 +54,7 @@ async function signUp(role: Role): Promise<Actor> {
 }
 
 function get(actor: Actor, path: string) {
-  return app.request(path, { headers: { cookie: actor.cookie, origin } });
+  return app.request(`${origin}${path}`, { headers: { cookie: actor.cookie, origin } });
 }
 
 async function addRoute(input: {

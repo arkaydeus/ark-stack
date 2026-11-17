@@ -475,11 +475,12 @@ describe("key delivery", () => {
       const response = await auth.handler(
         new Request(`${origin}/api/auth/sign-up/email`, {
           method: "POST",
-          // Keep this fixture outside other tests' per-IP signup rate-limit bucket.
+          // Keep this fixture outside other tests' per-IP signup rate-limit bucket. Better Auth reads
+          // the client address only from X-Ark-Client-Ip, which the app sets (client-ip.ts).
           headers: {
             "content-type": "application/json",
             origin,
-            "x-forwarded-for": `192.0.2.${50 + users.length}`,
+            "x-ark-client-ip": `192.0.2.${50 + users.length}`,
           },
           body: JSON.stringify({ name: "PKI delivery", email, password: "PKI-Delivery-Test-Password-123!" }),
         }),

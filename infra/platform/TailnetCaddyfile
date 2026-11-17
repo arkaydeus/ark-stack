@@ -1,11 +1,25 @@
 {
   admin off
+  servers {
+    trusted_proxies static 127.0.0.1 ::1
+    trusted_proxies_strict
+  }
 }
 
 :8080 {
+  # Only tailscale serve in this namespace can supply the client address.
+  bind 127.0.0.1 ::1
   route {
+    request_header -X-Ark-*
     @internal path /api/internal/* /api/metrics/prometheus /api/platform/maintain
     respond @internal 404
+    @adminAuth path /api/auth/sign-in/email /api/auth/sign-out /api/auth/get-session /api/auth/two-factor/verify-totp /api/auth/two-factor/verify-backup-code /api/auth/two-factor/enable /api/auth/two-factor/get-totp-uri /api/auth/two-factor/disable /api/auth/two-factor/generate-backup-codes
+    reverse_proxy @adminAuth api:3000 {
+      header_up -X-Forwarded-Host
+      header_up X-Forwarded-Proto https
+      header_up X-Forwarded-For {client_ip}
+      header_up X-Ark-Edge-Token {env.ARK_EDGE_GATE_TOKEN}
+    }
     @browserApi path /api/auth/* /api/setup/status /api/state /api/me /api/wizard /api/step-up /api/domains* /api/projects* /api/databases* /api/mailboxes* /api/aliases* /api/services* /api/sql/* /api/mail/* /api/devices/* /api/secrets/* /api/backups* /api/ses/* /api/updates/* /api/import/* /api/alerts/* /api/settings* /api/front/* /api/metrics
     reverse_proxy @browserApi api:3000 {
       header_up -X-Forwarded-Host

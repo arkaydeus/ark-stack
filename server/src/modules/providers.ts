@@ -552,6 +552,8 @@ export async function loadCaddyfile(adminUrl: string, caddyfile: string) {
 export async function writeEdge(input: {
   adminMode: "public" | "tailnet";
   adminHostname?: string;
+  /** The public gate login origin (front door §3.5, FD-10); rendered once its certificate is issued. */
+  gateHostname?: string;
   /** The current certificate status per hostname; only `issued` hostnames are served. */
   certificates?: Array<{ hostname: string; status: string }>;
   appRoutes?: EdgeAppRoute[];
@@ -568,6 +570,7 @@ export async function writeEdge(input: {
       adminHostname: input.adminHostname,
       challengeDir: process.env.ARK_ACME_WEBROOT ?? join(dir, "acme"),
       apiUpstream: process.env.ARK_API_UPSTREAM ?? "api:3000",
+      gate: input.gateHostname ? { hostname: input.gateHostname } : undefined,
       // Paths inside the edge container, which mounts the certificate directory read-only.
       certificates: (input.certificates ?? []).map((item) => ({
         ...item,
