@@ -148,7 +148,7 @@ describe("coordinator enqueue and claims", () => {
     expect(newRow?.restoreVerified).toBe(false);
   });
 
-  test("executed restore uses the stored native snapshot id", async () => {
+  test("PostgreSQL restore refuses an unavailable worker-local repo2 without fabricating proof", async () => {
     const { chmod, mkdtemp, writeFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
@@ -186,11 +186,12 @@ exit 0
         payload: { kind: "platform-postgres", targetId: target, backupId },
       });
       await processQueued(1);
-      const args = await Bun.file(argsFile).text();
-      expect(args).toContain("--set=snap-123");
-      expect(args).not.toContain(backupId);
+      expect(await Bun.file(argsFile).exists()).toBe(false);
       const [op] = await db.select().from(operations).where(eq(operations.id, operation.id));
-      expect(op?.status).toBe("succeeded");
+      expect(op?.status).toBe("failed");
+      expect(op?.error).toContain("off-VPS recovery host");
+      const [unchanged] = await db.select().from(backups).where(eq(backups.id, backupId));
+      expect(unchanged?.status).toBe("uploaded");
     } finally {
       process.env.PATH = previousPath;
       if (previousExecute === undefined) delete process.env.ARK_BACKUP_EXECUTE;

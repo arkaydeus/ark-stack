@@ -207,7 +207,9 @@ Switching public and tailnet administration is a durable operation that rewrites
 
 ## Backups
 
-Upload, integrity, and restore-test are three statuses. A successful upload is not a verified restore. Set `ARK_BACKUP_EXECUTE=1` only when pgBackRest or Restic should run. Mail jobs additionally require `ARK_MAIL_SNAPSHOT_READY=1` from a completed native snapshot/quiesce step. Plan-only execution fails the operation instead of reporting success.
+Upload, integrity, and restore-test are three statuses. File restore tests use an exact successful export and its sealed target credentials. PostgreSQL application restore tests refuse worker-local execution; use the off-VPS recovery tool for database recovery. A successful upload is not a verified restore. Set `ARK_BACKUP_EXECUTE=1` only when pgBackRest or Restic should run. Mail jobs additionally require `ARK_MAIL_SNAPSHOT_READY=1` from a completed native snapshot/quiesce step. Plan-only execution fails the operation instead of reporting success.
+
+PostgreSQL backups run inside each cluster's container (`ark-postgres`, `ark-app-postgres`) into an encrypted local pgBackRest repo2, and leave the VPS as restic snapshots to the S3-compatible targets configured under **Backups** (FD-21). A PostgreSQL backup row is `local` until a snapshot containing it reaches a target. The installer generates `ARK_PLATFORM_PG_EXECUTOR_TOKEN`, `ARK_APP_PG_EXECUTOR_TOKEN`, `ARK_PLATFORM_PG_REPO_CIPHER_PASS` and `ARK_APP_PG_REPO_CIPHER_PASS`; without a cipher pass and an executor token of at least 24 characters WAL archiving stays off and backup health says so. Copy both cipher passes and every target's restic password off-host. `pgbackrest expire` is never run on the VPS. Provider recipes, the append-only canary, alerts and the off-VPS restore runbook (`scripts/offsite-restore.ts`) are in [docs/guides/backups.md](guides/backups.md).
 
 ## Maintenance
 
