@@ -208,6 +208,9 @@ describe("check redirect or 401", () => {
   });
 });
 
+const identity = (id: string, port: number) =>
+  routeIdentityKey({ id, hostname: `${id}.example.com`, stableId: "n1", ip: "100.64.0.9", port });
+
 describe("revocation deadline (§3.9.3)", () => {
   const routes = [{ id: "rt_a" }, { id: "rt_b" }];
   const now = new Date("2026-11-17T12:00:00Z");
@@ -231,8 +234,6 @@ describe("revocation deadline (§3.9.3)", () => {
   });
 
   test("handlers of revoked routes whose streams outlive 5m are found for the Caddy stop", () => {
-    const identity = (id: string, port: number) =>
-      routeIdentityKey({ id, hostname: `${id}.example.com`, stableId: "n1", ip: "100.64.0.9", port });
     const config = {
       apps: {
         http: {

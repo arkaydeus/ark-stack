@@ -97,6 +97,7 @@ jobs:
       - run: bun scripts/test-db-ingress.ts
       - run: bun scripts/test-edge-observer.ts
       - run: bun scripts/test-edge-l4.ts
+      - run: bun scripts/test-edge-gate.ts
       - name: Off-VPS backups against MinIO (FD-21)
         run: |
           bunx tsc --noEmit -p scripts/tsconfig.backups.json

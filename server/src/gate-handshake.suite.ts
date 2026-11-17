@@ -822,21 +822,23 @@ describe("revocation closes sockets: every event journals a forced reload (§3.9
   });
 });
 
+/** An edge tailnet node for the lease snapshot. */
+const node = (stableId: string, name: string, ipv4: string, isSelf: boolean) => ({
+  source: "edge" as const,
+  generation: "g-fd11",
+  stableId,
+  dnsName: `${name}.tail1234.ts.net.`,
+  hostName: name,
+  ipv4,
+  ipv6: null,
+  tags: isSelf ? ["tag:ark-edge"] : [],
+  isSelf,
+  online: true,
+});
+
 describe("durable retry and fail closed (§3.9.3)", () => {
   async function seedLease() {
     const now = new Date();
-    const node = (stableId: string, name: string, ipv4: string, isSelf: boolean) => ({
-      source: "edge" as const,
-      generation: "g-fd11",
-      stableId,
-      dnsName: `${name}.tail1234.ts.net.`,
-      hostName: name,
-      ipv4,
-      ipv6: null,
-      tags: isSelf ? ["tag:ark-edge"] : [],
-      isSelf,
-      online: true,
-    });
     await commitTailnetGeneration("edge", {
       generation: "g-fd11",
       self: node("nEDGE", "ark-edge", "100.64.0.1", true),

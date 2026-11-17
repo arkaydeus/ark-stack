@@ -250,8 +250,10 @@ async function validateConfigurations() {
     throw new Error(`Generated app-route config should load 3 Ark certificates, found ${tlsSites?.length}.`);
   }
   // FD-09: the §3.5 example, rendered by the production planner (www proxies to the tailnet target,
-  // the apex redirects to www; an enabled SSO route is omitted before FD-11). FD-10 adds the login
-  // origin (login.example.com) and its path allowlist.
+  // the apex redirects to www). FD-10 adds the login origin (login.example.com) and its path
+  // allowlist. FD-11 makes www the §3.5 SSO route (forward_auth, the exact callback and logout
+  // rewrites, the guarded /webhooks/* bypass); an SSO route whose bypass covers the whole site is
+  // omitted.
   const route = {
     stableId: "nHOME",
     ip: "100.101.102.103",
@@ -276,13 +278,13 @@ async function validateConfigurations() {
       lastDeployedAt: new Date(),
     })),
     httpRoutes: [
-      { ...route, id: "rt_k3x9", hostname: "www.example.com" },
+      { ...route, id: "rt_k3x9", hostname: "www.example.com", access: "sso", bypassPaths: ["/webhooks/*"] },
       { ...route, id: "rt_a1b2", hostname: "example.com", redirectTo: "www.example.com" },
-      { ...route, id: "rt_sso1", hostname: "admin.example.com", access: "sso" },
+      { ...route, id: "rt_sso1", hostname: "admin.example.com", access: "sso", bypassPaths: ["/*"] },
     ],
   });
   if (routePlan.omitted.map((item) => item.id).join() !== "rt_sso1") {
-    throw new Error("The planner must omit the enabled SSO route before FD-11.");
+    throw new Error("The planner must omit the SSO route whose bypass covers the whole site.");
   }
   const routeConfig = renderCaddyfile({
     ...routePlan,
@@ -290,6 +292,13 @@ async function validateConfigurations() {
     challengeDir: "/var/lib/ark/acme",
     apiUpstream: "api:3000",
   });
+  if (
+    !routeConfig.includes("uri /api/gate/check?route=rt_k3x9") ||
+    !routeConfig.includes("rewrite * /api/gate/callback") ||
+    !routeConfig.includes("uri /api/gate/bypass-check?route=rt_k3x9")
+  ) {
+    throw new Error("The rendered §3.5 example must gate www.example.com (FD-11).");
+  }
   if (!routeConfig.includes(`${GATE_LOGIN_SITE_COMMENT}\nlogin.example.com {`)) {
     throw new Error("The rendered §3.5 example must include the login-origin site block (FD-10).");
   }

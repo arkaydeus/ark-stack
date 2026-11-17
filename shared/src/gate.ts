@@ -65,7 +65,11 @@ export const GATE_MAX_STREAM_CLOSE_DELAY_MS = 300_000;
 
 export const GATE_RD_MAX_BYTES = 2048;
 
-const CONTROL = /[\x00-\x1f\x7f]/;
+/** Whether a string contains an ASCII control character (U+0000-U+001F or U+007F). */
+const CONTROL = {
+  test: (value: string) =>
+    [...value].some((char) => char.charCodeAt(0) < 0x20 || char.charCodeAt(0) === 0x7f),
+};
 
 /**
  * Validates the `rd` return path (§3.9.3, "No open redirect"). The value is the query parameter as

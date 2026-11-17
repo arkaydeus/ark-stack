@@ -62,13 +62,14 @@ description = "Run native mail lifecycle checks against a disposable pinned Stal
 run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts"
 
 [tasks."test:edge"]
-description = "Check edge harness cleanup and pins, validate Caddy configurations, test edge behaviour, the public database port nftables rules, the LocalAPI deployment, route withdrawal and the HAProxy SNI router (edge-l4)"
+description = "Check edge harness cleanup and pins, validate Caddy configurations, test edge behaviour, the public database port nftables rules, the LocalAPI deployment, route withdrawal, the HAProxy SNI router (edge-l4) and the login gate's routing, Origin contract, bypass guard and revocation (FD-11)"
 run = [
   "bun test scripts/edge-test scripts/edge-l4-guard.test.ts scripts/maintain.test.ts",
   "bun scripts/test-edge-config.ts",
   "bun scripts/test-db-ingress.ts",
   "bun scripts/test-edge-observer.ts",
   "bun scripts/test-edge-l4.ts",
+  "bun scripts/test-edge-gate.ts",
 ]
 
 [tasks."test:pgbouncer"]
