@@ -8,8 +8,9 @@
 //   GET  /state -> {sessions: {id: {closed}}}       which held sessions have been closed
 //   POST /close {ids?}                               close held sessions (all without ids)
 //
-// `fragment` sends the ClientHello (the first 2 KiB) in pieces of that many bytes, 40 ms apart,
-// through a local relay, so the edge must buffer a fragmented ClientHello before selecting SNI.
+// `fragment` sends the ClientHello (the first 2 KiB) through a local relay in separate TCP segments,
+// 20 ms apart: first 3 bytes (splitting the TLS record header), then pieces of that many bytes. The
+// edge must buffer the whole ClientHello (within its 5 s inspect delay) before selecting SNI.
 import { connect as netConnect, createServer, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 
@@ -28,11 +29,12 @@ function fragmentingRelay(host: string, port: number, size: number) {
       client.on("data", (chunk: Buffer) => {
         queue = queue.then(async () => {
           for (let offset = 0; offset < chunk.length;) {
-            const piece = sent < 2048 ? Math.min(size, chunk.length - offset) : chunk.length - offset;
+            const step = sent === 0 ? 3 : size;
+            const piece = sent < 2048 ? Math.min(step, chunk.length - offset) : chunk.length - offset;
             upstream.write(chunk.subarray(offset, offset + piece));
             offset += piece;
             sent += piece;
-            if (sent < 2048) await Bun.sleep(40);
+            if (sent < 2048) await Bun.sleep(20);
           }
         });
       });

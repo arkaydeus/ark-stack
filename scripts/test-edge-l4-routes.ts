@@ -284,9 +284,36 @@ async function startContainers() {
     agents[key] = await startAgent(key, octet);
 }
 
+const watchdogName = `ark-edge-l4r-watchdog-${suffix}`;
+
+/**
+ * Waits until the watchdog reports verified HAProxy enforcement on two polls in a row. A reload
+ * re-executes the HAProxy master, so its CLI refuses connections for a moment; back-to-back reloads
+ * could make the launch guard miss two heartbeats and stop HAProxy (FD-25 fail-closed).
+ */
+async function settle() {
+  let healthy = 0;
+  await waitFor(
+    "verified watchdog enforcement on HAProxy",
+    async () => {
+      const status = await docker(
+        "exec",
+        watchdogName,
+        "bun",
+        "--eval",
+        'const r = await fetch("http://127.0.0.1:2021/v1/supervise?proxy=haproxy"); console.log(r.ok ? "ok" : "no")',
+      );
+      healthy = status === "ok" ? healthy + 1 : 0;
+      return healthy >= 2 ? true : undefined;
+    },
+    30_000,
+    400,
+  );
+}
+
 /** The edge watchdog as shipped (uid 1000, group 4400, read-only root, no capabilities), with HAProxy. */
 async function startWatchdog() {
-  const name = `ark-edge-l4r-watchdog-${suffix}`;
+  const name = watchdogName;
   runtime.containers.push(name);
   await docker(
     "run",
@@ -546,12 +573,20 @@ const policyOf = (route: EdgeL4TlsRoute | EdgeL4TcpRoute, kind: "tls" | "tcp"): 
   policy: route.policy,
 });
 
-/** edge.l4_apply as the domain worker runs it: the lease first (as edgePolicy), then the generation. */
+/**
+ * edge.l4_apply as the domain worker runs it. A test transition (not a revocation) allows the old and
+ * new identities while the new generation is reloaded, then narrows the lease to the new routes, so
+ * the old servers are fenced and drained in the leaving worker. Changing the lease first would make
+ * the launch guard re-point to the closed variant and reopen with a second reload; back-to-back
+ * reloads briefly make the master CLI unreachable, and two missed heartbeats make the guard kill
+ * HAProxy (FD-25 fail-closed). Revocation tests change the lease themselves.
+ */
 async function apply(input: { tlsRoutes?: EdgeL4TlsRoute[]; tcpRoutes?: EdgeL4TcpRoute[] }) {
-  lease.routes = [
+  const next = [
     ...(input.tlsRoutes ?? []).map((route) => policyOf(route, "tls")),
     ...(input.tcpRoutes ?? []).map((route) => policyOf(route, "tcp")),
   ];
+  lease.routes = [...lease.routes, ...next];
   const full: EdgeL4Input = { httpHostnames: [appHost], sniPorts: [8883], ...input };
   // The launch guard reacts to the lease too (it re-points or reloads); a reload racing it can go
   // unanswered, which the installer reports and restores, exactly as edge.l4_apply then retries.
@@ -588,6 +623,8 @@ async function apply(input: { tlsRoutes?: EdgeL4TlsRoute[]; tcpRoutes?: EdgeL4Tc
     30_000,
     300,
   );
+  lease.routes = next;
+  await settle();
 }
 
 /** The HAProxy launch guard's mode, from its latest mode line. */
@@ -653,7 +690,7 @@ async function literalExampleTest(report: Report) {
     });
     await apply({ tlsRoutes: [route] });
     const auth = mode === "terminate_mtls" ? { cert: certs.valid } : {};
-    for (const fragment of [undefined, 7] as const) {
+    for (const fragment of [undefined, 48] as const) {
       const label = fragment ? "fragmented ClientHello" : "full ClientHello";
       const allowed = await waitFor(
         `${mode} to admit A`,
@@ -771,16 +808,27 @@ async function perSourceLimitTest(report: Report) {
     "another allowed source and the other route keep their capacity",
     `B: ${other.ok ? "relayed" : other.error}; A to ${amqpHost}: ${otherRoute.ok ? "relayed" : otherRoute.error}`,
   );
-  const logs = await logsOf(stack.edgeL4);
-  const inner = logs.split("\n").filter((line) => line.includes("fe_rt_lim1_tls"));
+  await closeAll();
+  // The inner terminating frontend (behind the abns PROXY loop) logs the original source address when
+  // the session ends; `show sess` only shows the abns peer. HAProxy's stdout log may drop lines in a
+  // burst, so use isolated sessions from B on a quiet router.
+  let fromB = "";
+  for (let attempt = 0; attempt < 5 && !fromB; attempt++) {
+    await Bun.sleep(1_000);
+    const single = await open(agents.B);
+    if (!single.ok) continue;
+    await Bun.sleep(1_000);
+    fromB =
+      (await logsOf(stack.edgeL4))
+        .split("\n")
+        .findLast((line) => line.startsWith(`${agents.B.ip}:`) && line.includes(" fe_rt_lim1_tls~ ")) ?? "";
+  }
   expect(
     report,
-    inner.some((line) => line.includes(`${agents.A.ip}:`)) &&
-      inner.some((line) => line.includes(`${agents.B.ip}:`)),
+    Boolean(fromB),
     "the original source address is visible after the PROXY loop (inner terminating frontend)",
-    inner.at(-1)?.slice(0, 160) ?? "no log line",
+    fromB.slice(0, 110) || `no inner log line from ${agents.B.ip}`,
   );
-  await closeAll();
   // The total cap (maxconn) of a route: 3, with a per-source limit above it.
   await apply({ tlsRoutes: limitRoutes({ maxConn: 3 }) });
   await Bun.sleep(1_500);
@@ -822,9 +870,10 @@ async function revocationRaceTest(report: Report) {
     // Each reload leaves the previous worker draining with its sessions.
     const reload = await probe<{ reload: { success: boolean } }>(["reload"]);
     if (!reload.reload.success) throw new Error("reload failed");
-    await Bun.sleep(500);
+    await settle();
   }
   const survivor = await open(agents.B, { sni: amqpHost, hold: true });
+  const survivorTrace = [`opened ${survivor.ok}`, `before revocation ${await echo(agents.B, survivor.id)}`];
   const workers = await probe<
     Record<string, { section: string; servers: Array<{ server: string; backend: string }> }>
   >(["servers"]);
@@ -839,15 +888,29 @@ async function revocationRaceTest(report: Report) {
   const revokedAt = Date.now();
   lease.routes = lease.routes.filter((route) => route.id !== "rt_lim1");
   const racing: Opened[] = [];
+  const raceState = { done: false };
   const race = (async () => {
     while (Date.now() - revokedAt < 3_000) {
       const attempt = await open(agents.A, { hold: true });
       racing.push(attempt);
       if (attempt.ok) affected.push({ agent: agents.A, id: attempt.id });
     }
+    raceState.done = true;
   })();
+  // Poll while the race runs, so each close is timed from the revocation, not from the race's end.
+  const closedAt = new Map<string, number>();
+  while ((!raceState.done || closedAt.size < affected.length) && Date.now() - revokedAt < 10_000) {
+    for (const session of affected) {
+      if (closedAt.has(session.id)) continue;
+      if ((await closedState(session.agent))[session.id]?.closed !== false)
+        closedAt.set(session.id, Date.now() - revokedAt);
+    }
+    await Bun.sleep(100);
+  }
   await race;
-  const times = await closeTimes(affected, revokedAt, 8_000);
+  const times = affected.map((session) => closedAt.get(session.id) ?? null);
+  survivorTrace.push(`after the drain ${await echo(agents.B, survivor.id)}`);
+  await settle();
   expect(
     report,
     times.every((ms) => ms !== null && ms <= 5_000),
@@ -856,6 +919,8 @@ async function revocationRaceTest(report: Report) {
   );
   // edge.l4_apply then renders the generation without the route.
   await apply({ tlsRoutes: routes.slice(1) });
+  survivorTrace.push(`after the reload ${await echo(agents.B, survivor.id)}`);
+  console.log(`survivor: ${survivorTrace.join(", ")}`);
   const after: Opened[] = [];
   for (let index = 0; index < 3; index++) after.push(await open(agents.A));
   expect(
@@ -1120,6 +1185,7 @@ try {
 } catch (error) {
   failed = true;
   console.error(`\n${(error as Error).stack ?? error}`);
+  console.error(`watchdog events: ${JSON.stringify(events.slice(-10))}`);
   await runtime.dumpLogs();
 } finally {
   void api.stop(true);

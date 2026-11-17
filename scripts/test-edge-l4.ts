@@ -111,7 +111,8 @@ const mqttRoute: EdgePolicyRoute = {
   ip: peerTlsIp,
   port: 1883,
 };
-const mqttL4 = { ...mqttRoute, sourceCidrs: ["0.0.0.0/0"] };
+// Open to every source: since FD-14 only an explicit allowInternet renders 0.0.0.0/0 and ::/0.
+const mqttL4 = { ...mqttRoute, sourceCidrs: [], allowInternet: true };
 
 /** The FD-09 routes as `edgeHttpRoutes` reads them from front_routes and the edge observation. */
 const peerName = "peer-http.tail1234.ts.net";

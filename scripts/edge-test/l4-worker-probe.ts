@@ -7,7 +7,7 @@
 //   apply '<EdgeL4Input JSON>' [force]   writeEdgeL4 as edge.l4_apply runs it (validate, swap, reload)
 //   invalid                              an invalid candidate through the same installer
 //   broken-reload                        a broken file reaching HAProxy (bypassing the validator)
-//   reload | proc | stat | servers | sessions | sockets
+//   reload | proc | stat | servers | sessions | sessions-raw | sockets
 //   withdraw '<allowed identity keys JSON>'
 //   stop                                 the adapter's stop fallback
 import { lstat, stat, readFile, writeFile } from "node:fs/promises";
@@ -47,7 +47,11 @@ async function masterReloads() {
 function brokenGeneration(marker: string) {
   const config = `global\n    this-is-not-a-directive ${marker}\n`;
   const files = { "haproxy.cfg": config, "haproxy.closed.cfg": config, "manifest.json": "{}\n" };
-  return { id: generationId(files), files, manifest: { version: 1 as const, httpHostnames: [], routes: [] } };
+  return {
+    id: generationId(files),
+    files,
+    manifest: { version: 2 as const, httpHostnames: [], sniPorts: [], routes: [] },
+  };
 }
 
 async function describe(path: string) {
@@ -128,6 +132,13 @@ async function run(): Promise<unknown> {
       const out: Record<string, unknown> = {};
       for (const worker of await master.workers())
         out[worker.pid] = (await master.sessions(worker.pid)).filter((s) => s.frontend !== "GLOBAL");
+      return out;
+    }
+    case "sessions-raw": {
+      // Raw `show sess` lines (with src=) per worker, for FD-14's PROXY-loop source check.
+      const out: Record<string, string[]> = {};
+      for (const worker of await master.workers())
+        out[worker.pid] = (await master.worker(worker.pid, "show sess")).split("\n").filter(Boolean);
       return out;
     }
     case "sockets":
