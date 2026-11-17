@@ -233,7 +233,7 @@ Third-party images (Caddy, HAProxy, Tailscale, PgBouncer, PostgreSQL, Stalwart a
 
    For the edge namespace (FD-05), the run then checks the following:
 
-   - `edge-ts` has exactly `NET_ADMIN` and `NET_RAW` and `/dev/net/tun`. A control shows that tailscaled's iptables calls fail with `NET_ADMIN` alone.
+   - `edge-ts` has exactly `NET_ADMIN` and `NET_RAW` and `/dev/net/tun`. A control shows that tailscaled's iptables calls fail with `NET_ADMIN` alone. tailscaled uses legacy `ip6tables`, and a container cannot load kernel modules, so on a Linux host the `ip6table_filter` and `ip6table_nat` modules must already be loaded. Otherwise tailscaled logs `Table does not exist` and the check fails. CI loads them with `modprobe` first.
    - `tailscale0` is in the namespace Caddy runs in. `--shields-up` and `TS_ACCEPT_DNS=false` reach tailscaled, and UDP 41642 is published.
    - A container on `edge-control` reaches `edge-admin:2019`. A container on `admin` aliased `api` cannot reach it by alias or by either `edge-ts` address.
    - `edge` comes back serving after `edge-ts` is changed through `docker compose up`, restarted in place, or recreated on its own. The last two go through the rejoin step that `mise run maintain` runs.
@@ -266,5 +266,7 @@ The snippet's syntax and tests can be checked against a real tailnet with an opt
 `mise run import -- inventory.json` compares domains, databases, and services. Owners are never imported. Stop the old reconcilers before transferring a live mail domain.
 
 ## Local acceptance
+
+`mise run test:db` runs the DB-backed server tests against a throwaway `postgres:17.6` container that it migrates as `ark_migration` and removes on completion or interruption (cleanup failure returns nonzero). `mise run test:db:up` keeps one running and prints shell exports plus the `ark_test_db <file>` helper, which isolates follow-up tests from inherited provider settings (see the README).
 
 `mise run test:e2e` refuses non-loopback PostgreSQL, creates a uniquely named disposable database, migrates it from empty, drives Chromium through owner creation, pre-MFA denial, invalid and valid TOTP, recovery-code acknowledgement, custom domain setup and one-time recovery-code use, then removes the database. The provider/Linux release checks in `security-review.md` remain separate opt-in acceptance work.

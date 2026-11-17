@@ -26,6 +26,7 @@ Useful commands:
 | --------------------------------- | ------------------------------------------- |
 | `mise run check`                  | format, lint, typecheck, test               |
 | `mise run test`                   | bun unit tests                              |
+| `mise run test:db`                | DB-backed tests on a throwaway Postgres     |
 | `mise run test:agent`             | Go agent policy tests                       |
 | `mise run test:agent-integration` | disposable effective Docker/ledger test     |
 | `mise run test:e2e`               | disposable real-browser signup/MFA/wizard   |
@@ -42,6 +43,8 @@ Useful commands:
 | `mise run import -- file`         | read-only Orkmail/PgStack inventory compare |
 | `mise run recover-host`           | host-loss checklist                         |
 | `mise run db:studio`              | Drizzle Studio                              |
+
+`mise run test:db` needs only Docker, not `.env` or `mise run db:up`. It starts a uniquely named, labelled `postgres:17.6` container on a loopback port that Docker picks, applies the migrations as the owner role `ark_migration`, runs `bun test server` with fixed test-only secrets and an allowlisted host environment, and removes the container afterwards, also when tests fail or the run is interrupted. Cleanup failures return a nonzero status; `down` also fails if the named container is absent. Concurrent runs do not collide, and the shared `ark-platform` Compose project is never touched. Pass other `bun test` arguments to run something else (`mise run test:db -- server/src/coordinator.test.ts`). To keep a database for repeated single-file runs, load it with `eval "$(mise run test:db:up)"`, run `ark_test_db <file>` (the emitted helper also isolates follow-up tests from your shell’s provider settings), and remove it with the `mise run test:db:down <container>` command that `up` prints.
 
 PgBouncer runtime probes also have a dedicated TypeScript check in CI and `mise run typecheck`. The live PgBouncer harness selects an ephemeral loopback port by default (`ARK_PGBOUNCER_SMOKE_PORT` overrides it); run it after the unit suite because both use the migrated platform test database.
 

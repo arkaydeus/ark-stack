@@ -60,7 +60,7 @@ const bunImage =
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-l4-${suffix}-`));
 const network = `ark-edge-l4-${suffix}`;
-const runtime = new EdgeTestRuntime(directory, network);
+const runtime = new EdgeTestRuntime(directory, network, bunImage);
 const removeSignalHandlers = runtime.installSignalHandlers();
 const docker = (...args: string[]) => runtime.docker(...args);
 
@@ -1463,10 +1463,15 @@ async function launchGuardTest(report: Report) {
     500,
   );
   await refreshPorts();
+  // Without a watchdog both guards restart-loop by design: each starts closed after five launch
+  // attempts, serves through its 2 s grace, then stops on the first missed heartbeats. 443 answers
+  // only while HAProxy and Caddy are up together. Where the stopped watchdog's name takes seconds to
+  // fail to resolve (Docker behind systemd-resolved, as on the CI runner), each attempt runs to its
+  // `timeout`: Caddy cycles in ~25 s and HAProxy in ~16 s, so allow several cycles to overlap.
   await waitFor(
     "HTTP through 443 after the restart",
     async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
-    30_000,
+    120_000,
     500,
   );
   const after = await tlsOutcome();

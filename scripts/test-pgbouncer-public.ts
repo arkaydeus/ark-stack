@@ -817,10 +817,15 @@ try {
     `refused — ${lastLine(tls12.stderr) || lastLine(tls12.stdout)}`,
   );
   // Negative control: the assertion must fail against a real TLS-1.2-enabled listener.
+  // The served key is uid 1000's 0600 file now; read it as the host user (on a Linux runner that
+  // is not uid 1000, a direct read fails with EACCES).
+  const served = await asHost(async () => ({
+    key: await Bun.file(join(certDir, "privkey.pem")).text(),
+    cert: await Bun.file(join(certDir, "fullchain.pem")).text(),
+  }));
   const tls12Listener = createTlsServer(
     {
-      key: await Bun.file(join(certDir, "privkey.pem")).text(),
-      cert: await Bun.file(join(certDir, "fullchain.pem")).text(),
+      ...served,
       minVersion: "TLSv1.2",
       maxVersion: "TLSv1.2",
     },
@@ -2015,6 +2020,9 @@ try {
       certificateId: coordNext.id,
       now: new Date(),
     });
+    // The state trees belong to uid 1000; take them back as the host user to stage the files,
+    // and hand them back below (chownState(arkUid)) before the coordinator stand-in starts.
+    await chownState(hostUid);
     const certRoot = join(work, "tmp", "certs");
     for (const endpoint of await platform`SELECT hostname FROM endpoints WHERE kind = 'database'`) {
       const directory = join(certRoot, String(endpoint.hostname));
@@ -2035,14 +2043,9 @@ try {
       // Loopback is the host-side published port, not an address inside the worker container.
       // Join the platform Postgres container's network without modifying that container. This
       // works on shared Docker hosts whose isolated bridges cannot resolve host.docker.internal.
-      const containers = await run([
-        "docker",
-        "ps",
-        "--filter",
-        `publish=${platformUrl.port || "5432"}`,
-        "--format",
-        "{{.ID}}",
-      ]);
+      // Docker's publish filter matches the container port, not the published host port.
+      // Inspect the bindings below instead, including Docker-assigned ephemeral host ports.
+      const containers = await run(["docker", "ps", "--format", "{{.ID}}"]);
       let found = false;
       for (const id of containers.stdout.split("\n").filter(Boolean)) {
         const inspected = await run(["docker", "inspect", id]);
@@ -2193,3 +2196,7 @@ try {
   if (pgbouncerImage) await chownState(hostUid).catch(() => undefined);
   await rm(work, { recursive: true, force: true });
 }
+
+// All assertions and owned-resource cleanup have finished. Imported runtime handles must not
+// keep this one-shot CLI alive after success; errors above still propagate as a nonzero exit.
+process.exit(0);
