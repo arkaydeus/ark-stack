@@ -67,43 +67,82 @@ async function docker(args: string[]) {
   return result.output.trim();
 }
 
+/** Removes a container this script labelled; returns false if no such container exists. */
 async function remove(name: string) {
   if (!NAME_PATTERN.test(name)) throw new Error(`Refusing to remove ${name}: not a test-db container name.`);
   const label = await run("docker", ["inspect", "--format", `{{index .Config.Labels "${LABEL}"}}`, name], {
     quiet: true,
   });
-  if (label.code !== 0) return; // Already gone.
+  if (label.code !== 0) return false;
   if (label.output.trim() !== "1")
     throw new Error(`Refusing to remove ${name}: it lacks the ${LABEL} label.`);
   // -v also removes any anonymous volume; data lives on tmpfs, so normally there is none.
   await docker(["rm", "--force", "--volumes", name]);
+  return true;
+}
+
+// The container to remove if this process is interrupted, and its start-up while in progress.
+let owned: string | null = null;
+let starting: Promise<unknown> | null = null;
+
+async function interrupted(code: number) {
+  const name = owned;
+  if (name) {
+    // Let an in-flight `docker run` settle, then remove. The daemon may still be creating the
+    // container after the CLI was killed by the same signal, so look again briefly before giving up.
+    await Promise.race([starting?.catch(() => undefined), Bun.sleep(30_000)]);
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const removed = await remove(name).catch((error: unknown) => {
+        console.error(`test-db: cleanup failed: ${String(error)}`);
+        return true;
+      });
+      if (removed) break;
+      await Bun.sleep(500);
+    }
+    console.error(`test-db: interrupted; removed ${name}`);
+  }
+  process.exit(code);
+}
+
+for (const [signal, code] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+  ["SIGHUP", 129],
+] as const) {
+  process.on(signal, () => void interrupted(code));
 }
 
 async function start() {
   const name = `ark-test-db-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  owned = name;
+  starting = launch(name);
+  return (await starting) as Awaited<ReturnType<typeof launch>>;
+}
+
+async function launch(name: string) {
   const password = crypto.randomUUID().replaceAll("-", "");
-  await docker([
-    "run",
-    "--detach",
-    "--name",
-    name,
-    "--label",
-    `${LABEL}=1`,
-    "--env",
-    `POSTGRES_USER=${OWNER}`,
-    "--env",
-    `POSTGRES_PASSWORD=${password}`,
-    "--env",
-    `POSTGRES_DB=${DATABASE}`,
-    // Data on tmpfs at the image's VOLUME path, so Docker creates no volume to leak.
-    "--tmpfs",
-    "/var/lib/postgresql/data:rw,size=1g",
-    // Port 0 on loopback: Docker picks a free port, so concurrent runs cannot collide.
-    "--publish",
-    "127.0.0.1::5432",
-    IMAGE,
-  ]);
   try {
+    await docker([
+      "run",
+      "--detach",
+      "--name",
+      name,
+      "--label",
+      `${LABEL}=1`,
+      "--env",
+      `POSTGRES_USER=${OWNER}`,
+      "--env",
+      `POSTGRES_PASSWORD=${password}`,
+      "--env",
+      `POSTGRES_DB=${DATABASE}`,
+      // Data on tmpfs at the image's VOLUME path, so Docker creates no volume to leak.
+      "--tmpfs",
+      "/var/lib/postgresql/data:rw,size=1g",
+      // Port 0 on loopback: Docker picks a free port, so concurrent runs cannot collide.
+      "--publish",
+      "127.0.0.1::5432",
+      IMAGE,
+    ]);
     const mapping = await docker(["port", name, "5432/tcp"]);
     const port = Number(/:(\d+)\s*$/m.exec(mapping)?.[1]);
     if (!Number.isInteger(port) || port <= 0) throw new Error(`Unexpected port mapping: ${mapping}`);
@@ -136,6 +175,7 @@ async function start() {
     if (migrated.code !== 0) throw new Error(`Migrations failed:\n${migrated.output}`);
     return { name, env };
   } catch (error) {
+    // Also covers a failed `docker run` that still left a created container behind.
     await remove(name).catch(() => undefined);
     throw error;
   }
@@ -149,6 +189,7 @@ if (command === "down") {
   console.log(`Removed ${rest[0]}.`);
 } else if (command === "up") {
   const { name, env } = await start();
+  owned = null; // Left running on purpose; `down` removes it.
   const exports = ["DATABASE_URL", "DATABASE_APP_URL", ...Object.keys(TEST_ENV)];
   console.log(`# Started and migrated ${name}. Load it into your shell with:`);
   console.log(`#   eval "$(mise run test:db:up)"`);
@@ -160,20 +201,11 @@ if (command === "down") {
   const { name, env } = await start();
   console.error(`test-db: ${name} migrated; running bun test ${args.join(" ")}`);
   let exitCode = 1;
-  const cleanup = async () => {
-    await remove(name).catch((error: unknown) => console.error(`test-db: cleanup failed: ${String(error)}`));
-  };
-  for (const [signal, code] of [
-    ["SIGINT", 130],
-    ["SIGTERM", 143],
-    ["SIGHUP", 129],
-  ] as const) {
-    process.on(signal, () => void cleanup().finally(() => process.exit(code)));
-  }
   try {
     exitCode = (await run(process.execPath, ["--no-env-file", "test", ...args], { env })).code;
   } finally {
-    await cleanup();
+    owned = null;
+    await remove(name).catch((error: unknown) => console.error(`test-db: cleanup failed: ${String(error)}`));
     console.error(`test-db: removed ${name}`);
   }
   process.exit(exitCode);
