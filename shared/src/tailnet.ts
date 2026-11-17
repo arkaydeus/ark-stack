@@ -130,6 +130,11 @@ function inCidr(ip: ParsedIp, cidr: string) {
   return parsed?.version === ip.version && prefixMatch(ip.bytes, parsed.bytes, Number(bits));
 }
 
+/** True for any address in the Tailscale CGNAT or ULA range, reserved service addresses included. */
+export function inTailscaleRange(ip: ParsedIp) {
+  return inCidr(ip, ip.version === 4 ? TAILSCALE_V4 : TAILSCALE_V6);
+}
+
 /** Range rule (§3.2 rule 2): inside the Tailscale CGNAT or ULA range, and not reserved. */
 export function checkTailnetAddress(ip: ParsedIp): Rejected | null {
   if (!inCidr(ip, ip.version === 4 ? TAILSCALE_V4 : TAILSCALE_V6)) {

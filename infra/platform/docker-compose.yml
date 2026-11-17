@@ -91,6 +91,10 @@ services:
       # (docs/design/front-door.md §3.11, FD-18). Its own directory, so the API never sees the
       # PgBouncer userlist or TLS key.
       ARK_DB_INGRESS_METRICS_DIR: /var/lib/ark/db-ingress
+      # Authenticates the edge watchdog's read-only lease reads (docs/design/front-door.md §3.2).
+      # Without it the watchdog keeps every tailnet route withdrawn.
+      ARK_EDGE_WATCHDOG_TOKEN: ${ARK_EDGE_WATCHDOG_TOKEN:-}
+    # Never mount ark_edge_ts_socket here: the API has no access to tailscaled (front door §3.6).
     volumes: [../../tmp/db-ingress:/var/lib/ark/db-ingress:ro]
     expose: ["3000"]
     # Bootstrap and host-local recovery only; never bind the raw API publicly.
@@ -180,10 +184,16 @@ services:
       ARK_ACME_STAGING: ${ARK_ACME_STAGING:-1}
       DNS_API_TOKEN: ${DNS_API_TOKEN:-}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      # edge.observe reads the edge node's LocalAPI status through this socket (front door §3.6).
+      ARK_EDGE_TS_SOCKET: /var/run/tailscale/tailscaled.sock
     volumes:
       - ../../tmp/certs:/var/lib/ark/certs
       - ../../tmp/edge:/var/lib/ark/edge
       - ../../tmp/acme:/var/lib/ark/acme
+      # Read-only, and the worker runs as the non-root `bun` user: tailscaled grants it read access
+      # only (status, whois, dial), and refuses every state-changing endpoint with 403. Shown by
+      # the FD-06 deployment test in `mise run test:edge`; no observer sidecar is needed.
+      - ark_edge_ts_socket:/var/run/tailscale:ro
     depends_on: [api]
     networks: [control, admin, edge-control]
 
@@ -359,6 +369,8 @@ services:
       - "41642:41642/udp" # direct WireGuard paths for the edge node
     volumes:
       - ark_edge_ts_state:/var/lib/tailscale
+      # tailscaled's LocalAPI socket, shared read-only with domain-worker only (FD-06).
+      - ark_edge_ts_socket:/var/run/tailscale
     networks:
       admin: {}
       # Caddy binds its admin API to this alias, so the unauthenticated config endpoint is only
@@ -378,16 +390,50 @@ services:
     # leaves this container in a dead namespace until it is recreated: `mise run maintain` and
     # `mise run edge:rejoin` do that (docs/operating.md, "Edge Tailscale node").
     network_mode: service:edge-ts
+    # The launch guard asks edge-watchdog whether the lease allows every tailnet route in the
+    # Caddyfile, and otherwise starts the official binary from Caddyfile.closed (front door §3.2).
+    entrypoint: [/bin/sh, /usr/local/bin/ark-edge-launch-guard]
+    environment:
+      ARK_EDGE_CONFIG_DIR: /etc/caddy/ark
+      ARK_EDGE_WATCHDOG_URL: http://edge-watchdog:2021
     volumes:
       - ../../tmp/acme:/var/lib/ark/acme:ro
       # Ark-issued lego certificates, loaded per site with `tls` (docs/design/front-door.md §3.14).
       - ../../tmp/certs:/var/lib/ark/certs:ro
-      - ../../tmp/edge/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Caddyfile and Caddyfile.closed, written by the domain worker. A directory mount, so a
+      # renamed (atomically replaced) file is what a restart reads.
+      - ../../tmp/edge:/etc/caddy/ark:ro
+      - ./edge-launch-guard.sh:/usr/local/bin/ark-edge-launch-guard:ro
       - ark_edge_data:/data
-    depends_on: [edge-ts, api]
+    # Start order only: without the watchdog the guard starts closed rather than not at all.
+    depends_on: [edge-ts, api, edge-watchdog]
     restart: unless-stopped
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+
+  # Edge-local lease watchdog (docs/design/front-door.md §3.2, FD-06). Every second it reads the
+  # read-only lease endpoint and withdraws tailnet backends the lease no longer allows from the
+  # running Caddy through the admin API; if that fails it stops Caddy and raises an alert. It works
+  # with the operation workers stopped. No database credential, root key, Docker or tailscaled socket.
+  edge-watchdog:
+    <<: *app
+    image: ark-edge-watchdog:${ARK_VERSION:-local}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: edge-watchdog
+    command: [bun, run, --cwd, workers, edge-watchdog]
+    environment:
+      ARK_API_URL: http://api:3000
+      ARK_EDGE_WATCHDOG_TOKEN: ${ARK_EDGE_WATCHDOG_TOKEN:-}
+      ARK_EDGE_ADMIN_URL: http://edge-admin:2019
+      ARK_EDGE_DIR: /var/lib/ark/edge
+      ARK_EDGE_WATCHDOG_PORT: "2021"
+    volumes:
+      - ../../tmp/edge:/var/lib/ark/edge:ro
+    expose: ["2021"]
+    depends_on: [api]
+    networks: [control, edge-control]
 
   tailscale:
     image: tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2
@@ -422,6 +468,8 @@ volumes:
   ark_agent_state:
   ark_edge_data:
   ark_edge_ts_state:
+  # tailscaled's LocalAPI socket: read-write in edge-ts, read-only in domain-worker, nowhere else.
+  ark_edge_ts_socket:
   ark_tailscale_state:
   # PgBouncer's admin console socket directory. A tmpfs owned by uid 1000 (PgBouncer and the
   # database worker), mode 0700, mounted only into pgbouncer-public and database-worker.
