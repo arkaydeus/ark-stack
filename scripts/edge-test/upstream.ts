@@ -18,7 +18,11 @@ Bun.serve({
     if (url.pathname === "/__seen") return Response.json(seen);
     seen.push(url.pathname);
     // As the API behind the login origin (FD-10): echo what the edge forwarded.
-    if (url.pathname.startsWith("/api/auth/") || url.pathname.startsWith("/gate/")) {
+    if (
+      url.pathname === "/api/state" ||
+      url.pathname.startsWith("/api/auth/") ||
+      url.pathname.startsWith("/gate/")
+    ) {
       return Response.json(
         {
           path: `${url.pathname}${url.search}`,

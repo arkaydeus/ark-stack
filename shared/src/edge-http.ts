@@ -365,7 +365,10 @@ export const HTTP_ROUTE_SNIPPETS = (errorsDir: string) => `(ark_route_base) {
     header -Server
     root * ${errorsDir}
     rewrite * /{err.status_code}.html
-    file_server
+    # Keep startup (Caddyfile.closed) and admin /adapt output identical for guarded restoration.
+    file_server {
+      hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed ./Caddyfile
+    }
   }
 }
 

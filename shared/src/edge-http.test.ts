@@ -7,6 +7,7 @@ import { CADDY_GLOBAL_BLOCK, edgeCertificatePaths, planEdge, renderCaddyfile } f
 import {
   EDGE_ERRORS_DIR,
   HTTP_ROUTE_DEFAULTS,
+  HTTP_ROUTE_SNIPPETS,
   checkedHttpRoute,
   evaluateLocation,
   httpRouteOptions,
@@ -17,6 +18,12 @@ import { launchDecision, routeIdentityKey } from "./edge-withdrawal.ts";
 import { ValidationError } from "./errors.ts";
 
 const base = { challengeDir: "/var/lib/ark/acme", apiUpstream: "api:3000" } as const;
+
+test("error pages hide both startup filenames and the admin-adapt filename for stable restoration", () => {
+  expect(HTTP_ROUTE_SNIPPETS(EDGE_ERRORS_DIR)).toContain(
+    "hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed ./Caddyfile",
+  );
+});
 
 /** The §3.5 example route: www.example.com -> home.tail1234.ts.net (100.101.102.103:3000). */
 const www: EdgeHttpRoute = {
