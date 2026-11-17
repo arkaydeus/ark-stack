@@ -426,6 +426,8 @@ async function bypassTest(report: Report) {
   );
   const attempts = [
     "/webhooks/..;/admin",
+    "/webhooks/..%3b/admin",
+    "/webhooks/..%3B/admin",
     "/webhooks/..;/admin/secret",
     "/webhooks/../admin",
     "/webhooks/%2e%2e/admin",

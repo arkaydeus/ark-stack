@@ -57,6 +57,8 @@ describe("raw request URI guard (§3.9.5)", () => {
 
   test.each([
     "/webhooks/..;/admin",
+    "/webhooks/..%3b/admin",
+    "/webhooks/..%3B/admin",
     "/webhooks/../admin",
     "/webhooks/./admin",
     "/webhooks/x;y",

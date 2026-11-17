@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 
 import {
   GATE_COOKIE,
-  GATE_STATE_COOKIE,
+  gateStateCookieName,
   createId,
   privilegedRequestHash,
   sha256Hex,
@@ -303,7 +303,7 @@ async function runDrains() {
         await runOperation("edge.drain", operation);
         await sql`UPDATE operations SET status = 'succeeded' WHERE id = ${row.id}`;
       } catch (error) {
-        await sql`UPDATE operations SET status = 'failed', error = ${(error as Error).message} WHERE id = ${row.id}`;
+        await sql`UPDATE operations SET status = 'failed', updated_at = now(), error = ${(error as Error).message} WHERE id = ${row.id}`;
         throw error;
       }
     }
@@ -410,9 +410,28 @@ describe("handshake (§3.9.2)", () => {
     expect(location.searchParams.get("route")).toBe(route.id);
     expect(location.searchParams.get("rd")).toBe("/dashboard?tab=1");
     const state = location.searchParams.get("state")!;
-    const cookie = response.headers.getSetCookie().find((item) => item.startsWith(`${GATE_STATE_COOKIE}=`))!;
-    expect(cookie).toBe(`${GATE_STATE_COOKIE}=${state}; Max-Age=600; Path=/; Secure; HttpOnly; SameSite=Lax`);
+    const cookie = response.headers
+      .getSetCookie()
+      .find((item) => item.startsWith(`${gateStateCookieName(state)}=`))!;
+    expect(cookie).toBe(
+      `${gateStateCookieName(state)}=${state}; Max-Age=600; Path=/; Secure; HttpOnly; SameSite=Lax`,
+    );
     expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  test("concurrent sign-ins keep independent cookies and both callbacks succeed", async () => {
+    const browser = new Browser();
+    await signIn(browser, alice);
+    const checks = await Promise.all([browser.check(appHost, route.id), browser.check(appHost, route.id)]);
+    const callbacks: URL[] = [];
+    for (const check of checks) {
+      const url = new URL(check.headers.get("location")!);
+      const authorized = await browser.login(`${url.pathname}${url.search}`);
+      callbacks.push(new URL(authorized.headers.get("location")!));
+    }
+    expect(callbacks[0]!.searchParams.get("state")).not.toBe(callbacks[1]!.searchParams.get("state"));
+    for (const callback of callbacks)
+      expect((await browser.callback(appHost, route.id, callback.search)).status).toBe(303);
   });
 
   test("an XHR (Accept: application/json), an unsafe method or an upgrade without a session gets 401", async () => {
@@ -448,7 +467,7 @@ describe("handshake (§3.9.2)", () => {
   test("password + TOTP, authorize, callback: the route cookie is __Host-, Secure, HttpOnly, Lax, no Domain", async () => {
     const browser = new Browser();
     await signIn(browser, alice);
-    const { landed } = await handshake(browser, appHost, route.id);
+    const { landed, callback } = await handshake(browser, appHost, route.id);
     expect(landed.headers.get("location")).toBe(`https://${appHost}/dashboard?tab=1`);
     expect(landed.headers.get("referrer-policy")).toBe("no-referrer");
     const cookie = landed.headers.getSetCookie().find((item) => item.startsWith(`${GATE_COOKIE}=`))!;
@@ -456,9 +475,11 @@ describe("handshake (§3.9.2)", () => {
       /^__Host-ark_gate=[A-Za-z0-9_-]{43}; Max-Age=\d+; Path=\/; Secure; HttpOnly; SameSite=Lax$/,
     );
     expect(cookie.toLowerCase()).not.toContain("domain=");
-    expect(landed.headers.getSetCookie().some((item) => item.startsWith(`${GATE_STATE_COOKIE}=;`))).toBe(
-      true,
-    );
+    expect(
+      landed.headers
+        .getSetCookie()
+        .some((item) => item.startsWith(`${gateStateCookieName(callback.searchParams.get("state")!)}=;`)),
+    ).toBe(true);
     const ok = await browser.check(appHost, route.id, { uri: "/dashboard?tab=1" });
     expect(ok.status).toBe(204);
     expect(ok.headers.get("x-ark-user")).toBe(alice.id);
@@ -477,7 +498,12 @@ describe("handshake (§3.9.2)", () => {
     const { callback } = await handshake(browser, appHost, route.id);
     // Replay.
     const replayBrowser = new Browser();
-    replayBrowser.jar(appHost).cookies.set(GATE_STATE_COOKIE, callback.searchParams.get("state")!);
+    replayBrowser
+      .jar(appHost)
+      .cookies.set(
+        gateStateCookieName(callback.searchParams.get("state")!),
+        callback.searchParams.get("state")!,
+      );
     const replay = await replayBrowser.callback(appHost, route.id, callback.search);
     expect(replay.status).toBe(400);
     expect(replay.headers.getSetCookie().some((item) => item.startsWith(`${GATE_COOKIE}=`))).toBe(false);
@@ -495,16 +521,20 @@ describe("handshake (§3.9.2)", () => {
     expect((await browser.callback(appHost, route.id, expired.search)).status).toBe(400);
     // Presented on another route's hostname (the edge sets that route's X-Ark-Route).
     const moved = await fresh();
-    browser.jar(siblingHost).cookies.set(GATE_STATE_COOKIE, moved.searchParams.get("state")!);
+    browser
+      .jar(siblingHost)
+      .cookies.set(gateStateCookieName(moved.searchParams.get("state")!), moved.searchParams.get("state")!);
     const onSibling = await browser.callback(siblingHost, sibling.id, moved.search);
     expect(onSibling.status).toBe(400);
     expect(onSibling.headers.getSetCookie().some((item) => item.startsWith(`${GATE_COOKIE}=`))).toBe(false);
     // Without the matching state cookie (login CSRF / code injection).
     const noState = await fresh();
-    browser.jar(appHost).cookies.delete(GATE_STATE_COOKIE);
+    browser.jar(appHost).cookies.delete(gateStateCookieName(noState.searchParams.get("state")!));
     expect((await browser.callback(appHost, route.id, noState.search)).status).toBe(400);
     const wrongState = await fresh();
-    browser.jar(appHost).cookies.set(GATE_STATE_COOKIE, "A".repeat(22));
+    browser
+      .jar(appHost)
+      .cookies.set(gateStateCookieName(wrongState.searchParams.get("state")!), "A".repeat(22));
     expect((await browser.callback(appHost, route.id, wrongState.search)).status).toBe(400);
   });
 
@@ -611,6 +641,8 @@ describe("bypass precheck (§3.9.5)", () => {
     expect((await bypass("/webhooks/github?x=1")).status).toBe(204);
     for (const uri of [
       "/webhooks/..;/admin",
+      "/webhooks/..%3b/admin",
+      "/webhooks/..%3B/admin",
       "/webhooks/../admin",
       "/webhooks\\..\\admin",
       "/webhooks/%2e%2e/admin",
@@ -813,11 +845,38 @@ describe("revocation closes sockets: every event journals a forced reload (§3.9
     ownerAdminCookie = `${authCookieName("session_token")}=${encodeURIComponent(`${created.token}.${await makeSignature(created.token, ctx.secret)}`)}`;
   });
 
-  test("an expired or already revoked session needs no reload", async () => {
+  test("admin-origin MFA disable revokes separate gate parents", async () => {
+    await settleRevocations();
+    const { user, browser } = await liveUser("mfadisable", "owner");
+    const admin = new Browser();
+    expect(
+      (await admin.login("/api/auth/sign-in/email", { email: user.email, password }, adminHost)).status,
+    ).toBe(200);
+    expect(
+      (await admin.login("/api/auth/two-factor/verify-totp", { code: user.totp() }, adminHost)).status,
+    ).toBe(200);
+    expect((await admin.login("/api/auth/two-factor/disable", { password }, adminHost)).status).toBe(200);
+    await expectRevoked([route.id, sibling.id], browser);
+  });
+
+  test("MFA enrollment assurance changes revoke existing route sessions", async () => {
+    await settleRevocations();
+    const { user, browser } = await liveUser("mfareenroll");
+    await sql`UPDATE "user" SET mfa_enrolled_at = now() WHERE id = ${user.id}`;
+    await expectRevoked([route.id, sibling.id], browser);
+  });
+
+  test("expired sessions still journal a drain; already revoked sessions do not journal twice", async () => {
     await settleRevocations();
     const { user } = await liveUser("expired");
     await sql`UPDATE gate_sessions SET expires_at = now() - interval '1 second' WHERE user_id = ${user.id}`;
     await sql`DELETE FROM gate_sessions WHERE user_id = ${user.id}`;
+    expect(await pendingRevocations()).toHaveLength(2);
+    await runDrains();
+    const { user: revoked } = await liveUser("alreadyrevoked");
+    await sql`UPDATE gate_sessions SET revoked_at = now() WHERE user_id = ${revoked.id}`;
+    await runDrains();
+    await sql`DELETE FROM gate_sessions WHERE user_id = ${revoked.id}`;
     expect(await pendingRevocations()).toHaveLength(0);
   });
 });
@@ -886,13 +945,89 @@ describe("durable retry and fail closed (§3.9.3)", () => {
     const [alert] =
       await sql`SELECT severity, resolved_at FROM alerts WHERE dedup_key = 'gate-revocation-overdue'`;
     expect(alert?.severity).toBe("critical");
-    // Durable retry: the next claim queues a new drain, which applies the revocation.
+    // Immediate retries are suppressed; retry after the first 10 s backoff.
     expect(await queuedRevocationDrains()).toHaveLength(0);
+    await claimQueued({ limit: 0 });
+    expect(await queuedRevocationDrains()).toHaveLength(0);
+    await sql`UPDATE operations SET updated_at = now() - interval '11 seconds' WHERE status = 'failed' AND payload ->> 'reason' = 'gate_revocation'`;
     await claimQueued({ limit: 0 });
     expect(await queuedRevocationDrains()).toHaveLength(1);
     await runDrains();
     expect(await pendingRevocations()).toHaveLength(0);
     expect((await lease()).routes.map((item) => item.id)).toContain(route.id);
+  });
+
+  test("concurrent revocations coalesce; a newer event cannot be acknowledged by an older reload", async () => {
+    await settleRevocations();
+    await Promise.all([
+      sql.begin(async (tx) => {
+        await tx`SELECT ark_gate_revoke(${route.id}, 'first')`;
+        await tx`SELECT pg_sleep(0.1)`;
+      }),
+      sql.begin(async (tx) => {
+        await tx`SELECT ark_gate_revoke(${route.id}, 'second')`;
+      }),
+      claimQueued({ limit: 0 }),
+    ]);
+    expect(await pendingRevocations(route.id)).toHaveLength(1);
+    expect(await queuedRevocationDrains()).toHaveLength(1);
+    const [snapshot] = await pendingRevocations(route.id);
+    await sql`SELECT ark_gate_revoke(${route.id}, 'during_reload')`;
+    const { markGateRevocationsApplied } = await import("./modules/gate-revocations.ts");
+    expect(await markGateRevocationsApplied([String(snapshot!.id)], "old-reload")).toBe(0);
+    expect(await pendingRevocations(route.id)).toHaveLength(1);
+    await runDrains();
+    expect(await pendingRevocations()).toHaveLength(0);
+  });
+
+  test("persistent reload failures create only one failed operation during the backoff window", async () => {
+    await settleRevocations();
+    await sql`SELECT ark_gate_revoke(${route.id}, 'outage')`;
+    const [before] = await sql`SELECT count(*)::int AS n FROM operations WHERE kind = 'edge.drain'`;
+    caddy.failLoad = true;
+    try {
+      await expect(runDrains()).rejects.toThrow(/Caddy reload failed/);
+      for (let n = 0; n < 5; n++) {
+        await claimQueued({ limit: 0 });
+        await sql`SELECT ark_gate_revoke(${route.id}, 'another_during_outage')`;
+        await runDrains();
+      }
+      const [after] = await sql`SELECT count(*)::int AS n FROM operations WHERE kind = 'edge.drain'`;
+      expect(after!.n).toBe(before!.n);
+      expect(await queuedRevocationDrains()).toHaveLength(0);
+    } finally {
+      caddy.failLoad = false;
+    }
+  });
+
+  test("retry delay grows after repeated failures instead of resetting on a new revocation", async () => {
+    await settleRevocations();
+    await sql`SELECT ark_gate_revoke(${route.id}, 'backoff')`;
+    await sql`UPDATE operations SET updated_at = now() - interval '1 day' WHERE status = 'failed' AND payload ->> 'reason' = 'gate_revocation'`;
+    // Keep all simulated failure timestamps inside the current outage.
+    await sql`UPDATE gate_revocations SET created_at = now() - interval '10 minutes' WHERE applied_at IS NULL`;
+    caddy.failLoad = true;
+    try {
+      await expect(runDrains()).rejects.toThrow(/Caddy reload failed/);
+      const [first] =
+        await sql`SELECT id FROM operations WHERE status = 'failed' AND payload ->> 'reason' = 'gate_revocation' ORDER BY updated_at DESC LIMIT 1`;
+      await sql`UPDATE operations SET updated_at = now() - interval '11 seconds' WHERE id = ${first!.id}`;
+      await claimQueued({ limit: 0 });
+      expect(await queuedRevocationDrains()).toHaveLength(1);
+      await expect(runDrains()).rejects.toThrow(/Caddy reload failed/);
+      // Eleven seconds was enough for attempt one, but attempt two requires twenty.
+      const [second] =
+        await sql`SELECT id FROM operations WHERE status = 'failed' AND payload ->> 'reason' = 'gate_revocation' ORDER BY updated_at DESC LIMIT 1`;
+      await sql`UPDATE operations SET updated_at = now() - interval '11 seconds' WHERE id = ${second!.id}`;
+      await sql`SELECT ark_gate_revoke(${route.id}, 'new_event_same_outage')`;
+      await claimQueued({ limit: 0 });
+      expect(await queuedRevocationDrains()).toHaveLength(0);
+      await sql`UPDATE operations SET updated_at = now() - interval '21 seconds' WHERE id IN (${first!.id}, ${second!.id})`;
+      await claimQueued({ limit: 0 });
+      expect(await queuedRevocationDrains()).toHaveLength(1);
+    } finally {
+      caddy.failLoad = false;
+    }
   });
 
   test("a drain lost with its worker is reclaimed and retried; the revocation is never reported applied before", async () => {

@@ -4,16 +4,16 @@
 // authorization must also end the connections they already hold. Every revocation (access removal,
 // user deletion, session deletion or sign-out, logout everywhere, MFA reset, route logout, a mode
 // change and tightening a route's gate) writes a `gate_revocations` row and queues a forced-reload
-// `edge.drain` in the revoking transaction. The SQL side lives in migration 0026: the
-// `ark_gate_revoke` function and the triggers on `gate_sessions` and `front_route_access`, so a
-// revocation made by Better Auth, a cascade or a script is journalled exactly like one made here.
+// `edge.drain` in the revoking transaction. The SQL side lives in migrations 0026 and 0028: the
+// `ark_gate_revoke` function and triggers on `gate_sessions`, `front_route_access` and the MFA
+// fields on `user`, so a revocation made by Better Auth, a cascade or a script is journalled exactly like one made here.
 //
 // - The drain (and any `edge.apply`) snapshots the pending rows, forces a Caddy `/load` with
 //   `Cache-Control: must-revalidate` even for identical text, and marks the rows applied only after
 //   it succeeded. The old handlers close their upgraded connections after `stream_close_delay`,
 //   which is at most 5m on an SSO route, so every socket is gone by revocation + 305 s.
 // - A failed or interrupted drain leaves the rows pending. `ensureGateRevocationDrain` re-queues the
-//   work on every claim, so it survives worker restarts and failures.
+//   work on claims with exponential backoff (10 s to 5 min), so it survives worker restarts and failures.
 // - A row pending for more than 5 s takes its route out of the lease the edge-local watchdog
 //   enforces (`edgeLeaseDocument`): the watchdog withdraws it (zero stream-close delay, or a Caddy
 //   stop when the old handler keeps streams open) and a critical alert is raised. The route comes
@@ -21,7 +21,6 @@
 
 import {
   GATE_REVOCATION_DEADLINE_MS,
-  createId,
   routesAfterRevocations,
   type EdgeLeaseDocument,
   type PendingGateRevocation,
@@ -60,25 +59,12 @@ export async function markGateRevocationsApplied(ids: string[], appliedBy: strin
 
 /**
  * Durable retry: queue a forced-reload drain whenever revocations are pending and no drain is in
- * flight (a failed drain, or one lost with its worker). Called before every claim.
+ * flight (a failed drain, or one lost with its worker). Called before every claim; failures back off
+ * from 10 seconds to 5 minutes while the independent 5-second withdrawal deadline stays in force.
  */
 export async function ensureGateRevocationDrain() {
-  const [pending] = await sql`SELECT 1 FROM gate_revocations WHERE applied_at IS NULL LIMIT 1`;
-  if (!pending) return null;
-  const id = createId("op");
-  const rows = await sql`
-    INSERT INTO operations (id, kind, status, idempotency_key, plan_hash, target_ids, payload)
-    SELECT ${id}, 'edge.drain', 'queued', ${`edge.drain:gate-revocation:${id}`},
-      encode(sha256(convert_to('{"reason":"gate_revocation"}', 'UTF8')), 'hex'),
-      '["platform"]'::jsonb, '{"reason":"gate_revocation"}'::jsonb
-    WHERE NOT EXISTS (
-      SELECT 1 FROM operations
-      WHERE kind = 'edge.drain' AND status IN ('queued', 'running')
-        AND payload ->> 'reason' = 'gate_revocation'
-    )
-    RETURNING id
-  `;
-  return rows[0] ? String(rows[0].id) : null;
+  const [row] = await sql`SELECT ark_gate_ensure_drain() AS id`;
+  return row?.id ? String(row.id) : null;
 }
 
 /**

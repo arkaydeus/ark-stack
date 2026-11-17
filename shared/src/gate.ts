@@ -14,8 +14,9 @@ import { normalizeHostname } from "./hostnames.ts";
 
 /** The route-host gate session cookie (`__Host-`: Secure, Path=/, no Domain). */
 export const GATE_COOKIE = "__Host-ark_gate";
-/** The one-time handshake state cookie the check sets on the route host. */
+/** Prefix for per-flow, one-time state cookies on the route host. */
 export const GATE_STATE_COOKIE = "__Host-ark_gate_state";
+export const gateStateCookieName = (state: string) => `${GATE_STATE_COOKIE}_${state}`;
 
 /** Public route-host paths. Only these two reach the API; every other `/.ark/gate/*` is 404. */
 export const GATE_CALLBACK_PATH = "/.ark/gate/callback";
@@ -191,6 +192,7 @@ export function checkRawRequestUri(uri: unknown): { ok: true; path: string } | {
   } catch {
     return { ok: false, reason: "undecodable path" };
   }
+  if (path.includes(";")) return { ok: false, reason: "encoded semicolon" };
   if (CONTROL.test(path)) return { ok: false, reason: "encoded control character" };
   return { ok: true, path };
 }

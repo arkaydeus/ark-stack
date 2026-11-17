@@ -60,6 +60,7 @@ export type GateEdgeOptions = {
   /** The lease's routes (§3.2); `overdue` below removes entries as the API does (§3.9.3). */
   policy: (peerIp: string) => EdgePolicyRoute[];
   /** The `api:3000` container: bundled entry point and its environment. */
+  lease?: () => Promise<EdgeLeaseDocument | undefined>;
   api: { entry: string; env: Record<string, string>; hostGateway?: boolean };
 };
 
@@ -120,6 +121,8 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
         return new Response("no", { status: 401 });
       const { pathname } = new URL(incoming.url);
       if (pathname === "/api/internal/edge/lease") {
+        const real = await options.lease?.();
+        if (real) return Response.json(real);
         const now = Date.now();
         const document: EdgeLeaseDocument = {
           now: new Date(now).toISOString(),

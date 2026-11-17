@@ -53,13 +53,21 @@ function page(nonce: string, title: string, body: string, script = "") {
 <main>
 ${body}
 </main>
-${script ? `<script nonce="${nonce}">${script}</script>` : ""}
+${script || body.includes(SIGN_OUT_FORM) ? `<script nonce="${nonce}">${body.includes(SIGN_OUT_FORM) ? SIGN_OUT_SCRIPT : ""}${script}</script>` : ""}
 </body>
 </html>
 `;
 }
 
-const SIGN_OUT_FORM = `<form method="post" action="/gate/logout"><button type="submit">Sign out everywhere</button></form>`;
+const SIGN_OUT_FORM = `<form id="signout" method="post" action="/gate/logout"><button type="submit">Sign out everywhere</button></form>`;
+
+const SIGN_OUT_SCRIPT = `
+document.getElementById("signout").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const response = await fetch("/gate/logout", { method: "POST", credentials: "same-origin" });
+  if (response.ok) location.assign("/gate/login");
+});
+`;
 
 const LOGIN_SCRIPT = `
 const next = document.body.dataset.next || "";

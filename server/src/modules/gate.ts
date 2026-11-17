@@ -22,7 +22,7 @@ import {
   GATE_LAST_SEEN_INTERVAL_MS,
   GATE_SESSION_ABSOLUTE_MS,
   GATE_SESSION_IDLE_MS,
-  GATE_STATE_COOKIE,
+  gateStateCookieName,
   GATE_STATE_MAX_AGE_S,
   ROUTE_ID_PATTERN,
   bypassMatches,
@@ -230,7 +230,7 @@ export async function gateCheck(input: GateCheckInput): Promise<GateResponse> {
       302,
       [
         ["Location", location.toString()],
-        ["Set-Cookie", cookie(GATE_STATE_COOKIE, state, GATE_STATE_MAX_AGE_S)],
+        ["Set-Cookie", cookie(gateStateCookieName(state), state, GATE_STATE_MAX_AGE_S)],
       ],
       "no session: redirect",
     );
@@ -324,19 +324,20 @@ export async function gateCallback(input: {
   ipAddress: string | null;
   userAgent: string | null;
 }): Promise<GateResponse> {
+  const state = checkGateNonce(input.state);
+  const stateCookie = state ? gateStateCookieName(state) : null;
   const fail = (status: number, reason: string) =>
     respond(
       status,
       [
-        ["Set-Cookie", clearCookie(GATE_STATE_COOKIE)],
+        ...(stateCookie ? [["Set-Cookie", clearCookie(stateCookie)] as [string, string]] : []),
         ["Referrer-Policy", "no-referrer"],
       ],
       reason,
     );
   const code = checkGateNonce(input.code, 40);
-  const state = checkGateNonce(input.state);
   if (!code || !state) return fail(400, "malformed code or state");
-  const stateCookies = parseCookies(input.cookie).get(GATE_STATE_COOKIE) ?? [];
+  const stateCookies = parseCookies(input.cookie).get(stateCookie!) ?? [];
   if (stateCookies.length !== 1 || !secureEqual(stateCookies[0]!, state))
     return fail(400, "state cookie missing or different");
   const [handoff] = await sql`
@@ -378,7 +379,7 @@ export async function gateCallback(input: {
   return respond(303, [
     ["Location", `https://${route.hostname}${checkReturnPath(String(handoff.return_path))}`],
     ["Set-Cookie", cookie(GATE_COOKIE, token, (expiresAt.getTime() - Date.now()) / 1000)],
-    ["Set-Cookie", clearCookie(GATE_STATE_COOKIE)],
+    ["Set-Cookie", clearCookie(stateCookie!)],
     ["Referrer-Policy", "no-referrer"],
   ]);
 }

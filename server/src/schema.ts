@@ -709,6 +709,9 @@ export const gateRevocations = pgTable(
     alertedAt: timestamp("alerted_at", { withTimezone: true }),
   },
   (table) => [
+    uniqueIndex("gate_revocations_pending_route_idx")
+      .on(table.routeId)
+      .where(sql`applied_at IS NULL`),
     index("gate_revocations_pending_idx")
       .on(table.createdAt)
       .where(sql`applied_at IS NULL`),
