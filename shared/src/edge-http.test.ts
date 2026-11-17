@@ -320,7 +320,7 @@ describe("rendered site blocks (§3.5 example)", () => {
 describe("SSO routes (§3.5, §3.9, FD-11)", () => {
   const sso: EdgeHttpRoute = { ...www, access: "sso", bypassPaths: ["/webhooks/*"] };
   const caddyfile = render([sso]);
-  const body = site(caddyfile, "www.example.com");
+  const body = site(caddyfile, "www.example.com")!;
 
   test("planEdge serves an SSO route and omits one with an invalid bypass", () => {
     const bad: EdgeHttpRoute = { ...sso, id: "rt_bad1", hostname: "bad.example.com", bypassPaths: ["/*"] };
@@ -373,13 +373,13 @@ describe("SSO routes (§3.5, §3.9, FD-11)", () => {
   });
 
   test("without bypass paths there is no bypass handler", () => {
-    const plain = site(render([{ ...sso, bypassPaths: [] }]), "www.example.com");
+    const plain = site(render([{ ...sso, bypassPaths: [] }]), "www.example.com")!;
     expect(plain).not.toContain("@ark_bypass");
     expect(plain).not.toContain("bypass-check");
   });
 
   test("a public route never renders forward_auth or bypasses", () => {
-    const publicBody = site(render([{ ...www, bypassPaths: ["/webhooks/*"] }]), "www.example.com");
+    const publicBody = site(render([{ ...www, bypassPaths: ["/webhooks/*"] }]), "www.example.com")!;
     expect(publicBody).not.toContain("forward_auth");
     expect(publicBody).not.toContain("ARK_EDGE_GATE_TOKEN");
     expect(publicBody).toContain("  handle /.ark/gate/* {\n    respond 404\n  }\n");
