@@ -814,10 +814,15 @@ try {
     `refused — ${lastLine(tls12.stderr) || lastLine(tls12.stdout)}`,
   );
   // Negative control: the assertion must fail against a real TLS-1.2-enabled listener.
+  // The served key is uid 1000's 0600 file now; read it as the host user (on a Linux runner that
+  // is not uid 1000, a direct read fails with EACCES).
+  const served = await asHost(async () => ({
+    key: await Bun.file(join(certDir, "privkey.pem")).text(),
+    cert: await Bun.file(join(certDir, "fullchain.pem")).text(),
+  }));
   const tls12Listener = createTlsServer(
     {
-      key: await Bun.file(join(certDir, "privkey.pem")).text(),
-      cert: await Bun.file(join(certDir, "fullchain.pem")).text(),
+      ...served,
       minVersion: "TLSv1.2",
       maxVersion: "TLSv1.2",
     },
@@ -2012,6 +2017,9 @@ try {
       certificateId: coordNext.id,
       now: new Date(),
     });
+    // The state trees belong to uid 1000; take them back as the host user to stage the files,
+    // and hand them back below (chownState(arkUid)) before the coordinator stand-in starts.
+    await chownState(hostUid);
     const certRoot = join(work, "tmp", "certs");
     for (const endpoint of await platform`SELECT hostname FROM endpoints WHERE kind = 'database'`) {
       const directory = join(certRoot, String(endpoint.hostname));
