@@ -26,7 +26,7 @@ function "refs" {
 }
 
 group "default" {
-  targets = ["app", "database-worker", "database-ingress", "domain-worker", "edge-watchdog", "haproxy-validator", "mail-worker", "backup-worker", "agent"]
+  targets = ["app", "database-worker", "database-ingress", "domain-worker", "edge-watchdog", "haproxy-validator", "mail-worker", "backup-worker", "postgres", "app-postgres", "agent"]
 }
 
 target "_common" {
@@ -94,6 +94,19 @@ target "backup-worker" {
   inherits = ["_app"]
   target   = "backup-worker"
   tags     = refs("ark-backup-worker")
+}
+
+# PostgreSQL clusters with pgBackRest and the backup executor (docs/design/front-door.md §3.18.1, FD-21).
+target "postgres" {
+  inherits = ["_app"]
+  target   = "postgres-backup"
+  tags     = refs("ark-postgres")
+}
+
+target "app-postgres" {
+  inherits = ["_app"]
+  target   = "app-postgres-backup"
+  tags     = refs("ark-app-postgres")
 }
 
 target "agent" {

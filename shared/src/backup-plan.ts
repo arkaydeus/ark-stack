@@ -1,11 +1,21 @@
+import { pgbackrestArgv, type PgBackupType } from "./pg-backup.ts";
+
 export type BackupKind = "platform-postgres" | "app-postgres" | "mail" | "volume";
 
-export function backupCommand(kind: BackupKind, target: string, repository = target) {
+export function backupCommand(
+  kind: BackupKind,
+  target: string,
+  repository = target,
+  type: PgBackupType = "full",
+) {
   if (kind === "platform-postgres" || kind === "app-postgres") {
+    // Runs inside the cluster's PostgreSQL container through its executor (FD-21), into the local
+    // encrypted repo2; backup.export then ships staged copies off the VPS.
     return {
-      argv: ["pgbackrest", `--stanza=${target}`, "--type=full", "backup"],
+      argv: pgbackrestArgv("backup", target, { type }),
       tool: "pgbackrest",
-      notes: "Physical base backup plus WAL archival. pg_dump alone is not PITR.",
+      notes:
+        "Physical backup into the local encrypted repo2 plus WAL archival; exported off-VPS as restic snapshots. pg_dump alone is not PITR.",
     };
   }
   if (kind === "mail") {
@@ -46,6 +56,7 @@ export function restoreTestCommand(
       argv: [
         "pgbackrest",
         `--stanza=${target}`,
+        "--repo=2",
         `--set=${backupId}`,
         `--pg1-path=${restoreRoot}/postgres`,
         "--delta=n",
@@ -68,7 +79,15 @@ export function restoreTestCommand(
   };
 }
 
-export type BackupStatus = "queued" | "planned" | "uploaded" | "integrity_ok" | "restore_verified" | "failed";
+/** `local`: a PostgreSQL backup in the VPS-local repo2 that no off-VPS target has yet (FD-21). */
+export type BackupStatus =
+  | "queued"
+  | "planned"
+  | "local"
+  | "uploaded"
+  | "integrity_ok"
+  | "restore_verified"
+  | "failed";
 
 export function backupProofAllowed(input: { executed?: boolean; status: string }) {
   return (

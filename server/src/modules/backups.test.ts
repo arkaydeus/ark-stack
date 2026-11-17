@@ -27,16 +27,30 @@ describe("backup execution evidence", () => {
   });
 
   test("restore execution uses the native snapshot id, not a control-plane row id", async () => {
+    // FD-21: the backup itself runs in the cluster's executor; a fake executor answers here.
+    const requests: Array<{ path: string; auth: string | null; body: unknown }> = [];
+    const executor = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        requests.push({
+          path: new URL(request.url).pathname,
+          auth: request.headers.get("authorization"),
+          body: await request.json(),
+        });
+        return Response.json({ label: "snap-123", type: "full", output: "" });
+      },
+    });
+    const previousUrl = process.env.ARK_PLATFORM_PG_EXECUTOR_URL;
+    const previousToken = process.env.ARK_PLATFORM_PG_EXECUTOR_TOKEN;
+    process.env.ARK_PLATFORM_PG_EXECUTOR_URL = `http://127.0.0.1:${executor.port}`;
+    process.env.ARK_PLATFORM_PG_EXECUTOR_TOKEN = "executor-token-0123456789-abcdef";
     const directory = await mkdtemp(join(tmpdir(), "ark-backup-"));
     const binary = join(directory, "pgbackrest");
     const argsFile = join(directory, "restore.args");
     await writeFile(
       binary,
       `#!/bin/sh
-if echo "$@" | grep -q ' backup'; then
-  echo "backup label: snap-123"
-  exit 0
-fi
 echo "$@" > "${argsFile}"
 exit 0
 `,
@@ -52,14 +66,25 @@ exit 0
     try {
       const backup = await runBackup("platform-postgres", "platform");
       expect(backup.snapshotId).toBe("snap-123");
+      // Local until a stage containing it reaches an off-VPS target.
+      expect(backup.status).toBe("local");
+      expect(requests).toEqual([
+        { path: "/v1/backup", auth: "Bearer executor-token-0123456789-abcdef", body: { type: "full" } },
+      ]);
       const restore = await runRestoreTest("platform-postgres", "platform", "snap-123");
       expect(restore.executed).toBe(true);
       expect(restore.argv).toContain("--set=snap-123");
+      expect(restore.argv).toContain("--repo=2");
       expect(restore.argv.some((item) => item.startsWith("bak_"))).toBe(false);
       const args = await Bun.file(argsFile).text();
       expect(args).toContain("--set=snap-123");
       expect(args).not.toContain("bak_");
     } finally {
+      executor.stop(true);
+      if (previousUrl === undefined) delete process.env.ARK_PLATFORM_PG_EXECUTOR_URL;
+      else process.env.ARK_PLATFORM_PG_EXECUTOR_URL = previousUrl;
+      if (previousToken === undefined) delete process.env.ARK_PLATFORM_PG_EXECUTOR_TOKEN;
+      else process.env.ARK_PLATFORM_PG_EXECUTOR_TOKEN = previousToken;
       process.env.PATH = previousPath;
       if (previousExecute === undefined) delete process.env.ARK_BACKUP_EXECUTE;
       else process.env.ARK_BACKUP_EXECUTE = previousExecute;

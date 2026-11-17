@@ -1,7 +1,16 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import { backupCommand, createId, restoreTestCommand, type BackupKind } from "@ark-stack/shared";
+import {
+  PG_CLUSTERS,
+  backupCommand,
+  createId,
+  restoreTestCommand,
+  type BackupKind,
+  type PgBackupType,
+} from "@ark-stack/shared";
+
+import { clusterForBackupKind, runPgBackup } from "./pg-executor-client.ts";
 
 const exec = promisify(execFile);
 
@@ -17,37 +26,64 @@ function resolvedBackupLocation(kind: BackupKind, targetId: string) {
   }
   if (kind === "platform-postgres") {
     if (targetId !== "platform") throw new Error("Platform PostgreSQL backups require the platform target.");
-    return { target: process.env.ARK_PLATFORM_PGBACKREST_STANZA ?? "ark-platform", repository: "" };
+    return { target: PG_CLUSTERS.platform.stanza, repository: "" };
   }
   if (kind === "app-postgres") {
-    return { target: process.env.ARK_APP_PGBACKREST_STANZA ?? "ark-app", repository: "" };
+    return { target: PG_CLUSTERS.app.stanza, repository: "" };
   }
-  const repository = process.env.RESTIC_REPOSITORY;
-  if (process.env.ARK_BACKUP_EXECUTE === "1" && !repository) {
-    throw new Error("RESTIC_REPOSITORY is required for mail and volume backups.");
-  }
-  return { target: targetId, repository: repository ?? "configured-restic-repository" };
+  // Mail and volume backups go to the restic repository of every enabled off-VPS target (FD-21).
+  return { target: targetId, repository: "backup-targets" };
 }
 
-export async function runBackup(kind: BackupKind, targetId: string) {
+function filesPath(kind: BackupKind, targetId: string) {
+  return kind === "mail" ? "/var/lib/stalwart-snapshot" : `/var/lib/ark/volumes/${targetId}`;
+}
+
+export async function runBackup(kind: BackupKind, targetId: string, options: { type?: PgBackupType } = {}) {
   const location = resolvedBackupLocation(kind, targetId);
-  const plan = backupCommand(kind, location.target, location.repository);
+  const type = options.type ?? "full";
+  const plan = backupCommand(kind, location.target, location.repository, type);
   requireExecution();
   if (process.env.ARK_BACKUP_EXECUTE !== "1") {
     return { status: "planned" as const, executed: false, argv: plan.argv, notes: plan.notes };
   }
+  const cluster = clusterForBackupKind(kind);
+  if (cluster) {
+    // The executor inside the PostgreSQL container runs pgBackRest; the result is a local backup
+    // until backup.export ships a stage containing it.
+    const result = await runPgBackup(cluster, type);
+    return {
+      status: "local" as const,
+      executed: true,
+      argv: plan.argv,
+      notes: plan.notes,
+      snapshotId: result.label,
+      output: (result.output ?? "").slice(0, 2000),
+    };
+  }
   if (kind === "mail" && process.env.ARK_MAIL_SNAPSHOT_READY !== "1") {
     throw new Error("Mail backup requires a completed native snapshot or quiesce step.");
   }
-  const { stdout, stderr } = await exec(plan.argv[0], plan.argv.slice(1), { timeout: 120_000 });
-  const output = `${stdout}\n${stderr}`;
+  const { exportFiles } = await import("./offsite-backups.ts");
+  const source = kind === "mail" ? "mail" : `volume:${targetId}`;
+  const results = await exportFiles(source, filesPath(kind, targetId), []);
+  const failed = results.filter((item) => item.error);
+  const snapshotId = results.find((item) => item.snapshotId)?.snapshotId;
+  if (failed.length || !snapshotId) {
+    throw new Error(
+      `Backup to ${failed.length} target(s) failed: ${failed
+        .map((item) => item.error)
+        .join("; ")
+        .slice(0, 800)}`,
+    );
+  }
   return {
     status: "uploaded" as const,
     executed: true,
     argv: plan.argv,
     notes: plan.notes,
-    snapshotId: nativeSnapshotId(kind, output),
-    output: output.slice(0, 2000),
+    snapshotId,
+    targets: results,
   };
 }
 
@@ -79,21 +115,4 @@ export async function runRestoreTest(kind: BackupKind, targetId: string, backupI
     validation: "Restored bytes require service boot and data/access assertions before proof.",
     output: output.slice(0, 2000),
   };
-}
-
-function nativeSnapshotId(kind: BackupKind, output: string) {
-  if (kind === "platform-postgres" || kind === "app-postgres") {
-    const match = /(?:backup label|label)\s*[:=]\s*([\w-]+)/i.exec(output);
-    if (match?.[1]) return match[1];
-  } else {
-    for (const line of output.split("\n").toReversed()) {
-      try {
-        const parsed = JSON.parse(line) as { snapshot_id?: string };
-        if (parsed.snapshot_id) return parsed.snapshot_id;
-      } catch {
-        continue;
-      }
-    }
-  }
-  throw new Error("Backup tool completed without a native snapshot identifier.");
 }
