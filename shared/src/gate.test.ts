@@ -271,3 +271,44 @@ describe("revocation deadline (§3.9.3)", () => {
     expect(caddyLongLivedStreams(config, new Set(["rt_b"]), 300_000)).toEqual([]);
   });
 });
+
+/** Caddy `path` semantics for the allowlists: exact, or a prefix when the pattern ends with `*`. */
+const matches = (pattern: string, path: string) =>
+  pattern.endsWith("*") ? path.startsWith(pattern.slice(0, -1)) : pattern === path;
+const allowlists = (caddyfile: string) =>
+  [...caddyfile.matchAll(/^\s*@(?:browserApi|adminAuth|gateApi) path (.+)$/gm)].flatMap((match) =>
+    match[1]!.trim().split(/\s+/),
+  );
+
+describe("edge-only handlers are on no public or tailnet allowlist (§3.3, §3.9.4)", () => {
+  test("the public admin site, the login origin and the tailnet gateway never forward /api/gate/*", async () => {
+    const { renderCaddyfile } = await import("./edge.ts");
+    const { GATE_EDGE_API_PATHS } = await import("./gate.ts");
+    const rendered = renderCaddyfile({
+      adminMode: "public",
+      adminHostname: "admin.example.com",
+      challengeDir: "/var/lib/ark/acme",
+      apiUpstream: "api:3000",
+      gate: { hostname: "login.example.com" },
+      certificates: ["admin.example.com", "login.example.com"].map((hostname) => ({
+        hostname,
+        status: "issued",
+        fullchain: `/c/${hostname}.pem`,
+        privkey: `/k/${hostname}.pem`,
+      })),
+    });
+    const tailnet = await Bun.file(new URL("../../infra/platform/TailnetCaddyfile", import.meta.url)).text();
+    for (const [name, caddyfile] of [
+      ["public edge", rendered],
+      ["tailnet gateway", tailnet],
+    ] as const) {
+      const patterns = allowlists(caddyfile);
+      expect(patterns.length, name).toBeGreaterThan(5);
+      for (const path of [...GATE_EDGE_API_PATHS, "/api/gate/users"])
+        expect(
+          patterns.filter((pattern) => matches(pattern, path)),
+          `${name} ${path}`,
+        ).toEqual([]);
+    }
+  });
+});
