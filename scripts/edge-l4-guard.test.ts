@@ -18,6 +18,8 @@ test.each(["Success=0", "disconnect"])(
         haproxy:
           '#!/bin/sh\necho $$ > "$TEST_ROOT/pid"\ntrap "exit 0" USR1 TERM INT\nwhile :; do sleep 0.1; done\n',
         wget: '#!/bin/sh\ncase "$*" in *supervise*) echo ok;; *) cat "$TEST_ROOT/decision";; esac\n',
+        // The guard bounds each request with `timeout`, which stock macOS lacks; pass through.
+        timeout: '#!/bin/sh\nshift\nexec "$@"\n',
         socat: `#!/bin/sh\ncat >/dev/null\nif [ ! -f "$TEST_ROOT/attempt" ]; then\n touch "$TEST_ROOT/attempt"\n ${failure === "disconnect" ? "exit 1" : "echo Success=0"}\nelse\n echo Success=1\n touch "$TEST_ROOT/succeeded"\nfi\n`,
         pkill: '#!/bin/sh\nkill -KILL "$(cat "$TEST_ROOT/pid")" 2>/dev/null || true\n',
       };
