@@ -75,7 +75,7 @@ function sealing() {
   return { rootKey: env.rootKey, rootKeyId: env.rootKeyId };
 }
 
-async function auditEvent(input: {
+export async function auditEvent(input: {
   actorId?: string | null;
   action: string;
   databaseId: string;
@@ -118,7 +118,7 @@ export async function databaseClientContext(databaseId: string, executor: Pick<t
 }
 
 /** One recursive query for all connected generations, including cross-CA rollovers. */
-async function loadLinkedCertificates(caIds: string[], executor: Pick<typeof db, "select"> = db) {
+export async function loadLinkedCertificates(caIds: string[], executor: Pick<typeof db, "select"> = db) {
   if (!caIds.length) return [];
   return executor.select().from(clientCertificates).where(sql`${clientCertificates.id} IN (
     WITH RECURSIVE linked AS (
@@ -130,7 +130,8 @@ async function loadLinkedCertificates(caIds: string[], executor: Pick<typeof db,
   )`);
 }
 
-function certificateChain(caId: string, rows: CertificateRow[]) {
+/** The certificates of the chain through `caId`, oldest first (rollovers cross CAs). */
+export function certificateChain(caId: string, rows: CertificateRow[]) {
   const byId = new Map(rows.map((row) => [row.id, row]));
   const predecessors = new Map<string, CertificateRow[]>();
   for (const row of rows)
@@ -151,8 +152,11 @@ function certificateChain(caId: string, rows: CertificateRow[]) {
   return [...seen.values()].toSorted((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 }
 
-async function linkedCertificates(client: Pick<ClientRow, "caId">) {
-  return certificateChain(client.caId, await loadLinkedCertificates([client.caId]));
+export async function linkedCertificates(
+  client: Pick<ClientRow, "caId">,
+  executor: Pick<typeof db, "select"> = db,
+) {
+  return certificateChain(client.caId, await loadLinkedCertificates([client.caId], executor));
 }
 
 /** The certificate a client connects with now: its current (or newest issued) generation. */

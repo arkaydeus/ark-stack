@@ -1,8 +1,10 @@
 import { createId } from "@ark-stack/shared";
-import { desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 
 import { db } from "../db.ts";
 import { alerts, backups, certificates, operations } from "../schema.ts";
+
+const SEVERITY_RANK: Record<string, number> = { info: 0, warning: 1, critical: 2 };
 
 export async function raiseAlert(input: {
   severity: "warning" | "critical" | "info";
@@ -20,6 +22,23 @@ export async function raiseAlert(input: {
         .returning();
       if (reopened) await maybeNotify(reopened);
       return reopened ?? row;
+    }
+    if (row.severity !== input.severity || row.title !== input.title) {
+      // An open alert keeps its identity while its severity moves (the FD-28 rollover alert goes
+      // info → warning → critical). An escalation is news: clear the acknowledgement and the
+      // notification throttle so it is delivered again.
+      const escalated = (SEVERITY_RANK[input.severity] ?? 0) > (SEVERITY_RANK[row.severity] ?? 0);
+      const [updated] = await db
+        .update(alerts)
+        .set({
+          severity: input.severity,
+          title: input.title,
+          ...(escalated ? { acknowledged: false, lastNotifiedAt: null, notificationAttempts: 0 } : {}),
+        })
+        .where(eq(alerts.id, row.id))
+        .returning();
+      if (updated) await maybeNotify(updated);
+      return updated ?? row;
     }
     await maybeNotify(row);
     return row;
@@ -59,6 +78,14 @@ async function maybeNotify(row: typeof alerts.$inferSelect) {
       notificationAttempts: row.notificationAttempts + 1,
     })
     .where(eq(alerts.id, row.id));
+}
+
+/** Resolve every open alert with exactly this dedup key. */
+export async function resolveAlert(dedupKey: string, at = new Date()) {
+  await db
+    .update(alerts)
+    .set({ resolvedAt: at })
+    .where(and(eq(alerts.dedupKey, dedupKey), isNull(alerts.resolvedAt)));
 }
 
 export async function evaluateAlerts() {
