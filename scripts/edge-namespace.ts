@@ -1,6 +1,6 @@
-// Puts `network_mode: service:` dependents (today `edge`, later `edge-l4`) back into their owner's
-// live namespace. A restarted or recreated `edge-ts` leaves `edge` running with only loopback, so the
-// public edge stops serving until `edge` is recreated (docs/design/front-door.md §3.6).
+// Puts `network_mode: service:` dependents (`edge` and `edge-l4`) back into their owner's live
+// namespace. A restarted or recreated `edge-ts` leaves them running with only loopback, so the public
+// edge stops serving until they are recreated (docs/design/front-door.md §3.6).
 //
 // `mise run maintain` runs this after every applied release; `mise run edge:rejoin` runs it on demand,
 // for example after enrolling the edge node or after `edge-ts` restarted on its own.
@@ -60,7 +60,7 @@ export type RejoinOptions = {
 
 /** Recreates stale edge dependents only; their namespace owners must already be running. */
 export async function rejoinNamespaceDependents(
-  { project, composeArgs, services = ["edge"], log = console.log }: RejoinOptions,
+  { project, composeArgs, services = ["edge", "edge-l4"], log = console.log }: RejoinOptions,
   io = { projectContainers, recreate: recreateDependents },
 ) {
   const containers = await io.projectContainers(project);

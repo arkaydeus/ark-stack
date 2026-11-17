@@ -9,6 +9,7 @@ export const imageTargets = [
   "database-worker",
   "domain-worker",
   "edge-watchdog",
+  "haproxy-validator",
   "mail-worker",
 ];
 export const imageSource = "https://github.com/arkaydeus/ark-stack";
@@ -60,5 +61,5 @@ if (import.meta.main) {
   const [code, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
   assert.equal(code, 0, "Bake --print failed");
   checkImagePlan(JSON.parse(output));
-  console.log("All seven Bake targets retain index source annotations and minimal provenance.");
+  console.log("All nine Bake targets retain index source annotations and minimal provenance.");
 }

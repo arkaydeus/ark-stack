@@ -33,7 +33,7 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/edge-namespace.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts"
 
 [tasks."test:e2e"]
 description = "Run fresh-volume browser onboarding against a disposable local database"
@@ -48,12 +48,13 @@ description = "Run native mail lifecycle checks against a disposable pinned Stal
 run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts"
 
 [tasks."test:edge"]
-description = "Check edge harness cleanup and pins, validate Caddy configurations, test edge behaviour, the public database port nftables rules, the LocalAPI deployment and route withdrawal"
+description = "Check edge harness cleanup and pins, validate Caddy configurations, test edge behaviour, the public database port nftables rules, the LocalAPI deployment, route withdrawal and the HAProxy SNI router (edge-l4)"
 run = [
   "bun test scripts/edge-test",
   "bun scripts/test-edge-config.ts",
   "bun scripts/test-db-ingress.ts",
   "bun scripts/test-edge-observer.ts",
+  "bun scripts/test-edge-l4.ts",
 ]
 
 [tasks."test:pgbouncer"]
@@ -189,7 +190,7 @@ raw_args = true
 run = "bun --env-file=.env scripts/maintain.ts"
 
 [tasks."edge:rejoin"]
-description = "Recreate edge (and later edge-l4) if edge-ts was restarted or replaced under it"
+description = "Recreate edge and edge-l4 if edge-ts was restarted or replaced under it"
 run = "bun --env-file=.env scripts/edge-namespace.ts"
 
 [tasks."test:edge-tailnet"]

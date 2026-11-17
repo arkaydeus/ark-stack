@@ -44,6 +44,7 @@ import { loadEnv } from "./env.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
+import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
 import { edgePolicy, observeEdgeTailnet, startEdgeObserveSchedule } from "./modules/edge-observe.ts";
 import { edgeLocalApi, edgeSocketPath } from "./modules/tailnet-localapi.ts";
 import {
@@ -526,6 +527,7 @@ export async function runOperation(
   if (kind === "ses.reconcile") return reconcileSesOp(operation);
   if (kind === "pgbouncer.reload") return reloadPgbouncer(operation);
   if (kind === "edge.apply") return applyEdge(operation);
+  if (kind === "edge.l4_apply") return applyEdgeL4(operation);
   if (kind === "edge.observe") return observeEdge(operation);
   if (kind === "edge.drain") return drainEdge(operation);
   if (kind === "update.detect") return detectUpdates(operation);
@@ -1784,6 +1786,36 @@ async function applyEdge(operation: OperationRow) {
     unrouted: plan.appRoutes.map((route) => route.hostname),
     awaitingCertificate: plan.awaitingCertificate,
   });
+  // The SNI router names every hostname Caddy serves; a queued edge.l4_apply is reused.
+  if (edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+}
+
+/**
+ * Serializes edge-l4 apply, reload and drain (§3.8.6: one edge lock). A transaction-scoped advisory
+ * lock, so a crashed worker never leaves it held.
+ */
+async function withEdgeLock<T>(work: () => Promise<T>) {
+  return (await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtext('ark:edge:l4'))`;
+    return work();
+  })) as T;
+}
+
+// HAProxy SNI router on 443 (front door §3.8.5, FD-25): HTTP, admin and login hostnames go to Caddy
+// over PROXY v2; unknown SNI goes to Caddy too; non-TLS is rejected after 5 s. TLS-TCP routes arrive
+// with FD-14, so no tailnet backend is rendered here yet.
+async function applyEdgeL4(operation: OperationRow) {
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const plan = await edgePlan(
+    settings?.adminMode === "tailnet" ? "tailnet" : "public",
+    settings?.adminHostname,
+  );
+  const httpHostnames = plan.certificates
+    .filter((certificate) => certificate.status === "issued")
+    .map((certificate) => certificate.hostname);
+  const written = await withEdgeLock(() => writeEdgeL4({ httpHostnames, tlsRoutes: [] }));
+  await addStep(operation.id, "edge-l4-apply", written);
+  return written;
 }
 
 /** Thrown when `edge.observe` has no LocalAPI to read; nothing is changed. */
@@ -1843,8 +1875,8 @@ async function reconcileServedRoutes() {
 export const EDGE_WITHDRAWAL_ALERT = "edge-withdrawal";
 
 // Withdraws tailnet backends that the current policy no longer allows from the running proxies.
-// Caddy is enforced through its admin API here and by the edge-local watchdog every second; the
-// HAProxy adapter (every worker generation, master CLI) is an FD-25 integration gate.
+// Caddy is enforced through its admin API and HAProxy through its master CLI (every current and
+// leaving worker, admission first), here and by the edge-local watchdog every second.
 async function drainEdge(operation: OperationRow) {
   const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
   const backends = Array.isArray(operation.payload.backends) ? operation.payload.backends : [];
@@ -1855,7 +1887,7 @@ async function drainEdge(operation: OperationRow) {
     await addStep(operation.id, "edge-drain", {
       backends,
       caddy: "not configured",
-      haproxy: "not deployed (FD-25)",
+      haproxy: await drainHaproxy(allowedBackends(await edgePolicy())),
     });
     return;
   }
@@ -1877,13 +1909,36 @@ async function drainEdge(operation: OperationRow) {
     throw new Error(`Caddy withdrawal failed; ${outcome}: ${result.error}`);
   }
   if (result.unreachable) throw new Error(result.error);
+  const haproxy = await drainHaproxy(allowed);
   await addStep(operation.id, "edge-drain", {
     reason: operation.payload.reason ?? null,
     routeIds: operation.payload.routeIds ?? [],
     backends,
     caddy: { active: result.active, withdrawn: result.withdrawn },
-    haproxy: "not deployed (FD-25)",
+    haproxy,
   });
+}
+
+/** HAProxy half of `edge.drain`, under the edge lock; a failure stops HAProxy and alerts. */
+async function drainHaproxy(allowed: ReadonlySet<string>) {
+  const adapter = haproxyAdapter();
+  if (!adapter) return "not configured";
+  const result = await withEdgeLock(() => adapter.enforce(allowed));
+  if (result.error) {
+    let outcome = "HAProxy listeners were shut down";
+    try {
+      await adapter.stop();
+    } catch (error) {
+      outcome = `HAProxy stop failed: ${(error as Error).message}`;
+    }
+    await raiseAlert({
+      severity: "critical",
+      title: `Edge route withdrawal failed; ${outcome} (${result.error})`,
+      dedupKey: EDGE_WITHDRAWAL_ALERT,
+    });
+    throw new Error(`HAProxy withdrawal failed; ${outcome}: ${result.error}`);
+  }
+  return { active: result.active, withdrawn: result.withdrawn };
 }
 
 /** Schedules `edge.observe` every five minutes where the edge node's socket is mounted (§3.4). */

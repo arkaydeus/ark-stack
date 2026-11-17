@@ -87,3 +87,17 @@ test("propagates recreation failures without claiming success", async () => {
     }),
   ).rejects.toThrow(/docker compose exited 1/);
 });
+
+test("edge-l4 shares edge-ts's namespace and is repaired by default alongside edge", async () => {
+  const l4: NamespaceContainer = { ...edge, service: "edge-l4", id: "edge-l4", running: false };
+  let repaired = false;
+  await expect(
+    rejoinNamespaceDependents(options, {
+      projectContainers: async () => [owner, edge, { ...l4, running: repaired }],
+      recreate: async (_args, services) => {
+        expect(services).toEqual(["edge-l4"]);
+        repaired = true;
+      },
+    }),
+  ).resolves.toEqual([{ service: "edge-l4", parent: "edge-ts", reason: "not-running" }]);
+});

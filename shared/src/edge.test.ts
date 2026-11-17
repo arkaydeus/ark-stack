@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  CADDY_GLOBAL_BLOCK,
   currentEdgeCertificates,
   edgeCertificatePaths,
   planEdge,
@@ -52,7 +53,7 @@ describe("edge Caddyfile certificates", () => {
     expect([...rendered.keys()]).toEqual([":80", "admin.example.com", "example.com", "www.example.com"]);
     for (const hostname of ["admin.example.com", "example.com", "www.example.com"]) {
       expect(rendered.get(hostname)).toStartWith(
-        `  tls /var/lib/ark/certs/${hostname}/fullchain.pem /var/lib/ark/certs/${hostname}/privkey.pem\n`,
+        `  bind 127.0.0.1\n  tls /var/lib/ark/certs/${hostname}/fullchain.pem /var/lib/ark/certs/${hostname}/privkey.pem\n`,
       );
     }
     for (const hostname of ["pending", "failed", "untrusted", "nocert"]) {
@@ -270,5 +271,47 @@ describe("tailnet routes (front door §3.2, FD-06)", () => {
     const plan = planEdge({ adminMode: "tailnet", endpoints: [], certificates: [], tailnetRoutes: [route] });
     expect(plan.tailnetRoutes).toEqual([route]);
     expect(plan.awaitingCertificate).toEqual(["www.example.com"]);
+  });
+});
+
+describe("Caddyfile global block behind the HAProxy SNI router (§3.5, FD-25)", () => {
+  const caddyfile = renderCaddyfile({
+    ...base,
+    adminMode: "public",
+    adminHostname: "admin.example.com",
+    certificates: [certificate("admin.example.com", "issued")],
+  });
+
+  test("every render starts with the §3.5 global block", () => {
+    expect(caddyfile.startsWith(`${CADDY_GLOBAL_BLOCK}\n`)).toBe(true);
+    expect(renderCaddyfile({ ...base, adminMode: "tailnet" }).startsWith(CADDY_GLOBAL_BLOCK)).toBe(true);
+  });
+
+  test("HTTPS moves to the loopback 8443 listener with a required PROXY header and strict SNI", () => {
+    expect(CADDY_GLOBAL_BLOCK).toContain("  https_port 8443\n");
+    const scoped = /servers 127\.0\.0\.1:8443 \{([\s\S]*?)\n {2}\}/.exec(CADDY_GLOBAL_BLOCK)?.[1] ?? "";
+    expect(scoped).toMatch(
+      /listener_wrappers \{\s+proxy_protocol \{[^}]*fallback_policy require\s+\}\s+tls\s+\}/,
+    );
+    // An allow list would select optional USE instead of REQUIRE; trusted_proxies is never set.
+    expect(scoped).not.toMatch(/^\s*allow\b/m);
+    expect(CADDY_GLOBAL_BLOCK).not.toMatch(/^\s*trusted_proxies/m);
+    expect(scoped).toContain("strict_sni_host on");
+    expect(scoped).toContain("protocols h1 h2");
+    expect(scoped).toContain("read_header 10s");
+  });
+
+  test("the public :80 server never parses PROXY headers and HTTP/3 is off everywhere", () => {
+    // The only listener wrapper is scoped to 127.0.0.1:8443.
+    expect(CADDY_GLOBAL_BLOCK.match(/listener_wrappers/g)).toHaveLength(1);
+    expect(CADDY_GLOBAL_BLOCK.match(/protocols h1 h2/g)).toHaveLength(2);
+    expect(CADDY_GLOBAL_BLOCK).not.toContain("h3");
+    expect(caddyfile).toMatch(/^:80 \{$/m);
+  });
+
+  test("HTTPS sites bind to loopback only", () => {
+    const bodies = [...sites(caddyfile).entries()].filter(([address]) => address !== ":80");
+    expect(bodies.length).toBe(1);
+    for (const [, body] of bodies) expect(body.startsWith("  bind 127.0.0.1\n")).toBe(true);
   });
 });

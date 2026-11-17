@@ -26,7 +26,7 @@ function "refs" {
 }
 
 group "default" {
-  targets = ["app", "database-worker", "database-ingress", "domain-worker", "edge-watchdog", "mail-worker", "backup-worker", "agent"]
+  targets = ["app", "database-worker", "database-ingress", "domain-worker", "edge-watchdog", "haproxy-validator", "mail-worker", "backup-worker", "agent"]
 }
 
 target "_common" {
@@ -76,6 +76,12 @@ target "edge-watchdog" {
   inherits = ["_app"]
   target   = "edge-watchdog"
   tags     = refs("ark-edge-watchdog")
+}
+
+target "haproxy-validator" {
+  inherits = ["_app"]
+  target   = "haproxy-validator"
+  tags     = refs("ark-haproxy-validator")
 }
 
 target "mail-worker" {

@@ -71,7 +71,7 @@ jobs:
       - run: bunx tsc --noEmit -p web/tsconfig.json
       - run: bunx tsc --noEmit -p workers/tsconfig.json
       - run: bunx tsc --noEmit -p scripts/tsconfig.publish.json
-      - run: bun test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/edge-namespace.test.ts
+      - run: bun test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts
       - run: ARK_DOCKER_INTEGRATION=1 go test ./...
         working-directory: agent
       - run: bun run --cwd web build
@@ -87,6 +87,7 @@ jobs:
           bun scripts/test-edge-config.ts
       - run: bun scripts/test-db-ingress.ts
       - run: bun scripts/test-edge-observer.ts
+      - run: bun scripts/test-edge-l4.ts
       - uses: docker/setup-buildx-action@v3
       - run: bun scripts/check-image-plan.ts
       - name: Cold build every image with the filtered build context
