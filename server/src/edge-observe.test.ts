@@ -65,10 +65,11 @@ async function addRoute(input: {
   port: number;
   status: string;
   certificate?: boolean;
+  domainId?: string;
 }) {
   const endpointId = createId("end");
   const routeId = `rt_${createId("x").slice(2, 18)}`;
-  await sql`INSERT INTO endpoints (id, kind, hostname) VALUES (${endpointId}, 'route', ${`${routeId.slice(3)}.example.com`})`;
+  await sql`INSERT INTO endpoints (id, kind, hostname, domain_id) VALUES (${endpointId}, 'route', ${`${routeId.slice(3)}.example.com`}, ${input.domainId ?? null})`;
   await sql`
     INSERT INTO front_routes (id, kind, endpoint_id, listen_port, target_input, target_node_stable_id,
       target_ip, target_port, access_mode, status, enabled)
@@ -228,6 +229,7 @@ describe("identity pinning and the edge-netns probe", () => {
       ip: "100.101.102.103",
       port: 3000,
       status: "awaiting_acl",
+      certificate: true,
     });
     await observe();
     expect((await route(id)).status).toBe("awaiting_acl");
@@ -393,6 +395,7 @@ describe("lease expiry", () => {
       ip: "100.101.102.103",
       port: 3000,
       status: "awaiting_acl",
+      certificate: true,
     });
     await observe();
     const overview = await tailnetOverview();
@@ -570,6 +573,73 @@ describe("lifecycle recovery", () => {
     mock.state.peers = [home, nas];
     await observe();
     expect((await route(id)).status).toBe("identity_mismatch");
+  });
+});
+
+describe("route lifecycle (FD-08)", () => {
+  const domainId = createId("dom");
+  beforeEach(async () => {
+    await sql`
+      INSERT INTO domain_claims (id, name, ownership_token, status)
+      VALUES (${domainId}, ${`${suffix}.example.com`}, 'ark-own-test', 'verified')
+      ON CONFLICT (id) DO NOTHING
+    `;
+  });
+  afterAll(async () => {
+    await removeRoutes();
+    await sql`DELETE FROM domain_claims WHERE id = ${domainId}`;
+  });
+
+  test("a passing probe moves a new route on to awaiting_dns and queues domain.verify, not ready", async () => {
+    mock.state.reachable.add("100.101.102.103:3000");
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "awaiting_acl",
+      domainId,
+    });
+    const result = await observe();
+    expect((await route(id)).status).toBe("awaiting_dns");
+    expect(result.routes.find((item) => item.id === id)).toMatchObject({
+      from: "awaiting_acl",
+      to: "awaiting_dns",
+    });
+    expect(queued).toContainEqual({ kind: "domain.verify", targetIds: [domainId] });
+    expect((await edgePolicy()).routes.map((item) => item.id)).not.toContain(id);
+    // DNS is re-checked on every observation until it resolves.
+    queued = [];
+    await observe();
+    expect((await route(id)).status).toBe("awaiting_dns");
+    expect(queued).toContainEqual({ kind: "domain.verify", targetIds: [domainId] });
+  });
+
+  test("issuing_certificate becomes ready only with an issued certificate and a passing probe", async () => {
+    const id = await addRoute({
+      target: `home${tailnet}`,
+      stableId: home.id,
+      ip: "100.101.102.103",
+      port: 3000,
+      status: "issuing_certificate",
+      domainId,
+    });
+    mock.state.reachable.add("100.101.102.103:3000");
+    await observe();
+    expect((await route(id)).status).toBe("issuing_certificate");
+    const [row] = await sql`SELECT endpoint_id FROM front_routes WHERE id = ${id}`;
+    await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
+      VALUES (${createId("crt")}, ${row!.endpoint_id}, '[]'::jsonb, 'untrusted', now())`;
+    await observe();
+    expect((await route(id)).status).toBe("issuing_certificate");
+    await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
+      VALUES (${createId("crt")}, ${row!.endpoint_id}, '[]'::jsonb, 'issued', now() + interval '1 second')`;
+    mock.state.reachable.clear();
+    await observe();
+    expect((await route(id)).status).toBe("awaiting_acl");
+    mock.state.reachable.add("100.101.102.103:3000");
+    await observe();
+    expect((await route(id)).status).toBe("ready");
   });
 });
 
