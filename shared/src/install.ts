@@ -16,6 +16,10 @@ export const installEnvKeys = [
   "ARK_OFFHOST_HEARTBEAT_TOKEN",
   "ARK_EDGE_GATE_TOKEN",
   "ARK_EDGE_WATCHDOG_TOKEN",
+  "ARK_PLATFORM_PG_EXECUTOR_TOKEN",
+  "ARK_APP_PG_EXECUTOR_TOKEN",
+  "ARK_PLATFORM_PG_REPO_CIPHER_PASS",
+  "ARK_APP_PG_REPO_CIPHER_PASS",
   "ARK_CONTROL_DB_PASSWORD",
   "ARK_APP_DB_PASSWORD",
   "ARK_API_DB_PASSWORD",
@@ -66,6 +70,13 @@ export function generateInstallSecrets() {
     ARK_EDGE_GATE_TOKEN: randomBytes(32).toString("base64url"),
     // The edge watchdog's read-only lease credential (docs/design/front-door.md §3.2, FD-06).
     ARK_EDGE_WATCHDOG_TOKEN: randomBytes(32).toString("base64url"),
+    // pgBackRest executors inside the PostgreSQL containers (docs/design/front-door.md §3.18.1, FD-21):
+    // per-cluster tokens shared only with the backup worker, and the repo2 cipher passes. Copy the
+    // cipher passes off-host with the restic repository password: an off-VPS restore needs both.
+    ARK_PLATFORM_PG_EXECUTOR_TOKEN: randomBytes(32).toString("base64url"),
+    ARK_APP_PG_EXECUTOR_TOKEN: randomBytes(32).toString("base64url"),
+    ARK_PLATFORM_PG_REPO_CIPHER_PASS: randomBytes(48).toString("base64url"),
+    ARK_APP_PG_REPO_CIPHER_PASS: randomBytes(48).toString("base64url"),
     ARK_CONTROL_DB_PASSWORD: controlPassword,
     ARK_APP_DB_PASSWORD: appPassword,
     ARK_API_DB_PASSWORD: apiPassword,

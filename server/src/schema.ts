@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
+  bigint,
   boolean,
   check,
   index,
@@ -869,6 +870,8 @@ export const backupTargets = pgTable(
     pathStyle: boolean("path_style").notNull().default(false),
     restUrl: text("rest_url"),
     targetNodeStableId: text("target_node_stable_id"), // tailnet_rest: pinned like routes (§3.2)
+    // FD-30 (0025): the pinned address from backup-ts's observation; the only address dialled.
+    targetIp: text("target_ip"),
     credentialSecretId: text("credential_secret_id")
       .notNull()
       .references(() => secrets.id),
@@ -876,9 +879,99 @@ export const backupTargets = pgTable(
     appendOnlyEvidence: jsonb("append_only_evidence").$type<Record<string, unknown>>(),
     lastSuccessAt: timestamp("last_success_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    // FD-21 (0023): provider recipe, recovery window, sealed restic password, optional read-only
+    // verifier, and canary/attempt state.
+    provider: text("provider")
+      .$type<"aws" | "b2" | "r2" | "minio" | "other" | "rest_server">()
+      .notNull()
+      .default("other"),
+    enabled: boolean("enabled").notNull().default(true),
+    recoveryWindowDays: integer("recovery_window_days").notNull().default(30),
+    repositorySecretId: text("repository_secret_id").references(() => secrets.id),
+    verifierSecretId: text("verifier_secret_id").references(() => secrets.id),
+    appendOnlyStatus: text("append_only_status")
+      .$type<"unverified" | "append_only" | "deletable" | "unknown" | "retention_short">()
+      .notNull()
+      .default("unverified"),
+    appendOnlyCheckedAt: timestamp("append_only_checked_at", { withTimezone: true }),
+    retentionUntil: timestamp("retention_until", { withTimezone: true }),
+    lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    configRevision: text("config_revision").notNull().default("legacy"),
+    repositoryRevision: text("repository_revision").notNull().default("legacy"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [check("backup_targets_kind_check", sql`${table.kind} IN ('s3', 'tailnet_rest')`)],
+  (table) => [
+    check("backup_targets_kind_check", sql`${table.kind} IN ('s3', 'tailnet_rest')`),
+    check(
+      "backup_targets_provider_check",
+      sql`${table.provider} IN ('aws', 'b2', 'r2', 'minio', 'other', 'rest_server')`,
+    ),
+    check(
+      "backup_targets_tailnet_rest_shape_check",
+      sql`${table.kind} <> 'tailnet_rest' OR (${table.restUrl} IS NOT NULL AND ${table.targetNodeStableId} IS NOT NULL AND ${table.targetIp} IS NOT NULL AND ${table.provider} = 'rest_server')`,
+    ),
+    check("backup_targets_recovery_window_check", sql`${table.recoveryWindowDays} BETWEEN 1 AND 3650`),
+    check(
+      "backup_targets_append_only_status_check",
+      sql`${table.appendOnlyStatus} IN ('unverified', 'append_only', 'deletable', 'unknown', 'retention_short')`,
+    ),
+    check(
+      "backup_targets_s3_shape_check",
+      sql`${table.kind} <> 's3' OR (${table.endpoint} IS NOT NULL AND ${table.region} IS NOT NULL AND ${table.bucket} IS NOT NULL)`,
+    ),
+    uniqueIndex("backup_targets_name_unique").on(table.name),
+  ],
 );
+
+// Per-destination export manifest (FD-21, 0023): one row per attempt of one source to one target.
+export const backupExports = pgTable(
+  "backup_exports",
+  {
+    id: text("id").primaryKey(),
+    targetId: text("target_id")
+      .notNull()
+      .references(() => backupTargets.id, { onDelete: "cascade" }),
+    repositoryRevision: text("repository_revision").notNull().default("legacy"),
+    source: text("source").notNull(),
+    status: text("status").$type<"succeeded" | "failed">().notNull(),
+    stageId: text("stage_id"),
+    resticSnapshotId: text("restic_snapshot_id"),
+    backupLabels: jsonb("backup_labels")
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    walSegment: text("wal_segment"),
+    lastRecoverableAt: timestamp("last_recoverable_at", { withTimezone: true }),
+    repoBytes: bigint("repo_bytes", { mode: "number" }),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("backup_exports_status_check", sql`${table.status} IN ('succeeded', 'failed')`),
+    check(
+      "backup_exports_recovery_point_check",
+      sql`${table.status} = 'succeeded' OR (${table.lastRecoverableAt} IS NULL AND ${table.resticSnapshotId} IS NULL)`,
+    ),
+    index("backup_exports_target_source_idx").on(table.targetId, table.source, table.createdAt.desc()),
+  ],
+);
+
+// Latest observation of each local pgBackRest source, reported by the PostgreSQL executors.
+export const backupSources = pgTable("backup_sources", {
+  source: text("source").primaryKey(),
+  configured: boolean("configured").notNull().default(false),
+  archiveFailing: boolean("archive_failing").notNull().default(false),
+  repoBytes: bigint("repo_bytes", { mode: "number" }),
+  freeBytes: bigint("free_bytes", { mode: "number" }),
+  totalBytes: bigint("total_bytes", { mode: "number" }),
+  lastStageId: text("last_stage_id"),
+  localRecoverableAt: timestamp("local_recoverable_at", { withTimezone: true }),
+  lastFullAt: timestamp("last_full_at", { withTimezone: true }),
+  lastBackupAt: timestamp("last_backup_at", { withTimezone: true }),
+  detail: jsonb("detail").$type<Record<string, unknown>>(),
+  observedAt: timestamp("observed_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 // Last generated Tailscale policy snippet per scope (0016, front door §3.7, FD-07): the diff baseline.
 export const tailnetAclSnippets = pgTable(
@@ -943,5 +1036,7 @@ export const schema = {
   clientIssueLimits,
   vercelIntegrations,
   backupTargets,
+  backupExports,
+  backupSources,
   tailnetAclSnippets,
 };

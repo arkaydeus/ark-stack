@@ -35,6 +35,20 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 description = "Run unit tests"
 run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts"
 
+[tasks."test:db"]
+description = "Run the DB-backed server tests (or the bun test arguments given) against a throwaway, migrated postgres:17.6 container that is always removed"
+run = "bun --no-env-file scripts/test-db.ts"
+raw_args = true
+
+[tasks."test:db:up"]
+description = "Start and migrate a throwaway test PostgreSQL container and print shell exports plus an isolated ark_test_db test helper"
+run = "bun --no-env-file scripts/test-db.ts up"
+
+[tasks."test:db:down"]
+description = "Remove a throwaway test PostgreSQL container started by test:db:up"
+run = "bun --no-env-file scripts/test-db.ts down"
+raw_args = true
+
 [tasks."test:e2e"]
 description = "Run fresh-volume browser onboarding against a disposable local database"
 run = "bun --env-file=.env scripts/test-e2e.ts"
@@ -65,6 +79,30 @@ run = "bun scripts/test-pgbouncer-public.ts"
 description = "Check the public database port nftables rules (per-source limits, /64 grouping, both hooks), their counters and alerts in a privileged container"
 run = ["bun test shared/src/db-ingress.test.ts", "bun scripts/test-db-ingress.ts"]
 
+[tasks."test:backups"]
+description = "Off-VPS backups (FD-21) against a pinned MinIO, the actual postgres/app-postgres Compose services and a throwaway control database: append-only canary policy classes, the emulated R2 lock recipe, exact-config policy exceptions, Docker restore ownership, deployed-worker outage/file restores, and full PITR recovery of both clusters from the bucket alone (requires Docker)"
+run = [
+  "bunx tsc --noEmit -p scripts/tsconfig.backups.json",
+  "bun test scripts/backup-test/provider-policies.test.ts scripts/offsite-restore.test.ts",
+  "bun scripts/test-backups.ts",
+]
+
+[tasks."test:backups-tailnet"]
+description = "Home-machine backups over the tailnet (FD-30): the shipped backup-ts service (offline tailscaled, userspace, SOCKS5), rest-server --append-only --private-repos on a simulated tailnet, MinIO and a throwaway control database: LocalAPI uid/write denial, pinning from backup-ts's own observation, REST through SOCKS5 only (S3/API unproxied), the canary and V-18, transfers stopped within 5 s on identity replacement, removal or lease expiry, and two-destination health (requires Docker)"
+run = [
+  "bunx tsc --noEmit -p scripts/tsconfig.backups.json",
+  "bun test scripts/backup-test/tailnet-compose.test.ts",
+  "bun scripts/test-backups-tailnet.ts",
+]
+
+[tasks."test:backups-tailnet-live"]
+description = "Opt-in: a backup to a real home rest-server through backup-ts with only the tag:ark-backup -> home:8000 grant, and the live edge deny check; skips without ARK_TEST_TS_BACKUP_AUTHKEY and ARK_TEST_TS_HOME_AUTHKEY"
+run = "bun scripts/test-backups-tailnet-live.ts"
+
+[tasks."test:backups-hosted"]
+description = "Opt-in: the same backup and off-VPS restore against AWS S3, B2 or R2 (virtual-host style); skips without ARK_TEST_S3_* credentials"
+run = "bun scripts/test-backups-hosted.ts"
+
 [tasks."test:tailnet-acl"]
 description = "Validate the generated Tailscale policy snippet against a scratch tailnet (skips without ARK_TEST_TS_POLICY_API_KEY)"
 run = "bun scripts/test-tailnet-acl.ts"
@@ -88,6 +126,8 @@ run = [
   "bunx tsc --noEmit -p workers/tsconfig.json",
   "bunx tsc --noEmit -p scripts/tsconfig.publish.json",
   "bunx tsc --noEmit -p scripts/tsconfig.pgbouncer.json",
+  "bunx tsc --noEmit -p scripts/tsconfig.test-db.json",
+  "bunx tsc --noEmit -p scripts/tsconfig.backups.json",
 ]
 
 [tasks.lint]

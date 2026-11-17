@@ -19,6 +19,9 @@
 //    - hostnames sharing a backend remain independently revocable, including stale-file restarts;
 //    - stopping or freezing the watchdog while serving closes listeners and existing sessions;
 //    - when config inspection or withdrawal fails, Caddy stops and a critical alert is raised.
+//    Listener closure is measured on Caddy's 127.0.0.1:8443 listener itself, by a prober in the edge
+//    namespace (scripts/edge-test/listener.ts), so HAProxy's connect handling on 443 is not counted;
+//    the end-to-end outcome through 443 is checked separately against the same bounds.
 // HAProxy withdrawal is covered by scripts/test-edge-l4.ts (FD-25). It needs a local PostgreSQL (DATABASE_URL), like
 // `mise run test`; it creates and drops its own database.
 import { randomBytes } from "node:crypto";
@@ -33,6 +36,7 @@ import { connect as tlsConnect } from "node:tls";
 import { parseEnvFile } from "@ark-stack/shared";
 import postgres from "postgres";
 
+import { watchListener } from "./edge-test/listener.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
 
@@ -52,7 +56,7 @@ const fixtures = join(import.meta.dir, "edge-test");
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-observer-${suffix}-`));
 const network = `ark-edge-observer-${suffix}`;
-const runtime = new EdgeTestRuntime(directory, network);
+const runtime = new EdgeTestRuntime(directory, network, bunImage);
 const removeSignalHandlers = runtime.installSignalHandlers();
 const docker = (...args: string[]) => runtime.docker(...args);
 const leaseMs = 8_000;
@@ -405,10 +409,14 @@ async function readActiveBackends() {
 
 type Reply = { status: number; body: string };
 
+// Each probe opens a new connection (`agent: false`). With the default pooled keep-alive agent, a
+// poll kept reusing a connection accepted by the pre-reload Caddy, which kept answering with the
+// old configuration, so waitUntilServing() could time out although new clients were served.
 function secureGet(path = "/", hostname = routeHost) {
   return new Promise<Reply>((resolveReply, reject) => {
     const request = httpsRequest(
       {
+        agent: false,
         host: "127.0.0.1",
         port: ports.https,
         servername: hostname,
@@ -433,7 +441,7 @@ function secureGet(path = "/", hostname = routeHost) {
 function plainGet(host: string, path: string) {
   return new Promise<Reply>((resolveReply, reject) => {
     const request = httpRequest(
-      { host: "127.0.0.1", port: ports.http, path, headers: { host }, timeout: 3_000 },
+      { agent: false, host: "127.0.0.1", port: ports.http, path, headers: { host }, timeout: 3_000 },
       (response) => {
         let body = "";
         response.setEncoding("utf8");
@@ -830,7 +838,21 @@ async function leaseExpiryTest(report: Report) {
 
 async function expiredStartTest(report: Report) {
   // The lease is expired and the on-disk Caddyfile still names the route (nothing re-applied it).
-  const caddyfile = await Bun.file(join(edgeDir, "Caddyfile")).text();
+  // The worker stand-in (uid 1000) wrote it with mode 0600. Read it as uid 1000: on a Linux host
+  // whose user is not uid 1000 (a CI runner is 1001), a direct read fails with EACCES.
+  const caddyfile = await docker(
+    "run",
+    "--rm",
+    "--network",
+    "none",
+    "--user",
+    "1000:1000",
+    "--volume",
+    `${edgeDir}:/edge:ro`,
+    bunImage,
+    "cat",
+    "/edge/Caddyfile",
+  );
   expect(
     report,
     caddyfile.includes(`# ark-tailnet-route ${routeId} ${peerBackend}`),
@@ -858,22 +880,27 @@ async function expiredStartTest(report: Report) {
   );
   // Without the watchdog at all, the guard cannot obtain a lease and stays closed too.
   await docker("stop", watchdogName);
-  await restart();
-  const unreachable = (await edgeLogs()).match(/ark launch guard: [^\n]+/g)?.at(-1) ?? "";
-  expect(
-    report,
-    /Caddyfile\.closed: no valid lease \(watchdog: unreachable\)/.test(unreachable) &&
-      (await outcome()) !== "upstream",
-    "with the watchdog unreachable, the guard also starts closed",
-    unreachable,
-  );
-  await startWatchdog("http://edge-admin:2019");
+  try {
+    await restart();
+    const unreachable = (await edgeLogs()).match(/ark launch guard: [^\n]+/g)?.at(-1) ?? "";
+    expect(
+      report,
+      /Caddyfile\.closed: no valid lease \(watchdog: unreachable\)/.test(unreachable) &&
+        (await outcome()) !== "upstream",
+      "with the watchdog unreachable, the guard also starts closed",
+      unreachable,
+    );
+  } finally {
+    // Later cases need a running watchdog even if this one failed.
+    await startWatchdog("http://edge-admin:2019");
+  }
 }
 
 async function withdrawalFailureTest(report: Report, failure: "load" | "read" = "load") {
   // A fresh lease kept fresh, Caddy restarted through the guard (now open), and the route live again.
   await restoreRoute(report);
   const stopObserving = keepObserving();
+  let listener: Awaited<ReturnType<typeof watchListener>> | undefined;
   try {
     await docker("restart", stack.edge);
     await refreshPorts();
@@ -913,9 +940,17 @@ async function withdrawalFailureTest(report: Report, failure: "load" | "read" = 
     await Bun.sleep(1_200); // Complete an inspection through the fault proxy before enabling read errors.
     const restartsBefore = Number(await docker("inspect", "-f", "{{.RestartCount}}", stack.edge));
     await waitUntilServing(report, "control: the route is still served through the fault-injecting watchdog");
+    // Start the listener probe while observation still keeps the 8 s lease fresh.
+    listener = await watchListener({
+      runtime,
+      namespace: stack.edgeTs,
+      name: `ark-edge-observer-listener-${suffix}-${failure}`,
+      image: bunImage,
+    });
     await stopObserving();
     await sql`DELETE FROM alerts WHERE dedup_key = 'edge-withdrawal'`;
     const session = await openSession();
+    const injectedAt = Date.now();
     if (failure === "read")
       await docker(
         "exec",
@@ -926,8 +961,17 @@ async function withdrawalFailureTest(report: Report, failure: "load" | "read" = 
       );
     mock.state.peers = [impostor];
     const detection = await observe();
-    const gone = await withdrawnAt(15_000);
+    const [gone, listenerClosed] = await Promise.all([
+      withdrawnAt(15_000),
+      listener.next("closed", injectedAt, 15_000),
+    ]);
     const sessionClosed = await Promise.race([session.closed, Bun.sleep(5_000).then(() => 0)]);
+    expect(
+      report,
+      listenerClosed !== null && listenerClosed - detection.detectedAt <= 5_000,
+      "the stop closes Caddy's listener within detection + 5 s (127.0.0.1:8443, probed in the edge namespace)",
+      listenerClosed === null ? "still open" : `+${listenerClosed - detection.detectedAt} ms`,
+    );
     expect(
       report,
       sessionClosed > 0 && sessionClosed - detection.detectedAt <= 5_000,
@@ -950,7 +994,7 @@ async function withdrawalFailureTest(report: Report, failure: "load" | "read" = 
     );
     const guard = (await edgeLogs()).match(/ark launch guard: [^\n]+/g)?.at(-1) ?? "";
     report.lines.push(
-      `      timing: route stopped serving ${gone - detection.detectedAt} ms after detection`,
+      `      timing: route stopped serving ${gone - detection.detectedAt} ms after detection (through 443); Caddy listener closed ${listenerClosed === null ? "never" : listenerClosed - detection.detectedAt} ms after detection (127.0.0.1:8443)`,
     );
     expect(
       report,
@@ -972,6 +1016,7 @@ async function withdrawalFailureTest(report: Report, failure: "load" | "read" = 
     );
   } finally {
     await stopObserving();
+    await listener?.stop();
   }
 }
 
@@ -979,18 +1024,40 @@ async function withdrawalFailureTest(report: Report, failure: "load" | "read" = 
 async function watchdogLossTest(report: Report) {
   for (const mode of ["pause", "stop"] as const) {
     await startWatchdog("http://edge-admin:2019");
-    await restoreRoute(report);
+    // The probe container starts alongside the restore, so it adds nothing to the 8 s lease window.
+    // It is ready once it has seen the listener open; only transitions after `lostAt` are measured.
+    const [listener] = await Promise.all([
+      watchListener({
+        runtime,
+        namespace: stack.edgeTs,
+        name: `ark-edge-observer-listener-${suffix}-${mode}`,
+        image: bunImage,
+      }),
+      restoreRoute(report),
+    ]);
     const session = await openSession();
     const lostAt = Date.now();
     try {
       await docker(mode, watchdogName);
-      const gone = await withdrawnAt(5_000);
-      const closed = await Promise.race([session.closed, Bun.sleep(5_000).then(() => 0)]);
+      const [listenerClosed, gone, closed] = await Promise.all([
+        listener.next("closed", lostAt, 5_000),
+        withdrawnAt(5_000),
+        Promise.race([session.closed, Bun.sleep(5_000).then(() => 0)]),
+      ]);
+      report.lines.push(
+        `      timing: ${mode}: Caddy listener closed +${listenerClosed === null ? "never" : listenerClosed - lostAt} ms (127.0.0.1:8443), route stopped serving through 443 +${gone - lostAt} ms, session closed +${closed ? closed - lostAt : "never"} ms`,
+      );
+      expect(
+        report,
+        listenerClosed !== null && listenerClosed - lostAt <= 5_000,
+        `watchdog ${mode}: listener closed within 5 s (Caddy's 127.0.0.1:8443, probed in the edge namespace)`,
+        listenerClosed === null ? "still open after 5 s" : `+${listenerClosed - lostAt} ms`,
+      );
       expect(
         report,
         gone - lostAt <= 5_000 && closed > 0 && closed - lostAt <= 5_000,
-        `${mode}: independent supervisor closes listener and session within 5 s`,
-        `listener +${gone - lostAt} ms, session +${closed - lostAt} ms`,
+        `${mode}: independent supervisor stops the route through 443 and closes its session within 5 s`,
+        `route through 443 +${gone - lostAt} ms, session +${closed - lostAt} ms`,
       );
       await Bun.sleep(1_000);
       expect(
@@ -1001,6 +1068,7 @@ async function watchdogLossTest(report: Report) {
       );
     } finally {
       session.end();
+      await listener.stop();
       if (mode === "pause") await docker("unpause", watchdogName);
     }
   }

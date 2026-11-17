@@ -15,7 +15,8 @@
 // TLS refused, real client address in X-Forwarded-For, no Docker peer reaches 8443, :80 never parses
 // PROXY); SNI/Host 421; no Alt-Svc; every HTTP route through 443; idle and non-TLS rejection within
 // 5 s; master-CLI reload Success=1/0 with old workers serving after a failed reload; a WebSocket across
-// HAProxy and Caddy reloads; watchdog withdrawal of an HAProxy-routed tailnet backend on identity
+// HAProxy and Caddy reloads, with requests during Caddy /load all served; with Caddy's 8443 listener
+// closed, a connection through 443 fails within 1 s (no retries on the loopback hop); watchdog withdrawal of an HAProxy-routed tailnet backend on identity
 // failure and on lease expiry across current and leaving workers, and the domain worker's own drain;
 // the fail-closed HAProxy launch guard.
 //
@@ -68,7 +69,7 @@ const bunImage =
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-l4-${suffix}-`));
 const network = `ark-edge-l4-${suffix}`;
-const runtime = new EdgeTestRuntime(directory, network);
+const runtime = new EdgeTestRuntime(directory, network, bunImage);
 const removeSignalHandlers = runtime.installSignalHandlers();
 const docker = (...args: string[]) => runtime.docker(...args);
 
@@ -1183,18 +1184,161 @@ ${wsHost} {
     "a WebSocket survives an HAProxy master-CLI reload (the old worker keeps it)",
     `reload Success=${haproxy.reload.success ? 1 : 0}; echo ${afterHaproxy}`,
   );
-  const reloaded = await caddyAdmin("/load", { method: "POST", body: site, contentType: "text/caddyfile" });
+  // Fresh requests run throughout repeated Caddy reloads: the listener stays open across /load, so
+  // HAProxy's fail-fast loopback hop (retries 0) must not turn a reload into failed requests.
+  const loadTraffic = { done: false, requests: 0, failures: [] as string[] };
+  const traffic = (async () => {
+    while (!loadTraffic.done) {
+      const reply = await secureGet(wsHost).catch((error: Error) => ({ status: 0, body: error.message }));
+      loadTraffic.requests++;
+      if (reply.status !== 200 || reply.body !== "ok")
+        loadTraffic.failures.push(`${reply.status} ${reply.body.slice(0, 60)}`);
+      await Bun.sleep(50);
+    }
+  })();
+  const loads: number[] = [];
+  try {
+    for (let i = 0; i < 5; i++) {
+      const reply = await caddyAdmin("/load", { method: "POST", body: site, contentType: "text/caddyfile" });
+      loads.push(reply.status);
+    }
+  } finally {
+    loadTraffic.done = true;
+    await traffic;
+  }
   const afterCaddy = await ws.echo("after-caddy-reload");
   expect(
     report,
-    reloaded.status === 200 && afterCaddy === "after-caddy-reload" && !ws.closed(),
-    "the same WebSocket survives a Caddy /load behind HAProxy",
-    `/load ${reloaded.status}; echo ${afterCaddy}`,
+    loads.every((status) => status === 200) && afterCaddy === "after-caddy-reload" && !ws.closed(),
+    "the same WebSocket survives Caddy /load reloads behind HAProxy",
+    `/load ${loads.join(", ")}; echo ${afterCaddy}`,
+  );
+  expect(
+    report,
+    loadTraffic.requests > 0 && loadTraffic.failures.length === 0,
+    "requests through 443 during Caddy /load reloads all succeed",
+    loadTraffic.failures.join(", ") || `${loadTraffic.requests} requests, all 200`,
   );
   ws.end();
   // Back to the production configuration for the remaining tests.
   const restored = await edgeApply();
   if (!restored.applied) throw new Error("writeEdge did not re-apply the production configuration");
+}
+
+/** A TLS handshake through 443 that is expected to fail: how it ended and after how long. */
+function failedHandshake(servername: string) {
+  return new Promise<{ ms: number; outcome: string }>((resolveOutcome) => {
+    const started = Date.now();
+    let settled = false;
+    const settle = (outcome: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolveOutcome({ ms: Date.now() - started, outcome });
+    };
+    const socket = tlsConnect({
+      host: "127.0.0.1",
+      port: ports.https,
+      servername,
+      rejectUnauthorized: false,
+      ALPNProtocols: ["http/1.1"],
+    });
+    const timer = setTimeout(() => settle("still open after 5 s"), 5_000);
+    socket.once("secureConnect", () => settle("handshake completed"));
+    socket.once("error", (error: NodeJS.ErrnoException) => settle(error.code ?? error.message));
+    socket.once("close", () => settle("closed"));
+  });
+}
+
+/** HAProxy tcplog lines for connections to Caddy that failed to connect (termination state SC). */
+async function caddyConnectFailures() {
+  // %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq
+  const pattern = /be_caddy\/caddy (-?\d+)\/(-?\d+)\/\+?(\d+) \d+ SC \d+\/\d+\/\d+\/\d+\/\+?(\d+)/;
+  return (await logsOf(stack.edgeL4))
+    .split("\n")
+    .map((line) => ({ line, match: pattern.exec(line) }))
+    .filter((entry) => entry.match)
+    .map(({ line, match }) => ({
+      line: line.slice(line.indexOf("be_caddy")).trim(),
+      connect: Number(match![2]),
+      total: Number(match![3]),
+      retries: Number(match![4]),
+    }));
+}
+
+/**
+ * Caddy's 8443 listener closed (watchdog stop, withdrawal failure, the FD-09 restart): HAProxy still
+ * accepts on 443, but must fail the loopback connect at once rather than retrying it for about 3 s.
+ * Caddy keeps running here (an HTTP-only config through the admin API), so its listener stays closed
+ * for the whole measurement and no restart races it.
+ */
+async function caddyListenerDownTest(report: Report) {
+  const httpOnly = `{
+  admin edge-admin:2019
+  auto_https off
+}
+
+http://${adminHost} {
+  respond "listener down test" 200
+}
+`;
+  const loaded = await caddyAdmin("/load", { method: "POST", body: httpOnly, contentType: "text/caddyfile" });
+  if (loaded.status !== 200) throw new Error(`/load returned ${loaded.status}: ${loaded.body}`);
+  const measured = await measureListenerDown(report).catch((error: Error) => error);
+  // Back to the production configuration for the remaining tests, whatever the measurement showed.
+  const restored = await edgeApply();
+  if (!restored.applied) throw new Error("writeEdge did not re-apply the production configuration");
+  await waitFor(
+    "HTTPS through 443 after the listener comes back",
+    async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
+    30_000,
+  );
+  if (measured instanceof Error) throw measured;
+}
+
+async function measureListenerDown(report: Report) {
+  const refused = await waitFor(
+    "Caddy's 8443 listener to close",
+    async () => {
+      const reply = await client<{ connected: boolean; code: string | null }>(`container:${stack.edgeTs}`, [
+        "tcp",
+        "127.0.0.1",
+        "8443",
+      ]);
+      return !reply.connected && reply.code === "ECONNREFUSED" ? reply.code : undefined;
+    },
+    15_000,
+    250,
+  );
+  const before = (await caddyConnectFailures()).length;
+  const attempts: Array<{ host: string; ms: number; outcome: string }> = [];
+  // HTTP route SNI (the explicit ACL), the admin site and unknown SNI (default_backend).
+  for (const host of [adminHost, tailnetHost, wwwHost, "unknown.example.net", adminHost, appHost]) {
+    attempts.push({ host, ...(await failedHandshake(host)) });
+  }
+  const slowest = Math.max(...attempts.map((attempt) => attempt.ms));
+  expect(
+    report,
+    attempts.every((attempt) => /ECONNRESET|ECONNREFUSED|closed/.test(attempt.outcome)) && slowest <= 1_000,
+    "with Caddy's 8443 listener closed, a connection through 443 is reset within 1 s",
+    `127.0.0.1:8443 ${refused}; ${attempts.map((attempt) => `${attempt.host} ${attempt.outcome} ${attempt.ms} ms`).join(", ")}`,
+  );
+  const failures = await waitFor(
+    "HAProxy's log lines for the failed Caddy connects",
+    async () => {
+      const lines = await caddyConnectFailures();
+      return lines.length >= before + attempts.length ? lines : undefined;
+    },
+    5_000,
+  );
+  const recent = failures.slice(before);
+  expect(
+    report,
+    failures.every((entry) => entry.retries === 0) && recent.every((entry) => entry.total < 1_000),
+    "HAProxy logs each failed Caddy connect with no retries (SC, retries 0)",
+    `${recent.length} SC lines this test, ${failures.length} in the run; e.g. ${recent[0]?.line ?? "none"}`,
+  );
 }
 
 async function serversWith(predicate: (server: { key: string | null; adminState: number }) => boolean) {
@@ -1331,20 +1475,31 @@ async function leaseExpiryTest(report: Report) {
   );
   // The adapters now enforce independently. HAProxy may close its sessions while Caddy is still
   // inside /load; wait for Caddy's verified withdrawal before asserting its post-withdrawal reply.
-  await waitFor(
+  const caddyWithdrawal = await waitFor(
     "Caddy to verify its independent lease withdrawal",
     async () =>
       events.slice(eventsBefore).find((event) => event.event === "withdrawn" && event.proxy === "caddy"),
     5_000,
     50,
   );
+  // The withdrawn tailnet HTTP route renders stream_close_delay (FD-09), so the watchdog stops Caddy
+  // and the launch guard restarts it. HAProxy no longer retries the loopback hop, so a request inside
+  // that restart is reset at once instead of waiting for Caddy; wait for the restart to finish.
+  const stoppedCaddy = /stopped caddy/.test(caddyWithdrawal.detail);
+  const withdrawnAt = Date.now();
+  const servingAgain = await waitFor(
+    "unrelated HTTP routes after the lease-expiry withdrawal",
+    async () => ((await secureGet(adminHost)).status === 200 ? Date.now() : undefined),
+    stoppedCaddy ? 20_000 : 2_000,
+    100,
+  );
   const fresh = await tlsOutcome();
   const admin = await secureGet(adminHost);
   expect(
     report,
     fresh.startsWith("refused") && admin.status === 200,
-    "unrelated HTTP routes keep serving while tailnet backends are withdrawn",
-    `${mqttHost}: ${fresh}; ${adminHost}: ${admin.status}`,
+    "unrelated HTTP routes keep serving (after Caddy's stream-close restart) while tailnet backends are withdrawn",
+    `${mqttHost}: ${fresh}; ${adminHost}: ${admin.status}${stoppedCaddy ? `, serving again +${servingAgain - withdrawnAt} ms after the Caddy stop was reported` : ""}`,
   );
 }
 
@@ -1477,18 +1632,37 @@ async function launchGuardTest(report: Report) {
     500,
   );
   await refreshPorts();
-  await waitFor(
-    "HTTP through 443 after the restart",
-    async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
+  // Exercise HAProxy's closed-config HTTP serving with a stable HTTP-only Caddy. Its independent
+  // guard otherwise restart-loops on the persisted tailnet config without a watchdog, so a request
+  // can fail solely because Caddy is down. Keep HAProxy's full/closed files unchanged: its guard
+  // must still choose the closed configuration without watchdog enforcement. Caddy's own guard
+  // and its listener/session shutdown are covered by test-edge-observer.ts.
+  // The worker owns these 0600 files; copy as its uid rather than relying on host file access.
+  await docker(
+    "run",
+    "--rm",
+    "--user",
+    "1000:1000",
+    "--volume",
+    `${edgeDir}:/edge`,
+    bunImage,
+    "cp",
+    "/edge/Caddyfile.closed",
+    "/edge/Caddyfile",
+  );
+  await docker("restart", "--time", "1", stack.edge);
+  const http = await waitFor(
+    "public HTTP 200 through 443 after the no-watchdog HAProxy restart",
+    async () => ((await secureGet(adminHost)).status === 200 ? 200 : undefined),
     30_000,
-    500,
+    250,
   );
   const after = await tlsOutcome();
   expect(
     report,
-    after.startsWith("refused"),
-    "restarted without a watchdog it serves HTTP but no tailnet route",
-    `${adminHost}: 200; ${mqttHost}: ${after}`,
+    http === 200 && after.startsWith("refused"),
+    "restarted without a watchdog it serves public HTTP 200 through 443 but no tailnet route",
+    `${adminHost}: ${http}; ${mqttHost}: ${after}`,
   );
 }
 
@@ -2022,6 +2196,7 @@ try {
   await run("idle and non-TLS connections", idleTest);
   await run("master-CLI reload", reloadTest);
   await run("WebSocket across HAProxy and Caddy reloads", websocketTest);
+  await run("Caddy listener down: 443 fails fast", caddyListenerDownTest);
   await run("FD-09: an enabled SSO route is absent from both configs", fd09AbsentTest);
   await run("FD-09: no-leak headers through 443", fd09HeadersTest);
   await run("FD-09: Location and Set-Cookie through 443", fd09LocationTest);

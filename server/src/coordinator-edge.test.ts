@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 
 test("database-backed edge planning, ACME selection and safe admin mode changes", async () => {
   // Separate process/database because a successful mode change revokes every session.
-  const child = Bun.spawn(["bun", "server/src/edge-test-fixture.ts"], {
+  const child = Bun.spawn([process.execPath, "--no-env-file", "server/src/edge-test-fixture.ts"], {
     cwd: resolve(import.meta.dir, "../.."),
     env: process.env,
     stdout: "pipe",

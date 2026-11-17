@@ -27,7 +27,9 @@ else
   decision=""
   attempt=0
   while [ "$attempt" -lt 5 ]; do
-    decision="$(wget -q -T 3 -O - "$watchdog/v1/launch" 2>/dev/null || true)"
+    # `wget -T` bounds reads, not name resolution: once the watchdog container is gone, resolving
+    # its name can take the resolver's 5 s timeout (Docker behind systemd-resolved). Bound it all.
+    decision="$(timeout 3 wget -q -T 3 -O - "$watchdog/v1/launch" 2>/dev/null || true)"
     [ -n "$decision" ] && break
     attempt=$((attempt + 1))
     sleep 1
@@ -60,7 +62,7 @@ supervise() {
     fi
     if [ "$guarded" -eq 1 ]; then
       # Caddy's own enforcement status: an HAProxy withdrawal failure stops HAProxy, not Caddy.
-      heartbeat="$(wget -q -T 1 -O - "$watchdog/v1/supervise?proxy=caddy" 2>/dev/null || true)"
+      heartbeat="$(timeout 1 wget -q -T 1 -O - "$watchdog/v1/supervise?proxy=caddy" 2>/dev/null || true)"
       if [ "$heartbeat" != "ok" ]; then
         echo "ark launch guard: watchdog enforcement unavailable; terminating Caddy" >&2
         # No graceful wait: existing upgraded sessions must close as well as listeners.

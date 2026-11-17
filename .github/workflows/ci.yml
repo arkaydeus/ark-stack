@@ -72,10 +72,13 @@ jobs:
       - run: bunx tsc --noEmit -p workers/tsconfig.json
       - run: bunx tsc --noEmit -p scripts/tsconfig.publish.json
       - run: bunx tsc --noEmit -p scripts/tsconfig.pgbouncer.json
+      - run: bunx tsc --noEmit -p scripts/tsconfig.test-db.json
+      - run: ARK_TEST_DB_DOCKER=1 bun --no-env-file test scripts/test-db.test.ts
+      # tests/browser/flows.test.ts checks the built UI, so build it before the unit tests.
+      - run: bun run --cwd web build
       - run: bun test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts
       - run: ARK_DOCKER_INTEGRATION=1 go test ./...
         working-directory: agent
-      - run: bun run --cwd web build
       - run: bunx playwright install --with-deps chromium
       - run: bun scripts/test-e2e.ts
       - run: bun scripts/test-upgrade-migrations.ts
@@ -83,12 +86,26 @@ jobs:
       - name: Install the host PostgreSQL client for the loopback smoke test
         run: sudo apt-get update && sudo apt-get install -y postgresql-client openssl
       - run: bun scripts/test-pgbouncer-public.ts
+      # edge-ts's tailscaled uses the image's legacy ip6tables. A container cannot load kernel
+      # modules, and the runner has not loaded the legacy IPv6 tables, so tailscaled would log
+      # "can't initialize ip6tables table `filter': Table does not exist" and fail the edge-ts check.
+      - name: Load the legacy IPv6 netfilter tables that tailscaled in edge-ts uses
+        run: sudo modprobe -a ip6_tables ip6table_filter ip6table_nat ip6table_mangle
       - run: |
           bun test scripts/edge-test scripts/edge-l4-guard.test.ts scripts/maintain.test.ts
           bun scripts/test-edge-config.ts
       - run: bun scripts/test-db-ingress.ts
       - run: bun scripts/test-edge-observer.ts
       - run: bun scripts/test-edge-l4.ts
+      - name: Off-VPS backups against MinIO (FD-21)
+        run: |
+          bunx tsc --noEmit -p scripts/tsconfig.backups.json
+          bun test scripts/backup-test/provider-policies.test.ts scripts/offsite-restore.test.ts
+          bun scripts/test-backups.ts
+      - name: Home-machine backups over the tailnet (FD-30)
+        run: |
+          bun test scripts/backup-test/tailnet-compose.test.ts
+          bun scripts/test-backups-tailnet.ts
       - uses: docker/setup-buildx-action@v3
       - run: bun scripts/check-image-plan.ts
       - name: Cold build every image with the filtered build context

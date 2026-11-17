@@ -31,6 +31,7 @@ import {
   servedHttpHostnames,
   planHash,
   platformDbIngressLimits,
+  redactLogLine,
   validateMaintenanceBundle,
   type BackupStatus,
   type DnsWrite,
@@ -48,6 +49,13 @@ import { loadEnv } from "./env.ts";
 import { canonicalHost, currentLoginHost, isAdminHost, refreshLoginHost } from "./origin-hosts.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
+import {
+  evaluateBackupAlerts,
+  exportTarget,
+  startBackupSchedule,
+  verifyTarget,
+  type TargetEvidence,
+} from "./modules/offsite-backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
 import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
@@ -64,6 +72,12 @@ import {
   routesCertificateFailed,
 } from "./modules/front-routes.ts";
 import { edgeLocalApi, edgeSocketPath } from "./modules/tailnet-localapi.ts";
+import {
+  backupLocalApi,
+  backupSocketPath,
+  observeBackupTailnet,
+  startBackupObserveSchedule,
+} from "./modules/backup-observe.ts";
 import {
   executeWorkspaceQuery,
   inspectDatabaseSchema,
@@ -134,6 +148,7 @@ import {
   aliases,
   auditEvents,
   backups,
+  backupTargets,
   certificates,
   clientCertificates,
   databaseClients,
@@ -582,6 +597,9 @@ export async function runOperation(
   }
   if (kind === "backup.create") return createBackup(operation);
   if (kind === "backup.restore_test") return restoreBackup(operation);
+  if (kind === "backup.export") return exportBackupTarget(operation);
+  if (kind === "backup.verify_target") return verifyBackupTarget(operation);
+  if (kind === "backup.observe") return observeBackup(operation);
   if (kind === "update.apply") return applyUpdate(operation);
   if (kind === "admin.mode_change") return changeMode(operation);
   if (kind === "dns.publish") return publishDns(operation);
@@ -1381,9 +1399,13 @@ async function applyUpdate(operation: OperationRow) {
 
 async function createBackup(operation: OperationRow) {
   const kind = String(operation.payload.kind ?? "platform-postgres");
+  const type = ["full", "diff", "incr"].includes(String(operation.payload.type))
+    ? (String(operation.payload.type) as "full" | "diff" | "incr")
+    : "full";
   const result = await runBackup(
     kind as "platform-postgres" | "app-postgres" | "mail" | "volume",
     operation.targetIds[0],
+    { type },
   );
   await db.insert(backups).values({
     id: createId("bak"),
@@ -1394,12 +1416,84 @@ async function createBackup(operation: OperationRow) {
     nativeSnapshotId: result.snapshotId ?? null,
     restoreVerified: false,
   });
+  if (result.status === "local") {
+    // FD-21: a PostgreSQL backup lands in the local repo2 first; ship it to every target now rather
+    // than at the next five-minute tick.
+    await addStep(operation.id, "backup", result);
+    for (const target of await db.select().from(backupTargets).where(eq(backupTargets.enabled, true))) {
+      await enqueue({ kind: "backup.export", targetIds: [target.id], payload: { fresh: true } });
+    }
+    return;
+  }
   if (!backupProofAllowed(result) && result.executed === false) {
     await addStep(operation.id, "backup", result);
     throw new Error("Backup execution is disabled; a plan cannot satisfy a backup operation.");
   }
   if (!backupProofAllowed(result)) throw new Error("Backup did not produce uploaded evidence.");
   await addStep(operation.id, "backup", result);
+}
+
+/** `backup.export` (FD-21): stage and upload both PostgreSQL clusters to one target. */
+async function exportBackupTarget(operation: OperationRow) {
+  const result = await exportTarget(operation.targetIds[0], { fresh: operation.payload.fresh === true });
+  await addStep(operation.id, "backup-export", result as unknown as Record<string, unknown>);
+}
+
+/** `backup.verify_target` (FD-21): the append-only canary with the deployed writer credentials. */
+async function verifyBackupTarget(operation: OperationRow) {
+  const evidence = await verifyTarget<TargetEvidence>(
+    operation.targetIds[0],
+    operation.payload.revision as string | undefined,
+  );
+  await addStep(operation.id, "append-only-canary", {
+    status: evidence.status,
+    findings: evidence.findings,
+    retentionUntil: evidence.retentionUntil,
+  });
+}
+
+/**
+ * `backup.observe` (FD-30, front door §3.18.3): backup-ts's own LocalAPI status, read-only, as one
+ * complete `source = 'backup'` generation. Alerts are re-evaluated either way, so an expired or
+ * failed observation raises the critical suspension alert at once.
+ */
+async function observeBackup(operation: OperationRow) {
+  const socket = backupSocketPath();
+  try {
+    if (!socket) {
+      throw new Error(
+        "ARK_BACKUP_TS_SOCKET is not set: backup-ts's LocalAPI socket is not mounted here (backup worker only).",
+      );
+    }
+    const result = await observeBackupTailnet({ api: backupLocalApi(socket), operationId: operation.id });
+    await addStep(operation.id, "backup-observe", result as unknown as Record<string, unknown>);
+    return result;
+  } finally {
+    await evaluateBackupAlerts().catch(() => undefined);
+  }
+}
+
+/** Schedules `backup.observe` every five minutes where backup-ts's socket is mounted (FD-30). */
+export function scheduleBackupObserve(intervalMs?: number) {
+  if (!backupSocketPath()) return null;
+  return startBackupObserveSchedule({
+    enqueue: (input) => enqueue(input),
+    intervalMs,
+    log: (line) => console.error(redactLogLine(line)),
+  });
+}
+
+/**
+ * Backup schedules (FD-21): observe the executors and enqueue due full/differential backups, an
+ * export per target every five minutes and the weekly canary. Run by the backup worker when backups
+ * execute; queued or running operations are reused, so a stopped worker does not pile them up.
+ */
+export function scheduleBackups() {
+  if (process.env.ARK_BACKUP_EXECUTE !== "1") return null;
+  return startBackupSchedule({
+    enqueue: (input) => enqueue(input),
+    log: (line) => console.error(redactLogLine(line)),
+  });
 }
 
 async function restoreBackup(operation: OperationRow) {
@@ -2656,5 +2750,8 @@ export function startCoordinator() {
   // Embedded workers include the database worker's duties, so they run the rollover scheduler.
   startRolloverScheduler();
   scheduleEdgeObserve();
+  // ...and the backup worker's (FD-21), when backups execute, and its backup-ts observation (FD-30).
+  scheduleBackups();
+  scheduleBackupObserve();
   return setInterval(tick, 1500);
 }

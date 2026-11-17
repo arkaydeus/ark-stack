@@ -660,6 +660,7 @@ describe("database client failure recovery and races", () => {
   beforeEach(async () => {
     await sql`DELETE FROM client_issue_limits WHERE user_id = ${actors.recoveryOwner.userId}`;
   });
+  // This scenario issues certificates and runs several sequential failure/retry jobs.
   test("failed role creation and RELOAD stay non-revealable; API retries reuse every credential", async () => {
     const body = { name: "recoverissue", environment: "production" };
     const first = await queueIssue(body);
@@ -709,7 +710,7 @@ describe("database client failure recovery and races", () => {
     } finally {
       await connection.end();
     }
-  });
+  }, 30_000);
 
   test("a missing real group role fails safely and can be retried after provisioning", async () => {
     const body = { name: "missinggroup", environment: "preview" };
@@ -756,6 +757,7 @@ describe("database client failure recovery and races", () => {
     await runQueued(retry.operationId);
   });
 
+  // Allow time for five certificate issuances and sequential failure/retry paths on CI.
   test("role rotation, RELOAD and KILL_CLIENT failures all resume, with isolated alerts", async () => {
     const unaffected = await issue(actors.recoveryOwner, { name: "unaffected", environment: "production" });
     const unaffectedBefore = await roleState(unaffected.role);
@@ -842,7 +844,7 @@ describe("database client failure recovery and races", () => {
       reload: async () => {},
       kill: async () => ({ killed: 0, remaining: 0, attempts: 1 }),
     });
-  });
+  }, 30_000);
 
   test("concurrent issuance requests reserve one client identity before metadata exists", async () => {
     const body = { name: "duplicateissue", environment: "preview" };
@@ -1038,6 +1040,7 @@ describe("database client failure recovery and races", () => {
       Bun.spawn(
         [
           process.execPath,
+          "--no-env-file",
           "--eval",
           `
       const { consumeClientIssueAttempt } = await import('./server/src/modules/db-clients.ts');

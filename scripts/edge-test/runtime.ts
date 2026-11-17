@@ -13,6 +13,13 @@ export class EdgeTestRuntime {
   constructor(
     readonly directory: string,
     readonly network: string,
+    /**
+     * An image the run already uses (with `chown`), for handing the work directory back to the
+     * host user at cleanup. The harnesses chown fixtures to uid 1000 as the installer does; on a
+     * Linux host whose user is not uid 1000 (a CI runner is 1001) those files cannot be removed
+     * otherwise. Docker Desktop's file sharing hides this.
+     */
+    readonly ownershipImage?: string,
   ) {}
 
   private async execute(args: string[]) {
@@ -75,7 +82,34 @@ export class EdgeTestRuntime {
       if (this.networkCreated) {
         await this.execute(["network", "rm", this.network]).catch(() => undefined);
       }
-      await rm(this.directory, { recursive: true, force: true });
+      await rm(this.directory, { recursive: true, force: true }).catch(
+        async (error: NodeJS.ErrnoException) => {
+          if (
+            (error.code !== "EACCES" && error.code !== "EPERM") ||
+            !this.ownershipImage ||
+            !process.getuid
+          ) {
+            throw error;
+          }
+          await this.execute([
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "0:0",
+            "--entrypoint",
+            "chown",
+            "--volume",
+            `${this.directory}:/work`,
+            this.ownershipImage,
+            "-R",
+            `${process.getuid()}:${process.getgid?.() ?? process.getuid()}`,
+            "/work",
+          ]);
+          await rm(this.directory, { recursive: true, force: true });
+        },
+      );
     })();
     return this.cleanupPromise;
   }

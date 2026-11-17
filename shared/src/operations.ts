@@ -67,6 +67,7 @@ export type OperationKind =
   | "service.discover"
   | "backup.create"
   | "backup.restore_test"
+  | "backup.export"
   | "update.apply"
   | "update.detect"
   | "admin.mode_change"

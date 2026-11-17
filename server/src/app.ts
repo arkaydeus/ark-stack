@@ -1,3 +1,4 @@
+import { repositoryProtectionPolicy } from "@ark-stack/shared";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 
@@ -12,6 +13,11 @@ import {
   createId,
   createToken,
   privilegedRequestHash,
+  s3TargetInput,
+  tailnetRestTargetInput,
+  PROVIDER_RECIPES,
+  TAILNET_REST_RECIPE,
+  writerPolicy,
   localPart,
   normalizeHostname,
   redactValue,
@@ -123,6 +129,13 @@ import {
 import { EDGE_OBSERVE_TARGET, edgePolicy, tailnetOverview } from "./modules/edge-observe.ts";
 import { raiseAlert } from "./modules/alerts.ts";
 import {
+  backupHealth,
+  publicTarget,
+  saveS3Target,
+  saveTailnetRestTarget,
+} from "./modules/offsite-backups.ts";
+import { BACKUP_OBSERVE_TARGET, backupTailnetOverview } from "./modules/backup-observe.ts";
+import {
   CLIENT_PASSWORD_SECRET_KIND,
   DatabaseClientError,
   databaseClientContext,
@@ -166,6 +179,7 @@ import {
   operations,
   platformAccess,
   platformSettings,
+  backupTargets,
   platformSetup,
   projects,
   secrets,
@@ -424,7 +438,16 @@ const workerPrefixes: Record<string, string[]> = {
   // `integration.` (front door §3.4): the domain worker is the only worker with external egress.
   domains: ["domain.", "dns.", "certificate.", "edge.", "admin.", "integration."],
   mail: ["mail.", "mailbox.", "ses."],
-  backup: ["backup.", "update.detect", "import."],
+  backup: [
+    "backup.",
+    "backup.create",
+    "backup.restore_test",
+    "backup.export",
+    "backup.verify_target",
+    "backup.observe",
+    "update.detect",
+    "import.",
+  ],
   agent: ["service.", "update.apply"],
   module: [
     "database.",
@@ -711,6 +734,9 @@ app.get("/api/metrics/prometheus", async (c) => {
     // nft drop counters for the public database port (front door §3.11, FD-18), written by the
     // host-namespace database-ingress reconciler. A missing or unreadable snapshot reports 0.
     ...dbIngressCounterMetrics(await readDbIngressCounters()),
+    // Off-VPS backup targets (front door §3.19, FD-21): last success age, append-only verdict and the
+    // age of the newest off-VPS recovery point per source.
+    ...(await backupTargetMetrics()),
   ];
   return c.text(`${lines.join("\n")}\n`, 200, { "content-type": "text/plain; version=0.0.4" });
 });
@@ -2620,6 +2646,198 @@ app.post("/api/backups/:id/verify-restore", async (c) => {
   );
   return c.json({ id: selected.id, status, restoreVerified: true });
 });
+
+// Off-VPS backup targets (front door §3.3, §3.18, FD-21). Owner-only. Saving needs MFA and a
+// single-use `credential.rotate` grant bound to the request; credentials are write-only and never
+// returned. Saving (and the weekly schedule) runs the append-only canary.
+app.get("/api/backups/targets", async (c) => {
+  requireOwner(c.get("access"));
+  const targets = await db.select().from(backupTargets);
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  return c.json({
+    targets: targets.map(publicTarget),
+    health: await backupHealth(),
+    recipes: PROVIDER_RECIPES,
+    tailnetRecipe: TAILNET_REST_RECIPE,
+    regionHint: regionSummary(settings ?? null).backupRegionHint,
+    bucketProtectionPolicy: Object.fromEntries(
+      targets
+        .filter((item) => item.bucket)
+        .map((item) => [item.id, repositoryProtectionPolicy(item.bucket!, item.prefix)]),
+    ),
+    writerPolicy: Object.fromEntries(
+      targets.filter((item) => item.bucket).map((item) => [item.id, writerPolicy(item.bucket!, item.prefix)]),
+    ),
+  });
+});
+
+app.put("/api/backups/targets/:kind", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  if (c.req.param("kind") === "tailnet_rest")
+    return c.json(await saveTailnetTarget(await c.req.json(), access, c.get("session")));
+  if (c.req.param("kind") !== "s3") {
+    throw new HTTPException(400, { message: "Backup target kind must be s3 or tailnet_rest." });
+  }
+  const request = await c.req.json();
+  const input = s3TargetInput.parse(request);
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", { backupTarget: "s3", ...request }),
+  );
+  let target: Awaited<ReturnType<typeof saveS3Target>>;
+  try {
+    target = await saveS3Target(input);
+  } catch (error) {
+    throw new HTTPException(422, {
+      message: error instanceof Error ? error.message : "Backup target rejected.",
+    });
+  }
+  const operation = await enqueue({
+    kind: "backup.verify_target",
+    actorId: access.userId,
+    targetIds: [target.id],
+    payload: { revision: target.configRevision },
+  });
+  await audit(
+    access.userId,
+    "backup.target_saved",
+    "backup_target",
+    target.id,
+    {
+      provider: input.provider,
+      endpoint: input.endpoint,
+      bucket: input.bucket,
+      prefix: input.prefix,
+      pathStyle: input.pathStyle,
+      region: input.region,
+      recoveryWindowDays: input.recoveryWindowDays,
+      credentialsReplaced: Boolean(input.accessKeyId),
+      verifierReplaced: input.verifierToken !== undefined,
+    },
+    operation.id,
+    access.role,
+  );
+  return c.json({ target: publicTarget(target), verifyOperationId: operation.id });
+});
+
+/**
+ * The home target (FD-30, front door §3.18.3): pinned from backup-ts's own observation when saved, so
+ * the request fails unless backup-ts currently sees exactly one matching, untagged home machine.
+ */
+async function saveTailnetTarget(request: Record<string, unknown>, access: Access, session: SessionValue) {
+  const input = tailnetRestTargetInput.parse(request);
+  await requirePrivileged(
+    access,
+    session,
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", { backupTarget: "tailnet_rest", ...request }),
+  );
+  let target: Awaited<ReturnType<typeof saveTailnetRestTarget>>;
+  try {
+    target = await saveTailnetRestTarget(input);
+  } catch (error) {
+    throw new HTTPException(422, {
+      message: error instanceof Error ? error.message : "Backup target rejected.",
+    });
+  }
+  const operation = await enqueue({
+    kind: "backup.verify_target",
+    actorId: access.userId,
+    targetIds: [target.id],
+    payload: { revision: target.configRevision },
+  });
+  await audit(
+    access.userId,
+    "backup.target_saved",
+    "backup_target",
+    target.id,
+    {
+      kind: "tailnet_rest",
+      restUrl: input.restUrl,
+      pinned: { stableId: target.targetNodeStableId, ip: target.targetIp },
+      recoveryWindowDays: input.recoveryWindowDays,
+      credentialsReplaced: Boolean(input.password),
+    },
+    operation.id,
+    access.role,
+  );
+  return { target: publicTarget(target), verifyOperationId: operation.id };
+}
+
+// backup-ts's view of the tailnet (FD-30): its own generation, lease and each home target's identity.
+app.get("/api/backups/tailnet", async (c) => {
+  requireOwner(c.get("access"));
+  return c.json(await backupTailnetOverview());
+});
+
+app.post("/api/backups/tailnet/observe", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  // Read-only, no exposure effect; a queued or running observation is reused.
+  const operation = await enqueue({ kind: "backup.observe", targetIds: [BACKUP_OBSERVE_TARGET] });
+  await audit(access.userId, "backup.tailnet.observe", "tailnet", "backup", {}, operation?.id, access.role);
+  return c.json({ operation }, 202);
+});
+
+app.post("/api/backups/targets/:id/verify", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  const [target] = await db
+    .select()
+    .from(backupTargets)
+    .where(eq(backupTargets.id, c.req.param("id")));
+  if (!target) throw new HTTPException(404, { message: "Backup target not found." });
+  const operation = await enqueue({
+    kind: "backup.verify_target",
+    actorId: access.userId,
+    targetIds: [target.id],
+    payload: { revision: target.configRevision },
+  });
+  await audit(
+    access.userId,
+    "backup.target_verify",
+    "backup_target",
+    target.id,
+    {},
+    operation.id,
+    access.role,
+  );
+  return c.json({ operationId: operation.id });
+});
+
+const metricLabel = (value: string) => value.replace(/["\\\n]/g, "_");
+
+async function backupTargetMetrics() {
+  const health = await backupHealth();
+  const targets = await db.select().from(backupTargets);
+  const label = metricLabel;
+  return [
+    "# TYPE ark_backup_target_last_success_age_seconds gauge",
+    ...targets.map(
+      (item) =>
+        `ark_backup_target_last_success_age_seconds{target="${label(item.name)}"} ${item.lastSuccessAt ? Math.round((Date.now() - item.lastSuccessAt.getTime()) / 1000) : -1}`,
+    ),
+    "# TYPE ark_backup_target_append_only_verified gauge",
+    ...health.targets.map(
+      (item) =>
+        `ark_backup_target_append_only_verified{target="${label(item.name)}"} ${item.appendOnly.current ? 1 : 0}`,
+    ),
+    "# TYPE ark_backup_recovery_point_age_seconds gauge",
+    ...health.targets.flatMap((item) =>
+      item.sources.map(
+        (source) =>
+          `ark_backup_recovery_point_age_seconds{target="${label(item.name)}",source="${label(source.source)}"} ${source.lastRecoverableAt ? Math.round((Date.now() - new Date(source.lastRecoverableAt).getTime()) / 1000) : -1}`,
+      ),
+    ),
+    "# TYPE ark_backups_healthy gauge",
+    `ark_backups_healthy ${health.healthy ? 1 : 0}`,
+  ];
+}
 
 app.post("/api/mail/reconcile", async (c) => {
   const access = c.get("access");
