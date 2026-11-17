@@ -214,7 +214,7 @@ Third-party images (Caddy, HAProxy, Tailscale, PgBouncer, PostgreSQL, Stalwart a
 
    For the edge namespace (FD-05), the run then checks the following:
 
-   - `edge-ts` has exactly `NET_ADMIN` and `NET_RAW` and `/dev/net/tun`. A control shows that tailscaled's iptables calls fail with `NET_ADMIN` alone.
+   - `edge-ts` has exactly `NET_ADMIN` and `NET_RAW` and `/dev/net/tun`. A control shows that tailscaled's iptables calls fail with `NET_ADMIN` alone. tailscaled uses legacy `ip6tables`, and a container cannot load kernel modules, so on a Linux host the `ip6table_filter` and `ip6table_nat` modules must already be loaded. Otherwise tailscaled logs `Table does not exist` and the check fails. CI loads them with `modprobe` first.
    - `tailscale0` is in the namespace Caddy runs in. `--shields-up` and `TS_ACCEPT_DNS=false` reach tailscaled, and UDP 41642 is published.
    - A container on `edge-control` reaches `edge-admin:2019`. A container on `admin` aliased `api` cannot reach it by alias or by either `edge-ts` address.
    - `edge` comes back serving after `edge-ts` is changed through `docker compose up`, restarted in place, or recreated on its own. The last two go through the rejoin step that `mise run maintain` runs.

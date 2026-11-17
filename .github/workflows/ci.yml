@@ -84,6 +84,11 @@ jobs:
       - name: Install the host PostgreSQL client for the loopback smoke test
         run: sudo apt-get update && sudo apt-get install -y postgresql-client openssl
       - run: bun scripts/test-pgbouncer-public.ts
+      # edge-ts's tailscaled uses the image's legacy ip6tables. A container cannot load kernel
+      # modules, and the runner has not loaded the legacy IPv6 tables, so tailscaled would log
+      # "can't initialize ip6tables table `filter': Table does not exist" and fail the edge-ts check.
+      - name: Load the legacy IPv6 netfilter tables that tailscaled in edge-ts uses
+        run: sudo modprobe -a ip6_tables ip6table_filter ip6table_nat ip6table_mangle
       - run: |
           bun test scripts/edge-test scripts/edge-l4-guard.test.ts scripts/maintain.test.ts
           bun scripts/test-edge-config.ts
