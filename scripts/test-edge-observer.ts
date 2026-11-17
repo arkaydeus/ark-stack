@@ -312,7 +312,7 @@ async function startWatchdog(adminUrl: string) {
     "--env",
     "ARK_EDGE_DIR=/var/lib/ark/edge",
     "--volume",
-    `${edgeDir}:/var/lib/ark/edge:ro`,
+    `${edgeDir}:/var/lib/ark/edge`,
     "--volume",
     `${watchdogBundle}:/watchdog:ro`,
     "--workdir",
@@ -368,11 +368,19 @@ async function edgeApply() {
     "write",
     JSON.stringify(plan),
   );
-  return JSON.parse(output) as { applied: boolean; tailnetRoutes: string[] };
+  return JSON.parse(output) as { applied: boolean; httpRoutes: string[] };
 }
 
-/** Tailnet backends in Caddy's active config, read through the admin API from edge-control. */
+/**
+ * Tailnet backends in Caddy's active config, read through the admin API from edge-control. A
+ * withdrawal of a delayed handler stops Caddy conservatively (FD-09:
+ * stream_close_delay), so this waits for the launch guard's restart instead of racing it.
+ */
 async function activeBackends() {
+  return waitFor("Caddy admin API", () => readActiveBackends(), 30_000);
+}
+
+async function readActiveBackends() {
   const script = `
     const config = await (await fetch("http://edge-admin:2019/config/", { signal: AbortSignal.timeout(3000) })).json();
     const found = new Set();
@@ -682,7 +690,7 @@ async function identityWithdrawalTest(report: Report) {
   const applied = await edgeApply();
   expect(
     report,
-    applied.tailnetRoutes.includes(routeId),
+    applied.httpRoutes.includes(routeId),
     "edge.apply renders the route with its pinned address",
     JSON.stringify(applied),
   );
@@ -754,6 +762,35 @@ async function restoreRoute(report: Report) {
   }
   // Start the expiry measurement after the last apply and its container startup have finished.
   return observe();
+}
+
+async function disabledStreamTest(report: Report) {
+  await restoreRoute(report);
+  const stopObserving = keepObserving();
+  try {
+    await sql`DELETE FROM alerts WHERE dedup_key = 'edge-withdrawal'`;
+    const session = await openSession();
+    const at = Date.now();
+    await sql`UPDATE front_routes SET enabled = false, status = 'disabled' WHERE id = ${routeId}`;
+    const closedAt = await Promise.race([session.closed, Bun.sleep(7_000).then(() => 0)]);
+    expect(
+      report,
+      closedAt > 0 && closedAt - at <= 5_000,
+      "disabling a route closes its WebSocket within five seconds",
+      `closed after ${closedAt - at} ms`,
+    );
+    await activeBackends();
+    const [alert] =
+      await sql`SELECT title FROM alerts WHERE dedup_key = 'edge-withdrawal' AND resolved_at IS NULL`;
+    expect(
+      report,
+      !alert,
+      "a deliberate stream stop does not raise a critical withdrawal alert",
+      String(alert?.title),
+    );
+  } finally {
+    await stopObserving();
+  }
 }
 
 async function leaseExpiryTest(report: Report) {
@@ -1016,11 +1053,20 @@ async function sharedBackendTest(report: Report) {
       "revoking one hostname closes its handler and session on a shared backend",
       `withdrawn +${gone - revokedAt} ms; closed +${closed - revokedAt} ms`,
     );
+    // The revoked route held a WebSocket, which a reload cannot close before stream_close_delay
+    // (5 min, FD-09), so the watchdog stopped Caddy. The launch guard restarts it from the closed
+    // file (it still names the revoked route) and the watchdog restores its lease-checked config,
+    // without any edge.apply being processed.
+    const restoredAt = await waitFor(
+      "the other hostname after the withdrawal restart",
+      async () => ((await outcome(sharedHost)) === "upstream" ? Date.now() : undefined),
+      20_000,
+    );
     expect(
       report,
-      (await outcome(sharedHost)) === "upstream",
-      "the other hostname still reaches the same backend",
-      await outcome(sharedHost),
+      (await outcome(sharedHost)) === "upstream" && (await outcome()) !== "upstream",
+      "the other hostname reaches the same backend again without an edge.apply; the revoked one does not",
+      `restored +${restoredAt - revokedAt} ms; revoked: ${await outcome()}`,
     );
     await docker("restart", stack.edge);
     await refreshPorts();
@@ -1070,6 +1116,7 @@ try {
     await run("localapi read-only deployment (FD-06)", localApiTest),
     await run("identity withdrawal within detection + 5 s", identityWithdrawalTest),
     await run("shared backend per-route withdrawal and restart", sharedBackendTest),
+    await run("disable with a WebSocket has no critical withdrawal alert", disabledStreamTest),
     await run("watchdog loss while Caddy is serving", watchdogLossTest),
     await run("lease expiry with observation stopped", leaseExpiryTest),
     await run("start with an expired lease", expiredStartTest),

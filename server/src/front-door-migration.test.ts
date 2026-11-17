@@ -504,6 +504,8 @@ describe("Drizzle schema mirrors the migration", () => {
     schema.databaseClients,
     schema.vercelIntegrations,
     schema.backupTargets,
+    schema.backupExports,
+    schema.backupSources,
     schema.tailnetAclSnippets,
   ];
 

@@ -41,6 +41,12 @@ export type WithdrawalResult = {
   error?: string;
   /** The proxy could not be inspected at all (it may be stopped or restarting). */
   unreachable?: boolean;
+  /**
+   * Withdrawn backends that may hold upgraded streams a reload cannot promptly close (Caddy keeps
+   * them for the old handler's `stream_close_delay`, FD-09). The adapter stopped the proxy; its
+   * launch guard restarts it from the lease-checked configuration.
+   */
+  stopped?: string[];
 };
 
 /**
@@ -138,6 +144,8 @@ function identityMatches(identity: string, backend: string, hosts: string[]) {
  */
 export function withdrawCaddyBackends(config: unknown, allowed: ReadonlySet<string>) {
   const withdrawn = new Set<string>();
+  /** Withdrawn backends whose handler keeps upgraded streams open after a reload. */
+  const delayed = new Set<string>();
   const activeRoutes = new Set<string>();
   const rewrite = (value: Json, hosts: string[] = [], identity = ""): Json => {
     if (Array.isArray(value)) {
@@ -163,6 +171,7 @@ export function withdrawCaddyBackends(config: unknown, allowed: ReadonlySet<stri
       const denied = keys.filter((key) => !allowed.has(identity) || !identityMatches(identity, key, hosts));
       if (denied.length) {
         for (const key of denied) withdrawn.add(key);
+        if (streamCloseDelayed(value)) for (const key of denied) delayed.add(key);
         return structuredClone(WITHDRAWN_HANDLER) as unknown as Json;
       }
       if (keys.length) activeRoutes.add(identity);
@@ -172,8 +181,58 @@ export function withdrawCaddyBackends(config: unknown, allowed: ReadonlySet<stri
     );
   };
   const next = rewrite(config as Json);
-  return { config: next, withdrawn: [...withdrawn].toSorted(), activeRoutes: [...activeRoutes].toSorted() };
+  return {
+    config: next,
+    withdrawn: [...withdrawn].toSorted(),
+    delayed: [...delayed].toSorted(),
+    activeRoutes: [...activeRoutes].toSorted(),
+  };
 }
+
+/** A `reverse_proxy` handler whose upgraded streams outlive a reload (`stream_close_delay` > 0). */
+function streamCloseDelayed(handler: { [key: string]: Json }) {
+  const delay = handler.stream_close_delay;
+  if (typeof delay === "number") return delay > 0;
+  if (typeof delay === "string")
+    return !/^0+(?:\.0+)?(?:ns|us|µs|ms|s|m|h)?$/.test(delay.trim()) && delay.trim() !== "";
+  return false;
+}
+
+/**
+ * Tailnet backends with requests in flight, from Caddy's `GET /reverse_proxy/upstreams`. An upgraded
+ * stream (WebSocket) counts as in flight for its whole life. This is diagnostic only: an idle
+ * snapshot cannot rule out an upgrade arriving before admission is fenced.
+ */
+export function caddyBusyBackends(upstreams: unknown) {
+  const busy = new Set<string>();
+  if (!Array.isArray(upstreams)) throw new Error("Caddy /reverse_proxy/upstreams did not return a list.");
+  for (const item of upstreams) {
+    if (!item || typeof item !== "object") continue;
+    const { address, num_requests: requests } = item as { address?: unknown; num_requests?: unknown };
+    const key = tailnetDialKey(address);
+    if (key && typeof requests === "number" && requests > 0) busy.add(key);
+  }
+  return busy;
+}
+
+/** The backend key inside a route identity key (`routeIdentityKey`), or null. */
+export function identityBackend(identity: string) {
+  try {
+    const value = JSON.parse(decodeURIComponent(identity)) as unknown;
+    return Array.isArray(value) && typeof value[3] === "string" ? value[3] : null;
+  } catch {
+    return null;
+  }
+}
+
+/** How long after a deliberate stop an unreachable Caddy is its launch guard restarting it. */
+export const CADDY_RESTART_GRACE_MS = 60_000;
+
+/**
+ * Written to the rendered edge directory (wall-clock ms) by every deliberate Caddy stream stop.
+ * All adapters read it so a restart initiated by another process is not a failure.
+ */
+export const CADDY_STOP_MARKER = "caddy-stopped-at";
 
 /** Route identities currently served by Caddy (only correctly marked and host-bound handlers). */
 export function caddyTailnetRouteKeys(config: unknown) {
@@ -189,15 +248,58 @@ export function caddyTailnetRouteKeys(config: unknown) {
   return withdrawCaddyBackends(config, candidates).activeRoutes;
 }
 
+/** Stable object ordering for exact adapted-config comparisons. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object")
+    return `{${Object.entries(value)
+      // Caddy's HTTP adapter appends its default Caddyfile hide even if already explicit.
+      // File-server hides are an unordered set; duplicate entries change no serving behaviour.
+      .map(
+        ([key, child]) =>
+          [
+            key,
+            key === "hide" &&
+            "handler" in value &&
+            value.handler === "file_server" &&
+            Array.isArray(child) &&
+            child.every((item) => typeof item === "string")
+              ? [...new Set(child)].toSorted()
+              : child,
+          ] as const,
+      )
+      .toSorted(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`)
+      .join(",")}}`;
+  return JSON.stringify(value);
+}
+
+function caddyGeneration(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  if ("ark_edge_generation" in value && typeof value.ark_edge_generation === "string")
+    return value.ark_edge_generation;
+  for (const child of Object.values(value)) {
+    const found = caddyGeneration(child);
+    if (found) return found;
+  }
+  return null;
+}
+
 type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
+
+/** A reachable admin API returned an unusable inspection; restart grace cannot excuse this. */
+class CaddyInspectionError extends Error {}
 
 /**
  * Caddy adapter over the admin API (`edge-admin:2019`, reachable only from edge-control). Withdrawal
  * is a `/load` of the active config with the denied handlers replaced, sent with
- * `Cache-Control: must-revalidate`. The reload closes the withdrawn handlers' upgraded connections
- * (Ark renders no `stream_close_delay` for tailnet routes yet) and the rendered `grace_period` bounds
- * in-flight requests on the old server. The fallback is `POST /stop`, which ends the Caddy process;
- * its launch guard then refuses to serve tailnet routes until the lease is valid again.
+ * `Cache-Control: must-revalidate`; the rendered `grace_period` bounds in-flight requests on the old
+ * server. FD-09 routes render `stream_close_delay 5m` so WebSockets survive an ordinary edge.apply,
+ * and Caddy applies the *old* handler's delay on reload: a withdrawn handler's upgraded streams would
+ * stay open for five minutes. Whenever a withdrawn handler has a delay, the adapter stops Caddy after the
+ * verified reload. That closes every stream at once (fail closed; other routes reconnect after the
+ * restart); the launch guard restarts it from the lease-checked configuration. `POST /stop` is also
+ * the fallback when withdrawal fails.
  */
 export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
   readonly proxy = "caddy";
@@ -206,7 +308,37 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     private readonly adminUrl: string,
     private readonly fetcher: Fetch = fetch,
     private readonly timeoutMs = 3_000,
+    private readonly options: {
+      /** Monotonic clock for this adapter's own stops. */
+      now?: () => number;
+      /**
+       * Wall-clock time (ms) of the last deliberate stream stop by any adapter, read from
+       * `CADDY_STOP_MARKER` in the rendered edge directory; null when there is none.
+       */
+      appliedStopAt?: () => Promise<number | null>;
+      recordStop?: () => Promise<void>;
+      pendingStreams?: () => Promise<string[]>;
+      markPendingStreams?: (keys: string[]) => Promise<void>;
+      clearPendingStreams?: () => Promise<void>;
+      /** Read the current authoritative files, never a cached pre-stop snapshot. */
+      configFiles?: () => Promise<{ full: string; closed: string }>;
+    } = {},
   ) {}
+
+  /** Set by a deliberate stop; until the grace ends, an unreachable Caddy is restarting, not failing. */
+  private stoppedAt: number | null = null;
+  private pendingStreams: string[] = [];
+  private configEtag: string | null = null;
+
+  private clock() {
+    return (this.options.now ?? (() => performance.now()))();
+  }
+
+  private async restarting() {
+    if (this.stoppedAt !== null && this.clock() - this.stoppedAt < CADDY_RESTART_GRACE_MS) return true;
+    const applied = await this.options.appliedStopAt?.().catch(() => null);
+    return typeof applied === "number" && Date.now() - applied < CADDY_RESTART_GRACE_MS;
+  }
 
   private request(path: string, init: RequestInit = {}) {
     return this.fetcher(`${this.adminUrl.replace(/\/$/, "")}${path}`, {
@@ -217,8 +349,13 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
 
   private async activeConfig() {
     const response = await this.request("/config/");
-    if (!response.ok) throw new Error(`GET /config/ returned ${response.status}`);
-    return (await response.json()) as unknown;
+    if (!response.ok) throw new CaddyInspectionError(`GET /config/ returned ${response.status}`);
+    this.configEtag = response.headers.get("etag");
+    try {
+      return (await response.json()) as unknown;
+    } catch {
+      throw new CaddyInspectionError("GET /config/ returned invalid JSON");
+    }
   }
 
   async activeRoutes() {
@@ -230,23 +367,136 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     return caddyTailnetBackends(await this.activeConfig());
   }
 
+  /** Tailnet backends with requests or upgraded streams in flight. */
+  async busyBackends() {
+    const response = await this.request("/reverse_proxy/upstreams");
+    if (!response.ok) throw new Error(`GET /reverse_proxy/upstreams returned ${response.status}`);
+    return caddyBusyBackends(await response.json());
+  }
+
+  /**
+   * Backends whose upgraded streams a reload to a config serving only `next` route identities would
+   * leave open (all removed handlers with `stream_close_delay`, including currently idle ones).
+   * `edge.apply` reads this before its `/load`, since it can remove a route before the watchdog
+   * or `edge.drain` sees it.
+   */
+  async lingeringStreams(next: ReadonlySet<string>) {
+    // Admission is still open: even an idle handler can accept an upgrade before /load.
+    return withdrawCaddyBackends(await this.activeConfig(), next).delayed;
+  }
+
+  /** Persist before changing configuration so a failed stop cannot lose the removed handler. */
+  async markPendingStreams(keys: string[]) {
+    this.pendingStreams = keys;
+    await this.options.markPendingStreams?.(keys);
+  }
+
+  async stopForStreams() {
+    await this.options.recordStop?.();
+    await this.stop();
+    this.stoppedAt = this.clock();
+    this.pendingStreams = [];
+    await this.options.clearPendingStreams?.();
+  }
+
+  /** Restore only the current generation's exact closed configuration, with an atomic ETag guard. */
+  private async restoreCurrent(config: unknown, allowed: ReadonlySet<string>) {
+    if (!this.options.configFiles || !this.configEtag || caddyTailnetRouteKeys(config).length) return config;
+    const generation = caddyGeneration(config);
+    if (!generation) return config;
+    const etag = this.configEtag;
+    const files = await this.options.configFiles();
+    if (files.full === files.closed) return config;
+    const adapt = async (body: string) => {
+      const response = await this.request("/adapt", {
+        method: "POST",
+        headers: { "content-type": "text/caddyfile" },
+        body,
+      });
+      if (!response.ok) throw new Error(`POST /adapt returned ${response.status}`);
+      const { result } = (await response.json()) as { result: unknown };
+      return result;
+    };
+    const closed = await adapt(files.closed);
+    if (caddyGeneration(closed) !== generation || canonicalJson(closed) !== canonicalJson(config))
+      return config;
+    const full = await adapt(files.full);
+    if (caddyGeneration(full) !== generation) return config;
+    const next = withdrawCaddyBackends(full, allowed).config;
+    if (canonicalJson(next) === canonicalJson(config)) return config;
+    const loaded = await this.request("/config/", {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "if-match": etag, "cache-control": "must-revalidate" },
+      body: JSON.stringify(next),
+    });
+    if (!loaded.ok && loaded.status !== 412) throw new Error(`PATCH /config/ returned ${loaded.status}`);
+    return this.activeConfig();
+  }
+
   async enforce(allowed: ReadonlySet<string>): Promise<WithdrawalResult> {
-    let config: unknown;
+    let pending: string[];
     try {
-      config = await this.activeConfig();
+      pending = [...new Set([...this.pendingStreams, ...((await this.options.pendingStreams?.()) ?? [])])];
     } catch (error) {
       return {
         proxy: this.proxy,
         active: [],
         withdrawn: [],
+        error: `Cannot inspect pending Caddy stops: ${(error as Error).message}`,
+      };
+    }
+    if (pending.length) {
+      try {
+        await this.stopForStreams();
+        return { proxy: this.proxy, active: [], withdrawn: [], stopped: pending, unreachable: true };
+      } catch (error) {
+        // Another adapter may have completed the same intents and stopped this process first.
+        const remaining = await this.options.pendingStreams?.().catch(() => null);
+        if (remaining?.length === 0 && (await this.restarting())) {
+          this.pendingStreams = [];
+          return { proxy: this.proxy, active: [], withdrawn: [], unreachable: true };
+        }
+        return {
+          proxy: this.proxy,
+          active: [],
+          withdrawn: [],
+          error: `Pending stream stop failed: ${(error as Error).message}`,
+        };
+      }
+    }
+    let config: unknown;
+    try {
+      config = await this.activeConfig();
+    } catch (error) {
+      // After a deliberate stop the launch guard restarts Caddy from lease-checked files; an
+      // unreachable Caddy is never counted as verified enforcement (`/v1/supervise`).
+      const restarting = !(error instanceof CaddyInspectionError) && (await this.restarting());
+      return {
+        proxy: this.proxy,
+        active: [],
+        withdrawn: [],
         unreachable: true,
-        error: `Caddy admin API unreachable: ${(error as Error).message}`,
+        ...(restarting ? {} : { error: `Caddy admin API unreachable: ${(error as Error).message}` }),
+      };
+    }
+    this.stoppedAt = null;
+    try {
+      config = await this.restoreCurrent(config, allowed);
+    } catch (error) {
+      return {
+        proxy: this.proxy,
+        active: [],
+        withdrawn: [],
+        error: `Restore failed: ${(error as Error).message}`,
       };
     }
     const active = caddyTailnetBackends(config);
-    const { config: next, withdrawn } = withdrawCaddyBackends(config, allowed);
+    const { config: next, withdrawn, delayed } = withdrawCaddyBackends(config, allowed);
     if (!withdrawn.length) return { proxy: this.proxy, active, withdrawn };
+    // No idle census can rule out a late upgrade while admission remains open.
+    const lingering = delayed;
     try {
+      if (lingering.length) await this.markPendingStreams(lingering);
       const loaded = await this.request("/load", {
         method: "POST",
         headers: { "content-type": "application/json", "cache-control": "must-revalidate" },
@@ -263,6 +513,19 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
         withdrawn,
         error: `withdrawal failed: ${(error as Error).message}`,
       };
+    }
+    if (lingering.length) {
+      try {
+        await this.stopForStreams();
+      } catch (error) {
+        return {
+          proxy: this.proxy,
+          active,
+          withdrawn,
+          error: `withdrawn, but upgraded streams to ${lingering.join(", ")} stay open: stop failed: ${(error as Error).message}`,
+        };
+      }
+      return { proxy: this.proxy, active, withdrawn, stopped: lingering };
     }
     return { proxy: this.proxy, active, withdrawn };
   }
@@ -462,7 +725,7 @@ export class EdgeWatchdog {
         await this.emit({
           event: "withdrawn",
           proxy: adapter.proxy,
-          detail: `withdrew ${backendSummary(result.withdrawn)} in ${took} ms${this.lastPolicyError ? ` (policy unavailable: ${this.lastPolicyError})` : ""}`,
+          detail: `withdrew ${backendSummary(result.withdrawn)} in ${took} ms${result.stopped?.length ? `; stopped ${adapter.proxy} to close upgraded streams to ${backendSummary(result.stopped)} (the launch guard restarts it)` : ""}${this.lastPolicyError ? ` (policy unavailable: ${this.lastPolicyError})` : ""}`,
         });
       }
       if (!result.unreachable) this.inspected.add(adapter.proxy);

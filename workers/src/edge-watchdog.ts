@@ -9,7 +9,9 @@
 // policy cannot be read for 5 s, that is all of them. If a withdrawal cannot be applied and verified
 // it fences protected traffic and raises an alert. Caddy stops its HTTP app; HAProxy preserves
 // unrelated HTTP, with its launch guard stopping the process if enforcement stays unverified.
-// It works with the operation workers stopped.
+// It works with the operation workers stopped. A withdrawn Caddy route that still holds WebSockets
+// (FD-09 renders stream_close_delay 5m, which a reload cannot cut short) is closed by stopping Caddy;
+// the launch guard restarts it and the next pass restores the lease-checked config (§3.5).
 //
 // `GET /v1/launch[?proxy=haproxy]` answers `open` or `closed` for the launch guards
 // (infra/platform/edge-launch-guard.sh, infra/platform/edge-l4-launch-guard.sh): `open` only when
@@ -19,6 +21,7 @@
 import { join } from "node:path";
 
 import {
+  caddyState,
   CaddyWithdrawalAdapter,
   HaproxyWithdrawalAdapter,
   haproxyLaunchDecision,
@@ -36,7 +39,8 @@ import { watchdogConfig } from "./watchdog-config.ts";
 const apiUrl = (process.env.ARK_API_URL ?? "http://api:3000").replace(/\/$/, "");
 const token = process.env.ARK_EDGE_WATCHDOG_TOKEN?.trim() ?? "";
 const adminUrl = process.env.ARK_EDGE_ADMIN_URL ?? "http://edge-admin:2019";
-const caddyfile = join(process.env.ARK_EDGE_DIR ?? "/var/lib/ark/edge", "Caddyfile");
+const edgeDir = process.env.ARK_EDGE_DIR ?? "/var/lib/ark/edge";
+const caddyfile = join(edgeDir, "Caddyfile");
 // HAProxy (edge-l4, FD-25): enforced only where its master socket is mounted.
 const haproxyMaster = process.env.ARK_HAPROXY_MASTER_SOCKET?.trim() ?? "";
 const haproxyConfig = join(process.env.ARK_EDGE_L4_DIR ?? "/usr/local/etc/haproxy", "current", "haproxy.cfg");
@@ -66,7 +70,9 @@ async function report(event: WatchdogEvent) {
   if (!response.ok) throw new Error(`watchdog-event returned ${response.status}`);
 }
 
-const adapters: EdgeWithdrawalAdapter[] = [new CaddyWithdrawalAdapter(adminUrl)];
+const adapters: EdgeWithdrawalAdapter[] = [
+  new CaddyWithdrawalAdapter(adminUrl, fetch, 3_000, caddyState(edgeDir)),
+];
 if (haproxyMaster) adapters.push(new HaproxyWithdrawalAdapter(haproxyMaster));
 const proxies = new Map(
   adapters.map((adapter) => [

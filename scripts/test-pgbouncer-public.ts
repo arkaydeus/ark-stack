@@ -471,12 +471,15 @@ function expectRejected(result: { status: number; stderr: string }, pattern: Reg
 
 try {
   await mkdir(projectDir, { recursive: true });
-  if (requestedPort !== "15432") {
-    const override = join(work, "smoke-ports.yml");
-    const binding = `127.0.0.1:${requestedPort === "0" ? "" : requestedPort}:5432`;
-    await Bun.write(override, `services:\n  pgbouncer-public:\n    ports: !override ["${binding}"]\n`);
-    compose.push("-f", override);
-  }
+  const override = join(work, "smoke-ports.yml");
+  const portBinding = `127.0.0.1:${requestedPort === "0" ? "" : requestedPort}:5432`;
+  // --project-directory relocates bind mounts, so anchor the new PostgreSQL image build at
+  // the real source root instead of the disposable state directory.
+  await Bun.write(
+    override,
+    `services:\n  app-postgres:\n    build:\n      context: ${JSON.stringify(root)}\n  pgbouncer-public:\n    ports: !override ["${portBinding}"]\n`,
+  );
+  compose.push("-f", override);
   await mkdir(pgbouncerDir, { recursive: true });
   await mkdir(certDir, { recursive: true });
   await mkdir(clientDir, { recursive: true });

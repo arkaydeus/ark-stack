@@ -101,6 +101,7 @@ export async function runWorker(
   name: string,
   prefixes: string[],
   executor: (job: WorkerJob) => Promise<void | { complete: boolean; evidence?: Record<string, unknown> }>,
+  options: { concurrency?: number; signal?: AbortSignal; pollMs?: number } = {},
 ) {
   process.env.ARK_WORKER_NAME = name;
   let stopped = false;
@@ -109,13 +110,27 @@ export async function runWorker(
   };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
+  const running = new Set<Promise<void>>();
+  const concurrency = Math.max(1, Math.min(16, options.concurrency ?? 1));
   while (true) {
-    if (stopped) break;
+    if (stopped || options.signal?.aborted) break;
     try {
-      for (const job of await poll(prefixes)) await executeOne(job, executor);
+      if (running.size < concurrency) {
+        for (const job of await poll(prefixes)) {
+          const task = executeOne(job, executor)
+            .catch((error) => {
+              console.error(redactLogLine(error instanceof Error ? error.message : "worker job failed"));
+            })
+            .finally(() => running.delete(task));
+          running.add(task);
+        }
+      }
     } catch (error) {
       console.error(redactLogLine(error instanceof Error ? error.message : "worker tick failed"));
     }
-    await Bun.sleep(2_000);
+    await Bun.sleep(options.pollMs ?? 2_000);
   }
+  await Promise.allSettled(running);
+  process.off("SIGTERM", stop);
+  process.off("SIGINT", stop);
 }

@@ -1,11 +1,12 @@
 import { resolve4, resolve6, resolveCname, resolveMx, resolveTxt } from "node:dns/promises";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import {
   allowedBackends,
   routeIdentityKey,
   assertCidrs,
   CaddyWithdrawalAdapter,
+  caddyState,
   backupProofAllowed,
   buildProvisionPlan,
   candidateRequiresApproval,
@@ -27,8 +28,10 @@ import {
   PGBOUNCER_PORT,
   PGBOUNCER_SOCKET_DIR,
   planEdge,
+  servedHttpHostnames,
   planHash,
   platformDbIngressLimits,
+  redactLogLine,
   validateMaintenanceBundle,
   type BackupStatus,
   type DnsWrite,
@@ -45,8 +48,10 @@ import { withPgbouncerLock } from "./modules/pgbouncer-lock.ts";
 import { loadEnv } from "./env.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
+import { exportTarget, startBackupSchedule, verifyTarget } from "./modules/offsite-backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
 import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
+import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import {
   EDGE_OBSERVE_TARGET,
   edgePolicy,
@@ -130,6 +135,7 @@ import {
   aliases,
   auditEvents,
   backups,
+  backupTargets,
   certificates,
   clientCertificates,
   databaseClients,
@@ -578,6 +584,8 @@ export async function runOperation(
   }
   if (kind === "backup.create") return createBackup(operation);
   if (kind === "backup.restore_test") return restoreBackup(operation);
+  if (kind === "backup.export") return exportBackupTarget(operation);
+  if (kind === "backup.verify_target") return verifyBackupTarget(operation);
   if (kind === "update.apply") return applyUpdate(operation);
   if (kind === "admin.mode_change") return changeMode(operation);
   if (kind === "dns.publish") return publishDns(operation);
@@ -1377,9 +1385,13 @@ async function applyUpdate(operation: OperationRow) {
 
 async function createBackup(operation: OperationRow) {
   const kind = String(operation.payload.kind ?? "platform-postgres");
+  const type = ["full", "diff", "incr"].includes(String(operation.payload.type))
+    ? (String(operation.payload.type) as "full" | "diff" | "incr")
+    : "full";
   const result = await runBackup(
     kind as "platform-postgres" | "app-postgres" | "mail" | "volume",
     operation.targetIds[0],
+    { type },
   );
   await db.insert(backups).values({
     id: createId("bak"),
@@ -1390,12 +1402,53 @@ async function createBackup(operation: OperationRow) {
     nativeSnapshotId: result.snapshotId ?? null,
     restoreVerified: false,
   });
+  if (result.status === "local") {
+    // FD-21: a PostgreSQL backup lands in the local repo2 first; ship it to every target now rather
+    // than at the next five-minute tick.
+    await addStep(operation.id, "backup", result);
+    for (const target of await db.select().from(backupTargets).where(eq(backupTargets.enabled, true))) {
+      await enqueue({ kind: "backup.export", targetIds: [target.id], payload: { fresh: true } });
+    }
+    return;
+  }
   if (!backupProofAllowed(result) && result.executed === false) {
     await addStep(operation.id, "backup", result);
     throw new Error("Backup execution is disabled; a plan cannot satisfy a backup operation.");
   }
   if (!backupProofAllowed(result)) throw new Error("Backup did not produce uploaded evidence.");
   await addStep(operation.id, "backup", result);
+}
+
+/** `backup.export` (FD-21): stage and upload both PostgreSQL clusters to one target. */
+async function exportBackupTarget(operation: OperationRow) {
+  const result = await exportTarget(operation.targetIds[0], { fresh: operation.payload.fresh === true });
+  await addStep(operation.id, "backup-export", result as unknown as Record<string, unknown>);
+}
+
+/** `backup.verify_target` (FD-21): the append-only canary with the deployed writer credentials. */
+async function verifyBackupTarget(operation: OperationRow) {
+  const evidence = await verifyTarget(
+    operation.targetIds[0],
+    operation.payload.revision as string | undefined,
+  );
+  await addStep(operation.id, "append-only-canary", {
+    status: evidence.status,
+    findings: evidence.findings,
+    retentionUntil: evidence.retentionUntil,
+  });
+}
+
+/**
+ * Backup schedules (FD-21): observe the executors and enqueue due full/differential backups, an
+ * export per target every five minutes and the weekly canary. Run by the backup worker when backups
+ * execute; queued or running operations are reused, so a stopped worker does not pile them up.
+ */
+export function scheduleBackups() {
+  if (process.env.ARK_BACKUP_EXECUTE !== "1") return null;
+  return startBackupSchedule({
+    enqueue: (input) => enqueue(input),
+    log: (line) => console.error(redactLogLine(line)),
+  });
 }
 
 async function restoreBackup(operation: OperationRow) {
@@ -2288,7 +2341,8 @@ export function startRolloverScheduler(
 
 // The edge serves only hostnames whose current certificate is `issued`. Public `http` endpoints
 // have no upstream yet, so they are rendered as unrouted (a fixed 503 naming no internal host).
-// Tailnet HTTP routes are rendered only while the lease allows them (front door §3.2, FD-06).
+// Front-door HTTP routes are read from `front_routes` and rendered only while the lease allows them
+// (front door §3.2, FD-06) and only in an implemented access mode (§3.5, FD-09: public).
 export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
   const policy = await edgePolicy();
   return planEdge({
@@ -2296,15 +2350,7 @@ export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: s
     adminHostname,
     endpoints: await db.select().from(endpoints),
     certificates: await db.select().from(certificates),
-    tailnetRoutes: policy.routes
-      .filter((route) => route.kind === "http")
-      .map((route) => ({
-        id: route.id,
-        hostname: route.hostname,
-        stableId: route.stableId,
-        ip: route.ip,
-        port: route.port,
-      })),
+    httpRoutes: await edgeHttpRoutes(policy.routes),
   });
 }
 
@@ -2319,6 +2365,8 @@ async function applyEdge(operation: OperationRow) {
     ...written,
     unrouted: plan.appRoutes.map((route) => route.hostname),
     awaitingCertificate: plan.awaitingCertificate,
+    // Routes the lease allows but this release cannot serve (sso before FD-11, invalid options).
+    omitted: plan.omitted,
   });
   // The SNI router names every hostname Caddy serves; a queued edge.l4_apply is reused.
   if (edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
@@ -2337,17 +2385,20 @@ export async function withEdgeLock<T>(work: () => Promise<T>) {
 
 // HAProxy SNI router on 443 (front door §3.8.5, FD-25): HTTP, admin and login hostnames go to Caddy
 // over PROXY v2; unknown SNI goes to Caddy too; non-TLS is rejected after 5 s. TLS-TCP routes arrive
-// with FD-14, so no tailnet backend is rendered here yet.
+// with FD-14, so no tailnet backend is rendered here yet. The HTTP hostnames are exactly the ones the
+// same plan gives Caddy a site for (FD-09): servable routes with an issued certificate, never an
+// omitted or unservable route.
+export function edgeL4Input(plan: Pick<Awaited<ReturnType<typeof edgePlan>>, "certificates">) {
+  return { httpHostnames: servedHttpHostnames(plan), tlsRoutes: [] };
+}
+
 async function applyEdgeL4(operation: OperationRow) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
     settings?.adminHostname,
   );
-  const httpHostnames = plan.certificates
-    .filter((certificate) => certificate.status === "issued")
-    .map((certificate) => certificate.hostname);
-  const written = await withEdgeLock(() => writeEdgeL4({ httpHostnames, tlsRoutes: [] }));
+  const written = await withEdgeLock(() => writeEdgeL4(edgeL4Input(plan)));
   await addStep(operation.id, "edge-l4-apply", written);
   return written;
 }
@@ -2391,11 +2442,17 @@ async function reconcileServedRoutes() {
       .filter((certificate) => certificate.status === "issued")
       .map((certificate) => certificate.hostname),
   );
-  const allowed = plan.tailnetRoutes.filter((route) => issued.has(route.hostname));
+  // Redirect-only routes dial no backend, so they carry no identity to look for.
+  const allowed = plan.httpRoutes.filter((route) => issued.has(route.hostname) && !route.redirectTo);
   if (!allowed.length) return { checked: true, missing: [] };
   let active: string[];
   try {
-    active = await new CaddyWithdrawalAdapter(adminUrl).activeRoutes();
+    active = await new CaddyWithdrawalAdapter(
+      adminUrl,
+      fetch,
+      3_000,
+      caddyState(process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform")),
+    ).activeRoutes();
   } catch (error) {
     return { checked: false, error: (error as Error).message };
   }
@@ -2426,7 +2483,12 @@ async function drainEdge(operation: OperationRow) {
     return;
   }
   const allowed = allowedBackends(await edgePolicy());
-  const adapter = new CaddyWithdrawalAdapter(adminUrl);
+  const adapter = new CaddyWithdrawalAdapter(
+    adminUrl,
+    fetch,
+    3_000,
+    caddyState(process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform")),
+  );
   const result = await adapter.enforce(allowed);
   if (result.error) {
     let outcome = "Caddy was stopped";
@@ -2442,13 +2504,13 @@ async function drainEdge(operation: OperationRow) {
     });
     throw new Error(`Caddy withdrawal failed; ${outcome}: ${result.error}`);
   }
-  if (result.unreachable) throw new Error(result.error);
+  // An unreachable result without an error is an expected, bounded restart. HAProxy still drains.
   const haproxy = await drainHaproxy(allowed);
   await addStep(operation.id, "edge-drain", {
     reason: operation.payload.reason ?? null,
     routeIds: operation.payload.routeIds ?? [],
     backends,
-    caddy: { active: result.active, withdrawn: result.withdrawn },
+    caddy: { active: result.active, withdrawn: result.withdrawn, restarting: !!result.unreachable },
     haproxy,
   });
 }
@@ -2627,5 +2689,7 @@ export function startCoordinator() {
   // Embedded workers include the database worker's duties, so they run the rollover scheduler.
   startRolloverScheduler();
   scheduleEdgeObserve();
+  // ...and the backup worker's (FD-21), when backups execute.
+  scheduleBackups();
   return setInterval(tick, 1500);
 }

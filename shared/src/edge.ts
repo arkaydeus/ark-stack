@@ -1,9 +1,13 @@
-import { routeIdentityKey } from "./edge-withdrawal.ts";
 import type { AdminMode } from "./dns-plan.ts";
+import {
+  EDGE_ERRORS_DIR,
+  HTTP_ROUTE_SNIPPETS,
+  checkedHttpRoute,
+  httpRouteSiteBody,
+  type EdgeHttpRoute,
+} from "./edge-http.ts";
 import { ValidationError } from "./errors.ts";
 import { normalizeHostname } from "./hostnames.ts";
-import { checkTailnetAddress, parseIpLiteral } from "./tailnet.ts";
-import { backendKey } from "./tailnet-observe.ts";
 
 /** Where the `edge` container mounts Ark's lego certificates (read-only), one directory per hostname. */
 export const EDGE_CERT_DIR = "/var/lib/ark/certs";
@@ -28,13 +32,8 @@ export type EdgeCertificate = {
  */
 export type EdgeAppRoute = { hostname: string; upstream?: string };
 
-/**
- * A front-door HTTP route to a tailnet backend (docs/design/front-door.md §3.2, FD-06). Only routes
- * that are enabled, `ready` and allowed by a fresh lease are passed in. The pinned IP is the only
- * address dialed; route and stable-ID metadata authorise that exact pin. FD-09 adds the gate, header
- * policy and per-route options.
- */
-export type EdgeTailnetRoute = { id: string; hostname: string; stableId: string; ip: string; port: number };
+/** A route `planEdge` left out, and why (an unimplemented access mode, invalid stored options). */
+export type OmittedHttpRoute = { id: string; hostname: string; reason: string };
 
 /**
  * The Caddyfile global block (docs/design/front-door.md §3.5, FD-25). HAProxy (`edge-l4`) owns public
@@ -97,22 +96,6 @@ function checkedHostname(hostname: string) {
   return hostname;
 }
 
-const ROUTE_ID = /^rt_[a-z0-9]+$/;
-
-function checkedTailnetRoute(route: EdgeTailnetRoute) {
-  const ip = parseIpLiteral(route.ip);
-  if (!ip || checkTailnetAddress(ip) || ip.canonical !== route.ip) {
-    throw new ValidationError(
-      `Tailnet route target ${JSON.stringify(route.ip)} is not a canonical Tailscale address.`,
-    );
-  }
-  if (!Number.isInteger(route.port) || route.port < 1 || route.port > 65535) {
-    throw new ValidationError(`Tailnet route port ${JSON.stringify(route.port)} is invalid.`);
-  }
-  if (!ROUTE_ID.test(route.id)) throw new ValidationError(`Route id ${JSON.stringify(route.id)} is invalid.`);
-  return { ...route, upstream: backendKey(ip.canonical, route.port) };
-}
-
 function checkedPath(path: string) {
   if (!PATH.test(path) || path.split("/").includes("..")) {
     throw new ValidationError(`Edge certificate path ${JSON.stringify(path)} is not a plain absolute path.`);
@@ -157,7 +140,11 @@ export function currentEdgeCertificates(input: {
 
 /**
  * What the edge should serve, from the endpoint and certificate rows. Public `http` endpoints have
- * no upstream yet (tailnet routes arrive with the front door), so they are rendered as unrouted.
+ * no upstream yet, so they are rendered as unrouted. Front-door HTTP routes come from `front_routes`
+ * through the lease policy (§3.2): only enabled, `ready` routes with a valid pin reach this point.
+ * Before FD-11 an `sso` route is omitted (fail closed: there is no gate to render), as is a route
+ * whose stored values fail validation; both are listed in `omitted` and served nowhere, so neither
+ * Caddy nor the HAProxy 443 map names them.
  */
 export function planEdge(input: {
   adminMode: AdminMode;
@@ -165,18 +152,29 @@ export function planEdge(input: {
   endpoints: Array<{ id: string; kind: string; hostname: string; exposure: string }>;
   certificates: Array<{ endpointId: string; status: string; lastDeployedAt: Date | null }>;
   certDir?: string;
-  /** Tailnet HTTP routes allowed by the current lease (§3.2); every other route is omitted. */
-  tailnetRoutes?: EdgeTailnetRoute[];
+  /** Front-door HTTP routes allowed by the current lease (§3.2); every other route is omitted. */
+  httpRoutes?: EdgeHttpRoute[];
 }) {
   const appRoutes: EdgeAppRoute[] = input.endpoints
     .filter((item) => item.kind === "http" && item.exposure === "public")
     .map((item) => ({ hostname: item.hostname }));
-  const tailnetRoutes = (input.tailnetRoutes ?? []).toSorted((a, b) => a.hostname.localeCompare(b.hostname));
+  const omitted: OmittedHttpRoute[] = [];
+  const httpRoutes = (input.httpRoutes ?? [])
+    .filter((route) => {
+      try {
+        checkedHttpRoute(route);
+        return true;
+      } catch (error) {
+        omitted.push({ id: route.id, hostname: route.hostname, reason: (error as Error).message });
+        return false;
+      }
+    })
+    .toSorted((a, b) => a.hostname.localeCompare(b.hostname));
   const adminHostname = input.adminMode === "public" ? (input.adminHostname ?? undefined) : undefined;
   const wanted = new Set([
     ...(adminHostname ? [adminHostname] : []),
     ...appRoutes.map((r) => r.hostname),
-    ...tailnetRoutes.map((r) => r.hostname),
+    ...httpRoutes.map((r) => r.hostname),
   ]);
   const certificates = currentEdgeCertificates(input).filter((item) => wanted.has(item.hostname));
   const issued = new Set(
@@ -187,9 +185,18 @@ export function planEdge(input: {
     adminHostname,
     certificates,
     appRoutes,
-    tailnetRoutes,
+    httpRoutes,
+    omitted,
     awaitingCertificate: [...wanted].filter((hostname) => !issued.has(hostname)).toSorted(),
   };
+}
+
+/**
+ * The HTTP hostnames for the HAProxy 443 map (`edge.l4_apply`, FD-09): exactly the hostnames the same
+ * plan gives Caddy a site for, so an omitted or unservable route is in neither config.
+ */
+export function servedHttpHostnames(plan: { certificates: Array<{ hostname: string; status: string }> }) {
+  return plan.certificates.filter((item) => item.status === "issued").map((item) => item.hostname);
 }
 
 /**
@@ -199,9 +206,12 @@ export function planEdge(input: {
  * The `:80` block serves ACME HTTP-01 challenges, redirects served hostnames to HTTPS with 308 and
  * answers 404 for every other host.
  *
- * Tailnet routes are preceded by a `# ark-tailnet-route <id> <ip:port>` marker. Rendering with
- * `tailnetRoutes` omitted gives the closed variant the Caddy launch guard starts from when the lease
- * is not valid (§3.2).
+ * Front-door HTTP routes (§3.5, FD-09) are rendered by `httpRouteSiteBody` (edge-http.ts): no-leak
+ * headers, static error pages from `errorsDir`, Location and Set-Cookie rewriting, WebSocket and
+ * timeout settings, HSTS, a body limit, or the apex redirect. Proxying routes are preceded by a
+ * `# ark-tailnet-route <id> <ip:port>` marker. Rendering with `httpRoutes` omitted gives the closed
+ * variant the Caddy launch guard starts from when the lease is not valid (§3.2). Any route that is not
+ * `public` fails the render: before FD-11 there is no forward_auth to protect it.
  */
 export function renderCaddyfile(input: {
   adminMode: AdminMode;
@@ -210,8 +220,15 @@ export function renderCaddyfile(input: {
   apiUpstream: string;
   certificates?: EdgeCertificate[];
   appRoutes?: EdgeAppRoute[];
-  tailnetRoutes?: EdgeTailnetRoute[];
+  httpRoutes?: EdgeHttpRoute[];
+  /** Static 502/503/504 pages inside the edge container (infra/platform/edge-errors). */
+  errorsDir?: string;
+  /** Binds the full and closed files to one apply, including route-free configurations. */
+  generation?: string;
 }) {
+  const errorsDir = checkedPath(input.errorsDir ?? EDGE_ERRORS_DIR);
+  if (input.generation && !/^[a-zA-Z0-9-]+$/.test(input.generation))
+    throw new ValidationError("Invalid edge generation.");
   const issued = new Map<string, EdgeCertificate>();
   const seen = new Set<string>();
   for (const certificate of input.certificates ?? []) {
@@ -224,8 +241,11 @@ export function renderCaddyfile(input: {
   }
   const served: string[] = [];
   const site = (hostname: string, body: string, marker = "") => {
-    const certificate = issued.get(checkedHostname(hostname));
-    if (!certificate || served.includes(hostname)) return "";
+    hostname = checkedHostname(hostname);
+    const certificate = issued.get(hostname);
+    if (!certificate) return "";
+    if (served.includes(hostname))
+      throw new ValidationError(`Edge hostname ${hostname} is listed more than once.`);
     served.push(hostname);
     // HTTPS sites listen on loopback only, behind the HAProxy SNI router on 443 (§3.5, §3.8).
     return `${marker}${hostname} {
@@ -272,23 +292,29 @@ ${body}}
     })
     .filter(Boolean)
     .join("\n");
-  const tailnet = (input.tailnetRoutes ?? [])
-    .map(checkedTailnetRoute)
+  const checkedRoutes = (input.httpRoutes ?? []).map(checkedHttpRoute);
+  const ids = new Set<string>();
+  for (const route of checkedRoutes) {
+    if (ids.has(route.id)) throw new ValidationError(`Route ${route.id} is listed more than once.`);
+    ids.add(route.id);
+  }
+  const http = checkedRoutes
     .map((route) =>
       site(
         route.hostname,
-        `  route {
-    vars ark_tailnet_route ${routeIdentityKey(route)}
-    reverse_proxy ${route.upstream}
-  }
-`,
-        `${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
+        httpRouteSiteBody(route),
+        // Redirect-only routes dial nothing, so they carry no tailnet marker.
+        route.redirectTo
+          ? `# ${route.id} ${route.hostname}: canonical redirect to ${route.redirectTo}
+`
+          : `# ${route.id} ${route.hostname}: public access
+${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
 `,
       ),
     )
     .filter(Boolean)
     .join("\n");
-  const sites = [admin, routes, tailnet].filter(Boolean).join("\n");
+  const sites = [admin, routes, http].filter(Boolean).join("\n");
   const known = served.length
     ? `  @known host ${served.join(" ")}
   handle @known {
@@ -296,13 +322,17 @@ ${body}}
   }
 `
     : "";
+  const snippets = http ? `${HTTP_ROUTE_SNIPPETS(errorsDir)}\n` : "";
   return `${CADDY_GLOBAL_BLOCK}
 
-:80 {
-  @challenge path /.well-known/acme-challenge/*
+${snippets}:80 {
+${input.generation ? `  vars ark_edge_generation ${input.generation}\n` : ""}  @challenge path /.well-known/acme-challenge/*
   handle @challenge {
     root * ${input.challengeDir}
-    file_server
+    # Explicit hides keep CLI and admin-API adaptation identical for guarded restoration.
+    file_server {
+      hide /etc/caddy/ark/Caddyfile /etc/caddy/ark/Caddyfile.closed ./Caddyfile
+    }
   }
 ${known}  handle {
     respond "Ark Stack challenge edge" 404

@@ -4,6 +4,7 @@ import { join } from "node:path";
 export const imageTargets = [
   "agent",
   "app",
+  "app-postgres",
   "backup-worker",
   "database-ingress",
   "database-worker",
@@ -11,6 +12,7 @@ export const imageTargets = [
   "edge-watchdog",
   "haproxy-validator",
   "mail-worker",
+  "postgres",
 ];
 export const imageSource = "https://github.com/arkaydeus/ark-stack";
 

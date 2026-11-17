@@ -17,7 +17,8 @@ export class ProxyWatchdog {
   async tick() {
     try {
       const results = await this.watchdog.tick(300);
-      this.lastVerifiedAt = results.some((result) => result.error)
+      // An unreachable proxy is never verified, not even while it restarts after a deliberate stop.
+      this.lastVerifiedAt = results.some((result) => result.error || result.unreachable)
         ? Number.NEGATIVE_INFINITY
         : performance.now();
       this.lastTick = {
