@@ -5,7 +5,7 @@ import { executeClaimedJob, scheduleBackups } from "../../server/src/coordinator
 // target every five minutes and re-run the weekly append-only canary (front door §3.18).
 const schedule = process.env.ARK_BACKUP_SCHEDULE === "0" ? null : scheduleBackups();
 try {
-  // Separate bounded lanes: uploads never wait behind a full backup or a weekly canary.
+  // Separate bounded lanes keep local backups and canaries from occupying all export slots.
   // The coordinator excludes overlapping target IDs; the executors serialize stanza mutations.
   await Promise.all([
     runWorker("backup", ["backup.create", "backup.restore_test"], executeClaimedJob, { concurrency: 2 }),

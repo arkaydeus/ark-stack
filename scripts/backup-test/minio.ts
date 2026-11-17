@@ -127,7 +127,7 @@ export async function startMinio(label: string): Promise<MinioFixture> {
   const mc = (args: string[], options: { allowFailure?: boolean; stdin?: string } = {}) =>
     run([...mcBase([]), ...args], options);
   const createUser = async (name: string, policyName: string, policy: unknown) => {
-    const secretAccessKey = randomBytes(18).toString("base64url");
+    const secretAccessKey = `key-${randomBytes(18).toString("base64url")}`;
     await mc(["admin", "user", "add", "ark", name, secretAccessKey]);
     if (typeof policy !== "string") {
       await run(

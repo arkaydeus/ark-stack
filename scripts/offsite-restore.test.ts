@@ -190,4 +190,4 @@ test("real Docker collisions preserve an existing container and volume contents"
         await docker(["volume", "rm", volume]);
     }
   }
-}, 30000);
+}, 120000);

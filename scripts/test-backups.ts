@@ -1,11 +1,14 @@
+import { workerSmoke } from "./backup-test/worker-smoke.ts";
+import { S3Client } from "../server/src/modules/s3-client.ts";
 // FD-21 acceptance suite: S3-compatible off-VPS backups, append-only, run locally against MinIO
 // (docs/design/front-door.md §3.18, §5 FD-21). No provider credentials are needed; hosted providers
 // run the same scenario opt-in through scripts/test-backups-hosted.ts.
 //
 // It starts a pinned MinIO (path-style), a throwaway control database and the actual `postgres` and
 // `app-postgres` Compose services with their pgBackRest executors, then drives the production backup
-// worker code (server/src/modules/offsite-backups.ts) in-process. restic runs in the pinned restic
-// image through scripts/backup-test/restic-docker.sh with exactly the environment the worker gives it.
+// worker code (server/src/modules/offsite-backups.ts) in-process, then runs the deployed Compose
+// backup-worker as bun with group 999, its stage/cache mounts, API claims and actual restic. The
+// in-process cases use scripts/backup-test/restic-docker.sh with the worker's minimal environment.
 //
 // 1. Append-only policy classes: a versioning-only bucket with a full-access writer fails (and
 //    permanent deletion succeeds there); a locked bucket with the AWS-style no-delete writer passes
@@ -21,7 +24,13 @@
 //    read-only recovery credentials and only the MinIO destination.
 import { randomBytes } from "node:crypto";
 
-import { PG_CLUSTERS, resticS3Repository, writerPolicy, type PgCluster } from "@ark-stack/shared";
+import {
+  PG_CLUSTERS,
+  resticS3Repository,
+  repositoryProtectionPolicy,
+  writerPolicy,
+  type PgCluster,
+} from "@ark-stack/shared";
 
 import {
   assert,
@@ -137,13 +146,29 @@ async function main() {
   );
   await removeTarget(versionedTarget.id);
 
+  const protect = async (bucket: string) => {
+    const client = new S3Client(
+      { endpoint: m.endpoint, region: "us-east-1", bucket, pathStyle: true },
+      { accessKeyId: m.rootUser, secretAccessKey: m.rootPassword },
+    );
+    const response = await client.request("PUT", undefined, {
+      query: { policy: "" },
+      body: JSON.stringify(repositoryProtectionPolicy(bucket, "ark")),
+    });
+    assert(
+      response.status === 204 || response.status === 200,
+      `bucket policy installed: ${response.status} ${response.text}`,
+    );
+  };
+  await protect("short");
+
   const shortTarget = await backups.saveS3Target(
     s3("short", "short-retention", shortWriter, { recoveryWindowDays: 7 }),
   );
   const short = await backups.verifyTarget(shortTarget.id);
   assert(
     short.status === "retention_short",
-    `1-day retention vs 7-day window must be unhealthy, got ${short.status}`,
+    `1-day retention vs 7-day window must be unhealthy, got ${short.status}: ${JSON.stringify(short.findings)}`,
   );
   record(
     "Retention shorter than the recovery window",
@@ -165,7 +190,8 @@ async function main() {
     `canary "${fullVerdict.status}" ("${health.targets[0]!.appendOnly.label}"); backups unhealthy and alert raised`,
   );
 
-  // The AWS-style no-delete writer (delete only on locks/): append-only, and restic backup works.
+  await protect("pitr");
+  // The AWS-style no-delete writer plus independently evaluated bucket denial covers exact config.
   const pitr = await backups.saveS3Target({ ...s3("pitr", "minio-pitr", writer), id: fullOnLocked.id });
   const locked = await backups.verifyTarget(pitr.id);
   assert(
@@ -275,7 +301,7 @@ async function main() {
         "pgbackrest",
         "--stanza=ark-platform",
         "--repo=2",
-        `--repo2-path=/restore/var/lib/ark/pg-stages/ark-platform/${restore.manifest.stageId}/repo2`,
+        "--repo2-path=/restore/repo2",
         "--output=json",
         "info",
       ]).then((result) => result.stdout),
@@ -443,6 +469,15 @@ async function main() {
     await c.psql(cluster, "INSERT INTO fd21_pitr SELECT 'after-target' FROM generate_series(1, 2000)");
   }
   const final = await backups.exportTarget(pitr.id, { fresh: true });
+  for (const source of final.sources)
+    assert(
+      source.ok && source.stats.filesUnmodified! > 0,
+      `${source.source}: restic reused unchanged parent files`,
+    );
+  record(
+    "Restic parent reuse",
+    "freshly copied stage retains unchanged-file detection through a relative tree, an explicit per-source parent and ignore-inode",
+  );
   for (const item of final.sources)
     assert(item.ok && item.lastRecoverableAt, `${item.source} exported with a recovery point`);
   health = await backups.backupHealth();
@@ -450,6 +485,88 @@ async function main() {
   assert(
     pitrHealth.healthy,
     `the append-only target is healthy after export: ${pitrHealth.reasons.join("; ")}`,
+  );
+  // Default manifest-time recovery must also work with no user writes after the backup.
+  const idleExport = await backups.exportTarget(pitr.id, { fresh: true });
+  const idleSource = idleExport.sources.find((item) => item.source === "pg:ark-platform");
+  assert(idleSource?.ok && idleSource.lastRecoverableAt, "idle source has a recovery point");
+  const idle = await offsiteRestore({
+    endpoint: m.endpoint,
+    region: "us-east-1",
+    bucket: "pitr",
+    prefix: "ark",
+    pathStyle: true,
+    ...recovery,
+    resticPassword: repositoryPassword,
+    cluster: "platform",
+    cipherPass: c.cipherPasses.platform,
+    image: c.images.platform,
+    resticNetwork: `container:${m.container}`,
+    snapshot: idleSource.snapshotId,
+  });
+  restored.push(idle);
+  assert(idle.targetTime === idleSource.lastRecoverableAt, "default recovery preserves the manifest time");
+  assert(
+    (await idle.query("SELECT count(*) FROM fd21_pitr")) ===
+      (await c.psql("platform", "SELECT count(*) FROM fd21_pitr")),
+    "idle cluster default recovery includes all committed rows",
+  );
+  await idle.cleanup();
+  record(
+    "Idle default recovery",
+    "no explicit target; manifest-time recovery completed and recovered every committed row",
+  );
+
+  // Two actual commits inside one millisecond expose any rounding-up of a PITR target.
+  // Async commit avoids fsync latency in this fixture connection only; staging
+  // switches and archives WAL durably before recovery, including both real commit records.
+  await c.psql(
+    "platform",
+    "CREATE TABLE fd21_precision (note text, xid text); CREATE PROCEDURE fd21_precision_pair() LANGUAGE plpgsql AS $$ BEGIN PERFORM set_config('synchronous_commit', 'off', false); INSERT INTO fd21_precision VALUES ('first', pg_current_xact_id()::text); COMMIT; INSERT INTO fd21_precision VALUES ('second', pg_current_xact_id()::text); COMMIT; END $$",
+  );
+  let preciseTarget = "";
+  for (let attempt = 0; attempt < 100 && !preciseTarget; attempt++) {
+    await c.psql("platform", "TRUNCATE fd21_precision");
+    await c.psql("platform", "CALL fd21_precision_pair()");
+    preciseTarget = await c.psql(
+      "platform",
+      "WITH commits AS (SELECT max(pg_xact_commit_timestamp(xid::xid)) FILTER (WHERE note='first') AS a, max(pg_xact_commit_timestamp(xid::xid)) FILTER (WHERE note='second') AS b FROM fd21_precision) SELECT CASE WHEN b>a AND date_trunc('milliseconds', a)=date_trunc('milliseconds', b) THEN to_json(a+(b-a)/2)#>>'{}' ELSE '' END FROM commits",
+    );
+  }
+  assert(preciseTarget, "obtained two distinct commits within the same millisecond");
+  const preciseExport = await backups.exportTarget(pitr.id, { fresh: true });
+  const preciseSource = preciseExport.sources.find((item) => item.source === "pg:ark-platform");
+  assert(preciseSource?.ok, "precision fixture exported");
+  const precise = await offsiteRestore({
+    endpoint: m.endpoint,
+    region: "us-east-1",
+    bucket: "pitr",
+    prefix: "ark",
+    pathStyle: true,
+    ...recovery,
+    resticPassword: repositoryPassword,
+    cluster: "platform",
+    cipherPass: c.cipherPasses.platform,
+    image: c.images.platform,
+    resticNetwork: `container:${m.container}`,
+    snapshot: preciseSource.snapshotId,
+    targetTime: preciseTarget,
+  });
+  restored.push(precise);
+  assert(
+    (await precise.query("SELECT string_agg(note, ',') FROM fd21_precision")) === "first",
+    "sub-millisecond PITR excludes the later commit",
+  );
+  await precise.cleanup();
+  record(
+    "Microsecond recovery boundary",
+    "two commits within one millisecond; exact target restored the first and excluded the second",
+  );
+
+  await workerSmoke(c, control, m, writer, repositoryPassword);
+  record(
+    "Deployed backup worker",
+    "bun user/group 999, read-only stages, cache, two healthy exports during blocked full backup and mid-upload stall; mail and volume exact snapshots restored with content assertions; executor inaccessible on control interface",
   );
   // Lose every VPS-local copy: PGDATA, repo2 and staged copies of both clusters.
   await c.destroy();

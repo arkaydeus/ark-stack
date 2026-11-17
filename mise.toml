@@ -66,8 +66,12 @@ description = "Check the public database port nftables rules (per-source limits,
 run = ["bun test shared/src/db-ingress.test.ts", "bun scripts/test-db-ingress.ts"]
 
 [tasks."test:backups"]
-description = "Off-VPS backups (FD-21) against a pinned MinIO, the actual postgres/app-postgres Compose services and a throwaway control database: append-only canary policy classes, the emulated R2 lock recipe, an unavailable destination, and full PITR recovery of both clusters from the bucket alone (requires Docker)"
-run = ["bunx tsc --noEmit -p scripts/tsconfig.backups.json", "bun scripts/test-backups.ts"]
+description = "Off-VPS backups (FD-21) against a pinned MinIO, the actual postgres/app-postgres Compose services and a throwaway control database: append-only canary policy classes, the emulated R2 lock recipe, exact-config policy exceptions, Docker restore ownership, deployed-worker outage/file restores, and full PITR recovery of both clusters from the bucket alone (requires Docker)"
+run = [
+  "bunx tsc --noEmit -p scripts/tsconfig.backups.json",
+  "bun test scripts/backup-test/provider-policies.test.ts scripts/offsite-restore.test.ts",
+  "bun scripts/test-backups.ts",
+]
 
 [tasks."test:backups-hosted"]
 description = "Opt-in: the same backup and off-VPS restore against AWS S3, B2 or R2 (virtual-host style); skips without ARK_TEST_S3_* credentials"

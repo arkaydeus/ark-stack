@@ -2,7 +2,7 @@
 //
 // It runs as the `postgres` user next to PGDATA and the local Unix socket, and answers a fixed set of
 // token-authenticated actions on the internal `backup-management` network: status, stanza-create,
-// check, backup (full/diff/incr) into the encrypted posix repo2, stage, and prune-stages. There is no
+// check, backup (full/diff/incr) into the encrypted posix repo2, stage, release-stage, and prune-stages. There is no
 // generic command, no shell and no Docker socket, and pgBackRest `expire` is never run.
 //
 // Locking: every repo2 writer holds the executor lock. archive-push (archive_command) and backup take
