@@ -2733,7 +2733,7 @@ app.get("/api/front/routes/:id/acl", async (c) => {
 // HTTP route lifecycle (front door §3.3, §3.13, §3.14, FD-08). Every role may list routes; every
 // change is owner-only (R12) with MFA. Creating, enabling and loosening need a single-use
 // `exposure.public` grant bound to the exact request, deleting a `resource.delete` grant, and
-// disabling (a tightening) none. Each grant is consumed only after every validation has passed.
+// disabling (a tightening) none. Final validation, grant consumption and mutation commit together.
 app.get("/api/front/routes", async (c) => {
   return c.json({ routes: await listFrontRoutes() });
 });

@@ -15,7 +15,8 @@
 // `enable` is refused before `ready`. Rendering routes into the live edge is FD-09; until then the
 // edge serves at most the FD-06 tailnet route blocks for enabled `ready` routes.
 //
-// Every validation runs before the caller consumes a step-up grant, and every action is audited.
+// Preparation validates without writes; final validation and grant consumption share the mutation
+// transaction, so conflicts roll back the grant. Every action is audited.
 
 import {
   HTTP_LISTEN_PORT,
