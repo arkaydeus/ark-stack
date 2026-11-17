@@ -35,6 +35,20 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 description = "Run unit tests"
 run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts"
 
+[tasks."test:db"]
+description = "Run the DB-backed server tests (or the bun test arguments given) against a throwaway, migrated postgres:17.6 container that is always removed"
+run = "bun scripts/test-db.ts"
+raw_args = true
+
+[tasks."test:db:up"]
+description = "Start and migrate a throwaway test PostgreSQL container and print its DATABASE_URL and test environment as shell exports"
+run = "bun scripts/test-db.ts up"
+
+[tasks."test:db:down"]
+description = "Remove a throwaway test PostgreSQL container started by test:db:up"
+run = "bun scripts/test-db.ts down"
+raw_args = true
+
 [tasks."test:e2e"]
 description = "Run fresh-volume browser onboarding against a disposable local database"
 run = "bun --env-file=.env scripts/test-e2e.ts"

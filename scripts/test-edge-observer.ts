@@ -397,10 +397,14 @@ async function activeBackends() {
 
 type Reply = { status: number; body: string };
 
+// Each probe opens a new connection (`agent: false`). With the default pooled keep-alive agent, a
+// poll kept reusing a connection accepted by the pre-reload Caddy, which kept answering with the
+// old configuration, so waitUntilServing() could time out although new clients were served.
 function secureGet(path = "/", hostname = routeHost) {
   return new Promise<Reply>((resolveReply, reject) => {
     const request = httpsRequest(
       {
+        agent: false,
         host: "127.0.0.1",
         port: ports.https,
         servername: hostname,
@@ -425,7 +429,7 @@ function secureGet(path = "/", hostname = routeHost) {
 function plainGet(host: string, path: string) {
   return new Promise<Reply>((resolveReply, reject) => {
     const request = httpRequest(
-      { host: "127.0.0.1", port: ports.http, path, headers: { host }, timeout: 3_000 },
+      { agent: false, host: "127.0.0.1", port: ports.http, path, headers: { host }, timeout: 3_000 },
       (response) => {
         let body = "";
         response.setEncoding("utf8");

@@ -343,8 +343,10 @@ test("revoking the last client closes the live ingress before a failed admin rel
   const bin = join(work, "bin");
   await mkdir(bin);
   // Exercise the real ingress watcher/listener. Only privileged nft execution is replaced.
+  // Like `nft -f -`, the stub must drain stdin: one that exits unread makes the watcher's rules
+  // write fail with EPIPE, which on Linux kills the watcher before it opens the listener.
   const nft = join(bin, "nft");
-  await Bun.write(nft, "#!/bin/sh\necho ark_db_ingress\n");
+  await Bun.write(nft, "#!/bin/sh\ncat >/dev/null\necho ark_db_ingress\n");
   await chmod(nft, 0o700);
   await Bun.write(join(overrides.ARK_PGBOUNCER_DIR!, "expose"), "1\n");
   const ingress = Bun.spawn([process.execPath, resolve("scripts/database-ingress.ts")], {
