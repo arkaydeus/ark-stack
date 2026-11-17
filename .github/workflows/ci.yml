@@ -55,6 +55,23 @@ jobs:
       STALWART_ADMIN_PASSWORD: ci-stalwart-password-0123456789
     steps:
       - uses: actions/checkout@v4
+      - name: TEMPORARY DNS diagnostic (to be reverted)
+        run: |
+          set -x
+          docker version --format '{{.Server.Version}}'
+          cat /etc/docker/daemon.json || true
+          cat /etc/resolv.conf; resolvectl status | head -30 || true
+          IMG=caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
+          docker network create --internal diag-int; docker network create diag-ext
+          docker run -d --name diag-wd --network diag-int --network-alias edge-watchdog $IMG sleep 600
+          docker run -d --name diag-a --network diag-int $IMG sleep 600
+          docker run -d --name diag-b --network diag-int $IMG sleep 600
+          docker network connect diag-ext diag-b
+          docker exec diag-b cat /etc/resolv.conf
+          for c in a b; do docker exec diag-$c sh -c 's=$(date +%s); wget -q -T 1 -O - http://edge-watchdog:2021/ 2>&1 | head -1; echo "running alias: $(( $(date +%s) - s ))s"'; done
+          docker stop -t 0 diag-wd
+          for c in a b; do docker exec diag-$c sh -c 's=$(date +%s); wget -q -T 1 -O - http://edge-watchdog:2021/ 2>&1 | head -1; echo "stopped alias wget: $(( $(date +%s) - s ))s"; s=$(date +%s); nslookup edge-watchdog 2>&1 | tail -3; echo "stopped alias nslookup: $(( $(date +%s) - s ))s"; s=$(date +%s); nslookup example.com 2>&1 | tail -2; echo "external nslookup: $(( $(date +%s) - s ))s"'; done
+          exit 1
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
