@@ -1355,6 +1355,38 @@ async function serversWith(predicate: (server: { key: string | null; adminState:
   }));
 }
 
+/** The HAProxy launch guard's mode, from its latest mode line (the logs span container restarts). */
+async function guardMode() {
+  const line = (await logsOf(stack.edgeL4))
+    .split("\n")
+    .findLast((entry) =>
+      /launch guard: (starting from the (full|closed) configuration|lease valid; switched|lease no longer allows|full reload unconfirmed)/.test(
+        entry,
+      ),
+    );
+  if (!line) return undefined;
+  return /starting from the full|switched to the full/.test(line) ? "full" : "closed";
+}
+
+/**
+ * Allow every tailnet route again and wait until the launch guard runs the full configuration. When
+ * the guard was closed (a previous case withdrew a route), it reopens with its own master-CLI
+ * `reload`. HAProxy's master re-executes on a reload and drops a concurrent CLI client, so a test
+ * reload racing it gets no answer ("the master CLI did not answer the reload"). A fixed pause does
+ * not cover a slow host; waiting for the guard's confirmed switch does.
+ */
+async function allowAllTailnetRoutes() {
+  lease.routes = [webRoute, mqttRoute];
+  lease.validUntil = Number.POSITIVE_INFINITY;
+  await Bun.sleep(1_500);
+  await waitFor(
+    "the HAProxy launch guard to run the full configuration",
+    async () => ((await guardMode()) === "closed" ? undefined : true),
+    30_000,
+    250,
+  );
+}
+
 async function sessionsAcrossWorkers() {
   const applied = await probe<{ reloaded: boolean; error?: string }>([
     "apply",
@@ -1421,9 +1453,7 @@ async function identityWithdrawalTest(report: Report) {
 
 /** `edge.drain` as the domain worker runs it: the HAProxy adapter through the shared master socket. */
 async function workerDrainTest(report: Report) {
-  lease.routes = [webRoute, mqttRoute];
-  lease.validUntil = Number.POSITIVE_INFINITY;
-  await Bun.sleep(1_500);
+  await allowAllTailnetRoutes();
   const { leaving, current, workers } = await sessionsAcrossWorkers();
   const started = Date.now();
   // The drained policy no longer allows the TLS route; the HTTP route stays allowed.
@@ -1455,9 +1485,7 @@ async function workerDrainTest(report: Report) {
 }
 
 async function leaseExpiryTest(report: Report) {
-  lease.routes = [webRoute, mqttRoute];
-  lease.validUntil = Number.POSITIVE_INFINITY;
-  await Bun.sleep(1_500);
+  await allowAllTailnetRoutes();
   const { leaving, current, workers } = await sessionsAcrossWorkers();
   const eventsBefore = events.length;
   const expiresAt = Date.now() + 4_000;
