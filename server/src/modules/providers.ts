@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
@@ -9,7 +10,10 @@ import {
   cloudflareRecordBody,
   compareInventory,
   digestFromHeaders,
+  caddyState,
+  CaddyWithdrawalAdapter,
   EDGE_CERT_DIR,
+  EDGE_ERRORS_DIR,
   edgeCertificatePaths,
   funnelDisabled,
   jmapCall,
@@ -26,7 +30,7 @@ import {
   type DbIngressLimits,
   type DnsWrite,
   type EdgeAppRoute,
-  type EdgeTailnetRoute,
+  type EdgeHttpRoute,
   type ExternalInventory,
 } from "@ark-stack/shared";
 
@@ -551,13 +555,15 @@ export async function writeEdge(input: {
   /** The current certificate status per hostname; only `issued` hostnames are served. */
   certificates?: Array<{ hostname: string; status: string }>;
   appRoutes?: EdgeAppRoute[];
-  /** Tailnet routes allowed by the current lease (front door §3.2, FD-06). */
-  tailnetRoutes?: EdgeTailnetRoute[];
+  /** Front-door HTTP routes allowed by the current lease and servable (front door §3.2, §3.5). */
+  httpRoutes?: EdgeHttpRoute[];
 }) {
   const dir = process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform");
   await mkdir(dir, { recursive: true });
-  const render = (tailnetRoutes: EdgeTailnetRoute[]) =>
+  const generation = randomUUID();
+  const render = (httpRoutes: EdgeHttpRoute[]) =>
     renderCaddyfile({
+      generation,
       adminMode: input.adminMode,
       adminHostname: input.adminHostname,
       challengeDir: process.env.ARK_ACME_WEBROOT ?? join(dir, "acme"),
@@ -568,10 +574,12 @@ export async function writeEdge(input: {
         ...edgeCertificatePaths(item.hostname, EDGE_CERT_DIR),
       })),
       appRoutes: input.appRoutes,
-      tailnetRoutes,
+      httpRoutes,
+      // Static 502/503/504 pages: the edge container mounts infra/platform/edge-errors there (FD-09).
+      errorsDir: EDGE_ERRORS_DIR,
     });
-  const caddy = render(input.tailnetRoutes ?? []);
-  // The closed variant renders no tailnet route. The Caddy launch guard starts from it whenever the
+  const caddy = render(input.httpRoutes ?? []);
+  // The closed variant renders no front-door route. The Caddy launch guard starts from it whenever the
   // edge watchdog does not confirm a valid lease for every tailnet backend in `Caddyfile` (§3.2).
   const closed = render([]);
   const serve = renderTailscaleServe();
@@ -587,7 +595,23 @@ export async function writeEdge(input: {
   await writeFile(nextServe, JSON.stringify(serve, null, 2), { mode: 0o600 });
   const reloadUrl = process.env.ARK_EDGE_RELOAD_URL;
   let applied = false;
+  let lingering: string[] = [];
+  const state = caddyState(dir);
+  const adapter = reloadUrl ? new CaddyWithdrawalAdapter(reloadUrl, fetch, 3_000, state) : null;
   if (reloadUrl) {
+    // A prior apply may have loaded/renamed its files but failed to stop the old streams.
+    // Retry that durable stop before inspection can mistake the new config for an empty census.
+    const pending = await state.pendingStreams();
+    if (pending.length) {
+      await adapter!.stopForStreams();
+      throw new Error("Caddy is restarting after a pending stream stop; retry edge.apply.");
+    }
+    const next = new Set(
+      [...caddy.matchAll(/^\s*vars ark_tailnet_route (\S+)\s*$/gm)].map((match) => match[1]!),
+    );
+    // An unreadable config is unknown, never evidence of absent streams. Abort before /load.
+    lingering = await adapter!.lingeringStreams(next);
+    if (lingering.length) await adapter!.markPendingStreams(lingering);
     await loadCaddyfile(reloadUrl, caddy);
     applied = true;
   } else if (process.env.NODE_ENV === "production") {
@@ -597,7 +621,19 @@ export async function writeEdge(input: {
   await rename(nextCaddy, caddyPath);
   await rename(nextServe, servePath);
   await chmod(caddyPath, 0o600);
-  return { dir, funnel: false, applied, tailnetRoutes: (input.tailnetRoutes ?? []).map((route) => route.id) };
+  // A removed route must not keep serving through open WebSockets: stop Caddy once the new files are
+  // in place, so its launch guard restarts it from them (front door §3.2, §3.5). The marker tells
+  // the edge watchdog that the restart is expected, not a failed withdrawal.
+  if (reloadUrl && lingering.length) {
+    await adapter!.stopForStreams();
+  }
+  return {
+    dir,
+    funnel: false,
+    applied,
+    httpRoutes: (input.httpRoutes ?? []).map((route) => route.id),
+    ...(lingering.length ? { stoppedForStreams: lingering } : {}),
+  };
 }
 
 export async function resolveImageDigest(image: string) {

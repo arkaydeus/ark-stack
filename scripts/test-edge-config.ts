@@ -241,7 +241,46 @@ async function validateConfigurations() {
   if (tlsSites?.length !== 3) {
     throw new Error(`Generated app-route config should load 3 Ark certificates, found ${tlsSites?.length}.`);
   }
+  // FD-09: the §3.5 example, rendered by the production planner (www proxies to the tailnet target,
+  // the apex redirects to www; an enabled SSO route is omitted before FD-11).
+  const route = {
+    stableId: "nHOME",
+    ip: "100.101.102.103",
+    port: 3000,
+    access: "public" as const,
+    internalNames: ["home.tail1234.ts.net", "home"],
+    internalIps: ["fd7a:115c:a1e0::6465:6667"],
+  };
+  const routePlan = planEdge({
+    adminMode: "public",
+    adminHostname: "admin.example.com",
+    endpoints: issuedHostnames.map((hostname) => ({
+      id: `end_${hostname}`,
+      kind: hostname === "admin.example.com" ? "admin" : "route",
+      hostname,
+      exposure: "public",
+    })),
+    certificates: issuedHostnames.map((hostname) => ({
+      endpointId: `end_${hostname}`,
+      status: "issued",
+      lastDeployedAt: new Date(),
+    })),
+    httpRoutes: [
+      { ...route, id: "rt_k3x9", hostname: "www.example.com" },
+      { ...route, id: "rt_a1b2", hostname: "example.com", redirectTo: "www.example.com" },
+      { ...route, id: "rt_sso1", hostname: "admin.example.com", access: "sso" },
+    ],
+  });
+  if (routePlan.omitted.map((item) => item.id).join() !== "rt_sso1") {
+    throw new Error("The planner must omit the enabled SSO route before FD-11.");
+  }
+  const routeConfig = renderCaddyfile({
+    ...routePlan,
+    challengeDir: "/var/lib/ark/acme",
+    apiUpstream: "api:3000",
+  });
   console.log("Validating rendered and static Caddyfiles (tls files from fixture certificates):");
+  await validate("generated-public-with-http-routes", routeConfig);
   await validate("generated-public", publicConfig);
   await validate(
     "generated-tailnet-edge",
@@ -511,7 +550,7 @@ function headerFixture() {
       "headers",
       await fixture("headers.Caddyfile"),
       [8080, 8081, 8082, 8083, 8084],
-      [`${join(fixtures, "errors")}:/etc/caddy/errors:ro`],
+      [`${join(root, "infra/platform/edge-errors")}:/etc/caddy/errors:ro`],
     );
     await waitFor(`${caddy.name} sites`, async () =>
       (await fetch(`${caddy.url(8080)}/`, { signal: AbortSignal.timeout(2_000) })).ok ? true : undefined,

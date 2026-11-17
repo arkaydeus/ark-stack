@@ -113,6 +113,8 @@ try {
         candidate = await request.text();
         return Response.json({ result: { apps: {} } });
       }
+      // edge.apply reads the running config first (routes it removes may hold WebSockets, FD-09).
+      if (new URL(request.url).pathname === "/config/") return Response.json({ apps: {} });
       assert.equal(request.headers.get("cache-control"), "must-revalidate");
       return new Response("");
     },
@@ -208,7 +210,7 @@ try {
   assert(candidate.includes("admin.edge.example.com {"));
   assert(candidate.includes("app.edge.example.com {"));
   assert(!candidate.includes("waiting.edge.example.com {"));
-  assert.deepEqual(calls, ["/adapt", "/load"]);
+  assert.deepEqual(calls, ["/config/", "/adapt", "/load"]);
   const apply = await operation("edge.apply");
   await runOperation("edge.apply", apply);
   const [step] = await db.select().from(operationSteps).where(eq(operationSteps.operationId, apply.id));
@@ -221,6 +223,25 @@ try {
   console.log(
     "Production issuance -> issued rows -> public admin and app rendered; sessions revoked on success; edge evidence recorded",
   );
+  // A transient drain adapter must recognise another instance's deliberate stop.
+  const { caddyState } = await import("@ark-stack/shared");
+  await caddyState(process.env.ARK_EDGE_DIR!).recordStop();
+  // Use an actual stopped listener: an HTTP 500/502 is a failed inspection, not process absence.
+  const stopped = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+  const previousAdminUrl = process.env.ARK_EDGE_RELOAD_URL;
+  process.env.ARK_EDGE_RELOAD_URL = `http://127.0.0.1:${stopped.port}`;
+  await stopped.stop(true);
+  calls.length = 0;
+  const drain = await operation("edge.drain");
+  await runOperation("edge.drain", drain);
+  assert.deepEqual(calls, []);
+  // Query through the isolated application's pool, not the source database.
+  const { sql: fixtureSql } = await import("./db.ts");
+  const alertRows =
+    await fixtureSql`SELECT title FROM alerts WHERE dedup_key = 'edge-withdrawal' AND resolved_at IS NULL`;
+  assert.equal(alertRows.length, 0);
+  process.env.ARK_EDGE_RELOAD_URL = previousAdminUrl;
+  console.log("edge.drain recognises a shared restart marker without stop fallback or critical alert");
   // Staging metadata stays untrusted and is omitted by the same database-backed plan.
   process.env.ARK_ACME_STAGING = await stagingSetting("1");
   const staged = await operation("certificate.renew", ["admin"]);

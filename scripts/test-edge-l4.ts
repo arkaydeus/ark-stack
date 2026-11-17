@@ -18,6 +18,13 @@
 // HAProxy and Caddy reloads; watchdog withdrawal of an HAProxy-routed tailnet backend on identity
 // failure and on lease expiry across current and leaving workers, and the domain worker's own drain;
 // the fail-closed HAProxy launch guard.
+//
+// FD-09 (§3.5) HTTP routes, rendered by the production planner and renderer and reached through 443:
+// no Server/Via on success or 502; forged X-Forwarded-For and X-Ark-* never reach the upstream;
+// Location (the §3.5 fixture table, compared with the reference evaluator) and Set-Cookie Domain
+// rewriting; the static 502 for an unreachable upstream and for an unsupported Location, naming no
+// tailnet host; the apex redirect and the :80 list; an enabled SSO route absent from both configs;
+// and a WebSocket idle for more than 10 minutes that then survives one edge.apply.
 import { randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
@@ -28,7 +35,13 @@ import { connect as tlsConnect, type TLSSocket } from "node:tls";
 
 import {
   CADDY_GLOBAL_BLOCK,
+  checkedHttpRoute,
+  evaluateLocation,
+  locationPolicy,
+  planEdge,
   routeIdentityKey,
+  servedHttpHostnames,
+  type EdgeHttpRoute,
   type EdgeLeaseDocument,
   type EdgePolicyRoute,
   type WatchdogEvent,
@@ -63,7 +76,12 @@ const appHost = "app.example.com";
 const tailnetHost = "tailnet.example.com";
 const wsHost = "ws.example.com";
 const mqttHost = "mqtt.example.com";
-const httpHosts = [adminHost, appHost, tailnetHost];
+// FD-09 routes (§3.5 example): www proxies to the peer, the apex redirects to www, broken dials a
+// closed port, and sso is enabled with access_mode=sso, which this release must never serve.
+const wwwHost = "www.example.com";
+const apexHost = "example.com";
+const brokenHost = "broken.example.com";
+const ssoHost = "sso.example.com";
 
 const webRoute: EdgePolicyRoute = {
   id: "rt_web1",
@@ -82,6 +100,62 @@ const mqttRoute: EdgePolicyRoute = {
   port: 1883,
 };
 const mqttL4 = { ...mqttRoute, sourceCidrs: ["0.0.0.0/0"] };
+
+/** The FD-09 routes as `edgeHttpRoutes` reads them from front_routes and the edge observation. */
+const peerName = "peer-http.tail1234.ts.net";
+const wwwRoute: EdgeHttpRoute = {
+  id: "rt_www1",
+  hostname: wwwHost,
+  stableId: webRoute.stableId,
+  ip: peerHttpIp,
+  port: 3000,
+  access: "public",
+  // The observed MagicDNS names and the node's other address, as the coordinator passes them.
+  internalNames: [peerName, "peer-http", "home.tail1234.ts.net"],
+  internalIps: ["fd7a:115c:a1e0::6465:6667"],
+};
+const fd09Routes: EdgeHttpRoute[] = [
+  {
+    id: webRoute.id,
+    hostname: tailnetHost,
+    stableId: webRoute.stableId,
+    ip: webRoute.ip,
+    port: 3000,
+    access: "public",
+  },
+  wwwRoute,
+  { ...wwwRoute, id: "rt_apex1", hostname: apexHost, redirectTo: wwwHost },
+  { ...wwwRoute, id: "rt_brk1", hostname: brokenHost, port: 3999 },
+  { ...wwwRoute, id: "rt_sso1", hostname: ssoHost, access: "sso" },
+];
+/** Lease entries for every FD-09 route, SSO included: the lease alone never makes a route servable. */
+const fd09Policy: EdgePolicyRoute[] = fd09Routes
+  .filter((route) => route.id !== webRoute.id)
+  .map(({ id, hostname, stableId, ip, port }) => ({ id, kind: "http", hostname, stableId, ip, port }));
+
+/** `edge.apply`'s plan: the production planner over fixture endpoint, certificate and route rows. */
+function fixturePlan() {
+  const at = new Date();
+  const rows = [
+    { hostname: adminHost, kind: "admin" },
+    { hostname: appHost, kind: "http" },
+    ...fd09Routes.map((route) => ({ hostname: route.hostname, kind: "route" })),
+  ];
+  return planEdge({
+    adminMode: "public",
+    adminHostname: adminHost,
+    endpoints: rows.map((row) => ({ id: `end_${row.hostname}`, exposure: "public", ...row })),
+    // Every hostname, sso included, has an issued certificate on disk.
+    certificates: rows.map((row) => ({
+      endpointId: `end_${row.hostname}`,
+      status: "issued",
+      lastDeployedAt: at,
+    })),
+    httpRoutes: fd09Routes,
+  });
+}
+/** `edge.l4_apply`'s HTTP hostnames, derived from the same plan as the coordinator does. */
+const httpHosts = servedHttpHostnames(fixturePlan());
 
 type Report = { name: string; lines: string[] };
 
@@ -116,7 +190,10 @@ async function bundle(entry: string, name: string) {
 // ---- Lease API (the API's read-only lease endpoint, served by this process) ---------------------------
 
 const watchdogToken = randomBytes(24).toString("base64url");
-const lease = { validUntil: Number.POSITIVE_INFINITY, routes: [webRoute, mqttRoute] as EdgePolicyRoute[] };
+const lease = {
+  validUntil: Number.POSITIVE_INFINITY,
+  routes: [webRoute, mqttRoute, ...fd09Policy] as EdgePolicyRoute[],
+};
 const events: WatchdogEvent[] = [];
 const api = Bun.serve({
   hostname: "0.0.0.0",
@@ -177,7 +254,9 @@ async function prepareFiles() {
   await chmod(directory, 0o755);
   const script = [
     "set -e",
-    ...[adminHost, appHost, tailnetHost, wsHost].map((host) => certificate(`/out/certs/${host}`, host)),
+    ...[adminHost, appHost, tailnetHost, wsHost, wwwHost, apexHost, brokenHost, ssoHost].map((host) =>
+      certificate(`/out/certs/${host}`, host),
+    ),
     certificate("/out/peer-certs", mqttHost),
     "chmod 644 /out/peer-certs/privkey.pem",
     "chown -R 1000:1000 /out/certs /out/edge",
@@ -301,7 +380,7 @@ async function startWatchdog() {
     "--env",
     "ARK_HAPROXY_MASTER_SOCKET=/var/run/haproxy/master.sock",
     "--volume",
-    `${edgeDir}:/var/lib/ark/edge:ro`,
+    `${edgeDir}:/var/lib/ark/edge`,
     "--volume",
     `${stack.volumes.edgeL4}:/usr/local/etc/haproxy:ro`,
     "--volume",
@@ -411,23 +490,9 @@ async function edgeTsAddress(networkName: string) {
   return ip;
 }
 
-/** `edge.apply` as the domain worker runs it: the production renderer and writeEdge on edge-control. */
+/** `edge.apply` as the domain worker runs it: the production planner, renderer and writeEdge on edge-control. */
 async function edgeApply() {
-  const plan = {
-    adminMode: "public",
-    adminHostname: adminHost,
-    certificates: [adminHost, appHost, tailnetHost].map((hostname) => ({ hostname, status: "issued" })),
-    appRoutes: [{ hostname: appHost }],
-    tailnetRoutes: [
-      {
-        id: webRoute.id,
-        hostname: webRoute.hostname,
-        stableId: webRoute.stableId,
-        ip: webRoute.ip,
-        port: webRoute.port,
-      },
-    ],
-  };
+  const plan = fixturePlan();
   const output = await docker(
     "run",
     "--rm",
@@ -455,7 +520,7 @@ async function edgeApply() {
     "write",
     JSON.stringify(plan),
   );
-  return JSON.parse(output) as { applied: boolean };
+  return JSON.parse(output) as { applied: boolean; httpRoutes: string[] };
 }
 
 async function caddyAdmin(path: string, init: { method?: string; body?: string; contentType?: string } = {}) {
@@ -1413,6 +1478,363 @@ async function launchGuardTest(report: Report) {
   );
 }
 
+// ---- FD-09: HTTP routes through the SNI router (§3.5) ---------------------------------------------------------
+
+type FullReply = { status: number; headers: Array<[string, string]>; body: string };
+
+function decodeChunked(raw: string) {
+  let out = "";
+  let rest = raw;
+  while (rest.length) {
+    const end = rest.indexOf("\r\n");
+    const size = Number.parseInt(rest.slice(0, end), 16);
+    if (!size) break;
+    out += rest.slice(end + 2, end + 2 + size);
+    rest = rest.slice(end + 2 + size + 2);
+  }
+  return out;
+}
+
+/** One HTTPS request through the published 443 (HAProxy, then Caddy), keeping every header line. */
+function secureRequest(servername: string, path: string, extra: Record<string, string> = {}) {
+  return new Promise<FullReply>((resolveReply, reject) => {
+    const socket = tlsConnect({
+      host: "127.0.0.1",
+      port: ports.https,
+      servername,
+      rejectUnauthorized: false,
+      ALPNProtocols: ["http/1.1"],
+    });
+    const chunks: Buffer[] = [];
+    const timer = setTimeout(() => socket.destroy(new Error("timed out")), 10_000);
+    const lines = Object.entries(extra).map(([name, value]) => `${name}: ${value}\r\n`);
+    socket.on("secureConnect", () =>
+      socket.write(
+        `GET ${path} HTTP/1.1\r\nHost: ${servername}\r\n${lines.join("")}Connection: close\r\n\r\n`,
+      ),
+    );
+    socket.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    socket.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    socket.on("close", () => {
+      clearTimeout(timer);
+      const data = Buffer.concat(chunks).toString("utf8");
+      const split = data.indexOf("\r\n\r\n");
+      const [statusLine = "", ...headerLines] = data.slice(0, split).split("\r\n");
+      const headers = headerLines.map((line): [string, string] => {
+        const index = line.indexOf(":");
+        return [line.slice(0, index).toLowerCase(), line.slice(index + 1).trim()];
+      });
+      const raw = data.slice(split + 4);
+      const chunked = headers.some(([name, value]) => name === "transfer-encoding" && /chunked/i.test(value));
+      resolveReply({
+        status: Number(statusLine.split(" ")[1] ?? 0),
+        headers,
+        body: chunked ? decodeChunked(raw) : raw,
+      });
+    });
+  });
+}
+
+const values = (reply: FullReply, name: string) =>
+  reply.headers.filter(([field]) => field === name).map(([, value]) => value);
+
+/** Tailnet names and addresses that must never appear in a response from a public route. */
+const tailnetLeak = new RegExp(
+  [peerHttpIp, "100.88.", "tail1234", "ts.net", "fd7a", "peer-http", ":3999"]
+    .map((item) => item.replaceAll(".", "\\."))
+    .join("|"),
+  "i",
+);
+
+function leakIn(reply: FullReply) {
+  const text = `${reply.headers.map(([name, value]) => `${name}: ${value}`).join("\n")}\n${reply.body}`;
+  return tailnetLeak.exec(text)?.[0] ?? null;
+}
+
+function noLeakHeaders(reply: FullReply) {
+  return ["server", "via", "x-powered-by"].filter((name) => values(reply, name).length > 0);
+}
+
+async function fd09AbsentTest(report: Report) {
+  const plan = fixturePlan();
+  expect(
+    report,
+    plan.omitted.map((route) => route.id).join(",") === "rt_sso1" &&
+      !plan.httpRoutes.some((route) => route.access !== "public"),
+    "the planner omits the enabled access_mode=sso route before FD-11 (lease and certificate notwithstanding)",
+    plan.omitted.map((route) => `${route.id}: ${route.reason}`).join("; "),
+  );
+  const active = (await caddyAdmin("/config/")).body;
+  expect(
+    report,
+    !active.includes(ssoHost) && active.includes(wwwHost) && active.includes(apexHost),
+    "the running Caddy config has sites for www, the apex and broken, and none for the SSO route",
+    `sso ${active.includes(ssoHost) ? "present" : "absent"}, www ${active.includes(wwwHost) ? "present" : "absent"}`,
+  );
+  const applied = await probe<{ httpHostnames?: string[]; error?: string }>([
+    "apply",
+    JSON.stringify({ httpHostnames: httpHosts, tlsRoutes: [] }),
+  ]);
+  const mapped = applied.httpHostnames ?? [];
+  expect(
+    report,
+    [tailnetHost, wwwHost, apexHost, brokenHost].every((host) => mapped.includes(host)) &&
+      !mapped.includes(ssoHost),
+    "edge.l4_apply puts every served HTTP hostname in the 443 map, and not the SSO route",
+    applied.error ?? mapped.join(" "),
+  );
+  const sso = await secureRequest(ssoHost, "/").then(
+    (reply) => `HTTP ${reply.status}`,
+    (error: Error) => `refused (${error.message})`,
+  );
+  expect(
+    report,
+    sso.startsWith("refused"),
+    "the SSO hostname cannot be reached on 443 (no site, no certificate)",
+    sso,
+  );
+}
+
+async function fd09HeadersTest(report: Report) {
+  const forged = {
+    "X-Forwarded-For": "6.6.6.6",
+    "X-Ark-User": "usr_forged_mallory",
+    "X-Ark-Email": "mallory@evil.example",
+    Cookie: "a=1; __Host-ark_gate=gate-secret; b=2",
+  };
+  const reply = await secureRequest(wwwHost, "/headers", forged);
+  const seen = JSON.parse(reply.body || "{}") as Record<string, string>;
+  expect(
+    report,
+    reply.status === 200 && noLeakHeaders(reply).length === 0,
+    "a proxied 200 has no Server, Via or X-Powered-By",
+    `status ${reply.status}; present: ${noLeakHeaders(reply).join(",") || "none"}`,
+  );
+  expect(
+    report,
+    values(reply, "strict-transport-security")[0] === "max-age=31536000" &&
+      values(reply, "x-content-type-options")[0] === "nosniff" &&
+      values(reply, "referrer-policy")[0] === "strict-origin-when-cross-origin",
+    "HSTS, nosniff and the referrer policy are set",
+    ["strict-transport-security", "x-content-type-options", "referrer-policy"]
+      .map((name) => `${name}: ${values(reply, name)[0]}`)
+      .join("; "),
+  );
+  const ark = Object.keys(seen).filter((name) => name.startsWith("x-ark-"));
+  expect(
+    report,
+    Boolean(seen["x-forwarded-for"]) && !seen["x-forwarded-for"]!.includes("6.6.6.6") && ark.length === 0,
+    "forged X-Forwarded-For and X-Ark-User/X-Ark-Email are not passed upstream",
+    `upstream X-Forwarded-For ${seen["x-forwarded-for"]}; X-Ark-*: ${JSON.stringify(ark)}`,
+  );
+  expect(
+    report,
+    seen.cookie === "a=1; b=2" && seen.host === wwwHost,
+    "the gate cookie is stripped and the upstream sees the public Host",
+    `Cookie ${seen.cookie}; Host ${seen.host}`,
+  );
+}
+
+async function fd09LocationTest(report: Report) {
+  const policy = locationPolicy(checkedHttpRoute(wwwRoute));
+  const locations = [
+    `http://${peerHttpIp}:3000/next?x=1`,
+    "//home.tail1234.ts.net/login",
+    `//${peerName}/login`,
+    `//${peerHttpIp}?x=1`,
+    "http://[fd7a:115c:a1e0::6465:6667]/v6",
+    "http://[fd7a:115c:a1e0:0:0:0:6465:6667]:3000/v6",
+    "http://[FD7A:115C:A1E0:0000:0000:0000:6465:6667]#top",
+    `http://${peerHttpIp}:3000`,
+    `https://${peerName}.:3000`,
+    `//${peerName}`,
+    "http://peer-http/x?y#z",
+    "/login",
+    "?page=2",
+    "https://accounts.example.net/oauth?client=1",
+    "mailto:ops@example.com",
+    `http://${peerHttpIp}:8080/x`,
+    "http://[fd7a:115c:a1e0:0::6465:6667]/",
+    "http://100.88.1.20/",
+    "https://nas.tail1234.ts.net/",
+    "//1684366951/",
+    "https://user@www.example.com/",
+    "///evil.example.net/",
+    "/\\evil.example.net",
+    "http:evil.example.net",
+    `https://www.example.com/?next=http://${peerHttpIp}/`,
+    `/ok, //${peerHttpIp}/`,
+  ];
+  const outcomes: string[] = [];
+  for (const location of locations) {
+    const reply = await secureRequest(
+      wwwHost,
+      `/redirect-to?l=${Buffer.from(location).toString("base64url")}`,
+    );
+    const expected = evaluateLocation(policy, location);
+    const sent = values(reply, "location");
+    const ok =
+      "status" in expected
+        ? reply.status === 502 && sent.length === 0 && reply.body.includes("ark-static-error-502")
+        : reply.status === 302 && sent.length === 1 && sent[0] === expected.location;
+    const leaked = leakIn(reply);
+    outcomes.push(`${JSON.stringify(location)} -> ${reply.status} ${sent.join(" | ")}`);
+    if (!ok || leaked || noLeakHeaders(reply).length) {
+      expect(
+        report,
+        false,
+        "every Location fixture matches the reference policy and leaks nothing",
+        `${JSON.stringify(location)}: got ${reply.status} ${JSON.stringify(sent)}, expected ${JSON.stringify(expected)}; leak ${leaked}; ${noLeakHeaders(reply).join(",")}`,
+      );
+    }
+  }
+  expect(
+    report,
+    true,
+    `${locations.length} Location fixtures (MagicDNS, IPv4, compressed/expanded IPv6, ports, authority-only, no trailing slash) match the reference policy; no tailnet name or address reaches a response`,
+    outcomes.slice(0, 4).join("; "),
+  );
+  const first = await secureRequest(
+    wwwHost,
+    `/redirect-to?l=${Buffer.from(locations[0]!).toString("base64url")}`,
+  );
+  const cookies = values(first, "set-cookie");
+  expect(
+    report,
+    values(first, "location")[0] === "https://www.example.com/next?x=1" &&
+      cookies.length === 2 &&
+      cookies.every((cookie) => !/domain=/i.test(cookie)),
+    `upstream Location: http://${peerHttpIp}:3000/… and Set-Cookie Domain=…ts.net are rewritten`,
+    `Location ${values(first, "location")[0]}; Set-Cookie ${cookies.join(" | ")}`,
+  );
+}
+
+async function fd09ErrorTest(report: Report) {
+  const reply = await secureRequest(brokenHost, "/anything?x=1");
+  expect(
+    report,
+    reply.status === 502 && reply.body.includes("ark-static-error-502") && noLeakHeaders(reply).length === 0,
+    "an unreachable upstream serves the static 502 with no Server or Via",
+    `status ${reply.status}; ${reply.body.match(/<h1>[^<]*/)?.[0] ?? reply.body.slice(0, 60)}; present: ${noLeakHeaders(reply).join(",") || "none"}`,
+  );
+  expect(
+    report,
+    leakIn(reply) === null,
+    "the 502 names no tailnet host or address in its body or headers",
+    leakIn(reply) ?? `${reply.headers.length} headers, ${reply.body.length} bytes checked`,
+  );
+}
+
+async function fd09RedirectTest(report: Report) {
+  const apex = await secureRequest(apexHost, "/x?y=1");
+  expect(
+    report,
+    apex.status === 308 &&
+      values(apex, "location")[0] === "https://www.example.com/x?y=1" &&
+      values(apex, "strict-transport-security")[0] === "max-age=31536000" &&
+      noLeakHeaders(apex).length === 0,
+    "https://example.com/x redirects to https://www.example.com/x (redirectTo) with HSTS and no Server",
+    `${apex.status} ${values(apex, "location")[0]}`,
+  );
+  const replies = await Promise.all([
+    plainGet(apexHost, "/x"),
+    plainGet(wwwHost, "/p?q"),
+    plainGet(ssoHost, "/"),
+  ]);
+  expect(
+    report,
+    replies[0].status === 308 &&
+      replies[0].headers.location === "https://example.com/x" &&
+      replies[1].status === 308 &&
+      replies[1].headers.location === "https://www.example.com/p?q" &&
+      replies[2].status === 404,
+    ":80 redirects served route hostnames to HTTPS and not the omitted SSO hostname",
+    replies.map((reply) => `${reply.status} ${reply.headers.location ?? ""}`).join(", "),
+  );
+}
+
+/** More than the 10 minutes FD-09 requires, with no Caddy or HAProxy reload in between. */
+const websocketIdleMs = 630_000;
+
+async function fd09WebsocketTest(report: Report) {
+  const ws = await websocket(wwwHost);
+  const opened = await ws.echo("hello");
+  const started = Date.now();
+  await Bun.sleep(websocketIdleMs);
+  const afterIdle = await ws.echo("after-idle");
+  expect(
+    report,
+    opened === "hello" && afterIdle === "after-idle" && !ws.closed(),
+    "a WebSocket through 443 stays connected for more than 10 minutes idle",
+    `idle ${((Date.now() - started) / 60_000).toFixed(1)} min; echo ${afterIdle}`,
+  );
+  const applied = await edgeApply();
+  const afterApply = await ws.echo("after-apply");
+  await Bun.sleep(2_000);
+  expect(
+    report,
+    applied.applied && afterApply === "after-apply" && !ws.closed(),
+    "the same WebSocket survives one edge.apply (Caddy /load with must-revalidate)",
+    `applied ${applied.applied}; echo ${afterApply}`,
+  );
+  ws.end();
+}
+
+/**
+ * stream_close_delay keeps a withdrawn handler's WebSockets open after a reload, so the watchdog stops
+ * Caddy when a withdrawn route holds one; the guard restarts it and the watchdog restores the rest.
+ */
+async function fd09WithdrawalTest(report: Report) {
+  const ws = await websocket(wwwHost);
+  const opened = await ws.echo("before-withdrawal");
+  const closedAt = new Promise<number>((resolveClosed) => {
+    const timer = setInterval(() => {
+      if (ws.closed()) {
+        clearInterval(timer);
+        resolveClosed(Date.now());
+      }
+    }, 50);
+  });
+  const revokedAt = Date.now();
+  lease.routes = lease.routes.filter((route) => route.id !== wwwRoute.id);
+  const closed = await Promise.race([closedAt, Bun.sleep(10_000).then(() => 0)]);
+  // Detection (watchdog pass, at most 1 s plus the 300 ms lease read) + 5 s.
+  expect(
+    report,
+    opened === "before-withdrawal" && closed > 0 && closed - revokedAt <= 6_500,
+    "withdrawing a route closes its open WebSocket despite stream_close_delay 5m",
+    closed ? `closed +${closed - revokedAt} ms` : "still open after 10 s",
+  );
+  const restored = await waitFor(
+    "the other routes after the withdrawal restart",
+    async () => ((await secureGet(tailnetHost)).body === "ok" ? Date.now() : undefined),
+    30_000,
+    250,
+  );
+  const www = await secureGet(wwwHost).then(
+    (reply) => `${reply.status}`,
+    (error: Error) => `refused (${error.message})`,
+  );
+  expect(
+    report,
+    www !== "200",
+    "the other routes serve again without an edge.apply; the withdrawn one does not",
+    `${tailnetHost} restored +${restored - revokedAt} ms; ${wwwHost} -> ${www}`,
+  );
+  lease.routes = [webRoute, mqttRoute, ...fd09Policy];
+  await Bun.sleep(1_500);
+  const applied = await edgeApply();
+  const back = await waitFor(
+    "the route after it is allowed again",
+    async () => ((await secureGet(wwwHost)).status === 200 ? true : undefined),
+    15_000,
+  );
+  expect(report, applied.applied && back, "allowed again, edge.apply serves it again", wwwHost);
+}
+
 async function run(name: string, test: (report: Report) => Promise<unknown>) {
   const report: Report = { name, lines: [] };
   const started = Date.now();
@@ -1447,6 +1869,13 @@ try {
   await run("idle and non-TLS connections", idleTest);
   await run("master-CLI reload", reloadTest);
   await run("WebSocket across HAProxy and Caddy reloads", websocketTest);
+  await run("FD-09: an enabled SSO route is absent from both configs", fd09AbsentTest);
+  await run("FD-09: no-leak headers through 443", fd09HeadersTest);
+  await run("FD-09: Location and Set-Cookie through 443", fd09LocationTest);
+  await run("FD-09: static 502 through 443", fd09ErrorTest);
+  await run("FD-09: apex redirect and the :80 list", fd09RedirectTest);
+  await run("FD-09: WebSocket idle over 10 minutes, then one edge.apply", fd09WebsocketTest);
+  await run("FD-09: withdrawal closes a route's WebSockets despite stream_close_delay", fd09WithdrawalTest);
   await run("watchdog: identity failure across HAProxy workers", identityWithdrawalTest);
   await run("domain worker drain (edge.drain) across HAProxy workers", workerDrainTest);
   await run("watchdog: lease expiry across HAProxy workers", leaseExpiryTest);

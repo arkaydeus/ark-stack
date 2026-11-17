@@ -12,8 +12,8 @@
 //   are never requested before this point.
 // - ready: an issued certificate and a fresh passing probe. Only `edge.observe` writes `ready`.
 //
-// `enable` is refused before `ready`. Rendering routes into the live edge is FD-09; until then the
-// edge serves at most the FD-06 tailnet route blocks for enabled `ready` routes.
+// `enable` is refused before `ready`. `edge.apply` renders enabled `ready` public routes allowed by
+// the lease into the edge (FD-09, modules/edge-routes.ts and shared/src/edge-http.ts).
 //
 // Preparation validates without writes; final validation and grant consumption share the mutation
 // transaction, so conflicts roll back the grant. Every action is audited.

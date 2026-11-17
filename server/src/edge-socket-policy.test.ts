@@ -73,9 +73,9 @@ describe("tailscaled socket policy", () => {
 
   test("the edge watchdog holds no tailscaled or Docker socket, database credential or root key", () => {
     const watchdog = services["edge-watchdog"]!;
-    // Only HAProxy's master CLI socket (group 4400, FD-25) and read-only rendered configuration.
+    // HAProxy's master CLI socket and configs, plus Caddy's shared stop/restart state.
     expect(mounts(watchdog)).toEqual([
-      "../../tmp/edge:/var/lib/ark/edge:ro",
+      "../../tmp/edge:/var/lib/ark/edge",
       "../../tmp/edge-l4:/usr/local/etc/haproxy:ro",
       "ark_haproxy_run:/var/run/haproxy",
     ]);
@@ -100,6 +100,7 @@ describe("tailscaled socket policy", () => {
     expect(edge.entrypoint).toEqual(["/bin/sh", "/usr/local/bin/ark-edge-launch-guard"]);
     expect(mounts(edge)).toContain("../../tmp/edge:/etc/caddy/ark:ro");
     expect(mounts(edge)).toContain("./edge-launch-guard.sh:/usr/local/bin/ark-edge-launch-guard:ro");
+    expect(mounts(edge)).toContain("./edge-errors:/etc/caddy/errors:ro");
     expect(mounts(edge).filter(socketMount)).toEqual([]);
     expect(edge.environment?.ARK_EDGE_WATCHDOG_URL).toBe("http://edge-watchdog:2021");
   });
