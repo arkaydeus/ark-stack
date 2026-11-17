@@ -207,7 +207,7 @@ export type AdminSocketOptions = {
   connectTimeoutSeconds?: number;
 };
 
-const ADMIN_COMMAND = /^(RELOAD|SHOW [A-Z_]+)$/;
+const ADMIN_COMMAND = /^(RELOAD|SHOW [A-Z_]+|KILL_CLIENT [1-9][0-9]{0,18})$/;
 
 /** Run one console command as the administrator over the shared socket (simple protocol). */
 export async function pgbouncerAdminCommand(command: string, options: AdminSocketOptions) {
@@ -234,6 +234,47 @@ export async function pgbouncerAdminCommand(command: string, options: AdminSocke
 
 export async function reloadPgbouncerAdmin(options: AdminSocketOptions) {
   await pgbouncerAdminCommand("RELOAD", options);
+}
+
+const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
+
+/** The console client IDs (SHOW CLIENTS `id`) of every connection authenticated as `role`. */
+export async function roleClientIds(role: string, options: AdminSocketOptions) {
+  if (!ROLE_NAME.test(role)) throw new Error(`Invalid PgBouncer role: ${role}`);
+  const rows = await pgbouncerAdminCommand("SHOW CLIENTS", options);
+  return [...rows]
+    .filter((row) => String(row.user) === role)
+    .map((row) => String(row.id))
+    .filter((id) => /^[1-9][0-9]{0,18}$/.test(id));
+}
+
+/**
+ * Close every PgBouncer client session of one login role (§3.10.4 step 4). A RELOAD with a
+ * smaller CA bundle only affects new handshakes, and an authenticated session survives it, so
+ * revocation must kill them. `KILL_CLIENT` also closes the server connections those clients
+ * hold. Repeats until no session of the role remains, then reports what it closed; other roles'
+ * sessions are never touched.
+ */
+export async function killRoleClients(
+  role: string,
+  options: AdminSocketOptions & { attempts?: number; delayMs?: number },
+) {
+  if (role === PGBOUNCER_ADMIN_USER) throw new Error("Refusing to kill the console administrator.");
+  const attempts = Math.max(1, options.attempts ?? 3);
+  const killed = new Set<string>();
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const ids = await roleClientIds(role, options);
+    if (!ids.length) return { killed: killed.size, attempts: attempt, remaining: 0 };
+    for (const id of ids) {
+      // A client may disconnect between SHOW CLIENTS and KILL_CLIENT; that is not a failure.
+      await pgbouncerAdminCommand(`KILL_CLIENT ${id}`, options).catch(() => undefined);
+      killed.add(id);
+    }
+    await new Promise((done) => setTimeout(done, options.delayMs ?? 100));
+  }
+  const remaining = (await roleClientIds(role, options)).length;
+  if (remaining) throw new Error(`${remaining} PgBouncer session(s) of ${role} survived KILL_CLIENT.`);
+  return { killed: killed.size, attempts, remaining };
 }
 
 // ---- Served certificate --------------------------------------------------------------------------

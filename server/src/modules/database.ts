@@ -4,6 +4,8 @@ import { join } from "node:path";
 import {
   authQuerySql,
   buildProvisionPlan,
+  clientRoleSql,
+  revokedClientRoleSql,
   classifySql,
   generatePassword,
   groupSchemaRows,
@@ -305,6 +307,66 @@ export async function rotateRolePassword(input: { role: string; password: string
   try {
     await admin.unsafe(rotateRoleSql(input.role, input.password));
     if (input.database) await admin.unsafe(terminateRoleSessionsSql(input.role, input.database));
+  } finally {
+    await admin.end();
+  }
+}
+
+/** True when a role of this name exists in the application cluster. */
+export async function appRoleExists(role: string) {
+  const url = appAdminUrl();
+  if (!url) throw new Error("DATABASE_APP_URL is not configured.");
+  const admin = postgres(url, { max: 1, onnotice: () => undefined });
+  try {
+    const rows = await admin`SELECT 1 FROM pg_roles WHERE rolname = ${role}`;
+    return rows.length > 0;
+  } finally {
+    await admin.end();
+  }
+}
+
+/**
+ * Create a database client's login role `IN ROLE` its group, or bring an Ark-owned role left by
+ * an interrupted issue to the planned password, limit and membership (FD-17, §3.10.3). Runs in
+ * one transaction on the application cluster.
+ */
+export async function applyClientRole(input: {
+  role: string;
+  group: string;
+  password: string;
+  connectionLimit: number;
+}) {
+  const url = appAdminUrl();
+  if (!url) throw new Error("DATABASE_APP_URL is not configured.");
+  const admin = postgres(url, { max: 1, onnotice: () => undefined });
+  try {
+    await admin.begin(async (tx) => {
+      const group = await tx`SELECT 1 FROM pg_roles WHERE rolname = ${input.group}`;
+      if (!group.length)
+        throw new Error(`Group role ${input.group} is missing; provision the database first.`);
+      const exists = (await tx`SELECT 1 FROM pg_roles WHERE rolname = ${input.role}`).length > 0;
+      for (const statement of clientRoleSql({ ...input, exists })) await tx.unsafe(statement);
+    });
+  } finally {
+    await admin.end();
+  }
+}
+
+/**
+ * Revocation on the cluster: a new random password the client never sees, NOLOGIN, and every
+ * backend of the role terminated (PgBouncer's server connections included).
+ */
+export async function revokeClientRole(input: { role: string; password: string }) {
+  const url = appAdminUrl();
+  if (!url) throw new Error("DATABASE_APP_URL is not configured.");
+  const admin = postgres(url, { max: 1, onnotice: () => undefined });
+  try {
+    const exists = await admin`SELECT 1 FROM pg_roles WHERE rolname = ${input.role}`;
+    if (exists.length) {
+      for (const statement of revokedClientRoleSql(input.role, input.password)) await admin.unsafe(statement);
+    }
+    await admin.unsafe(terminateRoleSessionsSql(input.role));
+    return { existed: exists.length > 0 };
   } finally {
     await admin.end();
   }

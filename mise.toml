@@ -57,7 +57,7 @@ run = [
 ]
 
 [tasks."test:pgbouncer"]
-description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM and admin-socket reloads"
+description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM, admin-socket reloads and database clients (connect, read-only preview, revoke)"
 run = "bun scripts/test-pgbouncer-public.ts"
 
 [tasks."test:db-ingress"]

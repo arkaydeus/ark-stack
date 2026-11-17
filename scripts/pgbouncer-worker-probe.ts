@@ -8,11 +8,15 @@
 //
 //   probe.js show <COMMAND>          run one console command (RELOAD or SHOW ...)
 //   probe.js reload [fingerprint]    RELOAD, and verify the served fingerprint when given
+//   probe.js clients <role>          console client IDs of one login role (SHOW CLIENTS)
+//   probe.js kill <role>             KILL_CLIENT every session of one login role (FD-17 revoke)
 import { existsSync } from "node:fs";
 
 import {
   PgbouncerReloadError,
+  killRoleClients,
   pgbouncerAdminCommand,
+  roleClientIds,
   reloadAndVerify,
   reloadPgbouncerAdmin,
   servedCertificateFingerprint,
@@ -50,6 +54,10 @@ try {
       delayMs: Number(process.env.ARK_PGBOUNCER_RELOAD_RETRY_MS ?? 500),
     });
     report({ ok: true, ...result });
+  } else if (mode === "clients") {
+    report({ ok: true, ids: await roleClientIds(argument ?? "", socket) });
+  } else if (mode === "kill") {
+    report({ ok: true, ...(await killRoleClients(argument ?? "", socket)) });
   } else {
     throw new Error(`unknown probe mode ${mode}`);
   }
