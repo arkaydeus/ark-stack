@@ -104,13 +104,11 @@ try {
   const { eq } = await import("drizzle-orm");
   const calls: string[] = [];
   let candidate = "";
-  let restarting = false;
   caddy = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       calls.push(new URL(request.url).pathname);
-      if (restarting) return new Response(null, { status: 502 });
       if (new URL(request.url).pathname === "/adapt") {
         candidate = await request.text();
         return Response.json({ result: { apps: {} } });
@@ -228,17 +226,21 @@ try {
   // A transient drain adapter must recognise another instance's deliberate stop.
   const { caddyState } = await import("@ark-stack/shared");
   await caddyState(process.env.ARK_EDGE_DIR!).recordStop();
-  restarting = true;
+  // Use an actual stopped listener: an HTTP 500/502 is a failed inspection, not process absence.
+  const stopped = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+  const previousAdminUrl = process.env.ARK_EDGE_RELOAD_URL;
+  process.env.ARK_EDGE_RELOAD_URL = `http://127.0.0.1:${stopped.port}`;
+  await stopped.stop(true);
   calls.length = 0;
   const drain = await operation("edge.drain");
   await runOperation("edge.drain", drain);
-  assert.deepEqual(calls, ["/config/"]);
+  assert.deepEqual(calls, []);
   // Query through the isolated application's pool, not the source database.
   const { sql: fixtureSql } = await import("./db.ts");
   const alertRows =
     await fixtureSql`SELECT title FROM alerts WHERE dedup_key = 'edge-withdrawal' AND resolved_at IS NULL`;
   assert.equal(alertRows.length, 0);
-  restarting = false;
+  process.env.ARK_EDGE_RELOAD_URL = previousAdminUrl;
   console.log("edge.drain recognises a shared restart marker without stop fallback or critical alert");
   // Staging metadata stays untrusted and is omitted by the same database-backed plan.
   process.env.ARK_ACME_STAGING = await stagingSetting("1");

@@ -287,6 +287,9 @@ function caddyGeneration(value: unknown): string | null {
 
 type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** A reachable admin API returned an unusable inspection; restart grace cannot excuse this. */
+class CaddyInspectionError extends Error {}
+
 /**
  * Caddy adapter over the admin API (`edge-admin:2019`, reachable only from edge-control). Withdrawal
  * is a `/load` of the active config with the denied handlers replaced, sent with
@@ -346,9 +349,13 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
 
   private async activeConfig() {
     const response = await this.request("/config/");
-    if (!response.ok) throw new Error(`GET /config/ returned ${response.status}`);
+    if (!response.ok) throw new CaddyInspectionError(`GET /config/ returned ${response.status}`);
     this.configEtag = response.headers.get("etag");
-    return (await response.json()) as unknown;
+    try {
+      return (await response.json()) as unknown;
+    } catch {
+      throw new CaddyInspectionError("GET /config/ returned invalid JSON");
+    }
   }
 
   async activeRoutes() {
@@ -463,7 +470,7 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     } catch (error) {
       // After a deliberate stop the launch guard restarts Caddy from lease-checked files; an
       // unreachable Caddy is never counted as verified enforcement (`/v1/supervise`).
-      const restarting = await this.restarting();
+      const restarting = !(error instanceof CaddyInspectionError) && (await this.restarting());
       return {
         proxy: this.proxy,
         active: [],

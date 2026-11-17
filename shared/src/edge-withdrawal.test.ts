@@ -421,6 +421,15 @@ describe("withdrawal with stream_close_delay (FD-09)", () => {
     expect((await stale.enforce(new Set())).error).toMatch(/unreachable/);
   });
 
+  test("a recent restart marker cannot excuse a reachable admin API's failed inspection", async () => {
+    for (const response of [new Response(null, { status: 500 }), new Response("invalid JSON")]) {
+      const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", async () => response, 3000, {
+        appliedStopAt: async () => Date.now(),
+      });
+      expect((await adapter.enforce(new Set())).error).toContain("GET /config/");
+    }
+  });
+
   test("lingeringStreams names removed, delayed, busy backends for edge.apply", async () => {
     const caddy = fakeCaddy({
       initial: delayedConfig(),
