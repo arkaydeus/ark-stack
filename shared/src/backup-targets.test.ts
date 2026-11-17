@@ -392,13 +392,14 @@ describe("tailnet REST target model (FD-30)", () => {
       "http://backup-home.tail1234.ts.net:8000/",
       "http://backup-home.tail1234.ts.net:8000/ark?x=1",
       "ftp://backup-home.tail1234.ts.net:8000/ark",
+      "https://backup-home.tail1234.ts.net:8000/ark",
       "http://100.100.100.100:8000/ark",
     ]) {
       expect(tailnetRestTargetInput.safeParse({ name: "home", restUrl }).success).toBe(false);
     }
   });
 
-  test("http:// substitutes the pinned address; https:// keeps the certificate's name", () => {
+  test("HTTP substitutes the pinned address and HTTPS is refused", () => {
     expect(
       resticRestRepository({ restUrl: "http://backup-home.tail1234.ts.net:8000/ark", targetIp: "100.66.2.9" })
         .repository,
@@ -409,12 +410,12 @@ describe("tailnet REST target model (FD-30)", () => {
         targetIp: "fd7a:115c:a1e0::1:2",
       }).repository,
     ).toBe("rest:http://[fd7a:115c:a1e0::1:2]:8000/ark/");
-    expect(
+    expect(() =>
       resticRestRepository({
         restUrl: "https://backup-home.tail1234.ts.net:8000/ark",
         targetIp: "100.66.2.9",
-      }).repository,
-    ).toBe("rest:https://backup-home.tail1234.ts.net:8000/ark/");
+      }),
+    ).toThrow(/require http/);
     expect(() =>
       resticRestRepository({ restUrl: "http://backup-home.tail1234.ts.net:8000/ark", targetIp: "10.0.0.1" }),
     ).toThrow();
@@ -433,9 +434,9 @@ describe("tailnet REST target model (FD-30)", () => {
       RESTIC_PASSWORD: "repo",
       HTTP_PROXY: "socks5://backup-ts:1055",
     });
-    const https = resticRestEnv({ restUrl: "https://backup-home.tail1234.ts.net:8000/ark" }, keys, "");
-    expect(https.HTTPS_PROXY).toBe("socks5://backup-ts:1055");
-    expect(https.HTTP_PROXY).toBeUndefined();
+    expect(() =>
+      resticRestEnv({ restUrl: "https://backup-home.tail1234.ts.net:8000/ark" }, keys, ""),
+    ).toThrow(/require http/);
     expect(() => backupSocksProxy("http://backup-ts:1055")).toThrow();
     expect(() => backupSocksProxy("socks5://user:pw@backup-ts:1055")).toThrow();
   });

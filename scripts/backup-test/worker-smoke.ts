@@ -255,6 +255,8 @@ export async function workerSmoke(
         ["docker", "exec", workerId, "sh", "-c", "cat /tmp/ark-restic-*.stderr"],
         { allowFailure: true },
       );
+      const logs = await run(["docker", "logs", "--tail", "40", workerId], { allowFailure: true });
+      console.error(`Deployed worker diagnostics: ${logs.stdout} ${logs.stderr}`);
       console.error(`Deployed restic diagnostics: ${diagnostics.stdout.slice(-6000)}`);
     }
     throw error;

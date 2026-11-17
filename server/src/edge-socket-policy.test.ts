@@ -31,8 +31,7 @@ function networks(service: Service) {
   return Array.isArray(service.networks) ? service.networks : Object.keys(service.networks ?? {});
 }
 
-const socketMount = (mount: string) =>
-  mount.startsWith("ark_edge_ts_socket:") || mount.includes("/var/run/tailscale");
+const socketMount = (mount: string) => mount.startsWith("ark_edge_ts_socket:");
 
 describe("tailscaled socket policy", () => {
   test("only edge-ts (read-write) and domain-worker (read-only) mount the edge node's socket", () => {
@@ -48,6 +47,18 @@ describe("tailscaled socket policy", () => {
       "/var/run/tailscale/tailscaled.sock",
     );
     expect("ark_edge_ts_socket" in compose.volumes).toBe(true);
+  });
+
+  test("only backup-ts and backup-worker mount the independent backup socket", () => {
+    const holders = Object.entries(services).flatMap(([name, service]) =>
+      mounts(service)
+        .filter((mount) => mount.startsWith("ark_backup_ts_socket:"))
+        .map((mount) => [name, mount]),
+    );
+    expect(holders).toEqual([
+      ["backup-worker", "ark_backup_ts_socket:/var/run/tailscale-backup:ro"],
+      ["backup-ts", "ark_backup_ts_socket:/var/run/tailscale"],
+    ]);
   });
 
   test("the API container has no access to the tailscaled socket", () => {

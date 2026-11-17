@@ -24,3 +24,15 @@ test("a proxy variable on any service, or a socket mount on the API, is caught",
   );
   expect(failed).toContain("api cannot read backup-ts's LocalAPI (no socket mount)");
 });
+
+test("cross-mounting the backup socket into the domain worker violates isolation", async () => {
+  const compose = await loadCompose();
+  compose.services["domain-worker"]!.volumes = [
+    ...(compose.services["domain-worker"]!.volumes ?? []),
+    "ark_backup_ts_socket:/var/run/tailscale-backup:ro",
+  ];
+  const failed = tailnetComposeClaims(compose)
+    .filter((item) => !item.ok)
+    .map((item) => item.claim);
+  expect(failed).toContain("domain-worker cannot read backup-ts's LocalAPI (no socket mount)");
+});

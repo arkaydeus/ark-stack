@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer, type Socket } from "node:net";
 
 import { TRANSFER_STOP_BOUND_MS } from "@ark-stack/shared";
 import { and, eq, inArray, like } from "drizzle-orm";
@@ -18,7 +19,7 @@ const { db, sql } = await import("./db.ts");
 const { alerts, auditEvents, backupExports, backupTargets, secrets } = await import("./schema.ts");
 const observer = await import("./modules/backup-observe.ts");
 const offsite = await import("./modules/offsite-backups.ts");
-const { commitTailnetGeneration } = await import("./modules/tailnet-snapshot.ts");
+const { commitTailnetGeneration, loadTailnetSnapshot } = await import("./modules/tailnet-snapshot.ts");
 
 const suffix = Date.now().toString(36);
 const tailnet = ".tail4fd30.ts.net";
@@ -141,6 +142,11 @@ afterAll(async () => {
   await rm(work, { recursive: true, force: true });
 });
 
+async function waitUntil(predicate: () => boolean, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await Bun.sleep(5);
+}
+
 async function calls() {
   const text = await Bun.file(join(work, "calls"))
     .text()
@@ -226,6 +232,96 @@ describe("pinning the home target from backup-ts's snapshot only", () => {
         }),
       ).rejects.toThrow(/cannot be|belong to the platform/);
     }
+  });
+});
+
+describe("home target updates and coherent generations", () => {
+  test("credential preservation, user changes, URL moves and re-pinning fence repository evidence", async () => {
+    view = state([home]);
+    await observe();
+    const original = await saveHome(`updates-${suffix}`);
+    const input = { id: original.id, name: original.name, restUrl: homeUrl, recoveryWindowDays: 30 };
+    await expect(
+      offsite.saveTailnetRestTarget({ ...input, repositoryPassword: "different-repository-password-012345" }),
+    ).rejects.toThrow(/cannot change/);
+    const same = await offsite.saveTailnetRestTarget(input);
+    expect(same.repositoryRevision).toBe(original.repositoryRevision);
+    expect(same.configRevision).not.toBe(original.configRevision);
+    expect(same.credentialSecretId).toBe(original.credentialSecretId);
+    expect(same.repositorySecretId).toBe(original.repositorySecretId);
+    const otherUser = homeUrl.replace("/ark", "/other-user");
+    await expect(offsite.saveTailnetRestTarget({ ...input, restUrl: otherUser })).rejects.toThrow(
+      /user changed/,
+    );
+    const moved = await offsite.saveTailnetRestTarget({
+      ...input,
+      restUrl: otherUser,
+      password: "new-htpasswd-password",
+    });
+    expect(moved.repositoryRevision).not.toBe(same.repositoryRevision);
+    expect(moved.credentialSecretId).not.toBe(same.credentialSecretId);
+    expect((await offsite.targetSecrets(moved)).username).toBe("other-user");
+    const otherPath = await offsite.saveTailnetRestTarget({ ...input, restUrl: `${otherUser}/new-repo` });
+    expect(otherPath.repositoryRevision).not.toBe(moved.repositoryRevision);
+    view = state([impostor]);
+    await observe();
+    const repinned = await offsite.saveTailnetRestTarget({ ...input, restUrl: `${otherUser}/new-repo` });
+    expect(repinned.targetNodeStableId).toBe(impostor.id);
+    expect(repinned.repositoryRevision).not.toBe(otherPath.repositoryRevision);
+    view = state([home]);
+    await observe();
+    await db.update(backupTargets).set({ enabled: false }).where(eq(backupTargets.id, original.id));
+    // HTTPS must fail before credentials are used, including for internal callers.
+    await expect(
+      offsite.saveTailnetRestTarget({ ...input, restUrl: homeUrl.replace("http:", "https:") }),
+    ).rejects.toThrow(/require http/);
+  });
+
+  test("legacy persisted HTTPS targets cannot start restic or send canary credentials", async () => {
+    view = state([home]);
+    await observe();
+    const target = await saveHome(`legacy-https-${suffix}`);
+    const legacy = { ...target, restUrl: homeUrl.replace("http:", "https:") };
+    const keys = await offsite.targetSecrets(target);
+    await calls();
+    const previousDial = process.env.ARK_TEST_SOCKS5_DIAL;
+    let connections = 0;
+    const proxy = createServer((socket) => {
+      connections++;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    process.env.ARK_TEST_SOCKS5_DIAL = `127.0.0.1:${(proxy.address() as { port: number }).port}`;
+    try {
+      await db.update(backupTargets).set({ restUrl: legacy.restUrl }).where(eq(backupTargets.id, target.id));
+      await expect(offsite.runRestic(legacy, keys, ["snapshots", "--json"])).rejects.toThrow(/require http/);
+      await expect(offsite.verifyTarget(target.id)).rejects.toThrow(/require http/);
+      expect((await observer.currentTailnetIdentity(target.id)).ok).toBe(false);
+      expect(connections).toBe(0);
+      expect(await calls()).toEqual([]);
+    } finally {
+      await db.update(backupTargets).set({ enabled: false }).where(eq(backupTargets.id, target.id));
+      proxy.close();
+      if (previousDial === undefined) delete process.env.ARK_TEST_SOCKS5_DIAL;
+      else process.env.ARK_TEST_SOCKS5_DIAL = previousDial;
+    }
+  });
+
+  test("a refresh committed between header and nodes cannot abort an unchanged identity", async () => {
+    view = state([home]);
+    await observe();
+    const target = await saveHome(`atomic-${suffix}`);
+    const old = await loadTailnetSnapshot("backup");
+    const loaded = await loadTailnetSnapshot("backup", async () => {
+      await Bun.sleep(2);
+      await observe();
+    });
+    expect(loaded.snapshot!.generation).toBe(old.snapshot!.generation);
+    expect(loaded.self!.generation).toBe(loaded.snapshot!.generation);
+    expect(loaded.peers.every((node) => node.generation === loaded.snapshot!.generation)).toBe(true);
+    expect(observer.checkTailnetIdentity(target, loaded, new Date()).ok).toBe(true);
+    expect((await loadTailnetSnapshot("backup")).snapshot!.generation).not.toBe(old.snapshot!.generation);
+    await db.update(backupTargets).set({ enabled: false }).where(eq(backupTargets.id, target.id));
   });
 });
 
@@ -410,6 +506,142 @@ describe("transfers: proxy scoping, refusal and the watchdog", () => {
       await observe();
     });
   }
+});
+
+describe("watchdog deadlines independent of control reads", () => {
+  test("hard expiry aborts while the next read remains unresolved; late reads cannot renew it", async () => {
+    let readCount = 0;
+    let finish!: (value: {
+      identity: import("./modules/backup-observe.ts").TailnetIdentity;
+      validUntil: Date;
+    }) => void;
+    const identity = { ok: true as const, stableId: home.id, ip: home.ips[0]!, ipChanged: false };
+    const guard = observer.guardTransfer("deadline-fixture", {
+      intervalMs: 20,
+      readState: async () => {
+        if (++readCount === 1) return { identity, validUntil: new Date(Date.now() + 100) };
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      },
+    });
+    try {
+      await new Promise<void>((resolve) =>
+        guard.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      expect(readCount).toBe(2);
+      expect(guard.reason()).toMatch(/expired/);
+      finish({ identity, validUntil: new Date(Date.now() + 60_000) });
+      await Bun.sleep(30);
+      expect(guard.reason()).toMatch(/expired/);
+      expect(readCount).toBe(2);
+    } finally {
+      guard.stop();
+    }
+  });
+
+  test("a never-settling initial query still aborts within the read budget", async () => {
+    const started = Date.now();
+    const guard = observer.guardTransfer("unreachable-db", { readState: () => new Promise(() => {}) });
+    try {
+      await new Promise<void>((resolve) =>
+        guard.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      expect(guard.reason()).toMatch(/timed out/);
+      expect(Date.now() - started).toBeLessThan(TRANSFER_STOP_BOUND_MS - 2_000);
+    } finally {
+      guard.stop();
+    }
+  });
+
+  test("a real stalled database read cannot keep an upload subprocess alive", async () => {
+    view = state([home]);
+    await observe(3_000);
+    const target = await saveHome(`db-stall-${suffix}`);
+    await writeFile(join(work, "block"), "");
+    await rm(join(work, "pid"), { force: true });
+    const keys = await offsite.targetSecrets(target);
+    const upload = offsite.withTransfer(target, (signal) =>
+      offsite.runRestic(target, keys, ["backup", work], 30_000, undefined, { signal }),
+    );
+    let release!: () => void;
+    let locked!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    let transaction: Promise<unknown> | undefined;
+    try {
+      const deadline = Date.now() + 3_000;
+      while (!(await Bun.file(join(work, "pid")).exists())) {
+        if (Date.now() > deadline) throw new Error("upload did not start");
+        await Bun.sleep(10);
+      }
+      const pid = Number(await Bun.file(join(work, "pid")).text());
+      await Bun.sleep(100); // the initial guard read establishes its local lease
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      transaction = sql.begin(async (tx) => {
+        await tx`LOCK TABLE tailnet_snapshots IN ACCESS EXCLUSIVE MODE`;
+        locked();
+        await hold;
+      });
+      await acquired;
+      const started = Date.now();
+      await expect(upload).rejects.toThrow(/watchdog|Transfer stopped/);
+      expect(Date.now() - started).toBeLessThan(TRANSFER_STOP_BOUND_MS);
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      release?.();
+      await transaction;
+      await rm(join(work, "block"), { force: true });
+    }
+  }, 10_000);
+
+  test("identity replacement cancels an in-flight canary POST and closes its socket", async () => {
+    view = state([home]);
+    await observe();
+    const target = await saveHome(`canary-cancel-${suffix}`);
+    const previousDial = process.env.ARK_TEST_SOCKS5_DIAL;
+    const sockets = new Set<Socket>();
+    let posted = false;
+    let closed = false;
+    const proxy = createServer((socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.once("close", () => {
+        sockets.delete(socket);
+        closed = true;
+      });
+      let stage = 0;
+      socket.on("data", (data) => {
+        if (stage++ === 0) socket.write(Buffer.from([5, 0]));
+        else if (stage === 2) socket.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+        else if (data.toString().startsWith("POST ")) posted = true; // hold response open
+      });
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    process.env.ARK_TEST_SOCKS5_DIAL = `127.0.0.1:${(proxy.address() as { port: number }).port}`;
+    const pending = offsite.verifyTarget(target.id).catch((error: Error) => error);
+    try {
+      await waitUntil(() => posted, 3_000);
+      expect(posted).toBe(true);
+      view = state([impostor]);
+      const changedAt = Date.now();
+      await observe();
+      expect(((await pending) as Error).message).toMatch(/Transfer stopped/);
+      await waitUntil(() => closed, 500);
+      expect(closed).toBe(true);
+      expect(Date.now() - changedAt).toBeLessThan(TRANSFER_STOP_BOUND_MS);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      proxy.close();
+      if (previousDial === undefined) delete process.env.ARK_TEST_SOCKS5_DIAL;
+      else process.env.ARK_TEST_SOCKS5_DIAL = previousDial;
+      view = state([home]);
+      await observe();
+    }
+  });
 });
 
 /** In-memory rest-server: append-only refuses deletes (except locks) and overwrites. */

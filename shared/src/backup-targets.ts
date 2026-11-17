@@ -229,8 +229,8 @@ export const tailnetRestUrlSchema = z
   });
 
 function tailnetRestUrlProblem(url: URL, raw: string) {
-  if (url.protocol !== "http:" && url.protocol !== "https:")
-    return "The REST URL must be http:// or https://.";
+  if (url.protocol !== "http:")
+    return "Home REST targets require http:// over the encrypted tailnet; HTTPS cannot enforce the pinned address.";
   if (url.username || url.password)
     return "Do not put credentials in the URL; enter the htpasswd user and password.";
   if (url.search || url.hash || raw.includes("?") || raw.includes("#"))
@@ -300,22 +300,17 @@ export function backupSocksProxy(value: string | undefined | null) {
 }
 
 /**
- * The restic REST repository for a pinned home target (§3.18.3). For http:// the validated pinned
- * Tailscale address replaces the name, so a re-pointed MagicDNS name never redirects a transfer; the
- * path (repository and `--private-repos` user) is unchanged. https:// keeps the name, which the
- * certificate binds; backup-ts resolves it from its own netmap. Credentials never go into the URL.
+ * The restic REST repository dials the pinned Tailscale IP. HTTPS is refused until restic can
+ * preserve TLS hostname verification while dialing that IP. The tailnet encrypts HTTP transport.
  */
 export function resticRestRepository(config: TailnetRestConfig) {
   const url = new URL(config.restUrl);
+  if (url.protocol !== "http:")
+    throw new Error("Home REST targets require http:// over the encrypted tailnet.");
   const pinned = parseIpLiteral(config.targetIp);
   if (!pinned || checkTailnetAddress(pinned))
     throw new Error("The pinned target is not a Tailscale address.");
-  const host =
-    url.protocol === "https:"
-      ? url.hostname
-      : pinned.version === 6
-        ? `[${pinned.canonical}]`
-        : pinned.canonical;
+  const host = pinned.version === 6 ? `[${pinned.canonical}]` : pinned.canonical;
   return {
     repository: `rest:${url.protocol}//${host}:${url.port}${url.pathname.replace(/\/+$/, "")}/`,
     options: [] as string[],
@@ -324,8 +319,7 @@ export function resticRestRepository(config: TailnetRestConfig) {
 
 /**
  * The complete environment of the REST restic subprocess, apart from PATH/HOME/cache: htpasswd and
- * repository credentials, and exactly one matching-scheme proxy variable (HTTP_PROXY for http://,
- * HTTPS_PROXY for https://). Nothing else proxy-related is set, so inherited NO_PROXY/ALL_PROXY
+ * repository credentials, and HTTP_PROXY for the HTTP-over-tailnet transport. Nothing else proxy-related is set, so inherited NO_PROXY/ALL_PROXY
  * values can never bypass or redirect it, and no other subprocess or request ever sees the proxy.
  */
 export function resticRestEnv(
@@ -333,12 +327,13 @@ export function resticRestEnv(
   secrets: { username: string; password: string; repositoryPassword: string },
   proxy: string,
 ) {
-  const https = new URL(config.restUrl).protocol === "https:";
+  if (new URL(config.restUrl).protocol !== "http:")
+    throw new Error("Home REST targets require http:// over the encrypted tailnet.");
   return {
     RESTIC_REST_USERNAME: secrets.username,
     RESTIC_REST_PASSWORD: secrets.password,
     RESTIC_PASSWORD: secrets.repositoryPassword,
-    [https ? "HTTPS_PROXY" : "HTTP_PROXY"]: backupSocksProxy(proxy).url,
+    HTTP_PROXY: backupSocksProxy(proxy).url,
   } as Record<string, string>;
 }
 

@@ -356,6 +356,8 @@ ${testNetworks}
       ).stdout;
     },
     workerEnv: () => ({
+      // The host-side API and deployed worker must authenticate with the same fixture token.
+      ARK_BACKUP_WORKER_TOKEN: env.ARK_BACKUP_WORKER_TOKEN!,
       ARK_PLATFORM_PG_EXECUTOR_URL: executorUrls.platform,
       ARK_PLATFORM_PG_EXECUTOR_TOKEN: tokens.platform,
       ARK_APP_PG_EXECUTOR_URL: executorUrls.app,

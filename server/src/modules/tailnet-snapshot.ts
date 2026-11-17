@@ -24,20 +24,27 @@ function toNode(row: typeof tailnetNodes.$inferSelect): TailnetNode {
   };
 }
 
-/** The persisted snapshot of one source and its nodes. */
-export async function loadTailnetSnapshot(source: TailnetSource) {
-  const [row] = await db.select().from(tailnetSnapshots).where(eq(tailnetSnapshots.source, source));
-  const nodes = (await db.select().from(tailnetNodes).where(eq(tailnetNodes.source, source))).map(toNode);
-  const self = nodes.find((node) => node.isSelf) ?? null;
-  const snapshot: TailnetSnapshot | null = row
-    ? {
-        source,
-        generation: row.generation,
-        completedAt: row.completedAt.toISOString(),
-        validUntil: row.validUntil.toISOString(),
-      }
-    : null;
-  return { row: row ?? null, snapshot, self, peers: nodes.filter((node) => !node.isSelf) };
+/** The persisted snapshot of one source and its nodes. `afterHeaderRead` is a concurrency-test seam. */
+export async function loadTailnetSnapshot(source: TailnetSource, afterHeaderRead?: () => Promise<void>) {
+  // Both SELECTs must see the same generation, even if an observer commits between them.
+  return db.transaction(
+    async (tx) => {
+      const [row] = await tx.select().from(tailnetSnapshots).where(eq(tailnetSnapshots.source, source));
+      await afterHeaderRead?.();
+      const nodes = (await tx.select().from(tailnetNodes).where(eq(tailnetNodes.source, source))).map(toNode);
+      const self = nodes.find((node) => node.isSelf) ?? null;
+      const snapshot: TailnetSnapshot | null = row
+        ? {
+            source,
+            generation: row.generation,
+            completedAt: row.completedAt.toISOString(),
+            validUntil: row.validUntil.toISOString(),
+          }
+        : null;
+      return { row: row ?? null, snapshot, self, peers: nodes.filter((node) => !node.isSelf) };
+    },
+    { isolationLevel: "repeatable read", accessMode: "read only" },
+  );
 }
 
 export type LoadedSnapshot = Awaited<ReturnType<typeof loadTailnetSnapshot>>;

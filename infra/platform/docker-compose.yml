@@ -303,7 +303,7 @@ services:
       ARK_PG_STAGE_ROOT: /var/lib/ark/pg-stages
       ARK_RESTIC_CACHE_DIR: /var/lib/ark/backups/restic-cache
       # FD-30: backup-ts's LocalAPI (read-only, status only) and its SOCKS5 proxy. The proxy is given to
-      # the home target's restic subprocess alone (HTTP_PROXY for http://, HTTPS_PROXY for https://);
+      # the home target's restic subprocess alone (HTTP over the encrypted tailnet via HTTP_PROXY);
       # never set HTTP_PROXY/ALL_PROXY here, or S3 and API traffic would follow it.
       ARK_BACKUP_TS_SOCKET: /var/run/tailscale-backup/tailscaled.sock
       ARK_BACKUP_SOCKS5_PROXY: socks5://backup-ts:1055

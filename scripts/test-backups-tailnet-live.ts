@@ -359,13 +359,38 @@ try {
     "the append-only canary passes over the tailnet",
     JSON.stringify(evidence.attempts),
   );
-  const keys = await offsite.targetSecrets(target);
-  const forget = await offsite.runRestic(target, keys, ["forget", "--keep-last", "1", "--prune"], 180_000);
-  const listed = await offsite.runRestic(target, keys, ["snapshots", "--json"], 180_000);
+  // Make retention select an actual snapshot for deletion (disable grouping explicitly).
+  await writeFile(join(data, "payload.bin"), randomBytes(1024 * 1024));
+  await workVolume.sync(data);
+  const second = await offsite.exportFiles("volume:fd30-live", data, []);
   check(
-    forget.status !== 0 && (JSON.parse(listed.stdout) as unknown[]).length === 1,
-    "`restic forget` from the VPS cannot remove the snapshot",
-    `forget exit ${forget.status}`,
+    second.length === 1 && !second[0]!.error,
+    "a second distinct snapshot exists before forget",
+    second[0]?.error ?? "",
+  );
+  const keys = await offsite.targetSecrets(target);
+  const before = await offsite.runRestic(target, keys, ["snapshots", "--json"], 180_000);
+  const beforeIds = (JSON.parse(before.stdout) as { id: string }[]).map((snapshot) => snapshot.id).toSorted();
+  check(
+    before.status === 0 && beforeIds.length >= 2,
+    "forget fixture has at least two snapshots",
+    `${beforeIds.length}`,
+  );
+  const forget = await offsite.runRestic(
+    target,
+    keys,
+    ["forget", "--keep-last", "1", "--group-by", "", "--prune"],
+    180_000,
+  );
+  const listed = await offsite.runRestic(target, keys, ["snapshots", "--json"], 180_000);
+  const afterIds = (JSON.parse(listed.stdout) as { id: string }[]).map((snapshot) => snapshot.id).toSorted();
+  check(
+    forget.status !== 0 &&
+      /403|forbidden|not allowed/i.test(forget.stderr) &&
+      listed.status === 0 &&
+      JSON.stringify(afterIds) === JSON.stringify(beforeIds),
+    "`restic forget` attempts snapshot deletion, is refused, and leaves every snapshot intact",
+    `forget exit ${forget.status}: ${forget.stderr}`,
   );
 
   // 5. Deny checks: the backup node reaches no other port; the edge node reaches nothing there.

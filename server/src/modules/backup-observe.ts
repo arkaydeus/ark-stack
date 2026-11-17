@@ -23,6 +23,7 @@ import {
   restUrlTarget,
   revalidateRouteTarget,
   tailnetSuffixOf,
+  tailnetRestUrlSchema,
   validateRouteTarget,
 } from "@ark-stack/shared";
 import { and, desc, eq } from "drizzle-orm";
@@ -90,6 +91,14 @@ export function checkTailnetIdentity(
       status: "error",
       reason: "not_pinned",
       message: "The target is not a pinned tailnet target.",
+    };
+  }
+  if (!tailnetRestUrlSchema.safeParse(target.restUrl).success) {
+    return {
+      ok: false,
+      status: "error",
+      reason: "unsupported_transport",
+      message: "Home REST targets require http:// over the encrypted tailnet.",
     };
   }
   const check = revalidateRouteTarget({
@@ -275,39 +284,64 @@ export function guardTransfer(
     intervalMs?: number;
     now?: () => Date;
     onStop?: (reason: string) => void;
+    /** Injectable control read for deterministic deadline tests. */
+    readState?: () => Promise<{ identity: TailnetIdentity; validUntil: Date | null }>;
   } = {},
 ): TransferGuard {
   const controller = new AbortController();
   const clock = options.now ?? (() => new Date());
   const intervalMs = Math.min(options.intervalMs ?? TRANSFER_GUARD_INTERVAL_MS, TRANSFER_GUARD_INTERVAL_MS);
   let stopped: string | null = null;
+  let disposed = false;
   let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   let running = false;
+  const readState =
+    options.readState ??
+    (async () => {
+      const [target] = await db.select().from(backupTargets).where(eq(backupTargets.id, targetId));
+      const loaded = await loadBackupSnapshot();
+      return {
+        identity: target?.enabled
+          ? checkTailnetIdentity(target, loaded, clock())
+          : {
+              ok: false as const,
+              status: "error" as const,
+              reason: "missing",
+              message: "Backup target not found.",
+            },
+        validUntil: loaded.row?.validUntil ?? null,
+      };
+    });
   const abort = (reason: string) => {
-    if (stopped) return;
+    if (disposed || stopped) return;
     stopped = reason;
+    clearInterval(timer);
+    clearTimeout(expiryTimer);
+    clearTimeout(deadlineTimer);
     controller.abort(new Error(reason));
     options.onStop?.(reason);
   };
   const check = async () => {
-    if (running || stopped) return;
+    if (running || disposed || stopped) return;
     running = true;
+    // Independent of the query promise: 1 s polling + 1.5 s read budget + 2 s kill grace < 5 s.
+    deadlineTimer = setTimeout(() => abort("Transfer stopped: the identity check timed out"), 1_500);
     try {
-      const now = clock();
-      const identity = await currentTailnetIdentity(targetId, now);
+      const { identity, validUntil } = await readState();
+      if (disposed || stopped) return;
       if (!identity.ok) return abort(`Transfer stopped: ${identity.message}`);
       if (options.pinnedIp && identity.ip !== options.pinnedIp)
         return abort(`Transfer stopped: the home machine's address changed to ${identity.ip}`);
-      // Wake exactly when the current lease runs out, in case no tick lands on it.
-      const loaded = await loadBackupSnapshot();
-      if (loaded.row && snapshotLeaseValid(loaded, now)) {
-        clearTimeout(expiryTimer);
-        expiryTimer = setTimeout(() => void check(), loaded.row.validUntil.getTime() - now.getTime() + 1);
-      }
+      const remaining = (validUntil?.getTime() ?? 0) - clock().getTime();
+      if (remaining <= 0) return abort("Transfer stopped: the backup observation expired");
+      // Expiry aborts directly, even while a subsequent database read is hung.
+      clearTimeout(expiryTimer);
+      expiryTimer = setTimeout(() => abort("Transfer stopped: the backup observation expired"), remaining);
     } catch (error) {
-      // An unreadable control database cannot confirm the identity: fail closed.
       abort(`Transfer stopped: the identity check failed (${(error as Error).message})`);
     } finally {
+      clearTimeout(deadlineTimer);
       running = false;
     }
   };
@@ -317,8 +351,10 @@ export function guardTransfer(
     signal: controller.signal,
     reason: () => stopped,
     stop: () => {
+      disposed = true;
       clearInterval(timer);
       clearTimeout(expiryTimer);
+      clearTimeout(deadlineTimer);
     },
   };
 }

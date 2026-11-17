@@ -10,12 +10,12 @@ const observe = process.env.ARK_BACKUP_SCHEDULE === "0" ? null : scheduleBackupO
 try {
   // Separate bounded lanes keep local backups and canaries from occupying all export slots.
   // The coordinator excludes overlapping target IDs; the executors serialize stanza mutations.
-  // `backup.observe` has its own lane next to the canary, so a long export never delays the
-  // observation that keeps its own lease valid.
+  // Observation has reserved capacity even when every export and canary slot is occupied.
   await Promise.all([
     runWorker("backup", ["backup.create", "backup.restore_test"], executeClaimedJob, { concurrency: 2 }),
     runWorker("backup", ["backup.export"], executeClaimedJob, { concurrency: 4 }),
-    runWorker("backup", ["backup.verify_target", "backup.observe"], executeClaimedJob, { concurrency: 2 }),
+    runWorker("backup", ["backup.verify_target"], executeClaimedJob, { concurrency: 2 }),
+    runWorker("backup", ["backup.observe"], executeClaimedJob, { concurrency: 1 }),
     runWorker("backup", ["update.detect", "import."], executeClaimedJob),
   ]);
 } finally {

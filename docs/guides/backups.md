@@ -81,9 +81,9 @@ The second destination is a restic REST repository on a machine you own, served 
 ### How it works
 
 - **`backup-ts`** (Compose service, pinned `tailscale/tailscale:v1.86.2`, the same image as `edge-ts`) joins the tailnet as `tag:ark-backup` with its own key, in **userspace** networking (no tun device, no capabilities) and with `--shields-up`, so nothing on the tailnet can connect to it. It exposes a SOCKS5 proxy on `:1055` on the internal `backup-tailnet` network, whose only other member is the backup worker. Its own egress network (`backup-ts-egress`) has no other member.
-- **Only the home target's restic subprocess is proxied.** It gets exactly `HTTP_PROXY=socks5://backup-ts:1055` (`HTTPS_PROXY` for an `https://` URL) and no other proxy variable; every restic environment is built from scratch, so a `HTTP_PROXY`, `NO_PROXY` or `ALL_PROXY` inherited by the worker can neither redirect it nor leak into S3 subprocesses. S3 uploads, executor calls and API calls never see a proxy. restic 0.19.1 honours the `socks5://` scheme for its REST backend (Go's `ProxyFromEnvironment`), which `mise run test:backups-tailnet` proves, so the shared-namespace fallback from the design is not needed.
+- **Only the home target's restic subprocess is proxied.** It gets exactly `HTTP_PROXY=socks5://backup-ts:1055` and no other proxy variable; every restic environment is built from scratch, so a `HTTP_PROXY`, `NO_PROXY` or `ALL_PROXY` inherited by the worker can neither redirect it nor leak into S3 subprocesses. S3 uploads, executor calls and API calls never see a proxy. restic 0.19.1 honours the `socks5://` scheme for its REST backend (Go's `ProxyFromEnvironment`), which `mise run test:backups-tailnet` proves, so the shared-namespace fallback from the design is not needed.
 - **Pinned like a route.** `backup.observe` reads `backup-ts`'s **own** LocalAPI status every five minutes (the socket volume `ark_backup_ts_socket` is mounted read-only into the backup worker and nowhere else; as uid 1000 every LocalAPI write is refused) and commits a complete `source = backup` tailnet generation with a six-minute lease. When you save the target, its host must be exactly one peer in that generation: Ark pins the StableNodeID and Tailscale address. For `http://` URLs restic dials the **pinned address** (the URL path, user and repository are unchanged), so a re-pointed MagicDNS name cannot redirect backups. The edge node's snapshot and grants are never used.
-- **Identity and freshness during transfers.** Before every transfer (export, file backup, restore, canary) the pin is checked against the current backup generation, and a local watchdog re-checks it **every second while the transfer runs**. If the observation expires, the pinned node disappears, the name now identifies a different node, or the address changes, the transfer does not start, or the running restic is stopped (SIGTERM, SIGKILL after 2 s): **active REST transfers stop within 5 s** of the change. Nothing waits for the next scheduled backup, and no edge grant or manual step is involved. A stopped transfer is a failed export with no recovery point, and a critical `backup-tailnet:<target>` alert is raised.
+- **Identity and freshness during transfers.** Before every transfer (export, file backup, restore, canary) the pin is checked against the current backup generation, and a local watchdog re-checks it **every second while the transfer runs**. Each control read has a 1.5-second deadline, and a local hard lease timer aborts independently of database reads. Observation has its own worker lane, so blocked canaries cannot delay renewal. Canary sockets are destroyed immediately on abort. If the observation expires, the pinned node disappears, the name now identifies a different node, or the address changes, the transfer does not start, or the running restic is stopped (SIGTERM, SIGKILL after 2 s): **active REST transfers stop within 5 s** of the change. Nothing waits for the next scheduled backup, and no edge grant or manual step is involved. A stopped transfer is a failed export with no recovery point, and a critical `backup-tailnet:<target>` alert is raised.
 - **Append-only canary** (`backup.verify_target`, weekly and on save), with the deployed htpasswd credentials, through `backup-ts` to the pinned address: it writes a canary pack, then requires overwrite and delete of it to be refused (403) and the pack to read back unchanged; deletes of never-existing names under `snapshots/`, `keys/` and `index/` must be refused (403, not 404); restic must be able to create and remove a lock; unauthenticated requests must get 401; and another user's path must be refused (`--private-repos`). It never writes or deletes `config`, keys, snapshots or index files. A server without `--append-only` is reported **deletable**.
 
 ### Setting up the home machine
@@ -115,7 +115,23 @@ The second destination is a restic REST repository on a machine you own, served 
    Keep it running under systemd or the container's restart policy. Never point Ark at an instance without `--append-only`.
 
 5. **Create the backup node's key.** In the Tailscale admin console, add `tag:ark-backup` to `tagOwners` (the generated snippet declares it) and create a **one-off, pre-approved, non-ephemeral** auth key tagged `tag:ark-backup`. Never reuse the edge key. Put it in `.env` as `TS_BACKUP_AUTHKEY=tskey-auth-…` and start the node: `docker compose -f infra/platform/docker-compose.yml up -d backup-ts backup-worker`. After the first join, empty `TS_BACKUP_AUTHKEY` and revoke the key; the node keeps its identity in `ark_backup_ts_state`.
-6. **Add the target in Ark** (owner, MFA and your password): `PUT /api/backups/targets/tailnet_rest` with
+6. **Bootstrap the ACL grant before observing or saving.** Merge this grant into the tailnet policy first, replacing `100.66.2.9` with the home machine's actual Tailscale IPv4 address. No saved target is needed for this manual grant. Add `tag:ark-backup` to `tagOwners` if it is not already declared:
+
+   ```jsonc
+   "hosts": { "ark-backup-home": "100.66.2.9" },
+   "grants": [
+     { "src": ["tag:ark-backup"], "dst": ["ark-backup-home"], "ip": ["tcp:8000"] }
+   ],
+   "tests": [
+     { "src": "tag:ark-edge", "deny": ["ark-backup-home:8000"] },
+     { "src": "tag:ark-backup", "accept": ["ark-backup-home:8000"] }
+   ]
+   ```
+
+   Never give `tag:ark-edge` a grant to the home machine, and never give `tag:ark-backup` anything else: backup reach and route reach must not share grants (§3.7).
+
+7. **Observe and add the target in Ark** (owner, MFA and your password): `PUT /api/backups/targets/tailnet_rest` with
+
    ```json
    {
      "name": "home",
@@ -124,21 +140,10 @@ The second destination is a restic REST repository on a machine you own, served 
      "repositoryPassword": "<a new restic password, stored off-host>"
    }
    ```
-   The URL must be the home machine's MagicDNS name or Tailscale address, with an explicit port and a path starting with the htpasswd user; credentials never go in the URL. Saving pins the machine from `backup-ts`'s current observation, so it fails until `backup-ts` is logged in **and** the grant below is in place (`POST /api/backups/tailnet/observe` refreshes the observation; `GET /api/backups/tailnet` shows what `backup-ts` sees and each target's identity). Saving queues the canary. The **Backups** page has the same form.
-7. **Add the ACL grant.** Open **Front door ACL** (`GET /api/front/acl`) and merge the generated sections into the tailnet policy. For the home target they contain exactly one grant from the backup node, plus tests that the edge node cannot reach it:
 
-   ```jsonc
-   "hosts": { "ark-backup-home": "100.66.2.9" },
-   "grants": [
-     { "src": ["tag:ark-backup"], "dst": ["ark-backup-home"], "ip": ["tcp:8000"] }
-   ],
-   "tests": [
-     { "src": "tag:ark-edge", "deny": ["ark-backup-home:8000", "…"] },
-     { "src": "tag:ark-backup", "accept": ["ark-backup-home:8000"] }
-   ]
-   ```
+   Home targets require `http://` over the encrypted tailnet. HTTPS is rejected until pinned-IP dialing with hostname verification is supported for restic. The URL must be the home machine's MagicDNS name or Tailscale address, with an explicit port and a path starting with the htpasswd user; credentials never go in the URL. Saving pins the machine from `backup-ts`'s current observation, so it fails until `backup-ts` is logged in **and** the bootstrap grant above is in place (`POST /api/backups/tailnet/observe` refreshes the observation; `GET /api/backups/tailnet` shows what `backup-ts` sees and each target's identity). Saving queues the canary. The **Backups** page has the same form.
 
-   Never give `tag:ark-edge` a grant to the home machine, and never give `tag:ark-backup` anything else: backup reach and route reach must not share grants (§3.7).
+8. **Confirm the generated policy.** After saving, open **Front door ACL** (`GET /api/front/acl`) and merge or compare the generated home-target sections with the bootstrap grant. Keep only the backup-node-to-home TCP port grant and the generated edge deny tests.
 
 ### Pruning and recovery from the home machine
 

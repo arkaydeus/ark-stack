@@ -33,7 +33,14 @@ function socksAddress(host: string) {
 }
 
 /** Opens a TCP connection to `host:port` through the SOCKS5 proxy. */
-export function socks5Connect(proxy: string, host: string, port: number, timeoutMs: number) {
+export function socks5Connect(
+  proxy: string,
+  host: string,
+  port: number,
+  timeoutMs: number,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
   const configured = backupSocksProxy(proxy);
   // Test-only (scripts/test-backups-tailnet.ts): the harness process runs outside Docker and reaches
   // backup-ts's SOCKS5 port through a loopback publish; never set in production.
@@ -48,11 +55,18 @@ export function socks5Connect(proxy: string, host: string, port: number, timeout
       () => fail(new Error(`SOCKS5 proxy did not connect within ${timeoutMs} ms`)),
       timeoutMs,
     );
-    const fail = (error: Error) => {
+    const onAbort = () => fail(signal?.reason ?? new Error("SOCKS5 request aborted"));
+    const cleanup = () => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const fail = (error: Error) => {
+      cleanup();
       socket.destroy();
       reject(error);
     };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    socket.once("close", () => fail(new Error("SOCKS5 connection closed during handshake.")));
     socket.once("error", (error) =>
       fail(new Error(`SOCKS5 proxy ${proxyHost}:${proxyPort}: ${error.message}`)),
     );
@@ -78,7 +92,8 @@ export function socks5Connect(proxy: string, host: string, port: number, timeout
       const length = kind === 1 ? 10 : kind === 4 ? 22 : kind === 3 ? 7 + buffer[4]! : -1;
       if (length < 0) return fail(new Error("Malformed SOCKS5 reply address."));
       if (buffer.length < length) return;
-      clearTimeout(timer);
+      cleanup();
+      socket.removeAllListeners("close");
       socket.off("data", onData);
       socket.removeAllListeners("error");
       if (buffer.length > length) socket.unshift(buffer.subarray(length));
@@ -114,66 +129,96 @@ export async function socks5HttpRequest(input: {
   headers?: Record<string, string>;
   body?: Uint8Array | string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<SocksHttpResponse> {
   const url = new URL(input.url);
   const https = url.protocol === "https:";
   const port = Number(url.port || (https ? 443 : 80));
   const timeoutMs = input.timeoutMs ?? 30_000;
   const host = input.connectHost ?? url.hostname.replace(/^\[|\]$/g, "");
-  const raw = await socks5Connect(input.proxy, host, port, timeoutMs);
-  const socket: Socket = https
-    ? await new Promise<Socket>((resolve, reject) => {
-        const secure = tlsConnect({ socket: raw, servername: url.hostname }, () => resolve(secure));
-        secure.once("error", reject);
-      })
-    : raw;
-  const body = input.body === undefined ? Buffer.alloc(0) : Buffer.from(input.body);
-  const head = [
-    `${input.method} ${url.pathname}${url.search} HTTP/1.1`,
-    `Host: ${url.host}`,
-    "Connection: close",
-    `Content-Length: ${body.length}`,
-    ...Object.entries(input.headers ?? {}).map(([name, value]) => `${name}: ${value}`),
-    "",
-    "",
-  ].join("\r\n");
-  return new Promise<SocksHttpResponse>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error(`No HTTP answer from ${url.host} within ${timeoutMs} ms`));
-    }, timeoutMs);
-    socket.on("data", (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > MAX_RESPONSE_BYTES) {
-        socket.destroy();
-        return reject(new Error("HTTP response is too large."));
-      }
-      chunks.push(chunk);
-    });
-    socket.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    socket.once("close", () => {
-      clearTimeout(timer);
-      const all = Buffer.concat(chunks);
-      const split = all.indexOf("\r\n\r\n");
-      if (split < 0) return reject(new Error(`Connection to ${url.host} closed without an HTTP answer.`));
-      const [statusLine = "", ...lines] = all.subarray(0, split).toString("latin1").split("\r\n");
-      const match = /^HTTP\/1\.[01] (\d{3})/.exec(statusLine);
-      if (!match) return reject(new Error(`Malformed HTTP status line: ${statusLine.slice(0, 80)}`));
-      const headers = Object.fromEntries(
-        lines.map((line) => {
-          const index = line.indexOf(":");
-          return [line.slice(0, index).trim().toLowerCase(), line.slice(index + 1).trim()];
-        }),
-      );
-      let payload = all.subarray(split + 4);
-      if (/chunked/i.test(headers["transfer-encoding"] ?? "")) payload = decodeChunked(payload);
-      resolve({ status: Number(match[1]), headers, body: new Uint8Array(payload) });
-    });
-    socket.write(Buffer.concat([Buffer.from(head, "latin1"), body]));
+  // One deadline covers TCP, SOCKS negotiation, TLS and the complete HTTP response.
+  const controller = new AbortController();
+  let socket: Socket | undefined;
+  const abort = () => controller.abort(input.signal?.reason ?? new Error("HTTP request aborted"));
+  input.signal?.addEventListener("abort", abort, { once: true });
+  if (input.signal?.aborted) abort();
+  const timer = setTimeout(
+    () => controller.abort(new Error(`No HTTP answer from ${url.host} within ${timeoutMs} ms`)),
+    timeoutMs,
+  );
+  let onAbort: () => void;
+  const cancelled = new Promise<never>((_, reject) => {
+    onAbort = () => {
+      socket?.destroy();
+      reject(controller.signal.reason);
+    };
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    if (controller.signal.aborted) onAbort();
   });
+  const request = async (): Promise<SocksHttpResponse> => {
+    controller.signal.throwIfAborted();
+    socket = await socks5Connect(input.proxy, host, port, timeoutMs, controller.signal);
+    controller.signal.throwIfAborted();
+    if (https) {
+      const raw = socket;
+      socket = tlsConnect({ socket: raw, servername: url.hostname });
+      const secure = socket;
+      await new Promise<void>((resolve, reject) => {
+        secure.once("secureConnect", resolve);
+        secure.once("error", reject);
+        secure.once("close", () => reject(new Error("TLS connection closed during handshake.")));
+      });
+    }
+    controller.signal.throwIfAborted();
+    const connection = socket;
+    const body = input.body === undefined ? Buffer.alloc(0) : Buffer.from(input.body);
+    const head = [
+      `${input.method} ${url.pathname}${url.search} HTTP/1.1`,
+      `Host: ${url.host}`,
+      "Connection: close",
+      `Content-Length: ${body.length}`,
+      ...Object.entries(input.headers ?? {}).map(([name, value]) => `${name}: ${value}`),
+      "",
+      "",
+    ].join("\r\n");
+    return new Promise<SocksHttpResponse>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      connection.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > MAX_RESPONSE_BYTES) {
+          connection.destroy();
+          return reject(new Error("HTTP response is too large."));
+        }
+        chunks.push(chunk);
+      });
+      connection.once("error", reject);
+      connection.once("close", () => {
+        const all = Buffer.concat(chunks);
+        const split = all.indexOf("\r\n\r\n");
+        if (split < 0) return reject(new Error(`Connection to ${url.host} closed without an HTTP answer.`));
+        const [statusLine = "", ...lines] = all.subarray(0, split).toString("latin1").split("\r\n");
+        const match = /^HTTP\/1\.[01] (\d{3})/.exec(statusLine);
+        if (!match) return reject(new Error(`Malformed HTTP status line: ${statusLine.slice(0, 80)}`));
+        const headers = Object.fromEntries(
+          lines.map((line) => {
+            const index = line.indexOf(":");
+            return [line.slice(0, index).trim().toLowerCase(), line.slice(index + 1).trim()];
+          }),
+        );
+        let payload = all.subarray(split + 4);
+        if (/chunked/i.test(headers["transfer-encoding"] ?? "")) payload = decodeChunked(payload);
+        resolve({ status: Number(match[1]), headers, body: new Uint8Array(payload) });
+      });
+      connection.write(Buffer.concat([Buffer.from(head, "latin1"), body]));
+    });
+  };
+  try {
+    return await Promise.race([request(), cancelled]);
+  } finally {
+    clearTimeout(timer);
+    input.signal?.removeEventListener("abort", abort);
+    controller.signal.removeEventListener("abort", onAbort!);
+    socket?.destroy();
+  }
 }

@@ -13,7 +13,7 @@
 //   both an S3 and a home target.
 // - A `tailnet_rest` (home) target is pinned from backup-ts's own observation (backup-observe.ts).
 //   Its restic subprocess, and only that subprocess, gets `HTTP_PROXY=socks5://backup-ts:1055`
-//   (HTTPS_PROXY for https://) and the pinned address; every transfer checks identity and freshness
+//   and the pinned address; every transfer checks identity and freshness
 //   first and runs under the local watchdog, which kills it within the documented bound when either
 //   fails. S3 subprocesses and API/executor calls never see a proxy setting.
 //
@@ -32,6 +32,7 @@ import {
   evaluateBackupHealth,
   pgSnapshotTags,
   restRepositoryUser,
+  tailnetRestUrlSchema,
   resticRestEnv,
   resticRestRepository,
   resticS3Env,
@@ -271,6 +272,8 @@ export async function saveTailnetRestTarget(input: TailnetRestTargetInput) {
       throw new Error("The repository password cannot change; use a new URL path for a new repository.");
     }
   }
+  // Validate here too: internal callers and old persisted HTTPS targets must fail closed.
+  tailnetRestUrlSchema.parse(input.restUrl);
   const pin = await pinTailnetTarget(input.restUrl);
   const moved =
     !existing ||
@@ -388,6 +391,7 @@ function restConfig(target: BackupTargetRow) {
   if (target.kind !== "tailnet_rest" || !target.restUrl || !target.targetIp) {
     throw new Error(`Backup target ${target.name} is not a pinned tailnet REST target.`);
   }
+  tailnetRestUrlSchema.parse(target.restUrl);
   return { restUrl: target.restUrl, targetIp: target.targetIp };
 }
 
@@ -974,7 +978,8 @@ async function verifyRestTarget(target: BackupTargetRow): Promise<RestCanaryEvid
         const response = await socks5HttpRequest({
           proxy,
           url: new URL(path, base).toString(),
-          connectHost: base.protocol === "https:" ? undefined : config.targetIp,
+          connectHost: config.targetIp,
+          signal,
           method,
           body,
           headers: {
