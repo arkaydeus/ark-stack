@@ -2,7 +2,10 @@ import { resolve4, resolve6, resolveCname, resolveMx, resolveTxt } from "node:dn
 import { resolve } from "node:path";
 
 import {
+  allowedBackends,
+  routeIdentityKey,
   assertCidrs,
+  CaddyWithdrawalAdapter,
   backupProofAllowed,
   buildProvisionPlan,
   candidateRequiresApproval,
@@ -41,6 +44,8 @@ import { loadEnv } from "./env.ts";
 import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
+import { edgePolicy, observeEdgeTailnet, startEdgeObserveSchedule } from "./modules/edge-observe.ts";
+import { edgeLocalApi, edgeSocketPath } from "./modules/tailnet-localapi.ts";
 import {
   executeWorkspaceQuery,
   inspectDatabaseSchema,
@@ -521,6 +526,8 @@ export async function runOperation(
   if (kind === "ses.reconcile") return reconcileSesOp(operation);
   if (kind === "pgbouncer.reload") return reloadPgbouncer(operation);
   if (kind === "edge.apply") return applyEdge(operation);
+  if (kind === "edge.observe") return observeEdge(operation);
+  if (kind === "edge.drain") return drainEdge(operation);
   if (kind === "update.detect") return detectUpdates(operation);
   if (kind === "import.scan") return scanImportOp(operation);
   if (kind === "database.rotate") return rotateDatabase(operation);
@@ -1745,12 +1752,23 @@ async function revokeDatabaseClientOp(operation: OperationRow, runtime: ClientOp
 
 // The edge serves only hostnames whose current certificate is `issued`. Public `http` endpoints
 // have no upstream yet, so they are rendered as unrouted (a fixed 503 naming no internal host).
-async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
+// Tailnet HTTP routes are rendered only while the lease allows them (front door §3.2, FD-06).
+export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
+  const policy = await edgePolicy();
   return planEdge({
     adminMode,
     adminHostname,
     endpoints: await db.select().from(endpoints),
     certificates: await db.select().from(certificates),
+    tailnetRoutes: policy.routes
+      .filter((route) => route.kind === "http")
+      .map((route) => ({
+        id: route.id,
+        hostname: route.hostname,
+        stableId: route.stableId,
+        ip: route.ip,
+        port: route.port,
+      })),
   });
 }
 
@@ -1765,6 +1783,116 @@ async function applyEdge(operation: OperationRow) {
     ...written,
     unrouted: plan.appRoutes.map((route) => route.hostname),
     awaitingCertificate: plan.awaitingCertificate,
+  });
+}
+
+/** Thrown when `edge.observe` has no LocalAPI to read; nothing is changed. */
+function requireEdgeSocket() {
+  const socket = edgeSocketPath();
+  if (!socket) {
+    throw new Error("ARK_EDGE_TS_SOCKET is not set: the edge node's LocalAPI socket is not mounted here.");
+  }
+  return socket;
+}
+
+// Edge observer (front door §3.2, §3.6, FD-06): read-only LocalAPI status, one complete generation.
+async function observeEdge(operation: OperationRow) {
+  const result = await observeEdgeTailnet({
+    api: edgeLocalApi(requireEdgeSocket()),
+    enqueue,
+    operationId: operation.id,
+  });
+  const reconcile = await reconcileServedRoutes();
+  await addStep(operation.id, "edge-observe", { ...result, reconcile });
+  return { ...result, reconcile };
+}
+
+/**
+ * Re-applies the edge when an allowed HTTP route is missing from the running Caddy, for example
+ * after Caddy started from the closed config during a restart, or after a withdrawal on a policy
+ * that has since been renewed. Only ever adds what the policy allows, through edge.apply.
+ */
+async function reconcileServedRoutes() {
+  const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
+  if (!adminUrl) return { checked: false };
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const plan = await edgePlan(
+    settings?.adminMode === "tailnet" ? "tailnet" : "public",
+    settings?.adminHostname,
+  );
+  const issued = new Set(
+    plan.certificates
+      .filter((certificate) => certificate.status === "issued")
+      .map((certificate) => certificate.hostname),
+  );
+  const allowed = plan.tailnetRoutes.filter((route) => issued.has(route.hostname));
+  if (!allowed.length) return { checked: true, missing: [] };
+  let active: string[];
+  try {
+    active = await new CaddyWithdrawalAdapter(adminUrl).activeRoutes();
+  } catch (error) {
+    return { checked: false, error: (error as Error).message };
+  }
+  const missing = allowed
+    .filter((route) => !active.includes(routeIdentityKey(route)))
+    .map((route) => route.id);
+  if (missing.length) await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
+  return { checked: true, missing };
+}
+
+export const EDGE_WITHDRAWAL_ALERT = "edge-withdrawal";
+
+// Withdraws tailnet backends that the current policy no longer allows from the running proxies.
+// Caddy is enforced through its admin API here and by the edge-local watchdog every second; the
+// HAProxy adapter (every worker generation, master CLI) is an FD-25 integration gate.
+async function drainEdge(operation: OperationRow) {
+  const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
+  const backends = Array.isArray(operation.payload.backends) ? operation.payload.backends : [];
+  if (!adminUrl) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("ARK_EDGE_RELOAD_URL is required to drain edge routes in production.");
+    }
+    await addStep(operation.id, "edge-drain", {
+      backends,
+      caddy: "not configured",
+      haproxy: "not deployed (FD-25)",
+    });
+    return;
+  }
+  const allowed = allowedBackends(await edgePolicy());
+  const adapter = new CaddyWithdrawalAdapter(adminUrl);
+  const result = await adapter.enforce(allowed);
+  if (result.error) {
+    let outcome = "Caddy was stopped";
+    try {
+      await adapter.stop();
+    } catch (error) {
+      outcome = `Caddy stop failed: ${(error as Error).message}`;
+    }
+    await raiseAlert({
+      severity: "critical",
+      title: `Edge route withdrawal failed; ${outcome} (${result.error})`,
+      dedupKey: EDGE_WITHDRAWAL_ALERT,
+    });
+    throw new Error(`Caddy withdrawal failed; ${outcome}: ${result.error}`);
+  }
+  if (result.unreachable) throw new Error(result.error);
+  await addStep(operation.id, "edge-drain", {
+    reason: operation.payload.reason ?? null,
+    routeIds: operation.payload.routeIds ?? [],
+    backends,
+    caddy: { active: result.active, withdrawn: result.withdrawn },
+    haproxy: "not deployed (FD-25)",
+  });
+}
+
+/** Schedules `edge.observe` every five minutes where the edge node's socket is mounted (§3.4). */
+export function scheduleEdgeObserve(intervalMs?: number) {
+  if (!edgeSocketPath()) return null;
+  return startEdgeObserveSchedule({
+    enqueue,
+    intervalMs,
+    log: (line) => console.error(line),
   });
 }
 
@@ -1901,5 +2029,6 @@ export function startCoordinator() {
       });
   };
   tick();
+  scheduleEdgeObserve();
   return setInterval(tick, 1500);
 }

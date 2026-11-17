@@ -26,7 +26,7 @@ function "refs" {
 }
 
 group "default" {
-  targets = ["app", "database-worker", "database-ingress", "domain-worker", "mail-worker", "backup-worker", "agent"]
+  targets = ["app", "database-worker", "database-ingress", "domain-worker", "edge-watchdog", "mail-worker", "backup-worker", "agent"]
 }
 
 target "_common" {
@@ -70,6 +70,12 @@ target "domain-worker" {
   inherits = ["_app"]
   target   = "domain-worker"
   tags     = refs("ark-domain-worker")
+}
+
+target "edge-watchdog" {
+  inherits = ["_app"]
+  target   = "edge-watchdog"
+  tags     = refs("ark-edge-watchdog")
 }
 
 target "mail-worker" {

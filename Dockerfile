@@ -47,4 +47,8 @@ RUN apt-get update \
 COPY --from=lego /lego /usr/local/bin/lego
 USER bun
 
+# Edge-local lease watchdog (docs/design/front-door.md §3.2, FD-06): the runtime image with nothing
+# added. It runs as `bun` with no capabilities, database credential or socket mounts.
+FROM runtime AS edge-watchdog
+
 FROM runtime AS mail-worker

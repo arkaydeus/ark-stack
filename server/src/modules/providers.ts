@@ -26,6 +26,7 @@ import {
   type DbIngressLimits,
   type DnsWrite,
   type EdgeAppRoute,
+  type EdgeTailnetRoute,
   type ExternalInventory,
 } from "@ark-stack/shared";
 
@@ -550,28 +551,39 @@ export async function writeEdge(input: {
   /** The current certificate status per hostname; only `issued` hostnames are served. */
   certificates?: Array<{ hostname: string; status: string }>;
   appRoutes?: EdgeAppRoute[];
+  /** Tailnet routes allowed by the current lease (front door §3.2, FD-06). */
+  tailnetRoutes?: EdgeTailnetRoute[];
 }) {
   const dir = process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform");
   await mkdir(dir, { recursive: true });
-  const caddy = renderCaddyfile({
-    adminMode: input.adminMode,
-    adminHostname: input.adminHostname,
-    challengeDir: process.env.ARK_ACME_WEBROOT ?? join(dir, "acme"),
-    apiUpstream: process.env.ARK_API_UPSTREAM ?? "api:3000",
-    // Paths inside the edge container, which mounts the certificate directory read-only.
-    certificates: (input.certificates ?? []).map((item) => ({
-      ...item,
-      ...edgeCertificatePaths(item.hostname, EDGE_CERT_DIR),
-    })),
-    appRoutes: input.appRoutes,
-  });
+  const render = (tailnetRoutes: EdgeTailnetRoute[]) =>
+    renderCaddyfile({
+      adminMode: input.adminMode,
+      adminHostname: input.adminHostname,
+      challengeDir: process.env.ARK_ACME_WEBROOT ?? join(dir, "acme"),
+      apiUpstream: process.env.ARK_API_UPSTREAM ?? "api:3000",
+      // Paths inside the edge container, which mounts the certificate directory read-only.
+      certificates: (input.certificates ?? []).map((item) => ({
+        ...item,
+        ...edgeCertificatePaths(item.hostname, EDGE_CERT_DIR),
+      })),
+      appRoutes: input.appRoutes,
+      tailnetRoutes,
+    });
+  const caddy = render(input.tailnetRoutes ?? []);
+  // The closed variant renders no tailnet route. The Caddy launch guard starts from it whenever the
+  // edge watchdog does not confirm a valid lease for every tailnet backend in `Caddyfile` (§3.2).
+  const closed = render([]);
   const serve = renderTailscaleServe();
   if (!funnelDisabled(serve)) throw new Error("Tailscale Funnel must stay disabled on the admin node.");
   const caddyPath = join(dir, "Caddyfile");
   const nextCaddy = `${caddyPath}.next`;
+  const closedPath = join(dir, "Caddyfile.closed");
+  const nextClosed = `${closedPath}.next`;
   const servePath = join(dir, "serve.json");
   const nextServe = `${servePath}.next`;
   await writeFile(nextCaddy, caddy, { mode: 0o600 });
+  await writeFile(nextClosed, closed, { mode: 0o600 });
   await writeFile(nextServe, JSON.stringify(serve, null, 2), { mode: 0o600 });
   const reloadUrl = process.env.ARK_EDGE_RELOAD_URL;
   let applied = false;
@@ -581,10 +593,11 @@ export async function writeEdge(input: {
   } else if (process.env.NODE_ENV === "production") {
     throw new Error("ARK_EDGE_RELOAD_URL is required to apply gateway changes in production.");
   }
+  await rename(nextClosed, closedPath);
   await rename(nextCaddy, caddyPath);
   await rename(nextServe, servePath);
   await chmod(caddyPath, 0o600);
-  return { dir, funnel: false, applied };
+  return { dir, funnel: false, applied, tailnetRoutes: (input.tailnetRoutes ?? []).map((route) => route.id) };
 }
 
 export async function resolveImageDigest(image: string) {

@@ -18,12 +18,20 @@ export type EdgeStackOptions = {
   directory: string;
   acmeDir: string;
   certDir: string;
-  /** Mounted read-only at /etc/caddy/Caddyfile, as tmp/edge/Caddyfile is in production. */
-  caddyfile: string;
+  /**
+   * Mounted read-only at /etc/caddy/ark, as tmp/edge is in production: the launch guard starts Caddy
+   * from its Caddyfile, or from Caddyfile.closed without a valid lease (front door §3.2).
+   */
+  edgeDir: string;
   /** Published ports for edge-ts, replacing the production list. */
   ports: string[];
   /** Extra or replacement edge-ts environment. */
   edgeTsEnvironment?: Record<string, string>;
+  /**
+   * Replaces edge-ts's entrypoint and command. containerboot exits after its 60 s boot timeout when
+   * the node cannot log in, and the restart strands `edge`; long offline runs start tailscaled itself.
+   */
+  edgeTsCommand?: string[];
 };
 
 export type EdgeStack = {
@@ -71,12 +79,18 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
     ...(environment.length
       ? ["    environment:", ...environment.map(([key, value]) => `      ${key}: ${yamlString(value)}`)]
       : []),
+    ...(options.edgeTsCommand
+      ? [
+          `    entrypoint: ${JSON.stringify(options.edgeTsCommand.slice(0, 1))}`,
+          `    command: ${JSON.stringify(options.edgeTsCommand.slice(1))}`,
+        ]
+      : []),
     "  edge:",
     // Compose merges volumes by target, so these replace the tmp/ bind mounts.
     "    volumes:",
     `      - ${yamlString(`${options.acmeDir}:/var/lib/ark/acme:ro`)}`,
     `      - ${yamlString(`${options.certDir}:/var/lib/ark/certs:ro`)}`,
-    `      - ${yamlString(`${options.caddyfile}:/etc/caddy/Caddyfile:ro`)}`,
+    `      - ${yamlString(`${options.edgeDir}:/etc/caddy/ark:ro`)}`,
     ...(external.length
       ? [
           "networks:",

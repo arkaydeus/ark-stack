@@ -7,7 +7,8 @@
     "database": "bun src/database.ts",
     "mail": "bun src/mail.ts",
     "backup": "bun src/backup.ts",
-    "domains": "bun src/domains.ts"
+    "domains": "bun src/domains.ts",
+    "edge-watchdog": "bun src/edge-watchdog.ts"
   },
   "dependencies": {
     "@ark-stack/shared": "workspace:*"

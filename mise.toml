@@ -48,8 +48,13 @@ description = "Run native mail lifecycle checks against a disposable pinned Stal
 run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts"
 
 [tasks."test:edge"]
-description = "Check edge harness cleanup and pins, validate Caddy configurations, test edge behaviour, and test the public database port nftables rules"
-run = ["bun test scripts/edge-test", "bun scripts/test-edge-config.ts", "bun scripts/test-db-ingress.ts"]
+description = "Check edge harness cleanup and pins, validate Caddy configurations, test edge behaviour, the public database port nftables rules, the LocalAPI deployment and route withdrawal"
+run = [
+  "bun test scripts/edge-test",
+  "bun scripts/test-edge-config.ts",
+  "bun scripts/test-db-ingress.ts",
+  "bun scripts/test-edge-observer.ts",
+]
 
 [tasks."test:pgbouncer"]
 description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM, admin-socket reloads and database clients (connect, read-only preview, revoke)"

@@ -5,6 +5,8 @@
 //   ARK_TEST_TS_EDGE_AUTHKEY   required: pre-approved key tagged tag:ark-edge (ephemeral for tests)
 //   ARK_TEST_TS_PEER_AUTHKEY   optional: pre-approved key for a test peer (ephemeral), allowed by the
 //                              policy to reach tag:ark-edge:80, with no grant from tag:ark-edge to it
+//   ARK_TEST_TS_GRANTED_PORT   optional: a TCP port on the test peer that the policy grants to
+//                              tag:ark-edge (FD-06 probe pass); 8080 must stay ungranted
 //   ARK_TEST_TS_UDP_PORT       optional: host port published for 41642/udp (default 41642)
 //   ARK_TEST_TS_REQUIRE_DIRECT optional: 1 fails the run when only a DERP path is found
 //
@@ -13,8 +15,13 @@
 // grant the edge cannot open TCP to a tailnet peer; with --shields-up a peer cannot connect to the edge
 // node; UDP 41642 is published and a direct path is reported when the network allows it. Every node it
 // enrols is logged out at the end.
+//
+// FD-06 (edge observer): the production LocalAPI client reads a complete generation as the domain
+// worker's uid through the read-only socket mount; a peer that appears in status (it may reach the
+// edge) but whose port is not granted fails the edge-netns TCP probe, so its route would stay
+// `awaiting_acl`; with ARK_TEST_TS_GRANTED_PORT, granting that exact port makes the probe pass.
 import { randomBytes } from "node:crypto";
-import { mkdir, mkdtemp } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -32,10 +39,13 @@ if (!edgeKey) {
   process.exit(0);
 }
 const peerKey = process.env.ARK_TEST_TS_PEER_AUTHKEY?.trim() ?? "";
+const grantedPort = Number(process.env.ARK_TEST_TS_GRANTED_PORT ?? "") || 0;
 const udpPort = Number(process.env.ARK_TEST_TS_UDP_PORT ?? "41642");
 const requireDirect = process.env.ARK_TEST_TS_REQUIRE_DIRECT === "1";
 
 const root = resolve(import.meta.dir, "..");
+const bunImage =
+  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const tailscaleImage =
   "tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2";
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
@@ -74,6 +84,55 @@ type Status = {
   Peer?: Record<string, { HostName: string; TailscaleIPs?: string[]; CurAddr?: string; Relay?: string }>;
 };
 
+type Observation = {
+  backendState?: string;
+  statusError?: string;
+  parsed?: {
+    ok: boolean;
+    reason?: string;
+    self?: { tags: string[] };
+    peers?: Array<{ stableId: string; ipv4: string | null }>;
+  };
+  probe?: { ok: boolean; detail: string };
+};
+
+let observeHarness: string | undefined;
+/** The production LocalAPI client and parser, as uid 1000 through the read-only socket mount (FD-06). */
+async function observeAndProbe(project: string, ip: string, port: number): Promise<Observation> {
+  if (!observeHarness) {
+    const outdir = join(directory, "observe-status");
+    const built = await Bun.build({
+      entrypoints: [join(import.meta.dir, "edge-test", "observe-status.ts")],
+      target: "bun",
+      outdir,
+    });
+    if (!built.success) throw new Error(`Bundling observe-status.ts failed: ${built.logs.join("\n")}`);
+    await chmod(directory, 0o755);
+    await chmod(outdir, 0o755);
+    observeHarness = outdir;
+  }
+  const output = await docker(
+    "run",
+    "--rm",
+    "--user",
+    "1000:1000",
+    "--read-only",
+    "--cap-drop",
+    "ALL",
+    "--volume",
+    `${project}_ark_edge_ts_socket:/var/run/tailscale:ro`,
+    "--volume",
+    `${observeHarness}:/harness:ro`,
+    bunImage,
+    "bun",
+    "/harness/observe-status.js",
+    "/var/run/tailscale/tailscaled.sock",
+    ip,
+    String(port),
+  );
+  return JSON.parse(output.split("\n").at(-1)!) as Observation;
+}
+
 function tailscale(container: string, ...args: string[]) {
   return docker("exec", container, "tailscale", "--socket=/var/run/tailscale/tailscaled.sock", ...args);
 }
@@ -103,6 +162,9 @@ try {
   await mkdir(join(acme, ".well-known", "acme-challenge"), { recursive: true });
   await mkdir(certs);
   await Bun.write(join(acme, ".well-known", "acme-challenge", "tailnet-token"), "tailnet-token.key-auth");
+  const edgeDir = join(directory, "edge");
+  await mkdir(edgeDir);
+  await Bun.write(join(edgeDir, "Caddyfile"), await Bun.file(join(root, "infra/platform/Caddyfile")).text());
 
   // Compose interpolates TS_AUTHKEY from this process's environment; the key is never written to disk.
   process.env.TS_EDGE_AUTHKEY = edgeKey;
@@ -112,7 +174,7 @@ try {
     directory,
     acmeDir: acme,
     certDir: certs,
-    caddyfile: join(root, "infra/platform/Caddyfile"),
+    edgeDir,
     ports: ["127.0.0.1::80", "127.0.0.1::443", `${udpPort}:41642/udp`],
   });
   enrolled.push(stack.edgeTs);
@@ -154,6 +216,14 @@ try {
     challenge.status === 200 && (await challenge.text()) === "tailnet-token.key-auth",
     "edge serves the :80 ACME challenge from the edge-ts namespace",
     `HTTP ${challenge.status}`,
+  );
+
+  // FD-06: a complete generation through the read-only LocalAPI, as the domain worker reads it.
+  const generation = await observeAndProbe(stack.project, "100.64.0.1", 9);
+  check(
+    generation.parsed?.ok === true && JSON.stringify(generation.parsed.self?.tags) === '["tag:ark-edge"]',
+    "edge.observe's client reads a complete generation as uid 1000 through the :ro socket mount",
+    `BackendState ${generation.backendState}; ${generation.parsed?.peers?.length ?? 0} peer(s); self tags ${JSON.stringify(generation.parsed?.self?.tags)}`,
   );
 
   // 2. UDP 41642.
@@ -215,6 +285,50 @@ try {
       "with no grant, the edge namespace cannot open TCP to a tailnet peer",
       `edge -> ${peerIp}:8080 ${outbound}`,
     );
+
+    // FD-06: present in status (the peer may reach the edge) but not granted on 8080, so the
+    // edge-netns probe through LocalAPI dial fails and the route would stay awaiting_acl.
+    const ungranted = await waitFor("the peer in the edge node's status", async () => {
+      const observed = await observeAndProbe(stack.project, peerIp, 8080);
+      return observed.parsed?.peers?.some((item) => item.ipv4 === peerIp) ? observed : undefined;
+    });
+    check(
+      ungranted.probe?.ok === false,
+      "a peer present in status whose port is not granted fails the edge-netns probe (route stays awaiting_acl)",
+      `${peerIp}:8080 probe: ${ungranted.probe?.detail}`,
+    );
+    if (grantedPort) {
+      await docker(
+        "exec",
+        "--detach",
+        peer,
+        "nc",
+        "-lk",
+        "-p",
+        String(grantedPort),
+        "-e",
+        "/bin/echo",
+        "peer-ok",
+      );
+      const granted = await waitFor(
+        `the probe to ${peerIp}:${grantedPort}; grant tag:ark-edge tcp:${grantedPort} on the test peer`,
+        async () => {
+          const observed = await observeAndProbe(stack.project, peerIp, grantedPort);
+          return observed.probe?.ok ? observed : undefined;
+        },
+        60_000,
+      );
+      check(
+        true,
+        "granting that exact port makes the edge-netns probe pass (route becomes ready)",
+        `${peerIp}:${grantedPort} probe: ${granted.probe?.detail}`,
+      );
+    } else {
+      warn(
+        "ARK_TEST_TS_GRANTED_PORT is not set: skipped the granted-port probe pass",
+        "probe pass UNVERIFIED",
+      );
+    }
 
     const local = await tcp(stack.edgeTs, edgeIp, 80);
     check(local === "connected", "control: Caddy listens on the edge node's tailnet address", local);
