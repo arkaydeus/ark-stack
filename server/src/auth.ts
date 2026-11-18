@@ -63,6 +63,8 @@ export const auth = betterAuth({
   secret: env.authSecret,
   database: drizzleAdapter(db, {
     provider: "pg",
+    // Sign-up must roll back the user if credential linking or session creation fails.
+    transaction: true,
     schema: { user, session, account, verification, twoFactor },
   }),
   emailAndPassword: {

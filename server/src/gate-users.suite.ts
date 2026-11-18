@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 
 import { createId, privilegedRequestHash } from "@ark-stack/shared";
+import postgres from "postgres";
 
 const { app } = await import("./app.ts");
 const { auth, authCookieName } = await import("./auth.ts");
@@ -433,6 +434,164 @@ describe("creation and the one-time temporary password", () => {
     // The password works on the login origin.
     const browser = new Browser();
     expect((await browser.send("/api/auth/sign-in/email", { email: user.email, password })).status).toBe(200);
+  });
+});
+
+// Inject database errors at the real write boundaries, not mocked auth methods. These triggers
+// exist only in this suite's disposable database and are always removed before retrying.
+describe("creation failure recovery", () => {
+  for (const table of ["account", "session", "secrets", "gate_users", "audit_events"]) {
+    test(`${table} insertion failure leaves no partial account and the email can be retried`, async () => {
+      const email = `failure-${table}@example.test`;
+      const counts = async () =>
+        (
+          await sql`
+        SELECT (SELECT count(*)::int FROM "user") AS users,
+          (SELECT count(*)::int FROM account) AS accounts,
+          (SELECT count(*)::int FROM session) AS sessions,
+          (SELECT count(*)::int FROM gate_users) AS gate_users,
+          (SELECT count(*)::int FROM secrets) AS secrets
+      `
+        )[0];
+      const before = await counts();
+      await sql.unsafe(`
+        CREATE FUNCTION gate12_fail_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE target_id text;
+        BEGIN
+          target_id := coalesce(to_jsonb(NEW)->>'user_id', to_jsonb(NEW)->>'resource_id');
+          IF EXISTS (SELECT 1 FROM "user" WHERE id = target_id AND email = '${email}') THEN
+            RAISE EXCEPTION 'gate12 injected ${table} failure';
+          END IF;
+          RETURN NEW;
+        END $$
+      `);
+      try {
+        await sql.unsafe(`CREATE TRIGGER gate12_failure BEFORE INSERT ON ${table}
+          FOR EACH ROW EXECUTE FUNCTION gate12_fail_insert()`);
+        expect((await stepUp(owner, "role.grant", { email, gateUsers: "create" })).status).toBe(200);
+        const failed = await adminApi(owner, "/api/gate/users", "POST", { email });
+        expect(failed.status).toBeGreaterThanOrEqual(400);
+        expect(await sql`SELECT 1 FROM "user" WHERE email = ${email}`).toHaveLength(0);
+        expect(await counts()).toEqual(before);
+      } finally {
+        await sql.unsafe(`DROP TRIGGER IF EXISTS gate12_failure ON ${table}`);
+        await sql`DROP FUNCTION gate12_fail_insert()`;
+      }
+      const retry = await createGateUser(email);
+      expect(await sql`SELECT 1 FROM account WHERE user_id = ${retry.id}`).toHaveLength(1);
+      expect(await sql`SELECT 1 FROM session WHERE user_id = ${retry.id}`).toHaveLength(0);
+      expect(await sql`SELECT 1 FROM gate_users WHERE user_id = ${retry.id}`).toHaveLength(1);
+      expect(await sql`SELECT 1 FROM secrets WHERE resource_id = ${retry.id}`).toHaveLength(1);
+    });
+  }
+});
+
+describe("concurrent mutations", () => {
+  for (const firstTable of ["gate_users", "platform_access"]) {
+    test(`${firstTable} wins while the competing insert waits on another connection`, async () => {
+      const first = postgres(process.env.DATABASE_URL!, { max: 1, connection: { statement_timeout: 5000 } });
+      const second = postgres(process.env.DATABASE_URL!, { max: 1, connection: { statement_timeout: 5000 } });
+      const ctx = await auth.$context;
+      const target = await ctx.internalAdapter.createUser(
+        {
+          email: `race-${firstTable}@example.test`,
+          name: "race",
+          emailVerified: true,
+        },
+        { method: "email-password" },
+      );
+      const insert = (table: string) =>
+        table === "gate_users"
+          ? `INSERT INTO gate_users (user_id) VALUES ('${target.id}')`
+          : `INSERT INTO platform_access (user_id, role) VALUES ('${target.id}', 'viewer')`;
+      let release!: () => void;
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let inserted!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        inserted = resolve;
+      });
+      let writes: PromiseSettledResult<unknown>[] = [];
+      try {
+        const [firstPid] = await first`SELECT pg_backend_pid() AS pid`;
+        const [secondPid] = await second`SELECT pg_backend_pid() AS pid`;
+        const winner = first.begin(async (tx) => {
+          try {
+            await tx.unsafe(insert(firstTable));
+          } finally {
+            inserted();
+          }
+          await hold;
+        });
+        // Attach handlers immediately so a failed transaction cannot be an unhandled rejection.
+        const winnerResult = Promise.allSettled([winner]);
+        await ready;
+        const loserResult = Promise.allSettled([
+          second.begin(async (tx) => {
+            await tx.unsafe(insert(firstTable === "gate_users" ? "platform_access" : "gate_users"));
+          }),
+        ]);
+        try {
+          let blocked = false;
+          for (let attempt = 0; attempt < 200; attempt++) {
+            const [row] =
+              await sql`SELECT ${firstPid!.pid}::int = ANY(pg_blocking_pids(${secondPid!.pid}::int)) AS blocked`;
+            if (row!.blocked) {
+              blocked = true;
+              break;
+            }
+            await Bun.sleep(10);
+          }
+          expect(blocked, "the competing connection must actually wait on the winner's lock").toBe(true);
+        } finally {
+          release();
+          writes = [...(await winnerResult), ...(await loserResult)];
+        }
+        expect(writes[0]!.status).toBe("fulfilled");
+        expect(writes[1]!.status).toBe("rejected");
+        const error = writes[1] as PromiseRejectedResult;
+        expect(error.reason.code).toBe("23514");
+        expect(await sql`SELECT 1 FROM gate_users WHERE user_id = ${target.id}`).toHaveLength(
+          firstTable === "gate_users" ? 1 : 0,
+        );
+        expect(await sql`SELECT 1 FROM platform_access WHERE user_id = ${target.id}`).toHaveLength(
+          firstTable === "platform_access" ? 1 : 0,
+        );
+      } finally {
+        release();
+        await Promise.all([first.end(), second.end()]);
+        await sql`DELETE FROM "user" WHERE id = ${target.id}`;
+      }
+    });
+  }
+
+  test("simultaneous reveals with independent valid grants return one password and one 409", async () => {
+    const target = await createGateUser("reveal-race@example.test");
+    const otherOwner = await createAdmin("reveal-racer", "owner");
+    const binding = { gateUserTemporaryPassword: target.id };
+    for (const admin of [owner, otherOwner]) {
+      expect((await stepUp(admin, "secret.reveal", binding)).status).toBe(200);
+    }
+    const responses = await Promise.all(
+      [owner, otherOwner].map((admin) =>
+        adminApi(admin, `/api/gate/users/${target.id}/temporary-password`, "POST"),
+      ),
+    );
+    expect(responses.map((r) => r.status).toSorted()).toEqual([200, 409]);
+    const winner = responses.findIndex((r) => r.status === 200);
+    const password = ((await responses[winner]!.json()) as { password: string }).password;
+    expect(password).toHaveLength(24);
+    expect(JSON.stringify(await responses[1 - winner]!.json())).not.toContain(password);
+    expect(
+      await sql`SELECT 1 FROM audit_events WHERE resource_id = ${target.id} AND action = 'secret.reveal'`,
+    ).toHaveLength(1);
+    const grants = await sql`SELECT user_id, consumed_at FROM step_up_grants
+      WHERE user_id IN (${owner.id}, ${otherOwner.id}) AND action = 'secret.reveal'
+        AND plan_hash = ${privilegedRequestHash("secret.reveal", binding)}`;
+    expect(grants).toHaveLength(2);
+    expect(grants.filter((g) => g.consumed_at !== null)).toHaveLength(1);
+    expect(grants.find((g) => g.consumed_at !== null)!.user_id).toBe([owner, otherOwner][winner]!.id);
   });
 });
 

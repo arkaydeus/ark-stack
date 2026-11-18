@@ -53,8 +53,9 @@ export function GateUsersView({ state }: { state: PlatformState }) {
     }
   }, []);
   useEffect(() => {
-    if (isOwner) void load();
-  }, [isOwner, load]);
+    if (state.user.role === "owner") void load();
+    // App refresh replaces state; keep the view mounted so the once-only password stays visible.
+  }, [state, load]);
 
   if (!isOwner) {
     return (
