@@ -4,7 +4,8 @@ import { join, resolve } from "node:path";
 import {
   allowedBackends,
   routeIdentityKey,
-  assertCidrs,
+  type EdgeL4Input,
+  type EdgeL4Pooler,
   CaddyWithdrawalAdapter,
   caddyState,
   backupProofAllowed,
@@ -41,7 +42,7 @@ import {
   type OperationKind,
   type OperationState,
 } from "@ark-stack/shared";
-import { and, desc, eq, isNull, like, or, sql as drizzleSql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, like, or, sql as drizzleSql } from "drizzle-orm";
 
 import { db, sql, type DbTransaction } from "./db.ts";
 import { withPgbouncerLock } from "./modules/pgbouncer-lock.ts";
@@ -57,7 +58,14 @@ import {
   type TargetEvidence,
 } from "./modules/offsite-backups.ts";
 import { acmeAccountUri, issueCertificateFiles } from "./modules/certificates.ts";
-import { edgeL4Configured, haproxyAdapter, missingL4Routes, writeEdgeL4 } from "./modules/edge-l4.ts";
+import { applyFrontIngress } from "./modules/front-ingress.ts";
+import {
+  edgeL4Configured,
+  edgeL4Settings,
+  haproxyAdapter,
+  missingL4Routes,
+  writeEdgeL4,
+} from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import { edgeL4Routes, enabledSniPorts, type OmittedL4Route } from "./modules/l4-routes.ts";
 import { refreshRouteCrls, routeCrlsDue } from "./modules/route-pki.ts";
@@ -153,9 +161,9 @@ import {
 import { dnsBlockingError, emptyIfNoDnsData, isCloudflareProxyAddress } from "./modules/dns-verification.ts";
 import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
+import { poolerEdgeInput } from "./modules/pooler-policy.ts";
 import {
   applyDatabaseAllowlist,
-  fenceDatabasePublicListener,
   applyStalwartDevice,
   reconcileSes,
   resolveImageDigest,
@@ -330,7 +338,11 @@ async function enqueueInTransaction(tx: DbTransaction, input: EnqueueInput) {
     .from(operations)
     .where(or(eq(operations.idempotencyKey, base), like(operations.idempotencyKey, `${base}:%`)))
     .orderBy(desc(operations.createdAt));
-  const inflight = related.find((row) => isInFlight(row.status));
+  // A running edge apply may already have captured an older desired state. Reuse only queued
+  // successors: every mutation during a running apply must leave durable work behind it.
+  const inflight = related.find((row) =>
+    input.kind === "edge.l4_apply" ? row.status === "queued" : isInFlight(row.status),
+  );
   if (inflight) return inflight;
   const idempotencyKey = related.length ? `${base}:${createId("idem")}` : base;
   const [row] = await tx
@@ -562,7 +574,7 @@ const clientOperationRuntime: ClientOperationRuntime = {
   watchdog: {
     fence: (database) => socketAdmin(pgbouncerSocket())(`DISABLE ${database}`).then(() => undefined),
     stop: () => shutdownPgbouncerAdmin(pgbouncerSocket()),
-    fenceListener: () => fenceDatabasePublicListener(pgbouncerDir()),
+    fenceListener: () => fencePoolerListener("retirement-watchdog"),
   },
 };
 export type { ClientOperationRuntime };
@@ -1888,7 +1900,10 @@ export async function reconcileDatabaseIngressOnStartup() {
     .select({ id: managedDatabases.id })
     .from(managedDatabases)
     .where(eq(managedDatabases.exposure, "public"));
-  if (!publicDatabases.length) return null;
+  if (!publicDatabases.length) {
+    if (poolerEdgeManaged()) return enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+    return null;
+  }
   return enqueue({
     kind: "pgbouncer.reload",
     targetIds: [],
@@ -1896,21 +1911,88 @@ export async function reconcileDatabaseIngressOnStartup() {
   });
 }
 
-async function applyCurrentDatabaseIngress(
-  databases: Array<typeof managedDatabases.$inferSelect>,
-  dir: string,
-  expose: boolean,
-) {
-  const publicDatabases = databases.filter((item) => item.exposure === "public");
-  const cidrs = [...new Set(publicDatabases.flatMap((item) => item.sourceCidrs ?? []))];
-  if (cidrs.length) assertCidrs(cidrs);
+/**
+ * The host nft policy for tcp/5432 (`ark_db_ingress`, FD-18): per-source limits only. Since FD-26 the
+ * source allowlist is HAProxy's: the pooler-wide policy in `be_pgbouncer` and each `postgres` route's
+ * own list. A port-wide CIDR list here would also cut off the Postgres routes sharing 5432, and a
+ * union of database CIDRs would advertise an isolation the listener cannot enforce (§3.8.3).
+ */
+async function applyCurrentDatabaseIngress(dir: string) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const limits = platformDbIngressLimits(settings);
-  const allowlist = await applyDatabaseAllowlist(dir, cidrs, 5432, {
-    expose,
-    limits,
+  const allowlist = await applyDatabaseAllowlist(dir, [], 5432, { limits });
+  return { limits, allowlist };
+}
+
+/**
+ * Whether a domain worker renders `fe_pg5432`. The database worker that changes the pooler does not
+ * mount the edge-l4 tree itself, so production (and any external-worker deployment) always queues.
+ */
+function poolerEdgeManaged() {
+  return (
+    edgeL4Configured() || process.env.NODE_ENV === "production" || process.env.ARK_EMBEDDED_WORKERS === "0"
+  );
+}
+
+/** Re-render `fe_pg5432` after a pooler change; a queued `edge.l4_apply` is reused. */
+export async function queuePoolerEdgeApply() {
+  if (poolerEdgeManaged()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+}
+
+/**
+ * The retirement watchdog's fallback (FD-28) when PgBouncer cannot be stopped over its admin socket:
+ * close public admission to PgBouncer at the edge instead. The fence is durable (edge.l4_apply omits
+ * `be_pgbouncer` while it is set, also after restarts) and waits for the applied generation. The next
+ * successful `pgbouncer.reload` lifts it, as the old `expose` toggle was rewritten by the next apply.
+ */
+export async function fencePoolerListener(
+  reason: string,
+  { timeoutMs = 10_000, wait = true }: { timeoutMs?: number; wait?: boolean } = {},
+) {
+  const fencedAt = new Date();
+  await db
+    .update(platformSettings)
+    .set({ poolerFencedAt: fencedAt, poolerFenceReason: reason, updatedAt: fencedAt })
+    .where(eq(platformSettings.id, "default"));
+  if (!poolerEdgeManaged()) return;
+  const operation = await enqueue({
+    kind: "edge.l4_apply",
+    targetIds: ["platform"],
+    payload: { reason: "pooler-fence", fencedAt: fencedAt.toISOString() },
   });
-  return { cidrs, limits, allowlist };
+  if (!wait) return;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [row] = await db
+      .select({ status: operations.status })
+      .from(operations)
+      .where(eq(operations.id, operation.id));
+    if (row?.status === "succeeded") {
+      const [step] = await db
+        .select()
+        .from(operationSteps)
+        .where(and(eq(operationSteps.operationId, operation.id), eq(operationSteps.name, "edge-l4-apply")))
+        .orderBy(desc(operationSteps.createdAt))
+        .limit(1);
+      const detail = step?.evidence as
+        | { applied?: boolean; poolerPolicy?: { fence?: { at?: string } } }
+        | undefined;
+      if (detail?.applied && detail.poolerPolicy?.fence?.at === fencedAt.toISOString()) return;
+      break;
+    }
+    if (row?.status === "failed") break;
+    await Bun.sleep(100);
+  }
+  throw new Error("The edge did not confirm the PgBouncer fence; the fence stays recorded and is retried.");
+}
+
+async function liftPoolerFence() {
+  const lifted = await db
+    .update(platformSettings)
+    .set({ poolerFencedAt: null, poolerFenceReason: null, updatedAt: new Date() })
+    .where(and(eq(platformSettings.id, "default"), isNotNull(platformSettings.poolerFencedAt)))
+    .returning({ id: platformSettings.id });
+  return lifted.length > 0;
 }
 
 /** Dedup key of the alert raised when PgBouncer cannot be reloaded or serves the wrong certificate. */
@@ -1983,26 +2065,19 @@ async function reloadPgbouncerLocked(operation: OperationRow, now: Date) {
     now,
     host: process.env.ARK_APP_PG_HOST ?? "app-postgres",
   });
-  // Revoke the route before any rendering, secret or socket error can leave old admission live.
-  if (!plan.routed) await fenceDatabasePublicListener(pgbouncerDir());
-  if (operation.payload?.reason === "startup-db-ingress-policy") {
-    // An upgrade changes only the host firewall policy. Existing PgBouncer configuration,
-    // credentials and TLS files must not depend on a separate reload executor being present.
-    const { cidrs, limits, allowlist } = await applyCurrentDatabaseIngress(
-      databases,
-      pgbouncerDir(),
-      plan.routed,
-    );
-    for (const database of databases) {
-      await db
-        .update(managedDatabases)
-        .set({
-          allowlistEnforced:
-            database.exposure === "public" && Boolean(database.sourceCidrs?.length) && allowlist.enforced,
-        })
-        .where(eq(managedDatabases.id, database.id));
-    }
-    await addStep(operation.id, "db-ingress-startup", { cidrs, limits, ...allowlist });
+  // Revoke public admission before any rendering, secret or socket error can leave the old PgBouncer
+  // configuration reachable: with no admitted client the edge stops routing to PgBouncer at all.
+  const startup = operation.payload?.reason === "startup-db-ingress-policy";
+  // The startup policy pass reloads nothing, so it records the fence without waiting for the edge
+  // (the domain worker may still be starting); the edge applies it from the durable record.
+  if (!plan.routed) await fencePoolerListener("no-admitted-client", { wait: !startup });
+  if (startup) {
+    // An upgrade changes only the host firewall policy and the edge's pooler policy. Existing
+    // PgBouncer configuration, credentials and TLS files must not depend on a separate reload
+    // executor being present.
+    const { limits, allowlist } = await applyCurrentDatabaseIngress(pgbouncerDir());
+    await queuePoolerEdgeApply();
+    await addStep(operation.id, "db-ingress-startup", { limits, ...allowlist });
     return { routed: plan.routed, mappings: plan.mappings.map((item) => item.database), reloaded: false };
   }
   const dbEndpoint = (await db.select().from(endpoints)).find((item) => item.kind === "database");
@@ -2096,18 +2171,22 @@ async function reloadPgbouncerLocked(operation: OperationRow, now: Date) {
         .where(eq(endpoints.id, certificate.endpointId));
     }
   }
-  // Apply persisted rate limits while retaining the admitted-client routing decision.
-  const { cidrs, limits, allowlist } = await applyCurrentDatabaseIngress(databases, written.dir, plan.routed);
+  // Apply persisted rate limits on tcp/5432; admission itself is the edge's pooler-wide policy.
+  const { limits, allowlist } = await applyCurrentDatabaseIngress(written.dir);
+  // A confirmed reload with admitted clients is PgBouncer serving again: lift the fence (watchdog or
+  // no-client) and re-render the edge. Development without an admin socket counts as confirmed.
+  const fenceLifted = plan.routed && (reloaded || !required) ? await liftPoolerFence() : false;
+  await queuePoolerEdgeApply();
+  // Ready needs a published pooler (no unreviewed conflict, a policy that admits someone). There is
+  // no per-database enforcement status: the pooler-wide policy applies to every database (§3.8.3).
+  const { evaluation: pooler } = await poolerEdgeInput();
   const mapped = new Set(plan.mappings.map((item) => item.database));
   for (const database of databases) {
-    const allowlistReady = !database.sourceCidrs?.length || allowlist.enforced;
     await db
       .update(managedDatabases)
       .set({
-        allowlistEnforced:
-          database.exposure === "public" && Boolean(database.sourceCidrs?.length) && allowlist.enforced,
         status:
-          database.exposure === "public" && reloaded && allowlistReady && mapped.has(database.name)
+          database.exposure === "public" && reloaded && pooler.publishable && mapped.has(database.name)
             ? "ready"
             : database.exposure === "public"
               ? "awaiting_configuration"
@@ -2121,7 +2200,13 @@ async function reloadPgbouncerLocked(operation: OperationRow, now: Date) {
     users: plan.users.length,
     generations: plan.generations,
     excluded: plan.excluded,
-    cidrs,
+    pooler: {
+      status: pooler.status,
+      scope: pooler.scope,
+      admits: pooler.policy.admits,
+      conflict: pooler.conflict,
+    },
+    fenceLifted,
     limits,
     dir: written.dir,
     reloaded,
@@ -2716,18 +2801,29 @@ export async function withEdgeLock<T>(work: () => Promise<T>) {
 // port) and raw-TCP routes (dedicated ports) are the lease-allowed `tls`/`tcp` routes (FD-14).
 export function edgeL4Input(
   plan: Pick<Awaited<ReturnType<typeof edgePlan>>, "certificates">,
-  l4: Partial<Pick<Awaited<ReturnType<typeof edgeL4Routes>>, "tlsRoutes" | "tcpRoutes">> = {},
+  l4: Partial<
+    Pick<Awaited<ReturnType<typeof edgeL4Routes>>, "tlsRoutes" | "tcpRoutes" | "postgresRoutes">
+  > = {},
   sniPorts: number[] = [],
-) {
+  pooler: EdgeL4Pooler | null = null,
+): EdgeL4Input {
   return {
     httpHostnames: servedHttpHostnames(plan),
     tlsRoutes: l4.tlsRoutes ?? [],
     tcpRoutes: l4.tcpRoutes ?? [],
+    postgresRoutes: l4.postgresRoutes ?? [],
+    pooler,
     sniPorts,
   };
 }
 
 async function applyEdgeL4(operation: OperationRow) {
+  // Load desired state after taking the lock, so a delayed older operation cannot overwrite a
+  // newer generation. Mutations during this apply enqueue a successor rather than reusing it.
+  return withEdgeLock(() => applyEdgeL4Locked(operation));
+}
+
+async function applyEdgeL4Locked(operation: OperationRow) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
@@ -2737,9 +2833,28 @@ async function applyEdgeL4(operation: OperationRow) {
   const crls = await refreshRouteCrls();
   const sniPorts = enabledSniPorts();
   const l4 = await edgeL4Routes({ policyRoutes: (await edgePolicy()).routes, sniPorts });
-  const written = await withEdgeLock(() => writeEdgeL4(edgeL4Input(plan, l4, sniPorts)));
+  // PgBouncer on 5432 (FD-26): only while the pooler-wide policy is publishable and not fenced.
+  const pooler = await poolerEdgeInput();
+  const input = edgeL4Input(plan, l4, sniPorts, pooler.pooler);
+  if (edgeL4Configured() && !edgeL4Settings().validatorSocket)
+    throw new Error("ARK_HAPROXY_VALIDATOR_SOCKET is required to apply edge-l4.");
+  const firewall = edgeL4Configured()
+    ? await applyFrontIngress(input, platformDbIngressLimits(settings))
+    : null;
+  const written = await writeEdgeL4(input);
   const omitted: OmittedL4Route[] = l4.omitted;
-  await addStep(operation.id, "edge-l4-apply", { ...written, omittedL4Routes: omitted, crls });
+  await addStep(operation.id, "edge-l4-apply", {
+    ...written,
+    firewall,
+    omittedL4Routes: omitted,
+    crls,
+    poolerPolicy: {
+      status: pooler.evaluation.status,
+      admits: pooler.evaluation.policy.admits,
+      conflict: pooler.evaluation.conflict,
+      fence: pooler.fence,
+    },
+  });
   return written;
 }
 
@@ -2765,7 +2880,9 @@ async function observeEdge(operation: OperationRow) {
   if (edgeL4Configured() && l4Adapter) {
     try {
       const missing = await missingL4Routes((await edgePolicy()).routes, l4Adapter.master);
-      if (missing.length) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+      // Also reconcile the pooler and its durable fence. Route-server presence alone cannot
+      // detect a stale source policy or a missed pooler mutation after a worker restart.
+      await queuePoolerEdgeApply();
       l4Recovery = { missing };
     } catch (error) {
       // Inspection uncertainty needs a durable retry, too.

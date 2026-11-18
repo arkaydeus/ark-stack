@@ -48,3 +48,4 @@ export * from "./haproxy-control.ts";
 export * from "./update-policy.ts";
 
 export * from "./caddy-state.ts";
+export * from "./pooler-policy.ts";

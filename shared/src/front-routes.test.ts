@@ -85,12 +85,11 @@ describe("route address records (§3.13.1)", () => {
 });
 
 describe("route request policy", () => {
-  test("http, tls and tcp routes can be created; postgres waits for FD-26", () => {
+  test("http, tls, tcp and postgres routes can be created; other kinds are refused", () => {
     expect(assertSupportedRouteKind(undefined)).toBe("http");
-    for (const kind of ["http", "tls", "tcp"] as const) expect(assertSupportedRouteKind(kind)).toBe(kind);
-    for (const kind of ["postgres", "udp"]) {
-      expect(() => assertSupportedRouteKind(kind)).toThrow(UnsupportedRouteError);
-    }
+    for (const kind of ["http", "tls", "tcp", "postgres"] as const)
+      expect(assertSupportedRouteKind(kind)).toBe(kind);
+    expect(() => assertSupportedRouteKind("udp")).toThrow(UnsupportedRouteError);
   });
 
   test("public, sso and the omitted (schema default sso) mode are served (FD-11); anything else is refused", () => {

@@ -397,10 +397,13 @@ describe("route API rules (§3.8.2, §3.8.4)", () => {
     expect(() => routeListenPort("tls", 9999, [])).toThrow(/neither/);
   });
 
-  test("kinds: postgres waits for FD-26; HTTP and L4 fields do not mix", () => {
+  test("kinds: postgres is supported (FD-26); HTTP and L4 fields do not mix", () => {
     expect(assertSupportedRouteKind(undefined)).toBe("http");
     expect(assertSupportedRouteKind("tcp")).toBe("tcp");
-    expect(() => assertSupportedRouteKind("postgres")).toThrow(/FD-26/);
+    expect(assertSupportedRouteKind("postgres")).toBe("postgres");
+    expect(() => assertSupportedRouteKind("udp")).toThrow(/not supported/);
+    expect(() => assertFieldsForKind("tls", { compatPort: 20007 })).toThrow(/compatPort/);
+    expect(() => assertFieldsForKind("postgres", { compatPort: 20007 })).not.toThrow();
     expect(() => assertFieldsForKind("http", { sourceCidrs: [] })).toThrow(/sourceCidrs/);
     expect(() => assertFieldsForKind("tls", { accessMode: "public" })).toThrow(/accessMode/);
     expect(

@@ -1,5 +1,6 @@
-// HAProxy SNI router (`edge-l4`) in front of Caddy on 443 (docs/design/front-door.md §3.8, FD-25), and
-// its TLS-TCP and raw-TCP routes (FD-14).
+// HAProxy SNI router (`edge-l4`) in front of Caddy on 443 (docs/design/front-door.md §3.8, FD-25), its
+// TLS-TCP and raw-TCP routes (FD-14), and the PostgreSQL router on 5432 (FD-26): PgBouncer behind one
+// pooler-wide source policy, and `postgres` routes by direct-TLS SNI with an optional compatibility port.
 //
 // Pure rendering and parsing: the immutable configuration generation `edge.l4_apply` writes, its
 // content hash (the generation ID the restricted validator re-checks), the server naming that binds
@@ -48,6 +49,16 @@ export const SNI_ROUTER_PORT = 443;
 export const SHARED_SNI_PORTS = [8883, 5671, 636, 6380] as const;
 /** Dedicated raw-TCP ports (`tcp` routes, `plain` only): one frontend per port. */
 export const TCP_ROUTE_PORTS = { start: 20000, end: 20049 } as const;
+/** The PostgreSQL router (`fe_pg5432`): PgBouncer by default, `postgres` routes by SNI (§3.8.3). */
+export const POSTGRES_ROUTER_PORT = 5432;
+/**
+ * Where HAProxy reaches PgBouncer: over the internal `pgbouncer-ingress` network (members edge-ts and
+ * pgbouncer-public), resolved through Docker's DNS. The edge namespace never joins
+ * `database-management`, so it can never reach `app-postgres`.
+ */
+export const PGBOUNCER_INGRESS_SERVER = "pgbouncer-public:5432";
+/** The pooler allowlist file inside a generation (§3.8.5 `be_pgbouncer`). */
+export const POOLER_ALLOWLIST_FILE = "allow/pgbouncer.lst";
 /** Platform and mail ports that can never be a route's dedicated port. */
 export const RESERVED_ROUTE_PORTS = [25, 80, 443, 465, 587, 993, 2019, 3000, 5432, 41641, 41642] as const;
 
@@ -89,10 +100,17 @@ export type EdgeL4TlsMode = "passthrough" | "terminate" | "terminate_mtls";
 /** Per-route connection limits: a total cap and per-source concurrent and 10-second rate limits. */
 export type L4Limits = { maxConn: number; perSourceConn: number; perSourceRate: number };
 
-/** Defaults from §3.8.5: TLS-TCP routes 50/10/20, raw-TCP routes 20/5/10. */
-export const L4_LIMIT_DEFAULTS: Record<"tls" | "tcp", L4Limits> = {
+/** The L4 route kinds HAProxy serves. */
+export type L4RouteKind = "tls" | "tcp" | "postgres";
+
+/**
+ * Defaults from §3.8.5: TLS-TCP routes 50/10/20, raw-TCP routes 20/5/10. Postgres routes use the
+ * §3.8.3 recommendation (`maxconn` ≤ 50, per-source `conn_cur` ≤ 10 and `conn_rate` ≤ 20/10 s).
+ */
+export const L4_LIMIT_DEFAULTS: Record<L4RouteKind, L4Limits> = {
   tls: { maxConn: 50, perSourceConn: 10, perSourceRate: 20 },
   tcp: { maxConn: 20, perSourceConn: 5, perSourceRate: 10 },
+  postgres: { maxConn: 50, perSourceConn: 10, perSourceRate: 20 },
 };
 
 export const L4_LIMIT_BOUNDS: Record<keyof L4Limits, { min: number; max: number }> = {
@@ -102,7 +120,7 @@ export const L4_LIMIT_BOUNDS: Record<keyof L4Limits, { min: number; max: number 
 };
 
 /** The effective limits: defaults for the kind, overridden by valid stored values only. */
-export function l4Limits(kind: "tls" | "tcp", stored?: Partial<Record<keyof L4Limits, unknown>> | null) {
+export function l4Limits(kind: L4RouteKind, stored?: Partial<Record<keyof L4Limits, unknown>> | null) {
   const limits = { ...L4_LIMIT_DEFAULTS[kind] };
   for (const key of Object.keys(L4_LIMIT_BOUNDS) as Array<keyof L4Limits>) {
     const value = stored?.[key];
@@ -147,7 +165,7 @@ export function routeAllowlist(input: { sourceCidrs: string[]; allowInternet?: b
  * HAProxy servers and the old ones are fenced and drained in every worker (§3.8.6).
  */
 export function l4PolicyFingerprint(input: {
-  kind: "tls" | "tcp";
+  kind: L4RouteKind;
   listenPort: number;
   tlsMode: EdgeL4TlsMode | "plain";
   sourceCidrs: string[];
@@ -155,6 +173,8 @@ export function l4PolicyFingerprint(input: {
   limits: L4Limits;
   clientCaId?: string | null;
   revokedSerials?: string[];
+  /** Postgres routes: the opt-in compatibility port (null when off). Part of who is admitted where. */
+  compatPort?: number | null;
 }) {
   return sha256Hex(
     JSON.stringify([
@@ -167,6 +187,8 @@ export function l4PolicyFingerprint(input: {
       [input.limits.maxConn, input.limits.perSourceConn, input.limits.perSourceRate],
       input.clientCaId ?? null,
       [...new Set(input.revokedSerials ?? [])].toSorted(),
+      // Appended for postgres only, so existing tls/tcp fingerprints (and server names) are unchanged.
+      ...(input.kind === "postgres" ? [input.compatPort ?? null] : []),
     ]),
   ).slice(0, 16);
 }
@@ -202,11 +224,46 @@ export type EdgeL4TlsRoute = L4RouteBase & {
 /** A raw-TCP route on a dedicated port from `TCP_ROUTE_PORTS` (`plain`, no TLS at the edge). */
 export type EdgeL4TcpRoute = L4RouteBase & { listenPort: number };
 
+/**
+ * A `postgres` route on 5432, selected by the SNI of a direct-TLS ClientHello (`sslnegotiation=direct`,
+ * §3.8.3). `passthrough` relays to a PG ≥ 17 target, which terminates TLS itself; `terminate` and
+ * `terminate_mtls` terminate at the edge with ALPN `postgresql` for older targets and forward plaintext
+ * over WireGuard. The optional compatibility port (passthrough only) relays raw TCP from a port of
+ * the dedicated range to the target, which then answers classic `SSLRequest` itself.
+ */
+export type EdgeL4PostgresRoute = L4RouteBase & {
+  /** Default `passthrough`. */
+  tlsMode?: EdgeL4TlsMode;
+  compatPort?: number | null;
+  certificatePem?: string;
+  clientCaPem?: string;
+  clientCrlPem?: string;
+};
+
+/**
+ * PgBouncer behind `fe_pg5432` (§3.8.3). Rendered only while at least one database is published, so
+ * with no public database `SSLRequest` connections are rejected. One explicit pooler-wide source
+ * policy: classic negotiation carries no database name, so it is never a per-database allowlist.
+ */
+export type EdgeL4Pooler = {
+  /** The Ark database hostname: direct TLS with this SNI (or with none) goes to PgBouncer. */
+  hostname?: string | null;
+  /** `pooler_source_cidrs`; empty = deny all. */
+  sourceCidrs: string[];
+  /** `pooler_allow_internet`, saved under an owner exposure.public confirmation. */
+  allowInternet?: boolean;
+  /** Default `PGBOUNCER_INGRESS_SERVER`. */
+  server?: string;
+};
+
 export type EdgeL4Input = {
   /** Hostnames Caddy serves (HTTP routes, the admin site and the login origin). */
   httpHostnames: string[];
   tlsRoutes?: EdgeL4TlsRoute[];
   tcpRoutes?: EdgeL4TcpRoute[];
+  postgresRoutes?: EdgeL4PostgresRoute[];
+  /** PgBouncer on 5432; null or omitted while no database is published. */
+  pooler?: EdgeL4Pooler | null;
   /** Shared SNI ports enabled at install time (and published on edge-ts). */
   sniPorts?: number[];
 };
@@ -214,7 +271,7 @@ export type EdgeL4Input = {
 /** One route in a generation's manifest; prior generations' manifests name the backends to drain. */
 export type EdgeL4ManifestRoute = {
   id: string;
-  kind: "tls" | "tcp";
+  kind: L4RouteKind;
   hostname: string;
   stableId: string;
   target: string;
@@ -224,6 +281,8 @@ export type EdgeL4ManifestRoute = {
   server: string;
   /** Terminated routes: the pre-termination loop server, fenced with the target server. */
   loop?: { backend: string; server: string };
+  /** Postgres routes with a compatibility port: its backend, whose server is the same target server. */
+  compat?: { listenPort: number; backend: string; server: string };
 };
 
 export type EdgeL4Manifest = {
@@ -231,6 +290,8 @@ export type EdgeL4Manifest = {
   httpHostnames: string[];
   sniPorts: number[];
   routes: EdgeL4ManifestRoute[];
+  /** PgBouncer on 5432 (FD-26): null while no database is published. */
+  pooler?: { hostname: string | null; server: string; admits: "internet" | "allowlist" | "nobody" } | null;
 };
 
 /** The files of one generation, by path relative to the generation directory. */
@@ -295,7 +356,7 @@ function checkedPem(value: string | undefined, labels: string[], what: string, r
   return `${text}\n`;
 }
 
-function checkedBase(route: L4RouteBase, kind: "tls" | "tcp") {
+function checkedBase(route: L4RouteBase, kind: L4RouteKind) {
   if (!ROUTE_ID.test(route.id)) throw new ValidationError(`Route id ${JSON.stringify(route.id)} is invalid.`);
   const ip = parseIpLiteral(route.ip);
   if (!ip || checkTailnetAddress(ip) || ip.canonical !== route.ip) {
@@ -363,6 +424,79 @@ function checkedTlsRoute(route: EdgeL4TlsRoute, sniPorts: number[]) {
   };
 }
 
+function checkedPostgresRoute(route: EdgeL4PostgresRoute) {
+  const base = checkedBase(route, "postgres");
+  const mode = route.tlsMode ?? "passthrough";
+  if (!["passthrough", "terminate", "terminate_mtls"].includes(mode)) {
+    throw new ValidationError(`Route ${route.id}: TLS mode ${JSON.stringify(mode)} is invalid.`);
+  }
+  if (mode === "terminate" && (route.allowInternet || !base.cidrs.length)) {
+    throw new ValidationError(
+      `Route ${route.id}: terminate requires a restricted, non-empty CIDR allowlist.`,
+    );
+  }
+  const compatPort = route.compatPort ?? null;
+  if (compatPort !== null) {
+    if (!isTcpRoutePort(compatPort)) {
+      throw new ValidationError(
+        `Route ${route.id}: compatibility port ${compatPort} is outside ${TCP_ROUTE_PORTS.start}-${TCP_ROUTE_PORTS.end}.`,
+      );
+    }
+    // The compatibility port relays raw TCP to the target. With edge termination it would bypass the
+    // edge's TLS (and client certificate check), so it exists for passthrough routes only.
+    if (mode !== "passthrough") {
+      throw new ValidationError(`Route ${route.id}: a compatibility port needs tlsMode passthrough.`);
+    }
+  }
+  const terminated = mode !== "passthrough";
+  return {
+    ...base,
+    kind: "postgres" as const,
+    listenPort: POSTGRES_ROUTER_PORT,
+    mode,
+    backend: `be_${route.id}_pg`,
+    inner: terminated ? { frontend: `fe_${route.id}_pg`, backend: `be_${route.id}` } : null,
+    abns: `ark_${base.server.slice(2)}`,
+    compat:
+      compatPort === null
+        ? null
+        : { listenPort: compatPort, frontend: `fe_${route.id}_compat`, backend: `be_${route.id}_compat` },
+    certificate: terminated
+      ? checkedPem(route.certificatePem, ["CERTIFICATE", "PRIVATE KEY"], "its certificate and key", route.id)
+      : null,
+    clientCa:
+      mode === "terminate_mtls"
+        ? {
+            ca: checkedPem(route.clientCaPem, ["CERTIFICATE"], "its route CA", route.id),
+            crl: checkedPem(route.clientCrlPem, ["X509 CRL"], "the route CA's CRL", route.id),
+          }
+        : null,
+  };
+}
+
+const POOLER_SERVER =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*:\d{1,5}$/;
+
+function checkedPooler(pooler: EdgeL4Pooler) {
+  const server = pooler.server ?? PGBOUNCER_INGRESS_SERVER;
+  const port = Number(server.slice(server.lastIndexOf(":") + 1));
+  if (!POOLER_SERVER.test(server) || port < 1 || port > 65535) {
+    throw new ValidationError(`PgBouncer address ${JSON.stringify(server)} is not a hostname:port.`);
+  }
+  // A tailnet address would make PgBouncer look like a guarded route backend; it never is one.
+  if (tailnetDialKey(server) !== null) throw new ValidationError("PgBouncer cannot be a tailnet address.");
+  const cidrs = routeAllowlist({ sourceCidrs: pooler.sourceCidrs, allowInternet: pooler.allowInternet });
+  return {
+    hostname: pooler.hostname ? checkedHostname(pooler.hostname) : null,
+    server,
+    cidrs,
+    admits: (pooler.allowInternet ? "internet" : cidrs.length ? "allowlist" : "nobody") as
+      | "internet"
+      | "allowlist"
+      | "nobody",
+  };
+}
+
 function checkedTcpRoute(route: EdgeL4TcpRoute) {
   const base = checkedBase(route, "tcp");
   if (!isTcpRoutePort(route.listenPort)) {
@@ -382,9 +516,11 @@ function checkedTcpRoute(route: EdgeL4TcpRoute) {
 
 type TlsRoute = ReturnType<typeof checkedTlsRoute>;
 type TcpRoute = ReturnType<typeof checkedTcpRoute>;
+type PostgresRoute = ReturnType<typeof checkedPostgresRoute>;
+type Pooler = ReturnType<typeof checkedPooler>;
 
 /** Admission before forwarding: in each TLS backend and dedicated raw frontend (§3.8.6). */
-function admissionRules(route: TlsRoute | TcpRoute) {
+function admissionRules(route: TlsRoute | TcpRoute | PostgresRoute) {
   return [
     "    tcp-request inspect-delay 2s",
     `    tcp-request content reject if !{ src -f allow/${route.id}.lst }`,
@@ -396,7 +532,7 @@ function admissionRules(route: TlsRoute | TcpRoute) {
   ];
 }
 
-function admissionTables(route: TlsRoute | TcpRoute) {
+function admissionTables(route: TlsRoute | TcpRoute | PostgresRoute) {
   return `backend ad_src_${route.id}
     stick-table type ipv6 size 10k expire 10m store conn_cur,conn_rate(10s)
 
@@ -460,6 +596,119 @@ function renderTcpRoute(route: TcpRoute) {
   ].join("\n");
 }
 
+function renderPostgresRoute(route: PostgresRoute) {
+  const header = [
+    `${L4_TAILNET_ROUTE_MARKER} ${route.id} ${route.target}`,
+    `# ${route.id} ${route.hostname}:${route.listenPort} -> ${route.target} (StableID ${route.stableId}), ${route.mode}${route.mode === "passthrough" ? " (PG >= 17)" : ""}`,
+  ];
+  const compat = route.compat
+    ? [
+        "",
+        `# ---- ${route.compat.listenPort}: compatibility port for ${route.id} (classic SSLRequest, raw TCP) ----`,
+        "# Off by default. The target answers SSLRequest and terminates TLS itself; admission is the route's.",
+        `frontend ${route.compat.frontend}`,
+        `    bind :${route.compat.listenPort}`,
+        `    maxconn ${route.limits.maxConn + 1}`,
+        ...admissionRules(route),
+        `    default_backend ${route.compat.backend}`,
+        "",
+        `backend ${route.compat.backend}`,
+        `    server ${route.server} ${route.target} maxconn ${route.limits.maxConn}`,
+      ]
+    : [];
+  if (!route.inner) {
+    return [
+      ...header,
+      `backend ${route.backend}`,
+      ...admissionRules(route),
+      `    server ${route.server} ${route.target} maxconn ${route.limits.maxConn}`,
+      ...compat,
+      "",
+    ].join("\n");
+  }
+  // Direct TLS needs the server to select ALPN `postgresql`; libpq refuses the connection otherwise.
+  const bind = [
+    `bind abns@${route.abns} accept-proxy ssl crt certs/${route.id}.pem alpn postgresql`,
+    ...(route.clientCa ? [`ca-file cas/${route.id}.pem verify required crl-file cas/${route.id}.crl`] : []),
+  ].join(" ");
+  return [
+    ...header,
+    "# Admission (allowlist, per-source and total limits) before TLS termination, on the original source.",
+    `backend ${route.backend}`,
+    ...admissionRules(route),
+    `    server ${route.loopServer} abns@${route.abns} send-proxy-v2 maxconn ${route.limits.maxConn}`,
+    "",
+    `frontend ${route.inner.frontend}`,
+    `    ${bind}`,
+    `    maxconn ${route.limits.maxConn + 1}`,
+    `    default_backend ${route.inner.backend}`,
+    "",
+    "# Plaintext over WireGuard: the target's pg_hba.conf needs a `host` line for the edge node only.",
+    `backend ${route.inner.backend}`,
+    `    server ${route.server} ${route.target} maxconn ${route.limits.maxConn}`,
+    ...compat,
+    "",
+  ].join("\n");
+}
+
+/**
+ * `fe_pg5432` (§3.8.3, §3.8.5). Classic `SSLRequest`, `GSSENCRequest` and plaintext `CancelRequest` go to
+ * PgBouncer, as does direct TLS with the Ark database hostname or no SNI; a `postgres` route's SNI goes
+ * to that route; everything else (unknown SNI, a plaintext StartupMessage, garbage, nothing within 5 s)
+ * is rejected. Without a published database there is no PgBouncer rule, so classic clients are rejected.
+ */
+function renderPg5432Frontend(pooler: Pooler | null, routes: PostgresRoute[]) {
+  const poolerRules = pooler
+    ? [
+        "    # Ark databases via PgBouncer: classic negotiation, or direct TLS for the DB hostname / no SNI.",
+        "    use_backend be_pgbouncer if pg_ssl_request || pg_gssenc_request || pg_cancel_request",
+        ...(pooler.hostname
+          ? [`    use_backend be_pgbouncer if tls_client_hello { req.ssl_sni -i ${pooler.hostname} }`]
+          : []),
+        "    use_backend be_pgbouncer if tls_client_hello !{ req.ssl_sni -m found }",
+      ]
+    : ["    # No database is published: classic and no-SNI connections have no backend and are rejected."];
+  const routeRules = routes.length
+    ? [
+        "    # Postgres routes by SNI (direct TLS).",
+        ...routes.map(
+          (route) =>
+            `    use_backend ${route.backend} if tls_client_hello { req.ssl_sni -i ${route.hostname} }`,
+        ),
+      ]
+    : [];
+  return [
+    `# ---- ${POSTGRES_ROUTER_PORT}: PostgreSQL router ----------------------------------------------`,
+    "frontend fe_pg5432",
+    `    bind :${POSTGRES_ROUTER_PORT}`,
+    "    maxconn 2000",
+    "    tcp-request inspect-delay 5s",
+    "    acl pg_ssl_request req.payload(0,8) -m bin 0000000804d2162f",
+    "    acl pg_gssenc_request req.payload(0,8) -m bin 0000000804d21630",
+    "    acl pg_cancel_request req.payload(0,8) -m bin 0000001004d2162e",
+    "    acl tls_client_hello req.ssl_hello_type 1",
+    "    tcp-request content accept if pg_ssl_request || pg_gssenc_request || pg_cancel_request || tls_client_hello",
+    "    tcp-request content reject",
+    ...poolerRules,
+    ...routeRules,
+    "    default_backend be_reject",
+    "",
+  ].join("\n");
+}
+
+function renderPoolerBackend(pooler: Pooler) {
+  return [
+    "backend be_pgbouncer",
+    "    # One explicit pooler-wide policy (pooler_source_cidrs), never a union advertised as per-database",
+    "    # isolation: classic SSLRequest carries no database name. Empty = deny all; open CIDRs require",
+    "    # pooler_allow_internet saved under an owner exposure.public confirmation.",
+    `    tcp-request content reject if !{ src -f ${POOLER_ALLOWLIST_FILE} }`,
+    "    # No PROXY protocol: PgBouncer does not support it and sees HAProxy's address.",
+    `    server pgbouncer ${pooler.server} maxconn 2000 init-addr last,none resolvers docker`,
+    "",
+  ].join("\n");
+}
+
 /** A shared SNI port's frontend: TLS only, aggregate per-source limits, unknown SNI rejected. */
 function renderSniFrontend(port: number, routes: TlsRoute[]) {
   return [
@@ -480,7 +729,13 @@ function renderSniFrontend(port: number, routes: TlsRoute[]) {
   ].join("\n");
 }
 
-function renderConfig(input: { httpHostnames: string[]; routes: TlsRoute[]; tcpRoutes: TcpRoute[] }) {
+function renderConfig(input: {
+  httpHostnames: string[];
+  routes: TlsRoute[];
+  tcpRoutes: TcpRoute[];
+  postgresRoutes: PostgresRoute[];
+  pooler: Pooler | null;
+}) {
   const on443 = input.routes.filter((route) => route.listenPort === SNI_ROUTER_PORT);
   const sharedPorts = [...new Set(input.routes.map((route) => route.listenPort))]
     .filter((port) => port !== SNI_ROUTER_PORT)
@@ -502,9 +757,27 @@ function renderConfig(input: { httpHostnames: string[]; routes: TlsRoute[]; tcpR
     ),
   );
   const backends = input.routes.map(renderTlsRoute);
-  const reject = sharedPorts.length
-    ? ["backend be_reject", "    tcp-request content reject", ""].join("\n")
+  const pg5432 = Boolean(input.pooler || input.postgresRoutes.length);
+  const reject =
+    sharedPorts.length || pg5432
+      ? ["backend be_reject", "    tcp-request content reject", ""].join("\n")
+      : "";
+  // PgBouncer is the only backend addressed by name: Docker's DNS on the pgbouncer-ingress network.
+  const resolvers = input.pooler
+    ? `
+# PgBouncer is reached by name; start even if it does not resolve yet and re-resolve through Docker's DNS.
+resolvers docker
+    nameserver dns 127.0.0.11:53
+    hold valid 10s
+`
     : "";
+  const postgres = pg5432
+    ? [
+        renderPg5432Frontend(input.pooler, input.postgresRoutes),
+        ...(input.pooler ? [renderPoolerBackend(input.pooler)] : []),
+        ...input.postgresRoutes.map(renderPostgresRoute),
+      ]
+    : [];
   return `# Ark edge-l4 generation, rendered by edge.l4_apply (docs/design/front-door.md §3.8.5).
 # Immutable: edge.l4_apply writes a new generation, has it validated and swaps \`current\`.
 global
@@ -528,7 +801,7 @@ defaults
     timeout client 1h
     timeout server 1h
     timeout client-fin 30s
-
+${resolvers}
 # ---- 443: SNI router -------------------------------------------------------
 frontend fe_tls443
     bind :443
@@ -554,7 +827,7 @@ backend be_caddy
     timeout connect ${CADDY_CONNECT_TIMEOUT}
     server caddy ${CADDY_TLS_LISTENER} send-proxy-v2
 
-${[...[...input.routes, ...input.tcpRoutes].map(admissionTables), ...backends, ...sharedFrontends, reject, ...input.tcpRoutes.map(renderTcpRoute)].filter(Boolean).join("\n")}`;
+${[...[...input.routes, ...input.postgresRoutes, ...input.tcpRoutes].map(admissionTables), ...backends, ...sharedFrontends, ...postgres, reject, ...input.tcpRoutes.map(renderTcpRoute)].filter(Boolean).join("\n")}`;
 }
 
 /** Content hash of a generation: sorted `path NUL sha256(content)` lines. */
@@ -585,9 +858,13 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
   const tcpRoutes = (input.tcpRoutes ?? [])
     .map(checkedTcpRoute)
     .toSorted((a, b) => a.listenPort - b.listenPort || a.id.localeCompare(b.id));
+  const postgresRoutes = (input.postgresRoutes ?? [])
+    .map(checkedPostgresRoute)
+    .toSorted((a, b) => a.id.localeCompare(b.id));
+  const pooler = input.pooler ? checkedPooler(input.pooler) : null;
   const ids = new Set<string>();
   const listeners = new Set<string>();
-  for (const route of [...routes, ...tcpRoutes]) {
+  for (const route of [...routes, ...tcpRoutes, ...postgresRoutes]) {
     if (ids.has(route.id)) throw new ValidationError(`Route ${route.id} appears twice.`);
     ids.add(route.id);
   }
@@ -603,11 +880,25 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
     }
     listeners.add(key);
   }
-  for (const route of tcpRoutes) {
-    if (listeners.has(`tcp/${route.listenPort}`)) {
-      throw new ValidationError(`Route ${route.id}: port ${route.listenPort} already has a raw TCP route.`);
+  for (const route of postgresRoutes) {
+    const key = `${POSTGRES_ROUTER_PORT}/${route.hostname}`;
+    if (listeners.has(key) || route.hostname === pooler?.hostname) {
+      throw new ValidationError(
+        `Route ${route.id} (${route.hostname}) collides with another ${POSTGRES_ROUTER_PORT} route or the database hostname.`,
+      );
     }
-    listeners.add(`tcp/${route.listenPort}`);
+    listeners.add(key);
+  }
+  for (const port of [
+    ...tcpRoutes.map((route) => ({ id: route.id, port: route.listenPort })),
+    ...postgresRoutes.flatMap((route) =>
+      route.compat ? [{ id: route.id, port: route.compat.listenPort }] : [],
+    ),
+  ]) {
+    if (listeners.has(`tcp/${port.port}`)) {
+      throw new ValidationError(`Route ${port.id}: port ${port.port} already has a raw TCP route.`);
+    }
+    listeners.add(`tcp/${port.port}`);
   }
   const manifest: EdgeL4Manifest = {
     version: 2,
@@ -626,6 +917,27 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
         server: route.server,
         ...(route.inner ? { loop: { backend: route.backend, server: route.loopServer } } : {}),
       })),
+      ...postgresRoutes.map((route) => ({
+        id: route.id,
+        kind: route.kind,
+        hostname: route.hostname,
+        stableId: route.stableId,
+        target: route.target,
+        listenPort: route.listenPort,
+        mode: route.mode,
+        backend: route.inner?.backend ?? route.backend,
+        server: route.server,
+        ...(route.inner ? { loop: { backend: route.backend, server: route.loopServer } } : {}),
+        ...(route.compat
+          ? {
+              compat: {
+                listenPort: route.compat.listenPort,
+                backend: route.compat.backend,
+                server: route.server,
+              },
+            }
+          : {}),
+      })),
       ...tcpRoutes.map((route) => ({
         id: route.id,
         kind: route.kind,
@@ -638,16 +950,25 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
         server: route.server,
       })),
     ],
+    pooler: pooler ? { hostname: pooler.hostname, server: pooler.server, admits: pooler.admits } : null,
   };
   const files: Record<string, string> = {
-    "haproxy.cfg": renderConfig({ httpHostnames, routes, tcpRoutes }),
-    "haproxy.closed.cfg": renderConfig({ httpHostnames, routes: [], tcpRoutes: [] }),
+    "haproxy.cfg": renderConfig({ httpHostnames, routes, tcpRoutes, postgresRoutes, pooler }),
+    // PgBouncer is not a tailnet backend: the closed configuration keeps serving it without a lease.
+    "haproxy.closed.cfg": renderConfig({
+      httpHostnames,
+      routes: [],
+      tcpRoutes: [],
+      postgresRoutes: [],
+      pooler,
+    }),
     "admission.lua": L4_ADMISSION_LUA,
     "manifest.json": `${JSON.stringify(manifest, null, 2)}\n`,
   };
-  for (const route of [...routes, ...tcpRoutes])
+  for (const route of [...routes, ...tcpRoutes, ...postgresRoutes])
     files[`allow/${route.id}.lst`] = route.cidrs.map((cidr) => `${cidr}\n`).join("");
-  for (const route of routes) {
+  if (pooler) files[POOLER_ALLOWLIST_FILE] = pooler.cidrs.map((cidr) => `${cidr}\n`).join("");
+  for (const route of [...routes, ...postgresRoutes]) {
     if (route.certificate) files[`certs/${route.id}.pem`] = route.certificate;
     if (route.clientCa) {
       files[`cas/${route.id}.pem`] = route.clientCa.ca;

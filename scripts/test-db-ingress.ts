@@ -10,7 +10,9 @@
 // 3. Feeds the kernel's counter JSON through `parseNftCounters` and `dbIngressCounterMetrics`,
 //    the code behind /api/metrics/prometheus.
 // 4. Runs the real `scripts/database-ingress.ts` reconciler against a rendered file and checks its
-//    status file and counter snapshot.
+//    status file and counter snapshot, and that it no longer listens on 5432 (FD-26: edge-l4's
+//    fe_pg5432 owns the public port; the `forward`-hook checks in 2 are the path Docker DNAT to
+//    edge-ts's published 5432 takes, so these limits keep applying after the move).
 // 5. Checks `infra/monitoring/alerts.yml` with promtool, including unit tests of the drop alert.
 //
 // Needs Docker with privileged containers (Docker Desktop or a Linux host). No Python.
@@ -203,7 +205,6 @@ RUN apt-get update \\
   await mkdir(join(state, "metrics"), { recursive: true });
   await chmod(state, 0o777);
   await writeFile(join(state, "pgbouncer", "allowlist.nft"), files["defaults-allowlist.nft"]);
-  await writeFile(join(state, "pgbouncer", "expose"), "0\n");
   // Bundle the reconciler with its @ark-stack/shared imports: host node_modules may link into a
   // global cache outside the repository, so it cannot simply be mounted into the container.
   const bundle = join(directory, "bundle");
@@ -271,7 +272,8 @@ trap 'kill "$pid" 2>/dev/null || true' EXIT
 for i in $(seq 1 40); do test -s /state/metrics/counters.json && break; sleep 0.1; done
 nft -a list table inet ark_db_ingress > /tmp/before
 printf credentials > /state/pgbouncer/userlist.txt
-touch /state/pgbouncer/expose
+# FD-26: the reconciler is nft-only. The retired relay bound 0.0.0.0:5432 in the host namespace.
+if ss -Hltn | grep -q ':5432 '; then echo 'database-ingress still listens on 5432' >&2; exit 3; fi
 # An identical policy write also leaves handles/state intact.
 touch /state/pgbouncer/allowlist.nft
 sleep 1
@@ -321,8 +323,10 @@ cat /state/metrics/counters.json`,
   const [statusText = "", countersText = ""] = reconciler.stdout.split("---\n");
   console.log(statusText.trimEnd().replace(/^/gm, "  "));
   check(
-    statusText.includes("applied=true") && statusText.includes("enforced=true"),
-    "status file reports applied=true, enforced=true for an allowlist",
+    statusText.includes("applied=true") &&
+      statusText.includes("enforced=true") &&
+      !statusText.includes("exposed="),
+    "status file reports applied=true, enforced=true for an allowlist, and no relay exposure",
     statusText.replace(/\n/g, " ").trim() || reconciler.stderr.trim().slice(-500),
   );
   let snapshot: unknown = null;

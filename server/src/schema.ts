@@ -133,6 +133,19 @@ export const platformSettings = pgTable(
     publicIpv6: text("public_ipv6"),
     poolerSourceCidrs: jsonb("pooler_source_cidrs").$type<string[]>().notNull().default([]),
     poolerAllowInternet: boolean("pooler_allow_internet").notNull().default(false),
+    // FD-26 (0030): the owner's exposure.public confirmation saved with pooler_allow_internet, and the
+    // explicit review of the pooler-wide policy against the requests it covered (§3.8.3).
+    poolerInternetConfirmedBy: text("pooler_internet_confirmed_by").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    poolerInternetConfirmedAt: timestamp("pooler_internet_confirmed_at", { withTimezone: true }),
+    poolerPolicyReviewedBy: text("pooler_policy_reviewed_by").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    poolerPolicyReviewedAt: timestamp("pooler_policy_reviewed_at", { withTimezone: true }),
+    poolerPolicyReviewedRequests: text("pooler_policy_reviewed_requests"),
+    poolerFencedAt: timestamp("pooler_fenced_at", { withTimezone: true }),
+    poolerFenceReason: text("pooler_fence_reason"),
     ipv6Status: text("ipv6_status")
       .$type<"unchecked" | "passed" | "failed" | "not_present">()
       .notNull()
@@ -161,6 +174,10 @@ export const platformSettings = pgTable(
       sql`${table.ipv6Status} IN ('unchecked', 'passed', 'failed', 'not_present')`,
     ),
     check("platform_settings_gate_login_mode_check", sql`${table.gateLoginMode} IN ('disabled', 'public')`),
+    check(
+      "platform_settings_pooler_internet_confirmed_check",
+      sql`NOT ${table.poolerAllowInternet} OR ${table.poolerInternetConfirmedAt} IS NOT NULL`,
+    ),
     check(
       "platform_settings_region_check",
       sql`${table.region} IN ('us-east', 'us-west', 'eu-west', 'eu-central')`,
@@ -278,8 +295,8 @@ export const managedDatabases = pgTable(
     exposure: text("exposure").notNull().default("public"),
     withPgvector: boolean("with_pgvector").notNull().default(false),
     withTestDatabase: boolean("with_test_database").notNull().default(false),
+    // A request for the pooler-wide policy (FD-26, §3.8.3), never enforced per database.
     sourceCidrs: jsonb("source_cidrs").$type<string[]>().notNull().default([]),
-    allowlistEnforced: boolean("allowlist_enforced").notNull().default(false),
     status: text("status").notNull().default("queued"),
   },
   (table) => [uniqueIndex("managed_databases_cluster_name_idx").on(table.clusterId, table.name)],
@@ -650,7 +667,12 @@ export const frontRoutes = pgTable(
         OR (${table.kind} = 'tcp' AND ${table.tlsMode} = 'plain' AND ${table.listenPort} BETWEEN 20000 AND 20049)
         OR (${table.kind} = 'tls' AND ${table.tlsMode} IN ('passthrough', 'terminate', 'terminate_mtls')
             AND ${table.listenPort} IN (443, 8883, 5671, 636, 6380))
-        OR (${table.kind} = 'postgres' AND ${table.tlsMode} IN ('passthrough', 'terminate', 'terminate_mtls'))`,
+        OR (${table.kind} = 'postgres' AND ${table.tlsMode} IN ('passthrough', 'terminate', 'terminate_mtls')
+            AND ${table.listenPort} = 5432)`,
+    ),
+    check(
+      "front_routes_compat_port_check",
+      sql`${table.compatPort} IS NULL OR (${table.kind} = 'postgres' AND ${table.tlsMode} = 'passthrough' AND ${table.compatPort} BETWEEN 20000 AND 20049)`,
     ),
     check(
       "front_routes_mtls_ca_check",

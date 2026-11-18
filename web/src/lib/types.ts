@@ -48,6 +48,53 @@ export type FrontAclSnippet = {
   routes: Array<{ id: string; kind: string; hostname: string; listenPort: number; status: string }>;
 };
 
+export type PoolerPolicyStatus =
+  | "no_public_databases"
+  | "invalid_policy"
+  | "deny_all"
+  | "unconfirmed_internet"
+  | "review_required"
+  | "published"
+  | "fenced";
+
+export type PoolerRequestSource =
+  | { kind: "database"; id: string; name: string }
+  | { kind: "vercel_client"; id: string; name: string; databaseId: string };
+
+/** What every role sees of the pooler policy (`poolerPolicyView` in server/src/app.ts). */
+export type PoolerPolicyBrief = {
+  scope: "pooler-wide";
+  status: PoolerPolicyStatus;
+  publishable: boolean;
+  message: string;
+  boundary: string;
+  conflict: boolean;
+};
+
+/** Mirrors `evaluatePoolerPolicy` in shared/src/pooler-policy.ts (owners and operators). */
+export type PoolerPolicyFull = PoolerPolicyBrief & {
+  policyPublishable: boolean;
+  fence: { at: string; reason: string | null } | null;
+  policy: {
+    sourceCidrs: string[];
+    allowInternet: boolean;
+    admits: "internet" | "allowlist" | "nobody";
+    rendered: string[];
+    internetConfirmedAt: string | null;
+    reviewedAt: string | null;
+  };
+  requests: Array<{ source: PoolerRequestSource; unrestricted: boolean; sourceCidrs: string[]; key: string }>;
+  distinctRequests: string[];
+  requestsFingerprint: string;
+  conflicts: Array<{
+    reason: "different_cidrs" | "restricted_with_unrestricted";
+    message: string;
+    sources: PoolerRequestSource[];
+  }>;
+  matchesRequests: boolean;
+  reviewed: boolean;
+};
+
 export type PlatformState = {
   user: { id: string; name: string; email: string; role: Role; twoFactorEnabled?: boolean };
   setup: {
@@ -72,6 +119,11 @@ export type PlatformState = {
   region?: RegionSummary;
   /** Per-source limits on the public database port (front door §3.11). Absent on an older API. */
   dbIngress?: DbIngressSummary;
+  /**
+   * The one pooler-wide source policy on public 5432 (front door §3.8.3, FD-26). Owners and operators
+   * get the full evaluation; viewers only the boundary and publication state. Absent on an older API.
+   */
+  poolerPolicy?: PoolerPolicyFull | PoolerPolicyBrief;
   domains: Array<{
     id: string;
     name: string;
@@ -184,6 +236,8 @@ export type FrontRouteSummary = {
   domain: { id: string; name: string; status: string; dnsProvider: string } | null;
   l4: {
     tlsMode: string | null;
+    /** `postgres` passthrough routes only: the opt-in classic-SSLRequest port, or null (FD-26). */
+    compatPort: number | null;
     sourceCidrs: string[];
     allowInternet: boolean;
     internetConfirmedAt: string | null;
@@ -202,4 +256,13 @@ export type FrontListeners = {
   reservedPorts: number[];
   tlsModes: string[];
   guidance: Array<{ protocol: string; tlsFirst: string; byName: string; kind: string | null; notes: string }>;
+  /** Postgres routes on the 5432 router (§3.8.3, FD-26). Absent on an older API. */
+  postgres?: {
+    port: number;
+    compatPorts: { start: number; end: number };
+    checklist: Array<{ id: string; title: string; detail: string }>;
+    drivers: Array<{ client: string; option: string; since: string; verified: boolean }>;
+    notes: string[];
+    poolerBoundary: string;
+  };
 };

@@ -69,8 +69,11 @@ function pgbouncerPublicViolations(service: Service | undefined) {
   if (!service.security_opt?.includes("no-new-privileges:true")) {
     problems.push("security_opt must include no-new-privileges:true");
   }
-  if (JSON.stringify(service.ports) !== JSON.stringify(["127.0.0.1:15432:5432"])) {
-    problems.push(`ports must stay loopback-only 127.0.0.1:15432:5432, got ${JSON.stringify(service.ports)}`);
+  // FD-26: edge-l4's fe_pg5432 owns public 5432 and reaches PgBouncer over pgbouncer-ingress.
+  if (service.ports?.length) {
+    problems.push(
+      `pgbouncer-public must publish no port (edge-l4 owns 5432), got ${JSON.stringify(service.ports)}`,
+    );
   }
   for (const mount of ["/var/lib/ark/pgbouncer", "/var/lib/ark/certs"]) {
     if (!service.volumes?.some((volume) => volume.endsWith(`:${mount}:ro`))) {
@@ -81,6 +84,10 @@ function pgbouncerPublicViolations(service: Service | undefined) {
     problems.push("the admin socket volume ark_pgbouncer_socket must be mounted at /var/run/pgbouncer");
   }
   return problems;
+}
+
+function networksOf(service: Service | undefined) {
+  return Array.isArray(service?.networks) ? service.networks : Object.keys(service?.networks ?? {});
 }
 
 async function loadCompose() {
@@ -119,7 +126,6 @@ describe("pgbouncer-public compose service", () => {
       entrypoint: ["/usr/bin/pgbouncer"],
       command: ["/var/lib/ark/pgbouncer/pgbouncer.ini"],
       user: "1000:1000",
-      ports: ["127.0.0.1:15432:5432"],
       volumes: [
         "../../tmp/pgbouncer:/var/lib/ark/pgbouncer:ro",
         "../../tmp/certs:/var/lib/ark/certs:ro",
@@ -142,7 +148,8 @@ describe("pgbouncer-public compose service", () => {
       [{ user: undefined }, /1000:1000/],
       [{ cap_drop: [] }, /cap_drop/],
       [{ security_opt: [] }, /no-new-privileges/],
-      [{ ports: ["15432:5432"] }, /loopback-only/],
+      [{ ports: ["15432:5432"] }, /publish no port/],
+      [{ ports: ["127.0.0.1:15432:5432"] }, /publish no port/],
       [
         {
           volumes: [
@@ -194,25 +201,40 @@ describe("pgbouncer-public compose service", () => {
     }
   });
 
-  test("keeps backend networking internal and publishes through a dedicated bridge", async () => {
+  test("keeps backend networking internal; only edge-ts reaches PgBouncer, over pgbouncer-ingress", async () => {
     const compose = Bun.YAML.parse(await Bun.file(composeFile).text()) as {
-      services: Record<string, Service>;
+      services: Record<string, Service & { network_mode?: string }>;
       networks: Record<string, { internal?: boolean }>;
     };
     expect(compose.networks["database-management"]?.internal).toBe(true);
-    expect(compose.networks["database-loopback"]?.internal).not.toBe(true);
+    expect(compose.networks["pgbouncer-ingress"]?.internal).toBe(true);
+    // The pre-FD-26 loopback publish bridge is gone.
+    expect(compose.networks["database-loopback"]).toBeUndefined();
     expect(compose.services["pgbouncer-public"]?.networks).toEqual([
       "database-management",
-      "database-loopback",
+      "pgbouncer-ingress",
     ]);
-    for (const [name, service] of Object.entries(compose.services)) {
-      if (name !== "pgbouncer-public") {
-        const names = Array.isArray(service.networks)
-          ? service.networks
-          : Object.keys(service.networks ?? {});
-        expect(names).not.toContain("database-loopback");
-      }
-    }
+    const members = Object.entries(compose.services)
+      .filter(([, service]) => networksOf(service).includes("pgbouncer-ingress"))
+      .map(([name]) => name)
+      .toSorted();
+    expect(members).toEqual(["edge-ts", "pgbouncer-public"]);
+    // The edge namespace (edge-ts, and edge/edge-l4 inside it) never joins database-management, so it
+    // can never reach app-postgres (§3.8.3).
+    expect(networksOf(compose.services["edge-ts"])).not.toContain("database-management");
+    expect(compose.services["edge-l4"]?.network_mode).toBe("service:edge-ts");
+    expect(compose.services["edge-ts"]?.ports).toContain("5432:5432");
+  });
+
+  test("database-ingress is only the nft reconciler: no 5432 relay or loopback publish", async () => {
+    const compose = await loadCompose();
+    const ingress = compose.services["database-ingress"]!;
+    const environment = ingress.environment as Record<string, string>;
+    expect(Object.keys(environment)).not.toContain("ARK_PGBOUNCER_LOOPBACK_PORT");
+    expect(Object.keys(environment)).not.toContain("ARK_PUBLIC_DB_PORT");
+    const source = await Bun.file(join(root, "scripts", "database-ingress.ts")).text();
+    expect(source).not.toMatch(/createServer|\.listen\(|startListener/);
+    expect(JSON.stringify(compose)).not.toContain("15432");
   });
 
   test("shares the admin socket only between pgbouncer-public and database-worker", async () => {

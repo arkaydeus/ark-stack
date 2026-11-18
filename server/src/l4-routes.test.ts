@@ -249,7 +249,7 @@ describe("listeners (§3.8.2)", () => {
     await refused(tlsRequest("raw", { listenPort: 20002 }), /raw TCP port/);
     await refused(tlsRequest("ldaps", { listenPort: 636 }), /not enabled at install/);
     await refused(tlsRequest("mail", { listenPort: 993 }), /platform or mail port/);
-    await refused({ ...tlsRequest("pg"), kind: "postgres" }, /FD-26/);
+    await refused({ ...tlsRequest("pg"), kind: "postgres", listenPort: 443 }, /5432/);
     await refused(tlsRequest("plain", { tlsMode: "plain" }), /plain/);
     await refused(tlsRequest("terminate-empty", { tlsMode: "terminate", sourceCidrs: [] }), /restricted/);
     const route = await create(tlsRequest("mqtts", { listenPort: 8883 }));

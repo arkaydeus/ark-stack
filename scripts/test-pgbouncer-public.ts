@@ -474,10 +474,14 @@ try {
   const override = join(work, "smoke-ports.yml");
   const portBinding = `127.0.0.1:${requestedPort === "0" ? "" : requestedPort}:5432`;
   // --project-directory relocates bind mounts, so anchor the new PostgreSQL image build at
-  // the real source root instead of the disposable state directory.
+  // the real source root instead of the disposable state directory. In production pgbouncer-public
+  // publishes nothing (FD-26: edge-l4's fe_pg5432 reaches it over the internal pgbouncer-ingress
+  // network). This suite tests PgBouncer itself, so it publishes a loopback port through a test-only
+  // non-internal bridge (Docker publishes nothing for a container on internal networks only); the
+  // edge path is covered by scripts/test-edge-pg5432.ts.
   await Bun.write(
     override,
-    `services:\n  app-postgres:\n    build:\n      context: ${JSON.stringify(root)}\n  pgbouncer-public:\n    ports: !override ["${portBinding}"]\n`,
+    `services:\n  app-postgres:\n    build:\n      context: ${JSON.stringify(root)}\n  pgbouncer-public:\n    ports: !override ["${portBinding}"]\n    networks: !override [database-management, pgbouncer-ingress, smoke-publish]\nnetworks:\n  smoke-publish: {}\n`,
   );
   compose.push("-f", override);
   await mkdir(pgbouncerDir, { recursive: true });

@@ -35,7 +35,7 @@ test("provider enforcement matches the written marker, including all-invalid and
   }
 });
 
-test("external worker waits for a host acknowledgement of the exact policy and exposure", async () => {
+test("external worker waits for a host acknowledgement of the exact policy", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ark-ingress-ack-"));
   const saved = {
     ARK_EMBEDDED_WORKERS: process.env.ARK_EMBEDDED_WORKERS,
@@ -46,7 +46,7 @@ test("external worker waits for a host acknowledgement of the exact policy and e
   process.env.ARK_APPLY_NFT = "1";
   delete process.env.ARK_ALLOWLIST_HELPER;
   try {
-    await writeFile(join(dir, "allowlist.status"), "applied=true\nexposed=false\npolicy_hash=old-policy\n");
+    await writeFile(join(dir, "allowlist.status"), "applied=true\npolicy_hash=old-policy\n");
     let complete = false;
     const pending = applyDatabaseAllowlist(dir, ["192.0.2.0/24"]).then((result) => {
       complete = true;
@@ -61,18 +61,17 @@ test("external worker waits for a host acknowledgement of the exact policy and e
     expect(rules).toContain("ark_db_limits");
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(complete).toBe(false);
-    // A matching policy with an incorrect listener state is also insufficient.
+    // A matching policy that failed to apply is also insufficient.
     await writeFile(
       join(dir, "allowlist.status"),
-      `applied=true\nexposed=true\npolicy_hash=${sha256Hex(rules)}\n`,
+      `applied=false\npolicy_hash=${sha256Hex(rules)}\nerror=nft failed\n`,
     );
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(complete).toBe(false);
-    await writeFile(
-      join(dir, "allowlist.status"),
-      `applied=true\nexposed=false\npolicy_hash=${sha256Hex(rules)}\n`,
-    );
-    expect(await pending).toMatchObject({ applied: true, enforced: true, exposed: false });
+    await writeFile(join(dir, "allowlist.status"), `applied=true\npolicy_hash=${sha256Hex(rules)}\n`);
+    expect(await pending).toMatchObject({ applied: true, enforced: true });
+    // There is no exposure toggle any more: 5432 belongs to the edge (FD-26).
+    expect(await Bun.file(join(dir, "expose")).exists()).toBe(false);
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];

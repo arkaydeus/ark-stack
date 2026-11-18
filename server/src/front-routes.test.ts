@@ -873,28 +873,26 @@ describe("lifecycle regression coverage", () => {
     expect(await openGrants(actors.owner)).toBe(grants - 1);
   });
 
-  test("every mutation refuses unmanaged kinds (postgres, FD-26) and preserves resources and grants", async () => {
-    // tls and tcp routes are managed since FD-14 (server/src/l4-routes.test.ts).
-    for (const kind of ["postgres"]) {
-      const { route } = await createRoute(`kind-${kind}.${zone}`);
-      await sql`UPDATE front_routes SET kind = ${kind}, tls_mode = 'passthrough', status = 'ready', enabled = true WHERE id = ${route.id}`;
-      const certId = createId("crt");
-      await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
-        VALUES (${certId}, ${route.endpointId ?? (await routeRow(route.id))!.endpoint_id}, '[]', 'issued', now())`;
-      for (const [method, path, body, action] of [
-        ["PATCH", `/api/front/routes/${route.id}`, { targetPort: 3002 }, "exposure.public"],
-        ["POST", `/api/front/routes/${route.id}/enable`, {}, "exposure.public"],
-        ["POST", `/api/front/routes/${route.id}/disable`, {}, null],
-        ["DELETE", `/api/front/routes/${route.id}`, {}, "resource.delete"],
-      ] as const) {
-        if (action) await stepUp(actors.owner, action, { routeId: route.id, ...body });
-        const before = await openGrants(actors.owner);
-        expect((await call(actors.owner, method, path, body)).status).toBe(422);
-        expect(await openGrants(actors.owner)).toBe(before);
-        expect(await routeRow(route.id)).toMatchObject({ kind, enabled: true, target_port: 3000 });
-        expect(await sql`SELECT id FROM certificates WHERE id = ${certId}`).toHaveLength(1);
-        expect(await records(route.hostname)).toHaveLength(1);
-      }
+  test("a route with corrupt stored L4 settings is refused, not guessed, and keeps resources and grants", async () => {
+    // Every kind is managed since FD-26 (tls/tcp: server/src/l4-routes.test.ts; postgres:
+    // server/src/pg5432.test.ts). A stored policy that no longer validates is never reinterpreted.
+    const { route } = await createRoute(`kind-postgres.${zone}`);
+    await sql`UPDATE front_routes SET kind = 'postgres', listen_port = 5432, tls_mode = 'passthrough',
+      tcp_options = '{"maxConn": 0}', status = 'ready', enabled = false WHERE id = ${route.id}`;
+    for (const [method, path, body] of [
+      ["PATCH", `/api/front/routes/${route.id}`, { targetPort: 3002 }],
+      ["POST", `/api/front/routes/${route.id}/enable`, {}],
+    ] as const) {
+      await stepUp(actors.owner, "exposure.public", { routeId: route.id, ...body });
+      const before = await openGrants(actors.owner);
+      const response = await call(actors.owner, method, path, body);
+      expect([response.status, String(response.body.error)]).toEqual([
+        409,
+        expect.stringMatching(/stored TLS\/TCP settings are invalid/),
+      ]);
+      expect(await openGrants(actors.owner)).toBe(before);
+      expect(await routeRow(route.id)).toMatchObject({ kind: "postgres", enabled: false, target_port: 3000 });
+      expect(await records(route.hostname)).toHaveLength(1);
     }
   });
 

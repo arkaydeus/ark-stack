@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -397,33 +397,17 @@ export function dbIngressCountersFile() {
     : join(process.cwd(), "tmp", "db-ingress", "counters.json");
 }
 
-/** Close admission independently of PgBouncer's live configuration. A running host ingress
- * must acknowledge closure; local development without an ingress only writes the closed flag. */
-export async function fenceDatabasePublicListener(dir: string, timeoutMs = 10_000) {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const statusFile = join(dir, "allowlist.status");
-  const watching = await stat(statusFile).then(
-    () => true,
-    () => false,
-  );
-  // Remove stale acknowledgements before asking the host reconciler for a new one.
-  await rm(statusFile, { force: true });
-  await writeFile(join(dir, "expose"), "0\n", { mode: 0o600 });
-  if (!watching && process.env.ARK_EMBEDDED_WORKERS !== "0" && process.env.NODE_ENV !== "production") return;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const status = await readFile(statusFile, "utf8").catch(() => "");
-    if (/^exposed=false$/m.test(status)) return;
-    await Bun.sleep(25);
-  }
-  throw new Error("Public database ingress did not acknowledge closure; expose remains 0.");
-}
-
+/**
+ * Writes the tcp/5432 nft policy (`ark_db_ingress`, FD-18: per-source limits) for the host-namespace
+ * `database-ingress` reconciler and waits for its acknowledgement of these exact bytes. Since FD-26 the
+ * reconciler no longer relays 5432 (HAProxy's `fe_pg5432` owns it), so there is no exposure toggle
+ * here: whether PgBouncer is reachable is decided by rendering `be_pgbouncer` at the edge.
+ */
 export async function applyDatabaseAllowlist(
   dir: string,
   cidrs: string[],
   port = 5432,
-  options: { expose?: boolean; limits?: DbIngressLimits } = {},
+  options: { limits?: DbIngressLimits } = {},
 ) {
   const file = join(dir, "allowlist.nft");
   const previousRules = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
@@ -431,36 +415,34 @@ export async function applyDatabaseAllowlist(
     throw error;
   });
   const rules = nftAllowlist(cidrs, port, options.limits, previousRules);
-  const expose = Boolean(options.expose);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   // Publish complete policies atomically: the host watcher must never load a partial write.
   const temporary = `${file}.${crypto.randomUUID()}.tmp`;
   await writeFile(temporary, rules, { mode: 0o600 });
   await rename(temporary, file);
-  await writeFile(join(dir, "expose"), expose ? "1\n" : "0\n", { mode: 0o600 });
   const requireApply = process.env.ARK_APPLY_NFT === "1" || process.env.ARK_EMBEDDED_WORKERS === "0";
   const helper = process.env.ARK_ALLOWLIST_HELPER;
   try {
     if (helper) {
       await exec(helper, [file], { timeout: 20_000 });
-      return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules), exposed: expose };
+      return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules) };
     }
     // An empty allowlist installs per-source limits without CIDR allowlist jumps. The
     // reconcilers read the table back and treat a missing table as a failed apply.
     if (process.env.ARK_APPLY_NFT === "0") {
-      if (requireApply) throw new Error("Database CIDR allowlist cannot be applied because ARK_APPLY_NFT=0.");
-      return { file, applied: false, enforced: false, exposed: false, reason: "disabled" };
+      if (requireApply) throw new Error("Database ingress policy cannot be applied because ARK_APPLY_NFT=0.");
+      return { file, applied: false, enforced: false, reason: "disabled" };
     }
     // External workers have no host NET_ADMIN. The host reconciler acknowledges the exact
-    // policy bytes and exposure; an older success must never satisfy a new reload/upgrade.
+    // policy bytes; an older success must never satisfy a new reload/upgrade.
     if (process.env.ARK_EMBEDDED_WORKERS === "0") {
       const expectedHash = sha256Hex(rules);
       let lastStatus = "No acknowledgement from database-ingress.";
       for (let attempt = 0; attempt < 150; attempt++) {
         const status = await readFile(join(dir, "allowlist.status"), "utf8").catch(() => "");
         if (status.includes(`policy_hash=${expectedHash}\n`)) {
-          if (status.includes("applied=true\n") && status.includes(`exposed=${expose}\n`)) {
-            return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules), exposed: expose };
+          if (status.includes("applied=true\n")) {
+            return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules) };
           }
           lastStatus = status.split("error=")[1]?.trim() || "Requested policy is not ready.";
         }
@@ -470,15 +452,14 @@ export async function applyDatabaseAllowlist(
     }
     await exec("nft", ["-f", file], { timeout: 10_000 });
     await exec("nft", ["list", "table", "inet", "ark_db_ingress"], { timeout: 10_000 });
-    return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules), exposed: expose };
+    return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules) };
   } catch (error) {
-    await writeFile(join(dir, "expose"), "0\n", { mode: 0o600 }).catch(() => undefined);
     const message = error instanceof Error ? error.message : "nft apply failed";
     if (requireApply)
-      throw new Error(`Database CIDR allowlist was not applied; public listener is closed: ${message}`, {
+      throw new Error(`Database ingress policy was not applied: ${message}`, {
         cause: error,
       });
-    return { file, applied: false, enforced: false, exposed: false, reason: message };
+    return { file, applied: false, enforced: false, reason: message };
   }
 }
 

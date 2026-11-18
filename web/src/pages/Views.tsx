@@ -5,11 +5,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field } from "@/components/ui/input";
 import type { PlatformState } from "@/lib/types";
-import { act, api, formatDate } from "@/lib/utils";
+import { act, api, formatDate, parseCidrList } from "@/lib/utils";
 
 import { InlineError } from "./Auth";
 import { BackupTargetsPanel } from "./BackupTargets";
 import { DnsReviewPanel } from "./DnsReview";
+import { PoolerPolicyPanel, scrollToPoolerPolicy } from "./PoolerPolicy";
 
 export function Overview({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   return (
@@ -270,10 +271,7 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
               exposure: form.get("exposure"),
               withPgvector: form.has("withPgvector"),
               withTestDatabase: form.has("withTestDatabase"),
-              sourceCidrs: String(form.get("sourceCidrs") ?? "")
-                .split(",")
-                .map((item) => item.trim())
-                .filter(Boolean),
+              sourceCidrs: parseCidrList(String(form.get("sourceCidrs") ?? "")),
             }),
           });
           await reload();
@@ -287,7 +285,22 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
             <option value="private">Private only</option>
           </select>
         </div>
-        <Field label="Source CIDRs" name="sourceCidrs" placeholder="optional, comma-separated" />
+        <div>
+          <Field
+            label="Requested source CIDRs (pooler-wide policy applies)"
+            name="sourceCidrs"
+            placeholder="optional, comma-separated"
+            aria-describedby="sourceCidrsHelp"
+          />
+          <p id="sourceCidrsHelp" className="mt-1 text-xs text-muted-foreground">
+            A request, not an isolation: public 5432 enforces one{" "}
+            <button type="button" className="underline" onClick={scrollToPoolerPolicy}>
+              pooler-wide policy
+            </button>{" "}
+            for every Ark database. Use a separate listener or keep the database private if it needs its own
+            isolation.
+          </p>
+        </div>
         <label className="flex items-center gap-2 text-sm">
           <input type="checkbox" name="withPgvector" /> pgvector
         </label>
@@ -301,6 +314,20 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
                 <p className="text-xs text-muted-foreground">
                   {item.roles.map((role) => role.kind).join(", ")}
                 </p>
+                {item.exposure === "public" && item.sourceCidrs && (
+                  <p className="text-xs text-muted-foreground">
+                    Requests{" "}
+                    {item.sourceCidrs.length ? (
+                      <span className="mono">{item.sourceCidrs.join(", ")}</span>
+                    ) : (
+                      "unrestricted"
+                    )}{" "}
+                    ·{" "}
+                    <button type="button" className="underline" onClick={scrollToPoolerPolicy}>
+                      pooler-wide policy applies
+                    </button>
+                  </p>
+                )}
               </div>
               <Badge variant={statusVariant(item.status)}>{item.status}</Badge>
               <span>{item.exposure}</span>
@@ -365,6 +392,7 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
           ))}
         </CardContent>
       </Card>
+      <PoolerPolicyPanel state={state} reload={reload} />
       {secret && (
         <Card>
           <CardContent>

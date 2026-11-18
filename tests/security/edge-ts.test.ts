@@ -78,6 +78,8 @@ describe("edge-ts", () => {
     expect(edgeTs.ports).toEqual([
       "80:80",
       "443:443",
+      // The PostgreSQL router (FD-26): edge-l4's fe_pg5432.
+      "5432:5432",
       // Shared SNI ports (FD-14): published only when the installer enabled them; otherwise only on
       // an ephemeral loopback port where nothing listens.
       "${ARK_EDGE_SNI_PORT_8883:-127.0.0.1::8883}",
@@ -88,7 +90,13 @@ describe("edge-ts", () => {
       "20000-20049:20000-20049",
       "41642:41642/udp",
     ]);
-    expect(edgeTs.networks).toEqual({ admin: {}, "edge-control": { aliases: ["edge-admin"] } });
+    // pgbouncer-ingress (FD-26): HAProxy reaches PgBouncer only; never database-management.
+    expect(edgeTs.networks).toEqual({
+      admin: {},
+      "edge-control": { aliases: ["edge-admin"] },
+      "pgbouncer-ingress": {},
+    });
+    expect(compose.networks["pgbouncer-ingress"]?.internal).toBe(true);
     expect(compose.networks["edge-control"]?.internal).toBe(true);
   });
 });

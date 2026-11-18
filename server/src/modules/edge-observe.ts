@@ -28,7 +28,7 @@ import { desc, eq } from "drizzle-orm";
 import { db } from "../db.ts";
 import { auditEvents, certificates, endpoints, frontRoutes, operations } from "../schema.ts";
 import { currentRoute, routeVersion } from "./front-route-state.ts";
-import { l4RoutePolicy, revokedSerials, storedL4Settings } from "./l4-routes.ts";
+import { isL4Kind, l4RoutePolicy, revokedSerials, storedL4Settings } from "./l4-routes.ts";
 import type { EdgeLocalApi, ProbeResult } from "./tailnet-localapi.ts";
 import {
   commitTailnetGeneration,
@@ -138,7 +138,7 @@ export async function edgePolicy(
   const routes: EdgePolicyRoute[] = [];
   if (valid) {
     const live = (await loadRoutes()).filter((route) => route.enabled && route.status === "ready");
-    // TLS-TCP and raw-TCP routes (FD-14) carry their admission policy in the identity, so a policy
+    // TLS-TCP, raw-TCP and Postgres routes (FD-14, FD-26) carry their admission policy in the identity, so a policy
     // change or a client certificate revocation fences and drains their old servers everywhere.
     const revoked = await revokedSerials(
       live.flatMap((route) =>
@@ -149,7 +149,7 @@ export async function edgePolicy(
       const check = revalidate(route, loaded, now);
       if (!check.ok || check.ip !== route.targetIp) continue;
       let policy: string | undefined;
-      if (route.kind === "tls" || route.kind === "tcp") {
+      if (isL4Kind(route.kind)) {
         const settings = storedL4Settings(route);
         // Invalid stored settings, or an unconfirmed open route: never allowed (fail closed). An
         // empty list stays allowed and renders deny-all (the route admits nobody).
