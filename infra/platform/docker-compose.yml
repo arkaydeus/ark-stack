@@ -563,7 +563,7 @@ services:
 
   # Edge-local lease watchdog (docs/design/front-door.md §3.2, FD-06). Every second it reads the
   # read-only lease endpoint and withdraws tailnet backends the lease no longer allows from the
-  # running Caddy through the admin API; if that fails it stops Caddy and raises an alert. It works
+  # running Caddy and HAProxy. The HAProxy master socket closes only affected route sessions. It works
   # with the operation workers stopped. No database credential, root key, Docker or tailscaled socket.
   edge-watchdog:
     <<: *app
@@ -585,7 +585,7 @@ services:
       ARK_HAPROXY_MASTER_SOCKET: /var/run/haproxy/master.sock
     group_add: ["4400"]
     volumes:
-      # Shared stop intent and restart markers are written by every Caddy adapter.
+      # Read lease-checked Caddyfiles and coordinate fail-closed Caddy restarts.
       - ../../tmp/edge:/var/lib/ark/edge
       - ../../tmp/edge-l4:/usr/local/etc/haproxy:ro
       - ark_haproxy_run:/var/run/haproxy
@@ -594,9 +594,9 @@ services:
     networks: [control, edge-control]
 
   # HAProxy SNI router on 443 (docs/design/front-door.md §3.8, FD-25). It owns public 443 in the edge-ts
-  # namespace and sends HTTP, admin and login hostnames (and unknown SNI) to Caddy on 127.0.0.1:8443
-  # with PROXY v2; non-TLS is rejected after 5 s. The launch guard asks the edge watchdog before
-  # serving any tailnet backend and supervises HAProxy while one exists (front door §3.2).
+  # namespace and sends known HTTP, admin and login hostnames to Caddy on 127.0.0.1:8443 with
+  # PROXY v2. HTTP routes have individual backends. Non-TLS is rejected after 5 s. The launch guard
+  # checks the lease for HTTP and L4 route identities and supervises HAProxy once either exists.
   edge-l4:
     image: haproxy:3.2.26-alpine@sha256:1c3568e520453cc8ba98c39501febcf450429c80e6cc27ecad779961d76e597c
     # Binds 443 as the image's uid 99 with no capabilities: Docker sets ip_unprivileged_port_start=0 in

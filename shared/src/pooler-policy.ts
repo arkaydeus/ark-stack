@@ -6,7 +6,7 @@
 // whole pooler: `platform_settings.pooler_source_cidrs`, or every source when `pooler_allow_internet`
 // was saved under an owner exposure.public confirmation. Empty = deny all.
 //
-// A database's `source_cidrs` and its Vercel clients are *requests* for that policy, never enforced
+// A database's `source_cidrs` and its legacy Vercel clients are *requests* for that policy, never enforced
 // per database and never silently unioned. When the requests differ (two databases with different
 // CIDRs, or a restricted database sharing the pooler with an unrestricted Vercel client), publication
 // is refused until the owner explicitly reviews one common policy. A database that needs its own
@@ -74,7 +74,7 @@ export function poolerRequestKey(input: { unrestricted: boolean; sourceCidrs: re
 
 /**
  * The requests for the pooler policy: every public database (empty CIDRs = unrestricted, as the
- * pre-FD-26 open allowlist behaved) and every active Vercel-integrated client of a public database
+ * pre-FD-26 open allowlist behaved) and every active legacy Vercel client of a public database
  * (Vercel egress has no stable addresses, so it needs an unrestricted pooler).
  */
 export function poolerRequests(input: {

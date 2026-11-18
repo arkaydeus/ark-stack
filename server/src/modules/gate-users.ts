@@ -10,7 +10,7 @@
 //   (`/gate/enroll`); the gate check and authorize require MFA assurance, so no route is reachable.
 // - Deletion removes the `user` row in one transaction: sessions, gate sessions, handoffs and route
 //   access cascade, and the FD-11 triggers write the revocation journal and queue the forced-reload
-//   drain atomically, so open sockets close within the existing 305 s bound (§3.9.3).
+//   drain atomically, so the affected HAProxy backends are fenced and their sessions close (§3.9.3).
 
 import {
   GATE_USER_PASSWORD_SECRET_KIND,

@@ -22,7 +22,7 @@ const watchdog: string[] = [];
 // Remember only the job inserted by this probe, so cleanup never removes a pre-existing daily
 // operation and the scheduler cannot leave a global queue row behind its database fixture.
 const daily = await queueDailyRollover(new Date());
-const startedAt = new Date();
+const startedAt = new Date().toISOString();
 // A separate peer emulates the host ingress reconciler, including policy-hash matching. The
 // coordinator must await this exchange; it cannot use the development bypass. (Since FD-26 there
 // is no exposure toggle: whether PgBouncer is reachable on 5432 is the edge's be_pgbouncer.)
@@ -117,6 +117,7 @@ try {
   }
   if (daily) await sql`DELETE FROM operations WHERE id = ${daily.id}`;
   // pgbouncer.reload queues edge.l4_apply for the domain worker (FD-26); none runs here.
-  await sql`DELETE FROM operations WHERE kind = 'edge.l4_apply' AND status = 'queued' AND created_at >= ${startedAt.toISOString()}::timestamptz`;
+  await sql`DELETE FROM operations WHERE kind = 'edge.l4_apply' AND status = 'queued'
+    AND created_at >= ${startedAt}::timestamptz`;
   await sql.end({ timeout: 2 });
 }

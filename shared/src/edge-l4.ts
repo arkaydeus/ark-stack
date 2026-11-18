@@ -259,6 +259,8 @@ export type EdgeL4Pooler = {
 export type EdgeL4Input = {
   /** Hostnames Caddy serves (HTTP routes, the admin site and the login origin). */
   httpHostnames: string[];
+  /** Issued front-door routes. Omitted only by the bootstrap and legacy fixtures. */
+  httpRoutes?: EdgeL4HttpRoute[];
   tlsRoutes?: EdgeL4TlsRoute[];
   tcpRoutes?: EdgeL4TcpRoute[];
   postgresRoutes?: EdgeL4PostgresRoute[];
@@ -267,6 +269,25 @@ export type EdgeL4Input = {
   /** Shared SNI ports enabled at install time (and published on edge-ts). */
   sniPorts?: number[];
 };
+
+export type EdgeL4HttpRoute = Pick<EdgePolicyRoute, "id" | "hostname" | "stableId" | "ip" | "port">;
+
+export function haproxyHttpServerName(route: EdgeL4HttpRoute) {
+  return `h_${identityHash(route)}`;
+}
+
+export function haproxyHttpBackendName(hostname: string) {
+  return `be_http_${hostname}`;
+}
+
+const HTTP_SERVER = /^h_[a-f0-9]{32}$/;
+const HTTP_BACKEND_PREFIX = "be_http_";
+
+export function haproxyHttpHostname(server: { backend: string; server: string }) {
+  return server.backend.startsWith(HTTP_BACKEND_PREFIX) && HTTP_SERVER.test(server.server)
+    ? server.backend.slice(HTTP_BACKEND_PREFIX.length)
+    : null;
+}
 
 /** One route in a generation's manifest; prior generations' manifests name the backends to drain. */
 export type EdgeL4ManifestRoute = {
@@ -740,6 +761,7 @@ function renderSniFrontend(port: number, routes: TlsRoute[]) {
 
 function renderConfig(input: {
   httpHostnames: string[];
+  httpRoutes?: EdgeL4HttpRoute[];
   sniPorts: number[];
   routes: TlsRoute[];
   tcpRoutes: TcpRoute[];
@@ -751,13 +773,28 @@ function renderConfig(input: {
   const routeRules = on443.map(
     (route) => `    use_backend ${route.backend} if { req.ssl_sni -i ${route.hostname} }`,
   );
-  const httpRule = input.httpHostnames.length
+  const scoped = input.httpRoutes !== undefined;
+  const httpRoutes = input.httpRoutes ?? [];
+  const protectedHosts = new Set(httpRoutes.map((route) => route.hostname));
+  const platformHosts = input.httpHostnames.filter((hostname) => !protectedHosts.has(hostname));
+  const httpRule = platformHosts.length
     ? [
-        "    # HTTP routes, the admin site and the login origin terminate in Caddy.",
-        `    acl ark_http_sni req.ssl_sni -i ${input.httpHostnames.join(" ")}`,
+        "    # Platform HTTPS sites terminate in Caddy.",
+        `    acl ark_http_sni req.ssl_sni -i ${platformHosts.join(" ")}`,
         "    use_backend be_caddy if ark_http_sni",
       ]
     : [];
+  const httpRules = httpRoutes.map(
+    (route) =>
+      `    use_backend ${haproxyHttpBackendName(route.hostname)} if { req.ssl_sni -i ${route.hostname} }`,
+  );
+  const caddyBackends = [
+    renderCaddyBackend("be_caddy", scoped ? "caddy_platform" : "caddy"),
+    ...httpRoutes.map(
+      (route) =>
+        `# ark-http-route ${route.hostname}\n${renderCaddyBackend(haproxyHttpBackendName(route.hostname), haproxyHttpServerName(route))}`,
+    ),
+  ];
   const sharedFrontends = sharedPorts.map((port) =>
     renderSniFrontend(
       port,
@@ -766,7 +803,7 @@ function renderConfig(input: {
   );
   const backends = input.routes.map(renderTlsRoute);
   const reject =
-    sharedPorts.length || input.pooler || input.postgresRoutes.length
+    scoped || sharedPorts.length || input.pooler || input.postgresRoutes.length
       ? ["backend be_reject", "    tcp-request content reject", ""].join("\n")
       : "";
   // PgBouncer is the only backend addressed by name: Docker's DNS on the pgbouncer-ingress network.
@@ -819,20 +856,18 @@ frontend fe_tls443
     tcp-request content accept if { req.ssl_hello_type 1 }
     tcp-request content reject
     # Backend rules enforce each matched route policy. Content rules after accept are unreachable.
-${[...routeRules, ...httpRule].join("\n")}${routeRules.length || httpRule.length ? "\n" : ""}    # Everything else, including unknown SNI, goes to Caddy. Caddy has certificates only for
-    # configured names, so unknown SNI fails the handshake there.
-    default_backend be_caddy
+${[...routeRules, ...httpRules, ...httpRule, `    default_backend ${scoped ? "be_reject" : "be_caddy"}`].join("\n")}
 
-backend be_caddy
-    # PROXY v2 carries the real client address; Caddy requires it on this loopback listener.
-    # Fail fast on the loopback hop: a refused connect means Caddy's listener is down (fail-closed
-    # stop, restart), and retrying it only delays the client's reset by about a second per attempt.
-    # Caddy reloads keep the listener open, so they need no retry; no redispatch (one server).
+${[...caddyBackends, ...[...input.routes, ...input.postgresRoutes, ...input.tcpRoutes].map(admissionTables), ...backends, ...sharedFrontends, ...postgres, reject, ...input.tcpRoutes.map(renderTcpRoute)].filter(Boolean).join("\n")}`;
+}
+
+function renderCaddyBackend(backend: string, server: string) {
+  return `backend ${backend}
+    # PROXY v2 carries the client address. A refused loopback connect fails immediately.
     retries 0
     timeout connect ${CADDY_CONNECT_TIMEOUT}
-    server caddy ${CADDY_TLS_LISTENER} send-proxy-v2
-
-${[...[...input.routes, ...input.postgresRoutes, ...input.tcpRoutes].map(admissionTables), ...backends, ...sharedFrontends, ...postgres, reject, ...input.tcpRoutes.map(renderTcpRoute)].filter(Boolean).join("\n")}`;
+    server ${server} ${CADDY_TLS_LISTENER} send-proxy-v2
+`;
 }
 
 /** Content hash of a generation: sorted `path NUL sha256(content)` lines. */
@@ -853,6 +888,17 @@ export function generationId(files: Record<string, string | Uint8Array>) {
  */
 export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
   const httpHostnames = [...new Set(input.httpHostnames.map(checkedHostname))].toSorted();
+  const httpRoutes = input.httpRoutes?.toSorted((a, b) => a.hostname.localeCompare(b.hostname));
+  if (httpRoutes) {
+    const hosts = new Set<string>();
+    for (const route of httpRoutes) {
+      if (!httpHostnames.includes(route.hostname) || hosts.has(route.hostname))
+        throw new ValidationError(
+          `Unexpected or duplicate HTTP route hostname ${JSON.stringify(route.hostname)}.`,
+        );
+      hosts.add(route.hostname);
+    }
+  }
   const sniPorts = [...new Set(input.sniPorts ?? [])].toSorted((a, b) => a - b);
   for (const port of sniPorts) {
     if (!isSharedSniPort(port)) throw new ValidationError(`Shared SNI port ${port} is not supported.`);
@@ -958,10 +1004,21 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
     pooler: pooler ? { hostname: pooler.hostname, server: pooler.server, admits: pooler.admits } : null,
   };
   const files: Record<string, string> = {
-    "haproxy.cfg": renderConfig({ httpHostnames, sniPorts, routes, tcpRoutes, postgresRoutes, pooler }),
+    "haproxy.cfg": renderConfig({
+      httpHostnames,
+      httpRoutes,
+      sniPorts,
+      routes,
+      tcpRoutes,
+      postgresRoutes,
+      pooler,
+    }),
     // PgBouncer is not a tailnet backend: the closed configuration keeps serving it without a lease.
     "haproxy.closed.cfg": renderConfig({
       httpHostnames,
+      // HTTP admission is also guarded at Caddy. Keep SNI routing available when this variant is
+      // selected for an L4 lease denial so it cannot drop unrelated HTTP routes on reload.
+      httpRoutes,
       sniPorts,
       routes: [],
       tcpRoutes: [],
@@ -1019,6 +1076,7 @@ export function allowedServerIndex(allowed: ReadonlySet<string>) {
         }),
         target!,
       );
+      index.set(`h_${sha256Hex(identity).slice(0, 32)}`, hostname!);
     } catch {
       // Malformed identities authorise nothing.
     }
@@ -1037,36 +1095,47 @@ export function haproxyServerAllowed(
 /**
  * Servers the withdrawal adapter must fence when `index` no longer authorises them: tailnet target
  * servers whose identity or pin is not allowed, and the loop servers of terminated routes (FD-14)
- * whose target server is not allowed. Caddy and every other server are never affected.
+ * whose target server is not allowed. Protected HTTP route servers carry their own route identity.
+ * The platform Caddy backend is outside the lease.
  */
-export function haproxyServerProtected(server: { server: string; key: string | null }) {
-  return server.key !== null || LOOP_SERVER.test(server.server);
+export function haproxyServerProtected(server: { backend: string; server: string; key: string | null }) {
+  return server.key !== null || LOOP_SERVER.test(server.server) || haproxyHttpHostname(server) !== null;
 }
 
 export function haproxyServerDenied(
-  server: { server: string; key: string | null },
+  server: { backend: string; server: string; key: string | null },
   index: ReadonlyMap<string, string>,
 ) {
   if (server.key !== null) return !haproxyServerAllowed(server, index);
+  const hostname = haproxyHttpHostname(server);
+  if (hostname !== null) return index.get(server.server) !== hostname;
   const target = loopTargetServer(server.server);
   return target !== null && !index.has(target);
 }
 
 /**
- * The HAProxy launch guard's decision for the full configuration: `open` when it has no tailnet
- * server, or when every one is authorised by a currently valid lease. Otherwise the guard starts from
- * `haproxy.closed.cfg`.
+ * The full configuration opens only when the lease authorises every protected server.
+ * For the closed variant, Caddy independently enforces HTTP admission while the watchdog
+ * fences denied HTTP servers.
  */
 export function haproxyLaunchDecision(config: string, allowed: ReadonlySet<string>) {
   const index = allowedServerIndex(allowed);
-  const tailnet = haproxyConfigServers(config).filter((server) => server.key !== null);
-  const denied = tailnet.filter((server) => !haproxyServerAllowed(server, index));
-  const marked = config.split("\n").some((line) => line.startsWith(`${L4_TAILNET_ROUTE_MARKER} `));
+  const protectedServers = haproxyConfigServers(config).filter(haproxyServerProtected);
+  const denied = protectedServers.filter((server) => haproxyServerDenied(server, index));
+  const names = (servers: HaproxyServer[]) =>
+    [
+      ...new Set(
+        servers.map((server) => server.key ?? haproxyHttpHostname(server)).filter((key) => key !== null),
+      ),
+    ].toSorted();
+  const marked = config
+    .split("\n")
+    .some((line) => line.startsWith(`${L4_TAILNET_ROUTE_MARKER} `) || line.startsWith("# ark-http-route "));
   return {
     open: denied.length === 0,
-    guarded: marked || tailnet.length > 0,
-    backends: [...new Set(tailnet.map((server) => server.key!))].toSorted(),
-    denied: [...new Set(denied.map((server) => server.key!))].toSorted(),
+    guarded: marked || protectedServers.length > 0,
+    backends: names(protectedServers),
+    denied: names(denied),
   };
 }
 

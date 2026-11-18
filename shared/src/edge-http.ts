@@ -15,8 +15,8 @@
 // - or, for an apex route with `redirectTo`, a 308 to the canonical hostname and nothing else.
 //
 // `public` routes render no gate. `sso` routes (FD-11) render `forward_auth` to the API; their
-// `stream_close_delay` is capped at 5 minutes, so a revocation's forced reload closes every upgraded
-// connection within 305 s of the event (§3.9.3, GATE_MAX_STREAM_CLOSE_DELAY_MS).
+// `stream_close_delay` is capped at 5 minutes for routine reloads. Gate revocations drain
+// the affected HAProxy backend (§3.9.3).
 //
 // Location policy. Caddy evaluates it on the raw upstream value in `handle_response`, before the
 // `header_down` rewrite runs. In order:
@@ -222,8 +222,7 @@ export function checkedHttpRoute(route: EdgeHttpRoute) {
   if (redirectTo === hostname) throw new ValidationError(`Route ${route.id} redirects to itself.`);
   const options = httpRouteOptions(route.options as Record<string, unknown> | undefined);
   if (route.access === "sso" && !redirectTo) {
-    // A revocation's forced reload closes upgraded connections after the old handler's delay, so a
-    // longer delay would break the 305 s bound (§3.9.3).
+    // SSO routes retain their documented limit on stream lifetime across routine reloads.
     const match = DURATION.exec(options.streamCloseDelay)!;
     const ms = Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS];
     if (ms > GATE_MAX_STREAM_CLOSE_DELAY_MS)

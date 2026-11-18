@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { CADDY_STOP_MARKER, routeIdentityKey } from "@ark-stack/shared";
+import { haproxyHttpBackendName, haproxyHttpServerName, routeIdentityKey } from "@ark-stack/shared";
 
 import { writeEdge } from "./providers.ts";
 
@@ -12,10 +13,16 @@ const saved = {
   ARK_EDGE_DIR: process.env.ARK_EDGE_DIR,
   ARK_EDGE_RELOAD_URL: process.env.ARK_EDGE_RELOAD_URL,
   ARK_ACME_WEBROOT: process.env.ARK_ACME_WEBROOT,
+  ARK_HAPROXY_MASTER_SOCKET: process.env.ARK_HAPROXY_MASTER_SOCKET,
 };
 const temporaryDirectories: string[] = [];
+let master: Server | undefined;
 
 afterEach(async () => {
+  if (master) {
+    await new Promise<void>((resolve) => master!.close(() => resolve()));
+    master = undefined;
+  }
   globalThis.fetch = originalFetch;
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[key];
@@ -138,36 +145,81 @@ describe("writeEdge", () => {
     },
   };
 
-  test("removing a route that holds a WebSocket stops Caddy after the new files are in place", async () => {
-    const { directory, requests } = await prepare(200, 200, {
-      config: runningConfig,
-      upstreams: [{ address: "100.101.102.103:3000", num_requests: 1, fails: 0 }],
+  async function masterFor(legacy: boolean, timeline: string[]) {
+    const dir = await mkdtemp(join(tmpdir(), "ark-edge-cli-"));
+    temporaryDirectories.push(dir);
+    const socket = join(dir, "m");
+    const backend = legacy ? "be_caddy" : haproxyHttpBackendName(removed.hostname);
+    const name = legacy ? "caddy" : haproxyHttpServerName(removed);
+    let adminState = 0;
+    let sessions = 1;
+    master = createServer({ allowHalfOpen: true }, (connection) => {
+      let input = "";
+      connection.on("data", (chunk) => (input += chunk.toString()));
+      connection.on("end", () => {
+        const command = input.trim();
+        timeline.push(command);
+        if (command === "show proc") return connection.end("#<PID> <type>\n# workers\n10 worker 0\n");
+        if (command === "@!10 show servers state")
+          return connection.end(
+            `1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_port\n1 ${backend} 1 ${name} 127.0.0.1 2 ${adminState} 8443\n`,
+          );
+        if (command === "@!10 show sess") {
+          const rows = ["0xff: fe=GLOBAL be=<NONE> srv=<none>"];
+          if (sessions) rows.push(`0x10: fe=fe_tls443 be=${backend} srv=${name}`);
+          return connection.end(`${rows.join("\n")}\n`);
+        }
+        if (command === `@!10 disable server ${backend}/${name}`) adminState = 1;
+        if (command === `@!10 shutdown sessions server ${backend}/${name}`) sessions = 0;
+        return connection.end("\n");
+      });
     });
-    const result = await writeEdge({ adminMode: "tailnet" });
-    expect(result).toMatchObject({ applied: true, stoppedForStreams: ["100.101.102.103:3000"] });
-    expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
-      "/config/",
-      "/adapt",
+    await new Promise<void>((resolve, reject) => master!.once("error", reject).listen(socket, resolve));
+    process.env.ARK_HAPROXY_MASTER_SOCKET = socket;
+    return {
+      lateSession: () => {
+        sessions = 1;
+      },
+      target: `${backend}/${name}`,
+    };
+  }
+
+  test("a scoped withdrawal drains before load and verifies sessions again afterwards", async () => {
+    await prepare(200, 200, { config: runningConfig });
+    const timeline: string[] = [];
+    const cli = await masterFor(false, timeline);
+    const fetcher = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      timeline.push(path);
+      if (path === "/load") cli.lateSession();
+      return fetcher(input, init);
+    }) as typeof fetch;
+    expect((await writeEdge({ adminMode: "tailnet" })).applied).toBe(true);
+    expect(timeline.filter((item) => item.includes("shutdown sessions") || item === "/load")).toEqual([
+      `@!10 shutdown sessions server ${cli.target}`,
       "/load",
-      "/stop",
+      `@!10 shutdown sessions server ${cli.target}`,
     ]);
-    // The launch guard restarts from the new file; the marker tells the watchdog the stop is expected.
-    expect(await Bun.file(join(directory, "Caddyfile")).text()).not.toContain(removed.hostname);
-    expect(Number(await readFile(join(directory, CADDY_STOP_MARKER), "utf8"))).toBeGreaterThan(
-      Date.now() - 10_000,
-    );
   });
 
-  test("removing an idle delayed handler also stops Caddy to cover late upgrades", async () => {
-    const { directory, requests } = await prepare(200, 200, {
-      config: runningConfig,
-      upstreams: [{ address: "100.101.102.103:3000", num_requests: 0, fails: 0 }],
-    });
-    const result = await writeEdge({ adminMode: "tailnet" });
-    expect(result.stoppedForStreams).toEqual(["100.101.102.103:3000"]);
-    expect(requests.map((request) => new URL(request.url).pathname)).toContain("/stop");
-    expect(await Bun.file(join(directory, CADDY_STOP_MARKER)).exists()).toBe(true);
+  test("a removal on a legacy worker aborts without fencing shared admission or loading Caddy", async () => {
+    const { requests } = await prepare(200, 200, { config: runningConfig });
+    const timeline: string[] = [];
+    await masterFor(true, timeline);
+    await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow("requires a scoped HAProxy generation");
+    expect(requests.map(({ url }) => new URL(url).pathname)).toEqual(["/config/"]);
+    expect(timeline).toEqual(["show proc", "@!10 show servers state"]);
   });
+
+  test("loads a removal without issuing a stop to Caddy", async () => {
+    const { directory, requests } = await prepare(200, 200, { config: runningConfig });
+    const result = await writeEdge({ adminMode: "tailnet" });
+    expect(result.applied).toBe(true);
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual(["/config/", "/adapt", "/load"]);
+    expect(await Bun.file(join(directory, "Caddyfile")).text()).not.toContain(removed.hostname);
+  });
+
   test("failed active-config inspection aborts before adapt/load and preserves the current files", async () => {
     const { directory, requests } = await prepare();
     await Bun.write(join(directory, "Caddyfile"), "old configuration");
@@ -179,48 +231,6 @@ describe("writeEdge", () => {
     await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow("GET /config/ returned 502");
     expect(requests).toEqual([]);
     expect(await Bun.file(join(directory, "Caddyfile")).text()).toBe("old configuration");
-  });
-
-  test("late upgrades during load close even when the old upstream count was zero", async () => {
-    const { requests } = await prepare(200, 200, { config: runningConfig, upstreams: [] });
-    const fetcher = globalThis.fetch;
-    let streamOpen = false;
-    globalThis.fetch = (async (url, init) => {
-      if (String(url).endsWith("/load")) streamOpen = true;
-      const result = await fetcher(url, init);
-      if (String(url).endsWith("/stop")) streamOpen = false;
-      return result;
-    }) as typeof fetch;
-    await writeEdge({ adminMode: "tailnet" });
-    expect(streamOpen).toBe(false);
-    expect(requests.some((r) => r.url.endsWith("/reverse_proxy/upstreams"))).toBe(false);
-  });
-
-  test("a failed stop after rename persists intent; a fresh apply retries the stop", async () => {
-    const { directory } = await prepare(200, 200, { config: runningConfig });
-    const fetcher = globalThis.fetch;
-    let fail = true;
-    let stops = 0;
-    let streamOpen = true;
-    globalThis.fetch = (async (url, init) => {
-      if (String(url).endsWith("/stop")) {
-        stops++;
-        if (fail) return new Response(null, { status: 500 });
-        streamOpen = false;
-      }
-      // After /load no handler for the removed route remains to inspect.
-      if (String(url).endsWith("/config/") && stops) return Response.json({ apps: {} });
-      return fetcher(url, init);
-    }) as typeof fetch;
-    await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow("POST /stop returned 500");
-    expect(await Bun.file(join(directory, "Caddyfile")).exists()).toBe(true);
-    expect(streamOpen).toBe(true);
-    fail = false;
-    await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow(
-      "restarting after a pending stream stop",
-    );
-    expect(stops).toBe(2);
-    expect(streamOpen).toBe(false);
   });
 
   test("apply during an expected restart aborts safely before changing active config", async () => {

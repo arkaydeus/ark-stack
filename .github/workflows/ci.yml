@@ -83,6 +83,7 @@ jobs:
       - run: ARK_DOCKER_INTEGRATION=1 go test ./...
         working-directory: agent
       - run: bunx playwright install --with-deps chromium
+      - run: bunx playwright test e2e/vercel-rollover.spec.ts
       - run: bun scripts/test-e2e.ts
       - run: bun scripts/test-upgrade-migrations.ts
       - run: env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts

@@ -54,14 +54,11 @@ export const GATE_SESSION_IDLE_MS = 2 * 3_600_000;
 export const GATE_LAST_SEEN_INTERVAL_MS = 60_000;
 
 /**
- * A revocation's forced Caddy reload must begin within 5 s of the event; after that the edge-local
- * watchdog withdraws the route (fail closed) and a critical alert is raised (§3.9.3).
+ * A revocation still pending after 5 s triggers the edge-local watchdog's route withdrawal
+ * and raises a critical alert (§3.9.3).
  */
 export const GATE_REVOCATION_DEADLINE_MS = 5_000;
-/**
- * Upgraded connections close at most this long after the reload (the old handler's
- * `stream_close_delay`), so every open socket is gone by revocation + 305 s.
- */
+/** Maximum stream-close delay on an SSO route during routine Caddy reloads. */
 export const GATE_MAX_STREAM_CLOSE_DELAY_MS = 300_000;
 
 export const GATE_RD_MAX_BYTES = 2048;

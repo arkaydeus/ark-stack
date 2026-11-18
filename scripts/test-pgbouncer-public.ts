@@ -21,6 +21,7 @@
 //   closes a session querying through not_after and racing pre-auth clients by not_after + 5 s,
 //   after which the successor reconnects; and a certificate that expires without a drain keeps
 //   its session, which the deadline check reports as a failure.
+// - FD-29: a mocked partial provider write leaves the predecessor able to open a real mTLS session.
 //
 // The Compose file's relative bind mounts (`../../tmp/...`) are redirected into a temporary
 // directory with `--project-directory`, so the repository's own `tmp/` state is never touched.
@@ -1399,7 +1400,9 @@ try {
   }
   const dbClients = await import("../server/src/modules/db-clients.ts");
   const rollover = await import("../server/src/modules/db-client-rollover.ts");
+  const vercel = await import("../server/src/modules/vercel-integrations.ts");
   const tag = randomBytes(3).toString("hex");
+  const actorId = `fd29-smoke-${tag}`;
   const fd28Database = `ark_fd28_${tag}`;
   const fd28 = {
     databaseId: `mdb_fd28_${tag}`,
@@ -1707,25 +1710,121 @@ try {
       throw new Error(
         `Repeated runs created another successor: count=${emCount!.n}, outcomes=${secondRun.map((item) => item.outcome).join(",")}`,
       );
-    const emNext = await revealSuccessor(em);
-    if (emNext.caId === em.generations[0]!.caId)
+    const emPending = firstRun[0]!.successor!;
+    if (emPending.caId === em.generations[0]!.caId)
       throw new Error("The successor must come from a fresh CA generation.");
     note(
       "FD-28 day 60: the job issues exactly one successor",
-      `N not_after ${em.generations[0]!.notAfter.toISOString()} (T−30); N+1 ${firstRun[0]!.successor!.serial.slice(0, 12)}… from fresh CA ${emNext.caId}; a second run and two concurrent issuers added none (${emCount!.n} certificates)`,
+      `N not_after ${em.generations[0]!.notAfter.toISOString()} (T−30); N+1 ${emPending.serial.slice(0, 12)}… from fresh CA ${emPending.caId}; a second run and two concurrent issuers added none (${emCount!.n} certificates)`,
     );
 
     // An established session of another client of the same database, for the emergency removal.
     const bystander = await issue28("bystander", new Date(startedAt - 10 * DAY_MS));
 
     const overlap = await fd28Plan();
-    for (const caId of [em.generations[0]!.caId, emNext.caId]) {
+    for (const caId of [em.generations[0]!.caId, emPending.caId]) {
       const [ca] = await platform`SELECT cert_pem FROM private_cas WHERE id = ${caId}`;
       if (!overlap.caBundle.includes(String(ca!.cert_pem).trim()))
         throw new Error(`The overlap bundle lacks CA ${caId}.`);
     }
     await applyPlan(overlap);
     await expectConnects(em, em.generations[0]!, "FD-28 two-CA bundle reload: predecessor N connects");
+
+    const vercelRef = { actorId, actorRole: "owner", databaseId: fd28.databaseId, clientId: em.id };
+    const projectId = `prj_Fixture${tag}`;
+    const otherProjectId = `prj_Other${tag}`;
+    const teamId = `team_Fixture${tag}`;
+    const deployHook = `https://api.vercel.com/v1/integrations/deploy/${projectId}/FixtureHook`;
+    const proof = {
+      evidence: "mock-only",
+      listDenialCode: "fixture_project_scope_list_denied",
+      otherProjectDenialCode: "fixture_project_scope_other_denied",
+    };
+    let envWrites = 0;
+    let otherPosts = 0;
+    const fixture = {
+      proof,
+      transport: async (url: URL, init: RequestInit) => {
+        switch (url.pathname) {
+          case "/v5/user/tokens/current":
+            return Response.json({
+              token: { expiresAt: Date.now() + DAY_MS, scopes: [{ type: "project", projectId, teamId }] },
+            });
+          case `/v9/projects/${projectId}`:
+            return Response.json({
+              id: projectId,
+              accountId: teamId,
+              link: { productionBranch: "main", deployHooks: [{ url: deployHook, ref: "main" }] },
+            });
+          case "/v9/projects":
+            return Response.json({ error: { code: proof.listDenialCode } }, { status: 403 });
+          case `/v9/projects/${otherProjectId}`:
+            return Response.json({ error: { code: proof.otherProjectDenialCode } }, { status: 403 });
+          case `/v10/projects/${projectId}/env`: {
+            envWrites++;
+            const [{ key, type, target }] = JSON.parse(String(init.body));
+            return Response.json({ created: [{ key, type, target }], failed: [{}] }, { status: 201 });
+          }
+          default:
+            if (init.method === "POST") otherPosts++;
+            return Response.json({}, { status: 404 });
+        }
+      },
+    };
+    await platform`INSERT INTO "user" (id, name, email) VALUES (${actorId}, 'FD-29 smoke fixture', ${`${actorId}@example.com`})`;
+    await rollover.markSuccessorsTrusted([emPending.id], new Date());
+    await vercel.connectVercel(
+      vercelRef,
+      {
+        projectId,
+        otherProjectId,
+        teamId,
+        deployHook,
+        target: "production",
+        token: "vcp_Fixture",
+      },
+      fixture,
+    );
+    try {
+      const claimToken = `claim_${tag}`;
+      const [operation] = await platform`UPDATE operations SET status = 'running', claim_token = ${claimToken}
+        WHERE kind = 'integration.vercel_push' AND payload->>'clientId' = ${em.id} AND status = 'queued'
+        RETURNING id, payload`;
+      if (!operation) throw new Error("FD-29 smoke fixture did not queue a trusted successor.");
+      const failed = await vercel
+        .pushVercelRollover(
+          {
+            id: String(operation.id),
+            payload: operation.payload,
+            claimToken,
+          },
+          fixture,
+        )
+        .then(
+          () => false,
+          (error: Error) => error.message.includes("Manual rollover is available"),
+        );
+      const [alert] = await platform`SELECT severity FROM alerts
+        WHERE dedup_key = ${rollover.vercelPushAlertKey(em.id)} AND resolved_at IS NULL`;
+      const status = await rollover.rolloverStatus({ ...vercelRef, now: new Date() });
+      if (
+        !failed ||
+        envWrites !== 2 ||
+        otherPosts !== 0 ||
+        alert?.severity !== "critical" ||
+        status.current?.id !== em.generations[0]!.id ||
+        status.successor?.id !== emPending.id
+      )
+        throw new Error("FD-29 failed push must retain the current pair and leave the successor pending.");
+      await expectConnects(
+        em,
+        em.generations[0]!,
+        "FD-29 failed push: predecessor opens a new mTLS connection",
+      );
+    } finally {
+      await vercel.disconnectVercel(vercelRef);
+    }
+    const emNext = await revealSuccessor(em);
     await expectConnects(em, emNext, "FD-28 two-CA bundle reload: successor N+1 connects");
 
     // -- Emergency removal during overlap: only N's generation, then drain the role ---------------
@@ -2154,10 +2253,12 @@ try {
       : [];
     const alertKeys = [
       ...ids.map((id) => `db-client-rollover:${id}`),
+      ...ids.map(rollover.vercelPushAlertKey),
       ...certificateRows.map((row) => `db-client-retire:${row.id}`),
     ];
     if (alertKeys.length) await platform`DELETE FROM alerts WHERE dedup_key IN ${platform(alertKeys)}`;
     await platform`DELETE FROM operations WHERE target_ids ? ${fd28.databaseId}`;
+    await platform`DELETE FROM operations WHERE kind = 'integration.vercel_push' AND payload->>'databaseId' = ${fd28.databaseId}`;
     if (ids.length)
       await platform`DELETE FROM client_certificate_retirements WHERE client_id IN ${platform(ids)}`;
     await platform`DELETE FROM database_clients WHERE database_id = ${fd28.databaseId}`;
@@ -2170,6 +2271,7 @@ try {
     }
     await platform`DELETE FROM secrets WHERE resource_id = ${fd28.databaseId}`;
     await platform`DELETE FROM audit_events WHERE resource_id = ${fd28.databaseId}`;
+    await platform`DELETE FROM "user" WHERE id = ${actorId}`;
     await platform`DELETE FROM managed_databases WHERE id = ${fd28.databaseId}`;
     await platform`DELETE FROM database_clusters WHERE id = ${fd28.clusterId}`;
     await platform`DELETE FROM endpoints WHERE id = ${fd28.endpointId}`;

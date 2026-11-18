@@ -11,6 +11,7 @@ import { InlineError } from "./Auth";
 import { BackupTargetsPanel } from "./BackupTargets";
 import { DnsReviewPanel } from "./DnsReview";
 import { PoolerPolicyPanel, scrollToPoolerPolicy } from "./PoolerPolicy";
+import { VercelRolloverPanel } from "./VercelRollover";
 
 export function Overview({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   return (
@@ -254,6 +255,7 @@ async function waitForDatabaseResult(operationId: string) {
 
 export function DatabasesView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   const [secret, setSecret] = useState<string>("");
+  const [vercelDatabase, setVercelDatabase] = useState<string | null>(null);
   const [schemaOutput, setSchemaOutput] = useState<Record<string, string>>({});
   const [queryOutput, setQueryOutput] = useState<
     Record<string, { role: string; fingerprint: string; rows: unknown[]; truncated: boolean; bytes: number }>
@@ -307,7 +309,7 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
       </FormCard>
       <Card>
         <CardContent className="p-0">
-          {state.databases.map((item) => (
+          {state.databases.flatMap((item) => [
             <div className="table-row grid-cols-[1fr_auto_auto_auto]" key={item.id}>
               <div>
                 <strong>{item.name}</strong>
@@ -332,6 +334,16 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
               <Badge variant={statusVariant(item.status)}>{item.status}</Badge>
               <span>{item.exposure}</span>
               <div className="flex flex-wrap gap-2">
+                {state.user.role === "owner" && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    aria-expanded={vercelDatabase === item.id}
+                    onClick={() => setVercelDatabase((current) => (current === item.id ? null : item.id))}
+                  >
+                    Vercel rollover
+                  </Button>
+                )}
                 <Button
                   size="sm"
                   variant="outline"
@@ -388,8 +400,11 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
                   Schema
                 </Button>
               </div>
-            </div>
-          ))}
+            </div>,
+            vercelDatabase === item.id && state.user.role === "owner" ? (
+              <VercelRolloverPanel key={`vercel-${item.id}`} database={item} />
+            ) : null,
+          ])}
         </CardContent>
       </Card>
       <PoolerPolicyPanel state={state} reload={reload} />

@@ -20,9 +20,8 @@
 //   exception accepted, missing and `null` refused) and unsafe methods without the route's Origin;
 // - the raw-URI bypass guard: traversal, semicolon, backslash, encoded and malformed variants under a
 //   bypass path never reach a protected upstream path (400 or the login redirect);
-// - revocation (§3.9.3): a forced reload of the identical configuration closes an open WebSocket
-//   after the route's `stream_close_delay` with no other reload, and a route left out of the lease
-//   (an overdue revocation) is withdrawn by the watchdog, closing its socket at once (fail closed).
+// - revocation (§3.9.3): the worker and the overdue lease watchdog both close sockets through
+//   HAProxy while the sibling route stays connected.
 //
 // `ARK_EDGE_GATE_ONLY=<text>` runs only the tests whose name contains <text> (setup always runs).
 import { randomBytes } from "node:crypto";
@@ -112,7 +111,8 @@ function expect(report: Report, condition: boolean, claim: string, observed: str
 }
 
 let edge!: GateEdge;
-const edgeApply = () => edge.edgeApply(fixturePlan(edge.peerIp));
+const edgeApply = (revokedRouteIds: string[] = []) =>
+  edge.edgeApply({ ...fixturePlan(edge.peerIp), revokedRouteIds });
 const overdue = {
   add: (id: string) => edge.overdue.add(id),
   delete: (id: string) => edge.overdue.delete(id),
@@ -485,29 +485,27 @@ async function revocationReloadTest(report: Report) {
     "an authenticated WebSocket is open",
     String(socket.status),
   );
-  // The revocation's forced reload: the identical configuration, /load with must-revalidate.
-  const reloadAt = Date.now();
-  const applied = await edgeApply();
-  expect(
-    report,
-    applied.applied && !applied.stoppedForStreams,
-    "the forced reload of the identical configuration is applied without stopping Caddy",
-    JSON.stringify(applied),
-  );
-  // No other reload happens from here on; the old handler closes the stream after its delay.
-  const closedAt = await waitFor(
-    "the WebSocket to close after the forced reload",
-    async () => socket.closedAt() ?? undefined,
-    streamCloseDelayMs + 10_000,
-    100,
-  );
-  const elapsed = closedAt - reloadAt;
-  expect(
-    report,
-    elapsed <= streamCloseDelayMs + 5_000,
-    `the socket closes by the reload + stream_close_delay (${streamCloseDelayMs} ms; 5m in production, so revocation + 305 s)`,
-    `${elapsed} ms after the reload`,
-  );
+  const sibling = await websocket(siblingHost, { Origin: `https://${siblingHost}`, Cookie: sessionCookie });
+  try {
+    const at = Date.now();
+    const applied = await edgeApply(["rt_k3x9"]);
+    const closedAt = socket.closedAt();
+    expect(
+      report,
+      applied.applied && closedAt !== null && closedAt - at <= 5_000,
+      "the gate drain closes the affected socket within 5 seconds",
+      closedAt === null ? "still open" : `${closedAt - at} ms`,
+    );
+    expect(
+      report,
+      (await sibling.echo("uninterrupted")) === "uninterrupted",
+      "the sibling gate socket stays open",
+      siblingHost,
+    );
+  } finally {
+    sibling.end();
+    socket.end();
+  }
   const again = await websocket(wwwHost, { Origin: `https://${wwwHost}`, Cookie: sessionCookie });
   expect(
     report,
@@ -528,6 +526,7 @@ async function watchdogFailClosedTest(report: Report) {
   );
   // The revocation's reload did not happen within 5 s (worker killed, or the apply was rejected): the
   // API's lease leaves the route out, and the edge-local watchdog withdraws it on its own.
+  const sibling = await websocket(siblingHost, { Origin: `https://${siblingHost}`, Cookie: sessionCookie });
   const at = Date.now();
   overdue.add("rt_k3x9");
   const closedAt = await waitFor(
@@ -539,16 +538,23 @@ async function watchdogFailClosedTest(report: Report) {
   expect(
     report,
     closedAt - at <= 5_000,
-    "the watchdog withdraws the route (stopping Caddy, whose old handler would keep the stream) and the socket closes",
+    "the watchdog withdraws the gate route and closes its socket",
     `${closedAt - at} ms`,
   );
+  expect(
+    report,
+    (await sibling.echo("held")) === "held",
+    "the sibling socket survives the overdue withdrawal",
+    siblingHost,
+  );
+  sibling.end();
   const withdrawn = await waitFor(
     "the route to stay withdrawn while the revocation is pending",
     async () => {
       const reply = await request(wwwHost, "/headers", { headers: { Cookie: sessionCookie } }).catch(
         () => null,
       );
-      return reply && reply.status !== 200 ? reply.status : undefined;
+      return reply?.status !== 200 ? (reply?.status ?? "connection refused") : undefined;
     },
     30_000,
     500,
@@ -610,6 +616,7 @@ try {
     name: runName,
     gateToken,
     hostnames: [wwwHost, siblingHost],
+    targetedHttp: true,
     policy: (peerIp) =>
       fixtureRoutes(peerIp).map(({ id, hostname, stableId, ip, port }) => ({
         id,
