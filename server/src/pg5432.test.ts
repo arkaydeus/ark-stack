@@ -335,7 +335,7 @@ describe("pooler-wide policy (§3.8.3)", () => {
   });
 
   test("a restricted common policy renders exactly the saved CIDRs, and a new request needs a new review", async () => {
-    // Drop the Vercel client: the remaining requests still differ (two disjoint CIDR lists).
+    // Drop the legacy Vercel client: the remaining requests still differ (two disjoint CIDR lists).
     await sql`UPDATE database_clients SET status = 'revoked' WHERE id = ${clientId}`;
     const current = (await call(owner, "GET", "/api/databases/pooler-policy")).body;
     expect(current).toMatchObject({ conflict: true, publishable: false, status: "review_required" });

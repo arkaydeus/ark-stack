@@ -1,6 +1,6 @@
 // The pooler-wide source policy on public PostgreSQL 5432 (docs/design/front-door.md §3.8.3, FD-26).
 // Classic SSLRequest carries no database name, so PgBouncer enforces one policy for every Ark
-// database; each database's CIDRs (and each Vercel client) are only a request for that policy. This
+// database; each database's CIDRs (and each legacy Vercel client) are only a request for that policy. This
 // panel states that boundary, lists the requests and their conflicts, and lets an owner review and
 // save one common policy. It never presents a database's own CIDRs as isolating it.
 

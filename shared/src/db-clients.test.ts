@@ -233,7 +233,7 @@ describe("automatic rollover (§3.10.4, FD-28)", () => {
         "base64 -i client-next.crt | tr -d '\\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive --force",
         "base64 -i client-next.key | tr -d '\\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive --force",
         "vercel deploy --prod        # or redeploy from the dashboard",
-        '# Then press "Confirm rollover" in Ark.',
+        '# Check database access, then press "Confirm rollover" in Ark.',
         "",
       ].join("\n"),
     );
@@ -245,6 +245,13 @@ describe("automatic rollover (§3.10.4, FD-28)", () => {
     });
     expect(real.env.map((item) => Buffer.from(item.value, "base64").toString())).toEqual(["CERT", "KEY"]);
     expect(real.commands).toContain("vercel deploy        #");
+    const scoped = databaseClientRolloverGuide({
+      environment: "preview",
+      vercelScope: { projectId: "prj_Fixture", target: "preview", gitBranch: "release/a'$b" },
+    });
+    expect(scoped.commands).toContain("project prj_Fixture");
+    expect(scoped.commands.match(/--git-branch='release\/a'\\''\$b'/g)).toHaveLength(2);
+    expect(scoped.commands).toContain('Redeploy Preview branch "release/a\'$b"');
     expect(earlyRolloverInput.safeParse({}).success).toBe(true);
     expect(earlyRolloverInput.safeParse({ csrPem: "nope" }).success).toBe(false);
     expect(earlyRolloverInput.safeParse({ extra: 1 }).success).toBe(false);

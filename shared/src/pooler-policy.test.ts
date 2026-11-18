@@ -18,7 +18,7 @@ const databaseB = { id: "mdb_b", name: "crm", exposure: "public", sourceCidrs: [
 const vercel = { id: "dbc_v", name: "vercel-prod", databaseId: "mdb_b", status: "active" };
 
 describe("requests and conflicts", () => {
-  test("only public databases and active Vercel clients of public databases are requests", () => {
+  test("only public databases and active legacy Vercel clients of public databases are requests", () => {
     const requests = poolerRequests({
       databases: [databaseA, { ...databaseB, exposure: "private" }],
       vercelClients: [vercel, { ...vercel, id: "dbc_r", status: "revoked", databaseId: "mdb_a" }],

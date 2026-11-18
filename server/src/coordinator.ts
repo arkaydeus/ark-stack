@@ -149,6 +149,11 @@ import {
   type IssueSuccessorResult,
 } from "./modules/db-client-rollover.ts";
 import {
+  evaluateVercelTokenAlerts,
+  pushVercelRollover,
+  queueVercelPush,
+} from "./modules/vercel-integrations.ts";
+import {
   commitDnsSnapshot,
   confirmWithdrawals,
   desiredDns,
@@ -495,8 +500,11 @@ export function isDelegatedPayload(operation: Pick<OperationRow, "kind" | "paylo
   return typeof payload.composeHash === "string" && payload.composeHash.length > 0;
 }
 
-export async function processQueued(limit = 8, kindPrefix?: string) {
-  const excludePrefix = !env.embeddedWorkers && !kindPrefix ? "service." : undefined;
+export async function processQueued(
+  limit = 8,
+  kindPrefix?: string,
+  excludePrefix = !env.embeddedWorkers && !kindPrefix ? "service." : undefined,
+) {
   for (let index = 0; index < limit; index++) {
     const { token, rows } = await claimQueued({ limit: 1, kindPrefix, excludePrefix });
     if (!rows.length) break;
@@ -534,7 +542,7 @@ export async function processQueued(limit = 8, kindPrefix?: string) {
       clearInterval(heartbeat);
     }
   }
-  await evaluateAlerts().catch(() => undefined);
+  if (kindPrefix !== "integration.") await evaluateAlerts().catch(() => undefined);
 }
 
 async function addStep(operationId: string, name: string, evidence: Record<string, unknown> = {}) {
@@ -559,6 +567,7 @@ type ClientOperationRuntime = {
   reloadRequired: typeof pgbouncerReloadRequired;
   /** FD-28: the clock every rollover decision uses; tests inject a timeline. */
   now: () => Date;
+  vercelPush: typeof pushVercelRollover;
   /** FD-28: successor issuance (db-client-rollover.issueSuccessor). */
   issueSuccessor: typeof issueSuccessor;
   /** FD-28: fence, reduced reload, role and pre-auth drain, reopen (pgbouncer.retireGeneration). */
@@ -574,6 +583,7 @@ const clientOperationRuntime: ClientOperationRuntime = {
   reloadRequired: pgbouncerReloadRequired,
   now: () => new Date(),
   issueSuccessor,
+  vercelPush: pushVercelRollover,
   retire: retireGeneration,
   watchdog: {
     fence: (database) => socketAdmin(pgbouncerSocket())(`DISABLE ${database}`).then(() => undefined),
@@ -590,6 +600,7 @@ export async function runOperation(
 ) {
   const runtime = { ...clientOperationRuntime, ...overrides };
   await assertExecutionAuthorized(operation);
+  if (kind === "integration.vercel_push") return runtime.vercelPush(operation);
   if (kind === "domain.verify") return verifyDomain(operation);
   if (kind === "certificate.issue" || kind === "certificate.renew") return issueCertificate(operation);
   if (kind === "database.provision") return provisionDatabase(operation);
@@ -645,7 +656,12 @@ export async function assertExecutionAuthorized(operation: OperationRow) {
   if (access.role === "viewer") throw new Error("Operation actor no longer has mutation permission.");
   if (access.role === "owner") return;
   if (
-    ["database.client_issue", "database.client_revoke", "database.client_rollover"].includes(operation.kind)
+    [
+      "database.client_issue",
+      "database.client_revoke",
+      "database.client_rollover",
+      "integration.vercel_push",
+    ].includes(operation.kind)
   )
     throw new Error("Only owners may execute database client operations.");
   for (const targetId of operation.targetIds) {
@@ -2381,6 +2397,9 @@ async function rolloverDatabaseClientsOp(operation: OperationRow, runtime: Clien
       now,
     );
   }
+  for (const { databaseId, clientId, successor } of deliverable) {
+    if (databaseId && successor) await queueVercelPush({ databaseId, clientId }, successor.id, now);
+  }
   for (const result of issued) await auditRolloverIssued(result, operation);
   const alertsRaised = await evaluateRolloverAlerts(now);
   const retired = payload.clientId ? [] : await runDueRetirements(runtime, { operation });
@@ -2662,6 +2681,16 @@ export async function queueDailyRollover(now: Date) {
   return row ?? null;
 }
 
+const rolloverAlertSweeps = [evaluateRolloverAlerts, evaluateVercelTokenAlerts];
+
+type RolloverAlertSweep = { nextAt: number; running?: Promise<void> };
+type RolloverTickState = {
+  alertSweeps?: RolloverAlertSweep[];
+  alertTask?: Promise<void>;
+  timers?: Map<string, ReturnType<typeof setTimeout>>;
+  tickMs?: number;
+};
+
 /**
  * One scheduler tick (database worker, or the embedded coordinator): queue the daily job,
  * re-evaluate rollover alerts hourly, run due retirements immediately, and watch deadlines.
@@ -2669,15 +2698,28 @@ export async function queueDailyRollover(now: Date) {
  */
 export async function rolloverTick(
   overrides: Partial<ClientOperationRuntime> = {},
-  state: { lastAlerts?: number; timers?: Map<string, ReturnType<typeof setTimeout>>; tickMs?: number } = {},
+  state: RolloverTickState = {},
 ) {
   const runtime = { ...clientOperationRuntime, ...overrides };
   const now = runtime.now();
   const queued = await queueDailyRollover(now);
-  if (!state.lastAlerts || now.getTime() - state.lastAlerts >= 3_600_000) {
-    await evaluateRolloverAlerts(now);
-    state.lastAlerts = now.getTime();
-  }
+  const sweeps = (state.alertSweeps ??= rolloverAlertSweeps.map<RolloverAlertSweep>(() => ({ nextAt: 0 })));
+  rolloverAlertSweeps.forEach((evaluate, index) => {
+    const sweep = sweeps[index]!;
+    if (sweep.running || now.getTime() < sweep.nextAt) return;
+    sweep.running = evaluate(now)
+      .then(() => {
+        sweep.nextAt = runtime.now().getTime() + 3_600_000;
+      })
+      .catch(() => {
+        sweep.nextAt = runtime.now().getTime() + 5_000;
+        console.error("Rollover alert evaluation failed");
+      })
+      .finally(() => {
+        sweep.running = undefined;
+      });
+  });
+  state.alertTask = Promise.all(sweeps.map((sweep) => sweep.running)).then(() => {});
   const timers = state.timers;
   if (timers) {
     for (const item of await dueRetirements({ now, lookaheadMs: (state.tickMs ?? 1_000) * 2 })) {
@@ -2703,7 +2745,7 @@ export function startRolloverScheduler(
   tickMs = Number(process.env.ARK_ROLLOVER_TICK_MS ?? 1_000),
   overrides: Partial<ClientOperationRuntime> = {},
 ) {
-  const state = { timers: new Map<string, ReturnType<typeof setTimeout>>(), tickMs, lastAlerts: 0 };
+  const state = { timers: new Map<string, ReturnType<typeof setTimeout>>(), tickMs };
   let running = false;
   const tick = () => {
     if (running) return;
@@ -3208,16 +3250,30 @@ export function revealSecret(row: typeof secrets.$inferSelect) {
   return decryptSecret(env.rootKey, row);
 }
 
-let tickInFlight: Promise<void> | null = null;
+function reportCoordinatorError(error: unknown) {
+  console.error(error instanceof Error ? error.message : error);
+}
 
 export function startCoordinator() {
+  let coreInFlight = false;
+  let integrationInFlight = false;
   const tick = () => {
-    if (tickInFlight) return;
-    tickInFlight = processQueued()
-      .catch((error) => console.error(error instanceof Error ? error.message : error))
-      .finally(() => {
-        tickInFlight = null;
-      });
+    if (!coreInFlight) {
+      coreInFlight = true;
+      void processQueued(8, undefined, "integration.")
+        .catch(reportCoordinatorError)
+        .finally(() => {
+          coreInFlight = false;
+        });
+    }
+    if (!integrationInFlight) {
+      integrationInFlight = true;
+      void processQueued(1, "integration.")
+        .catch(reportCoordinatorError)
+        .finally(() => {
+          integrationInFlight = false;
+        });
+    }
   };
   tick();
   // Embedded workers include the database worker's duties, so they run the rollover scheduler.

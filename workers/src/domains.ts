@@ -38,6 +38,17 @@ export function dnsControlHandler(token: string) {
   };
 }
 
+export function runDomainJobs(
+  executor: Parameters<typeof runWorker>[2] = executeClaimedJob,
+  options: { signal?: AbortSignal; pollMs?: number } = {},
+) {
+  // Deployment polling can take 30 minutes. Keep the edge and DNS slot available throughout.
+  return Promise.all([
+    runWorker("domains", ["domain.", "dns.", "certificate.", "edge.", "admin."], executor, options),
+    runWorker("domains", ["integration."], executor, options),
+  ]);
+}
+
 if (import.meta.main) {
   const token = process.env.ARK_WORKER_TOKEN;
   if (!token) throw new Error("ARK_WORKER_TOKEN is required for the domain worker control endpoint.");
@@ -53,7 +64,7 @@ if (import.meta.main) {
   const observeSchedule = scheduleEdgeObserve();
   const dnsSchedule = scheduleDnsMaintenance();
   try {
-    await runWorker("domains", ["domain.", "dns.", "certificate.", "edge.", "admin."], executeClaimedJob);
+    await runDomainJobs();
   } finally {
     if (observeSchedule) clearInterval(observeSchedule);
     clearInterval(dnsSchedule);
