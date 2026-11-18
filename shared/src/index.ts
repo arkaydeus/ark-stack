@@ -15,6 +15,7 @@ export * from "./edge-http.ts";
 export * from "./errors.ts";
 export * from "./front-raw-nft.ts";
 export * from "./front-routes.ts";
+export * from "./gate.ts";
 export * from "./gate-login.ts";
 export * from "./hash.ts";
 export * from "./hostnames.ts";

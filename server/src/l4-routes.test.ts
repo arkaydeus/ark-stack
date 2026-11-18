@@ -256,6 +256,19 @@ describe("listeners (§3.8.2)", () => {
     expect(route).toMatchObject({ kind: "tls", listenPort: 8883, l4: { tlsMode: "passthrough" } });
   });
 
+  test("L4 routes reject HTTP gate settings on create and update", async () => {
+    for (const extra of [{ bypassPaths: ["/hooks/*"] }, { allowedOrigins: ["https://app.example.com"] }]) {
+      await refused(tlsRequest("gate-settings", extra), /cannot be set/);
+    }
+    const route = await create(tlsRequest("gate-update"));
+    expect(route.accessMode).toBeNull();
+    for (const update of [{ bypassPaths: [] }, { allowedOrigins: [] }]) {
+      const response = await call(owner, "PATCH", `/api/front/routes/${route.id}`, update);
+      expect(response.status).toBe(422);
+      expect(response.body.error).toMatch(/cannot be set/);
+    }
+  });
+
   test("the listeners endpoint names the enabled ports and the protocol guidance", async () => {
     const response = await call(operator, "GET", "/api/front/listeners");
     expect(response.status).toBe(200);

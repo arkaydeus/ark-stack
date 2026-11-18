@@ -64,6 +64,9 @@ import {
   SHARED_SNI_PORTS,
   TCP_ROUTE_PORTS,
   isGateLoginPath,
+  GATE_EDGE_API_PATHS,
+  checkLoginNext,
+  routeAccessInput,
   buildDomainPlan,
   nextBackupStatus,
   redactLogLine,
@@ -134,8 +137,21 @@ import {
   prepareRouteEnable,
   prepareRouteUpdate,
 } from "./modules/front-routes.ts";
-import { EDGE_OBSERVE_TARGET, edgePolicy, tailnetOverview } from "./modules/edge-observe.ts";
+import { EDGE_OBSERVE_TARGET, tailnetOverview } from "./modules/edge-observe.ts";
 import { enabledSniPorts } from "./modules/l4-routes.ts";
+import {
+  RouteAccessError,
+  gateAuthorize,
+  gateBypassCheck,
+  gateCallback,
+  gateCheck,
+  gateLogoutRoute,
+  listRouteAccess,
+  replaceRouteAccess,
+  type GateResponse,
+} from "./modules/gate.ts";
+import { edgeLeaseDocument } from "./modules/gate-revocations.ts";
+import { gateMessagePage, gateNonce, gatePageHeaders, loginPage } from "./gate-pages.ts";
 import { raiseAlert } from "./modules/alerts.ts";
 import {
   backupHealth,
@@ -239,6 +255,7 @@ app.onError((error, c) => {
   if (error instanceof DatabaseClientError) return c.json({ error: error.message }, error.status);
   if (error instanceof FrontRouteError) return c.json({ error: error.message }, error.status);
   if (error instanceof GateSettingsError) return c.json({ error: error.message }, error.status);
+  if (error instanceof RouteAccessError) return c.json({ error: error.message }, error.status);
   // CSR and CA policy refusals (CsrError included) describe the submitted input; no key material.
   if (error instanceof PkiPolicyError) return c.json({ error: error.message }, 422);
   console.error(error instanceof Error ? error.message : error);
@@ -284,11 +301,13 @@ function isApiError(error: unknown): error is Error & { status: number } {
 }
 
 // Paths served for any Host: they carry their own credentials (worker, watchdog, metrics bearer
-// tokens) or none at all (health, ACME), never a browser session, and Docker peers reach them by
-// service name (`api:3000`).
+// tokens, or the edge token on the gate's edge handlers, which arrive with the route's public Host)
+// or none at all (health, ACME), never an admin session, and Docker peers reach them by service name
+// (`api:3000`).
 function hostIndependent(path: string) {
   return (
     path.startsWith("/api/internal/") ||
+    (GATE_EDGE_API_PATHS as readonly string[]).includes(path) ||
     path === "/api/health" ||
     path === "/api/metrics/prometheus" ||
     path.startsWith("/.well-known/acme-challenge/")
@@ -367,6 +386,97 @@ function authRequest(c: Context<AppEnv>) {
   }
   return new Request(c.req.raw, { headers });
 }
+
+// ---- Login gate: edge handlers (front door §3.9, FD-11) ----------------------------------------------
+// Only the edge calls these, with `X-Ark-Edge-Token` (and, when `ARK_EDGE_PEER_ADDRESSES` is set, from
+// one of those exact peers). They are on no public or tailnet path allowlist: the login origin and
+// both gateways answer 404, and route hosts reach only the exact callback and logout rewrites. The
+// token authenticates the edge as a caller of these four handlers and grants no other authority.
+
+function edgeGateCaller(c: Context<AppEnv>) {
+  if (!env.edgeGateToken) return false;
+  if (!secureEqual(c.req.header(EDGE_TOKEN_HEADER) ?? "", env.edgeGateToken)) return false;
+  const peer = transportPeer(c.env, c.req.raw);
+  return env.edgePeerAddresses.length === 0 || Boolean(peer && env.edgePeerAddresses.includes(peer));
+}
+
+function sendGate(result: GateResponse) {
+  const headers = new Headers();
+  for (const [name, value] of result.headers) headers.append(name, value);
+  return new Response(result.body ?? null, { status: result.status, headers });
+}
+
+const edgeOnly = (c: Context<AppEnv>) =>
+  c.json({ error: "This endpoint is for the edge only." }, 401, {
+    "WWW-Authenticate": "Ark-Edge",
+    "Cache-Control": "no-store",
+  });
+
+/** The client address Caddy wrote from the PROXY v2 header (one address), for gate session records. */
+function edgeClientIp(c: Context<AppEnv>) {
+  const forwarded = (c.req.header("x-forwarded-for") ?? "").split(",").map((value) => value.trim());
+  return forwarded.length === 1 && forwarded[0] ? forwarded[0].slice(0, 64) : null;
+}
+
+app.get("/api/gate/check", async (c) => {
+  if (!edgeGateCaller(c)) return edgeOnly(c);
+  return sendGate(
+    await gateCheck({
+      routeId: c.req.query("route") ?? null,
+      host: requestHost(c.req.raw),
+      cookie: c.req.header("cookie") ?? null,
+      method: c.req.header("x-forwarded-method") ?? null,
+      uri: c.req.header("x-forwarded-uri") ?? null,
+      accept: c.req.header("accept") ?? null,
+      origin: c.req.header("origin") ?? null,
+      upgrade: c.req.header("x-ark-upgrade") || c.req.header("upgrade") || null,
+    }),
+  );
+});
+
+app.get("/api/gate/bypass-check", async (c) => {
+  if (!edgeGateCaller(c)) return edgeOnly(c);
+  return sendGate(
+    await gateBypassCheck({
+      routeId: c.req.query("route") ?? null,
+      host: requestHost(c.req.raw),
+      originalUri: c.req.header("x-ark-original-uri") ?? null,
+    }),
+  );
+});
+
+app.get("/api/gate/callback", async (c) => {
+  if (!edgeGateCaller(c)) return edgeOnly(c);
+  const url = new URL(c.req.url);
+  return sendGate(
+    await gateCallback({
+      host: requestHost(c.req.raw),
+      routeHeader: c.req.header("x-ark-route") ?? null,
+      code: url.searchParams.get("code"),
+      state: url.searchParams.get("state"),
+      cookie: c.req.header("cookie") ?? null,
+      ipAddress: edgeClientIp(c),
+      userAgent: c.req.header("user-agent") ?? null,
+    }),
+  );
+});
+
+app.post("/api/gate/logout-route", async (c) => {
+  if (!edgeGateCaller(c)) return edgeOnly(c);
+  return sendGate(
+    await gateLogoutRoute({
+      host: requestHost(c.req.raw),
+      routeHeader: c.req.header("x-ark-route") ?? null,
+      origin: c.req.header("origin") ?? null,
+      cookie: c.req.header("cookie") ?? null,
+    }),
+  );
+});
+
+// Any other method on the gate's edge handlers (the edge answers 405 before forwarding as well).
+app.all("/api/gate/:handler{(check|bypass-check|callback|logout-route)}", (c) =>
+  edgeGateCaller(c) ? c.json({ error: "Method not allowed." }, 405) : edgeOnly(c),
+);
 
 app.get("/api/health", async (c) => {
   await sql`SELECT 1`;
@@ -519,7 +629,8 @@ app.use("/api/internal/*", async (c, next) => {
 // second, independently of the operation workers.
 app.get("/api/internal/edge/lease", async (c) => {
   c.header("cache-control", "no-store");
-  return c.json(await edgePolicy());
+  // The lease policy minus routes whose gate revocation is overdue (FD-11, §3.9.3).
+  return c.json(await edgeLeaseDocument());
 });
 
 app.post("/api/internal/edge/watchdog-event", async (c) => {
@@ -3421,6 +3532,40 @@ app.delete("/api/front/routes/:id", async (c) => {
   return c.json({ id: routeId, ...result });
 });
 
+// Route access lists (front door §3.3, §3.9.6, FD-11): individual users only (R11). Reading is
+// owner-only like the rest of route management; replacing needs MFA and a `role.grant` step-up bound
+// to the route and the exact list. Removals revoke and drain atomically (§3.9.3).
+app.get("/api/front/routes/:id/access", async (c) => {
+  requireOwner(c.get("access"));
+  const routeId = c.req.param("id");
+  const [route] = await listFrontRoutes(routeId);
+  if (!route) throw new HTTPException(404, { message: "Route not found." });
+  return c.json({ routeId, users: await listRouteAccess(routeId) });
+});
+
+app.put("/api/front/routes/:id/access", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const routeId = c.req.param("id");
+  const request = (await c.req.json()) as Record<string, unknown>;
+  const input = routeAccessInput.parse(request);
+  const result = await replaceRouteAccess(
+    routeId,
+    input.userIds,
+    { userId: access.userId, role: access.role },
+    (tx) =>
+      requirePrivileged(
+        access,
+        c.get("session"),
+        "role.grant",
+        privilegedRequestHash("role.grant", { routeId, ...request }),
+        tx,
+      ),
+  );
+  return c.json({ routeId, ...result, users: await listRouteAccess(routeId) });
+});
+
 app.get("/api/metrics", async (c) => {
   const [ops, backupRows, certs] = await Promise.all([
     db.select().from(operations),
@@ -3445,8 +3590,78 @@ app.get("/api/me", async (c) => {
   return c.json({ user: row, access: c.get("access") });
 });
 
-// Gate pages on the login origin (`/gate/login`, `/gate/authorize`, `/gate/logout`) arrive with FD-11.
-// Until then the namespace answers 404 on every host and never falls through to the admin SPA.
+// ---- Login gate pages (front door §3.9.2, FD-11) --------------------------------------------------
+// Served on the login origin only; on every other host the namespace is 404 and never falls through
+// to the admin SPA.
+
+/** The login-origin session of this request, when it was minted on the login origin. */
+async function gateLoginSession(c: Context<AppEnv>) {
+  const value = await auth.api.getSession({ headers: authHeaders(c) });
+  if (!value || (value.session as { origin?: string }).origin !== "gate") return null;
+  const [row] = await db.select().from(user).where(eq(user.id, value.user.id));
+  if (!row) return null;
+  return { value, user: row };
+}
+
+function gateHtml(c: Context<AppEnv>, status: number, html: (nonce: string) => string) {
+  const nonce = gateNonce();
+  return c.body(html(nonce), status as 200, gatePageHeaders(nonce));
+}
+
+app.get("/gate/login", async (c) => {
+  if (c.get("requestOrigin")?.origin !== "gate") return c.json({ error: "Not found." }, 404);
+  const next = checkLoginNext(c.req.query("next"));
+  const current = await gateLoginSession(c);
+  if (current && next) return c.redirect(next, 303);
+  return gateHtml(c, 200, (nonce) => loginPage({ nonce, next, signedInAs: current?.user.email ?? null }));
+});
+
+app.get("/gate/authorize", async (c) => {
+  if (c.get("requestOrigin")?.origin !== "gate") return c.json({ error: "Not found." }, 404);
+  const url = new URL(c.req.url);
+  const current = await gateLoginSession(c);
+  if (!current) {
+    // Relative only: the login page follows `next` back here after sign-in.
+    const next = `/gate/authorize${url.search}`;
+    return c.redirect(`/gate/login?next=${encodeURIComponent(next)}`, 303);
+  }
+  const outcome = await gateAuthorize({
+    routeId: url.searchParams.get("route"),
+    state: url.searchParams.get("state"),
+    rd: url.searchParams.get("rd"),
+    session: {
+      id: current.value.session.id,
+      userId: current.user.id,
+      createdAt: new Date(current.value.session.createdAt),
+    },
+    user: { twoFactorEnabled: current.user.twoFactorEnabled, mfaEnrolledAt: current.user.mfaEnrolledAt },
+  });
+  if (outcome.kind === "redirect") {
+    return new Response(null, {
+      status: 303,
+      headers: { Location: outcome.location, "Referrer-Policy": "no-referrer", "Cache-Control": "no-store" },
+    });
+  }
+  return gateHtml(c, outcome.status, (nonce) =>
+    gateMessagePage({ nonce, title: "Access denied", message: outcome.message, signOut: true }),
+  );
+});
+
+// Global logout on the login origin: ends the login session, and with it (ON DELETE CASCADE) every
+// route session; the revocation triggers queue the forced reload for each affected route (§3.9.3).
+app.post("/gate/logout", async (c) => {
+  const requestOrigin = c.get("requestOrigin");
+  if (requestOrigin?.origin !== "gate") return c.json({ error: "Not found." }, 404);
+  if (c.req.header("origin") !== `https://${requestOrigin.host}`)
+    return c.json({ error: "The request origin is not trusted." }, 403);
+  const headers = new Headers({ Location: "/gate/login", "Cache-Control": "no-store" });
+  if (await gateLoginSession(c)) {
+    const signedOut = await auth.api.signOut({ headers: authHeaders(c), asResponse: true });
+    for (const cookie of signedOut.headers.getSetCookie()) headers.append("Set-Cookie", cookie);
+  }
+  return new Response(null, { status: 303, headers });
+});
+
 app.all("/gate/*", (c) => c.json({ error: "Not found." }, 404));
 
 const webDist = new URL("../../web/dist", import.meta.url).pathname;

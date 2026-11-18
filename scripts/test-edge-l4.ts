@@ -24,7 +24,7 @@
 // no Server/Via on success or 502; forged X-Forwarded-For and X-Ark-* never reach the upstream;
 // Location (the §3.5 fixture table, compared with the reference evaluator) and Set-Cookie Domain
 // rewriting; the static 502 for an unreachable upstream and for an unsupported Location, naming no
-// tailnet host; the apex redirect and the :80 list; an enabled SSO route absent from both configs;
+// tailnet host; the apex redirect and the :80 list; an SSO route with an invalid bypass absent from both configs;
 // and a WebSocket idle for more than 10 minutes that then survives one edge.apply.
 //
 // FD-10 (§3.5, §3.9.1) login origin, rendered by the production planner and renderer and reached
@@ -86,7 +86,7 @@ const tailnetHost = "tailnet.example.com";
 const wsHost = "ws.example.com";
 const mqttHost = "mqtt.example.com";
 // FD-09 routes (§3.5 example): www proxies to the peer, the apex redirects to www, broken dials a
-// closed port, and sso is enabled with access_mode=sso, which this release must never serve.
+// closed port, and sso is an enabled access_mode=sso route whose bypass covers the whole site (refused, FD-11).
 const wwwHost = "www.example.com";
 const apexHost = "example.com";
 const brokenHost = "broken.example.com";
@@ -139,7 +139,7 @@ const fd09Routes: EdgeHttpRoute[] = [
   wwwRoute,
   { ...wwwRoute, id: "rt_apex1", hostname: apexHost, redirectTo: wwwHost },
   { ...wwwRoute, id: "rt_brk1", hostname: brokenHost, port: 3999 },
-  { ...wwwRoute, id: "rt_sso1", hostname: ssoHost, access: "sso" },
+  { ...wwwRoute, id: "rt_sso1", hostname: ssoHost, access: "sso", bypassPaths: ["/*"] },
 ];
 /** Lease entries for every FD-09 route, SSO included: the lease alone never makes a route servable. */
 const fd09Policy: EdgePolicyRoute[] = fd09Routes
@@ -1781,7 +1781,7 @@ async function fd09AbsentTest(report: Report) {
     report,
     plan.omitted.map((route) => route.id).join(",") === "rt_sso1" &&
       !plan.httpRoutes.some((route) => route.access !== "public"),
-    "the planner omits the enabled access_mode=sso route before FD-11 (lease and certificate notwithstanding)",
+    "the planner omits the enabled access_mode=sso route with a whole-site bypass (lease and certificate notwithstanding)",
     plan.omitted.map((route) => `${route.id}: ${route.reason}`).join("; "),
   );
   const active = (await caddyAdmin("/config/")).body;

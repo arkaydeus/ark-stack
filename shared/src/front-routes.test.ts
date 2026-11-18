@@ -3,11 +3,14 @@ import { join } from "node:path";
 
 import { aaaaAllowed, routeAddressRecords } from "./dns-plan.ts";
 import { renderCaddyfile } from "./edge.ts";
+import { ValidationError } from "./errors.ts";
 import {
   ROUTE_RECORD_PURPOSE,
   UnsupportedRouteError,
+  assertFieldsForKind,
   assertSupportedAccessMode,
   assertSupportedRouteKind,
+  checkGateRouteSettings,
   frontRouteCreateInput,
   frontRouteUpdateInput,
   looseningChanges,
@@ -90,12 +93,64 @@ describe("route request policy", () => {
     }
   });
 
-  test("sso and the omitted (schema default sso) mode are refused until FD-11", () => {
+  test("public, sso and the omitted (schema default sso) mode are served (FD-11); anything else is refused", () => {
     expect(() => assertSupportedAccessMode("public", "create")).not.toThrow();
-    expect(() => assertSupportedAccessMode(undefined, "create")).toThrow(/accessMode is required.*"sso"/);
-    expect(() => assertSupportedAccessMode("sso", "create")).toThrow(/not supported yet.*FD-11/);
-    expect(() => assertSupportedAccessMode("sso", "enable")).toThrow(/cannot be enabled/);
-    expect(() => assertSupportedAccessMode("sso", "update")).toThrow(UnsupportedRouteError);
+    expect(() => assertSupportedAccessMode(undefined, "create")).not.toThrow();
+    expect(() => assertSupportedAccessMode("sso", "create")).not.toThrow();
+    expect(() => assertSupportedAccessMode("sso", "enable")).not.toThrow();
+    expect(() => assertSupportedAccessMode("open", "enable")).toThrow(/cannot be enabled/);
+    expect(() => assertSupportedAccessMode("open", "update")).toThrow(UnsupportedRouteError);
+  });
+
+  test("SSO settings: bypass paths and Origin exceptions are validated (§3.9.4, §3.9.5)", () => {
+    expect(checkGateRouteSettings({})).toEqual({ bypassPaths: undefined, allowedOrigins: undefined });
+    expect(
+      checkGateRouteSettings({
+        bypassPaths: ["/webhooks/*"],
+        allowedOrigins: ["HTTPS://App.Example.com:443"],
+      }),
+    ).toEqual({ bypassPaths: ["/webhooks/*"], allowedOrigins: ["https://app.example.com"] });
+    for (const path of ["/", "/*", "/.ark/gate/x", "/.ark*", "/.*", "/a/../b", "webhooks"])
+      expect(() => checkGateRouteSettings({ bypassPaths: [path] })).toThrow(ValidationError);
+    for (const origin of ["http://app.example.com", "https://app.example.com/path", "null", "*"])
+      expect(() => checkGateRouteSettings({ allowedOrigins: [origin] })).toThrow(ValidationError);
+  });
+
+  test("gate settings are HTTP-only across route create and update inputs", () => {
+    const gate = { bypassPaths: ["/hooks/*"], allowedOrigins: ["https://app.example.com"] };
+    const create = frontRouteCreateInput.parse({
+      hostname: "a.example.com",
+      target: "home",
+      targetPort: 3000,
+      ...gate,
+    });
+    const update = frontRouteUpdateInput.parse(gate);
+    for (const input of [create, update]) {
+      expect(() => assertFieldsForKind("http", input)).not.toThrow();
+      for (const kind of ["tls", "tcp"] as const) {
+        expect(() => assertFieldsForKind(kind, input)).toThrow(/bypassPaths, allowedOrigins cannot be set/);
+      }
+    }
+  });
+
+  test("new bypass paths and Origin exceptions loosen; removing them tightens", () => {
+    const current = {
+      targetInput: "home",
+      targetPort: 3000,
+      accessMode: "sso",
+      redirectTo: null,
+      status: "ready",
+      bypassPaths: ["/hooks/*"],
+      allowedOrigins: [],
+    };
+    expect(looseningChanges(current, { bypassPaths: ["/hooks/*", "/api/public/*"] })).toEqual([
+      "bypassPaths",
+    ]);
+    expect(looseningChanges(current, { bypassPaths: [] })).toEqual([]);
+    expect(looseningChanges(current, { allowedOrigins: ["https://a.example.com"] })).toEqual([
+      "allowedOrigins",
+    ]);
+    expect(looseningChanges({ ...current, accessMode: "public" }, { accessMode: "sso" })).toEqual([]);
   });
 
   test("hostnames: normalized, and tailnet names refused", () => {
@@ -125,7 +180,12 @@ describe("route request policy", () => {
 
   test("schemas are strict and require an explicit change", () => {
     expect(() =>
-      frontRouteCreateInput.parse({ hostname: "a.example.com", target: "x", targetPort: 1, bypassPaths: [] }),
+      frontRouteCreateInput.parse({
+        hostname: "a.example.com",
+        target: "x",
+        targetPort: 1,
+        unknownOption: true,
+      }),
     ).toThrow();
     expect(() =>
       frontRouteCreateInput.parse({ hostname: "a.example.com", target: "x", targetPort: 0 }),

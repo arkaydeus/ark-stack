@@ -3,7 +3,8 @@
 //
 // - authorisation: owners only (MFA, step-up) for create/update/delete/enable/disable; every role lists;
 // - DNS: a verified domain is required; apex and www get A records, AAAA only when allowed;
-// - the access-mode guard until FD-11, and `exposure.public` grants that validation never consumes;
+// - access modes (sso by default since FD-11, with validated bypass paths and Origin exceptions),
+//   and `exposure.public` grants that validation never consumes;
 // - the state machine draft -> awaiting_acl -> awaiting_dns -> issuing_certificate -> ready, with a
 //   stub DNS resolver proving certificates are requested only once the A record resolves to
 //   `public_ipv4`, and a fake lego issuing a real certificate; enable is refused before ready;
@@ -451,48 +452,65 @@ describe("domains and DNS records", () => {
   });
 });
 
-describe("access mode guard until FD-11", () => {
-  test("creating with sso, or without an access mode (schema default sso), is refused", async () => {
-    for (const request of [
-      routeRequest(`sso.${zone}`, { accessMode: "sso" }),
-      (({ accessMode: _mode, ...rest }) => rest)(routeRequest(`default.${zone}`)),
+describe("access modes (FD-11)", () => {
+  test("creating without an access mode gets the schema default, sso; bypass and origins are validated", async () => {
+    const sso = await createRoute(`sso.${zone}`, { accessMode: "sso", bypassPaths: ["/webhooks/*"] });
+    expect(sso.route.accessMode).toBe("sso");
+    expect(sso.route.bypassPaths).toEqual(["/webhooks/*"]);
+    const fresh = (({ accessMode: _mode, ...rest }) => rest)(routeRequest(`implicit.${zone}`));
+    await stepUp(actors.owner, "exposure.public", fresh);
+    const implicit = await call(actors.owner, "POST", "/api/front/routes", fresh);
+    expect(implicit.status).toBe(201);
+    expect(implicit.body.route.accessMode).toBe("sso");
+    for (const extra of [
+      { accessMode: "sso", bypassPaths: ["/*"] },
+      { accessMode: "sso", bypassPaths: ["/.ark/gate/callback"] },
+      { accessMode: "sso", allowedOrigins: ["http://a.example.com"] },
+      { accessMode: "public", bypassPaths: ["/webhooks/*"] },
     ]) {
+      const request = routeRequest(`refused.${zone}`, extra);
       await stepUp(actors.owner, "exposure.public", request);
       const before = await openGrants(actors.owner);
-      const response = await call(actors.owner, "POST", "/api/front/routes", request);
-      expect(response.status).toBe(422);
-      expect(response.body.error).toMatch(/not supported yet.*FD-11/);
+      const refused = await call(actors.owner, "POST", "/api/front/routes", request);
+      expect(refused.status).toBe(422);
       expect(await openGrants(actors.owner)).toBe(before);
     }
-    expect(
-      await sql`SELECT 1 FROM endpoints WHERE hostname IN (${`sso.${zone}`}, ${`default.${zone}`})`,
-    ).toHaveLength(0);
+    expect(await sql`SELECT 1 FROM endpoints WHERE hostname = ${`refused.${zone}`}`).toHaveLength(0);
   });
 
-  test("an sso route cannot be enabled even when ready, and a public route cannot be switched into sso", async () => {
-    const { route } = await createRoute(`legacy-sso.${zone}`);
-    // An sso row can only exist through the schema default (for example, a pre-FD-08 row).
-    await sql`UPDATE front_routes SET access_mode = 'sso', status = 'ready' WHERE id = ${route.id}`;
+  test("an sso route can be enabled; public -> sso is a tightening that records a gate revocation", async () => {
+    const { route } = await createRoute(`legacy-sso.${zone}`, { accessMode: "sso" });
+    await sql`UPDATE front_routes SET status = 'ready' WHERE id = ${route.id}`;
     await stepUp(actors.owner, "exposure.public", { routeId: route.id });
-    const before = await openGrants(actors.owner);
     const enable = await call(actors.owner, "POST", `/api/front/routes/${route.id}/enable`);
-    expect(enable.status).toBe(422);
-    expect(enable.body.error).toMatch(/"sso" is not supported yet.*cannot be enabled/);
-    expect(await openGrants(actors.owner)).toBe(before);
-    expect((await routeRow(route.id))?.enabled).toBe(false);
+    expect(enable.status).toBe(200);
+    expect((await routeRow(route.id))?.enabled).toBe(true);
 
     const publicRoute = await createRoute(`to-sso.${zone}`);
+    await sql`UPDATE front_routes SET status = 'ready', enabled = true WHERE id = ${publicRoute.route.id}`;
     const update = await call(actors.owner, "PATCH", `/api/front/routes/${publicRoute.route.id}`, {
       accessMode: "sso",
     });
-    expect(update.status).toBe(422);
-    expect(update.body.error).toMatch(/not supported yet/);
-    await sql`UPDATE front_routes SET status = 'ready', enabled = true WHERE id = ${publicRoute.route.id}`;
-    const enabledUpdate = await call(actors.owner, "PATCH", `/api/front/routes/${publicRoute.route.id}`, {
-      accessMode: "sso",
+    expect(update.status).toBe(200);
+    expect(update.body.loosening).toEqual([]);
+    expect((await routeRow(publicRoute.route.id))?.access_mode).toBe("sso");
+    const revocations =
+      await sql`SELECT reason FROM gate_revocations WHERE route_id = ${publicRoute.route.id} AND applied_at IS NULL`;
+    expect(revocations.map((row) => row.reason)).toEqual(["route_gate_tightened"]);
+    // Adding a bypass path loosens and needs a grant bound to the request.
+    const loosen = { bypassPaths: ["/hooks/*"] };
+    const refused = await call(actors.owner, "PATCH", `/api/front/routes/${publicRoute.route.id}`, loosen);
+    expect(refused.status).toBe(403);
+    await stepUp(actors.owner, "exposure.public", { routeId: publicRoute.route.id, ...loosen });
+    const loosened = await call(actors.owner, "PATCH", `/api/front/routes/${publicRoute.route.id}`, loosen);
+    expect(loosened.status).toBe(200);
+    expect(loosened.body.route.bypassPaths).toEqual(["/hooks/*"]);
+    // Back to public loosens too (and may not keep SSO-only settings).
+    await stepUp(actors.owner, "exposure.public", { routeId: publicRoute.route.id, accessMode: "public" });
+    const toPublic = await call(actors.owner, "PATCH", `/api/front/routes/${publicRoute.route.id}`, {
+      accessMode: "public",
     });
-    expect(enabledUpdate.status).toBe(422);
-    expect((await routeRow(publicRoute.route.id))?.access_mode).toBe("public");
+    expect(toPublic.status).toBe(422);
   });
 });
 

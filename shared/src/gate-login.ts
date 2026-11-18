@@ -28,7 +28,7 @@ export const ADMIN_CLIENT_IP_AUTH_PATHS = [
   "/api/auth/two-factor/generate-backup-codes",
 ] as const;
 
-/** Gate pages (FD-11: `/gate/login`, `/gate/authorize`, `/gate/logout`), forwarded without the token. */
+/** Gate pages (`/gate/login`, `/gate/authorize`, `/gate/logout`, FD-11), forwarded without the token. */
 export const GATE_LOGIN_PAGES_PREFIX = "/gate/";
 
 /**

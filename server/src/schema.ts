@@ -715,7 +715,36 @@ export const gateSessions = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
   },
-  (table) => [index("gate_sessions_user_idx").on(table.userId)],
+  (table) => [
+    index("gate_sessions_user_idx").on(table.userId),
+    // 0026 (FD-11)
+    index("gate_sessions_auth_session_idx").on(table.authSessionId),
+    index("gate_sessions_route_user_idx").on(table.routeId, table.userId),
+  ],
+);
+
+// 0026 (FD-11): the durable gate revocation journal (docs/design/front-door.md §3.9.3). Rows are
+// written by the `ark_gate_revoke` SQL function (gate session triggers, access removal, mode change)
+// in the revoking transaction, together with a queued forced-reload `edge.drain`.
+export const gateRevocations = pgTable(
+  "gate_revocations",
+  {
+    id: text("id").primaryKey(),
+    routeId: text("route_id").notNull(),
+    reason: text("reason").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    appliedAt: timestamp("applied_at", { withTimezone: true }),
+    appliedBy: text("applied_by"),
+    alertedAt: timestamp("alerted_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("gate_revocations_pending_route_idx")
+      .on(table.routeId)
+      .where(sql`applied_at IS NULL`),
+    index("gate_revocations_pending_idx")
+      .on(table.createdAt)
+      .where(sql`applied_at IS NULL`),
+  ],
 );
 
 export const clientCertificates = pgTable(
@@ -1060,6 +1089,7 @@ export const schema = {
   frontRouteAccess,
   gateHandoffs,
   gateSessions,
+  gateRevocations,
   clientCertificates,
   databaseClients,
   clientIssueLimits,

@@ -36,6 +36,12 @@ export type EdgeLeaseDocument = {
   lease: { generation: string; completedAt: string; validUntil: string; valid: boolean } | null;
   /** Allowed routes; always empty when the lease is missing or expired. */
   routes: EdgePolicyRoute[];
+  /**
+   * Gate revocations (FD-11, §3.9.3) still waiting for their forced reload. A route whose
+   * revocation is older than 5 s is already left out of `routes` (fail closed); this list is
+   * informational for operators and tests.
+   */
+  revocations?: Array<{ id: string; routeId: string; createdAt: string; overdue: boolean }>;
 };
 
 /** Result of one enforcement pass on one proxy. */
@@ -198,6 +204,53 @@ export function withdrawCaddyBackends(config: unknown, allowed: ReadonlySet<stri
     delayed: [...delayed].toSorted(),
     activeRoutes: [...activeRoutes].toSorted(),
   };
+}
+
+/** A handler's `stream_close_delay` in milliseconds (Caddy JSON stores nanoseconds or a duration). */
+function streamCloseDelayMs(handler: { [key: string]: Json }) {
+  const delay = handler.stream_close_delay;
+  if (typeof delay === "number") return delay / 1e6;
+  if (typeof delay !== "string" || !delay.trim()) return 0;
+  let total = 0;
+  const units: Record<string, number> = { ns: 1e-6, us: 1e-3, µs: 1e-3, ms: 1, s: 1e3, m: 6e4, h: 3.6e6 };
+  for (const match of delay.trim().matchAll(/([0-9.]+)(ns|us|µs|ms|s|m|h)/g))
+    total += Number(match[1]) * (units[match[2]!] ?? 0);
+  return total;
+}
+
+/**
+ * Tailnet backends of the given routes whose active handler keeps upgraded streams open longer than
+ * `maxMs` after a reload. A gate revocation (FD-11, §3.9.3) on such a route (for example a public
+ * route with a long delay that was just switched to SSO) cannot rely on the reload alone: the caller
+ * stops Caddy after it, as `edge.apply` does for removed routes.
+ */
+export function caddyLongLivedStreams(config: unknown, routeIds: ReadonlySet<string>, maxMs: number) {
+  const found = new Set<string>();
+  const visit = (value: Json, identity: string) => {
+    if (Array.isArray(value)) {
+      let current = identity;
+      for (const child of value) {
+        if (child && typeof child === "object" && !Array.isArray(child) && child.handler === "vars")
+          current = typeof child.ark_tailnet_route === "string" ? child.ark_tailnet_route : "";
+        visit(child, current);
+      }
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (value.handler === "reverse_proxy" && identity) {
+      let id = "";
+      try {
+        id = String((JSON.parse(decodeURIComponent(identity)) as unknown[])[0] ?? "");
+      } catch {
+        id = "";
+      }
+      if (routeIds.has(id) && streamCloseDelayMs(value) > maxMs)
+        for (const key of reverseProxyKeys(value)) found.add(key);
+    }
+    for (const child of Object.values(value)) visit(child, identity);
+  };
+  visit(config as Json, "");
+  return [...found].toSorted();
 }
 
 /** A `reverse_proxy` handler whose upgraded streams outlive a reload (`stream_close_delay` > 0). */
@@ -391,9 +444,17 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
    * `edge.apply` reads this before its `/load`, since it can remove a route before the watchdog
    * or `edge.drain` sees it.
    */
-  async lingeringStreams(next: ReadonlySet<string>) {
+  async lingeringStreams(
+    next: ReadonlySet<string>,
+    revoked: { routeIds: ReadonlySet<string>; maxMs: number } | null = null,
+  ) {
     // Admission is still open: even an idle handler can accept an upgrade before /load.
-    return withdrawCaddyBackends(await this.activeConfig(), next).delayed;
+    const config = await this.activeConfig();
+    const delayed = withdrawCaddyBackends(config, next).delayed;
+    if (!revoked?.routeIds.size) return delayed;
+    return [
+      ...new Set([...delayed, ...caddyLongLivedStreams(config, revoked.routeIds, revoked.maxMs)]),
+    ].toSorted();
   }
 
   /** Persist before changing configuration so a failed stop cannot lose the removed handler. */
