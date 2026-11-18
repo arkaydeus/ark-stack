@@ -192,6 +192,7 @@ export const MAX_SMALL_INTEGER_BYTES = 20;
 export const MAX_EXTENSIONS = 32;
 
 export function readNode(buffer: Buffer, offset = 0): Node {
+  if (!Number.isInteger(offset) || offset < 0) throw new DerError("Invalid DER offset.");
   if (offset + 2 > buffer.length) throw new DerError("Truncated DER header.");
   const tag = buffer[offset]!;
   if ((tag & 0x1f) === 0x1f) throw new DerError("Multi-byte DER tags are not supported.");
@@ -220,8 +221,8 @@ export function decode(buffer: Buffer) {
   return node;
 }
 
-export function children(node: Node) {
-  if (!(node.tag & 0x20)) throw new DerError("Expected a constructed DER value.");
+export function children(node: Node | undefined) {
+  if (!node || !(node.tag & 0x20)) throw new DerError("Expected a constructed DER value.");
   const items: Node[] = [];
   for (let offset = 0; offset < node.content.length;) {
     const child = readNode(node.content, offset);
@@ -308,35 +309,28 @@ export function decodeOid(node: Node | undefined) {
   return [...head, ...arcs.slice(1)].join(".");
 }
 
-export function decodeTime(node: Node) {
-  const text = node.content.toString("ascii");
+export function decodeTime(node: Node | undefined) {
+  const text = node?.content.toString("latin1") ?? "";
   const match =
-    node.tag === 0x17
+    node?.tag === 0x17
       ? /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(text)
-      : node.tag === 0x18
+      : node?.tag === 0x18
         ? /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(text)
         : null;
-  if (!match) throw new DerError("Expected a UTCTime or GeneralizedTime.");
-  let year = Number(match[1]);
-  if (node.tag === 0x17) year += year >= 50 ? 1900 : 2000;
-  return new Date(
-    Date.UTC(
-      year,
-      Number(match[2]) - 1,
-      Number(match[3]),
-      Number(match[4]),
-      Number(match[5]),
-      Number(match[6]),
-    ),
-  );
+  if (!match || match[0] !== text) throw new DerError("Expected a UTCTime or GeneralizedTime.");
+  const year = node?.tag === 0x17 ? `${Number(match[1]) >= 50 ? "19" : "20"}${match[1]}` : match[1];
+  const iso = `${year}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}.000Z`;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime()) || date.toISOString() !== iso) throw new DerError("Invalid DER time.");
+  return date;
 }
 
 /** Canonical serial text: uppercase hex of the integer magnitude, as `openssl x509 -serial` prints. */
-export function serialHex(node: Node) {
-  expectTag(node, 0x02, "an INTEGER serial");
-  let start = 0;
-  while (start < node.content.length - 1 && node.content[start] === 0) start += 1;
-  return node.content.subarray(start).toString("hex").toUpperCase();
+export function serialHex(node: Node | undefined) {
+  const serial = expectTag(node, 0x02, "an INTEGER serial");
+  decodeInteger(serial, "a serial number", { nonNegative: true });
+  const start = serial.content.length > 1 && serial.content[0] === 0 ? 1 : 0;
+  return serial.content.subarray(start).toString("hex").toUpperCase();
 }
 
 // ---- PEM ---------------------------------------------------------------------------------------
@@ -402,9 +396,8 @@ export function sha256Hex(der: Buffer) {
 
 export type ParsedExtension = { id: string; critical: boolean; value: Buffer };
 
-export function parseExtensions(node: Node): ParsedExtension[] {
-  expectTag(node, 0x30, "an Extensions SEQUENCE");
-  const items = children(node);
+export function parseExtensions(node: Node | undefined): ParsedExtension[] {
+  const items = children(expectTag(node, 0x30, "an Extensions SEQUENCE"));
   // RFC 5280: Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension.
   if (!items.length) throw new DerError("Empty Extensions SEQUENCE.");
   if (items.length > MAX_EXTENSIONS) throw new DerError("Too many extensions.");
@@ -415,6 +408,7 @@ export function parseExtensions(node: Node): ParsedExtension[] {
     let critical = false;
     if (parts[index]?.tag === 0x01) {
       critical = decodeBoolean(parts[index], "an Extension critical flag");
+      if (!critical) throw new DerError("The default Extension critical flag must be omitted.");
       index += 1;
     }
     const value = expectTag(parts[index], 0x04, "an extnValue OCTET STRING").content;
@@ -425,8 +419,11 @@ export function parseExtensions(node: Node): ParsedExtension[] {
 
 /** The named bits set in a DER KeyUsage BIT STRING. */
 export function decodeKeyUsage(value: Buffer): KeyUsage[] {
-  const { bytes } = decodeBitString(decode(value), "a KeyUsage BIT STRING");
+  const { bytes, unused } = decodeBitString(decode(value), "a KeyUsage BIT STRING");
   if (bytes.length > 2) throw new DerError("Oversized KeyUsage BIT STRING.");
+  if (bytes.length * 8 - unused > 9) throw new DerError("Unknown KeyUsage bits.");
+  if (!bytes.length || !(bytes[bytes.length - 1]! & (1 << unused)))
+    throw new DerError("Non-minimal KeyUsage BIT STRING.");
   return (Object.entries(KEY_USAGE_BITS) as [KeyUsage, number][])
     .filter(([, bit]) => ((bytes[Math.floor(bit / 8)] ?? 0) & (0x80 >> (bit % 8))) !== 0)
     .map(([usage]) => usage);
@@ -438,11 +435,13 @@ export function decodeBasicConstraints(value: Buffer) {
   let ca = false;
   if (parts[index]?.tag === 0x01) {
     ca = decodeBoolean(parts[index], "a BasicConstraints cA flag");
+    if (!ca) throw new DerError("The default BasicConstraints cA flag must be omitted.");
     index += 1;
   }
   let pathLength: number | undefined;
   if (parts[index]?.tag === 0x02) {
     const length = decodeInteger(parts[index], "a pathLenConstraint", { maxBytes: 4, nonNegative: true });
+    if (!ca) throw new DerError("BasicConstraints pathLenConstraint requires cA.");
     pathLength = Number(length);
     index += 1;
   }
@@ -470,32 +469,37 @@ export function decodeAuthorityKeyIdentifier(value: Buffer) {
 
 /** The parts of a DER certificate the PKI module and its tests need. */
 export function parseCertificate(der: Buffer) {
-  const [tbs, algorithm, signature] = children(expectTag(decode(der), 0x30, "a Certificate"));
-  const fields = children(expectTag(tbs, 0x30, "a TBSCertificate"));
+  const parts = children(expectTag(decode(der), 0x30, "a Certificate"));
+  if (parts.length !== 3) throw new DerError("Malformed Certificate.");
+  const [tbs, algorithm, signature] = parts;
+  const certificate = expectTag(tbs, 0x30, "a TBSCertificate");
+  const fields = children(certificate);
   let index = 0;
   let version = 1;
   if (fields[0]?.tag === 0xa0) {
     version = Number(decodeInteger(children(fields[0])[0], "a certificate version", { maxBytes: 1 })) + 1;
     index = 1;
   }
-  const serial = serialHex(fields[index]!);
-  const issuer = fields[index + 2]!;
-  const [notBefore, notAfter] = children(expectTag(fields[index + 3], 0x30, "a Validity"));
-  const subject = fields[index + 4]!;
+  const serial = serialHex(fields[index]);
+  const issuer = expectTag(fields[index + 2], 0x30, "an issuer Name");
+  const validity = children(expectTag(fields[index + 3], 0x30, "a Validity"));
+  if (validity.length !== 2) throw new DerError("Malformed certificate Validity.");
+  const [notBefore, notAfter] = validity;
+  const subject = expectTag(fields[index + 4], 0x30, "a subject Name");
   const spki = expectTag(fields[index + 5], 0x30, "a SubjectPublicKeyInfo");
   const extensionsWrapper = fields.slice(index + 6).find((field) => field.tag === 0xa3);
-  const extensions = extensionsWrapper ? parseExtensions(children(extensionsWrapper)[0]!) : [];
+  const extensions = extensionsWrapper ? parseExtensions(children(extensionsWrapper)[0]) : [];
   return {
     version,
     serial,
     issuerDer: Buffer.from(issuer.raw),
     subjectDer: Buffer.from(subject.raw),
-    notBefore: decodeTime(notBefore!),
-    notAfter: decodeTime(notAfter!),
+    notBefore: decodeTime(notBefore),
+    notAfter: decodeTime(notAfter),
     spki: Buffer.from(spki.raw),
     extensions,
-    tbs: Buffer.from(tbs!.raw),
-    signatureAlgorithm: decodeOid(children(algorithm!)[0]),
+    tbs: Buffer.from(certificate.raw),
+    signatureAlgorithm: decodeOid(children(expectTag(algorithm, 0x30, "a signature AlgorithmIdentifier"))[0]),
     signature: Buffer.from(decodeBitString(signature, "a signature BIT STRING").bytes),
   };
 }
@@ -504,14 +508,17 @@ export type ParsedCertificate = ReturnType<typeof parseCertificate>;
 
 /** The parts of a DER CRL the PKI module and its tests need. */
 export function parseCrl(der: Buffer) {
-  const [tbs, algorithm, signature] = children(expectTag(decode(der), 0x30, "a CertificateList"));
-  const fields = children(expectTag(tbs, 0x30, "a TBSCertList"));
+  const parts = children(expectTag(decode(der), 0x30, "a CertificateList"));
+  if (parts.length !== 3) throw new DerError("Malformed CertificateList.");
+  const [tbs, algorithm, signature] = parts;
+  const certList = expectTag(tbs, 0x30, "a TBSCertList");
+  const fields = children(certList);
   let index = fields[0]?.tag === 0x02 ? 1 : 0;
   index += 1; // signature AlgorithmIdentifier
-  const issuer = fields[index++]!;
-  const thisUpdate = decodeTime(fields[index++]!);
+  const issuer = expectTag(fields[index++], 0x30, "an issuer Name");
+  const thisUpdate = decodeTime(fields[index++]);
   const nextUpdate =
-    fields[index] && [0x17, 0x18].includes(fields[index]!.tag) ? decodeTime(fields[index++]!) : null;
+    fields[index] && [0x17, 0x18].includes(fields[index]!.tag) ? decodeTime(fields[index++]) : null;
   const revoked =
     fields[index]?.tag === 0x30
       ? children(fields[index++]!).map((entry) => {
@@ -520,14 +527,14 @@ export function parseCrl(der: Buffer) {
             ? parseExtensions(entryExtensions).find((item) => item.id === OID.crlReason)
             : undefined;
           return {
-            serial: serialHex(serial!),
-            revokedAt: decodeTime(revokedAt!),
+            serial: serialHex(serial),
+            revokedAt: decodeTime(revokedAt),
             reasonCode: reason ? (decode(reason.value).content[0] ?? 0) : null,
           };
         })
       : [];
   const extensionsWrapper = fields[index]?.tag === 0xa0 ? fields[index] : undefined;
-  const extensions = extensionsWrapper ? parseExtensions(children(extensionsWrapper)[0]!) : [];
+  const extensions = extensionsWrapper ? parseExtensions(children(extensionsWrapper)[0]) : [];
   const numberExtension = extensions.find((item) => item.id === OID.crlNumber);
   const crlNumber = numberExtension
     ? decodeInteger(decode(numberExtension.value), "a CRLNumber", { nonNegative: true })
@@ -539,8 +546,8 @@ export function parseCrl(der: Buffer) {
     revoked,
     extensions,
     crlNumber,
-    tbs: Buffer.from(tbs!.raw),
-    signatureAlgorithm: decodeOid(children(algorithm!)[0]!),
-    signature: Buffer.from(expectTag(signature, 0x03, "a signature BIT STRING").content.subarray(1)),
+    tbs: Buffer.from(certList.raw),
+    signatureAlgorithm: decodeOid(children(expectTag(algorithm, 0x30, "a signature AlgorithmIdentifier"))[0]),
+    signature: Buffer.from(decodeBitString(signature, "a signature BIT STRING").bytes),
   };
 }
