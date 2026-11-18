@@ -54,7 +54,8 @@ export type PoolerPolicyStatus =
   | "deny_all"
   | "unconfirmed_internet"
   | "review_required"
-  | "published";
+  | "published"
+  | "fenced";
 
 export type PoolerRequestSource =
   | { kind: "database"; id: string; name: string }
@@ -72,6 +73,8 @@ export type PoolerPolicyBrief = {
 
 /** Mirrors `evaluatePoolerPolicy` in shared/src/pooler-policy.ts (owners and operators). */
 export type PoolerPolicyFull = PoolerPolicyBrief & {
+  policyPublishable: boolean;
+  fence: { at: string; reason: string | null } | null;
   policy: {
     sourceCidrs: string[];
     allowInternet: boolean;

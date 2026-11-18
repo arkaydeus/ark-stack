@@ -1395,17 +1395,30 @@ async function sessionsAcrossWorkers() {
     "force",
   ]);
   if (applied.error) throw new Error(applied.error);
-  await waitFor(
-    "the TLS route to relay",
-    async () => ((await tlsOutcome()) === "relayed" ? true : undefined),
-    15_000,
-  );
-  const leaving = await tlsSession();
-  if ((await leaving.echo("a")) !== "a") throw new Error("the first session does not relay");
+  // These are positive controls established before fault injection. A CLI reload can finish
+  // before the launch guard has reopened an accepting worker; keep the session that proves relay
+  // rather than probing once and racing a second handshake against that transition.
+  const readySession = (label: string) =>
+    waitFor(
+      label,
+      async () => {
+        const session = await tlsSession().catch(() => undefined);
+        if (!session) return undefined;
+        if ((await session.echo("control").catch(() => "")) === "control") return session;
+        session.socket.destroy();
+        return undefined;
+      },
+      15_000,
+    );
+  const leaving = await readySession("the first worker session to relay");
   const reload = await probe<{ reload: { success: boolean }; workers: Array<{ pid: number }> }>(["reload"]);
   if (!reload.reload.success) throw new Error("reload failed");
-  const current = await tlsSession();
-  if ((await current.echo("b")) !== "b") throw new Error("the second session does not relay");
+  const current = await readySession("the reloaded worker session to relay");
+  if ((await leaving.echo("still-open").catch(() => "")) !== "still-open") {
+    leaving.socket.destroy();
+    current.socket.destroy();
+    throw new Error("The leaving worker session closed before fault injection.");
+  }
   const workers = await serversWith((server) => server.key === `${peerTlsIp}:1883`);
   return { leaving, current, workers };
 }
@@ -1533,6 +1546,14 @@ async function leaseExpiryTest(report: Report) {
 }
 
 async function launchGuardTest(report: Report) {
+  // Make both preconditions explicit, including when running this case with the filter: a live
+  // generation containing the tailnet route, followed by an expired lease.
+  lease.validUntil = Number.POSITIVE_INFINITY;
+  await sessionsAcrossWorkers().then(({ leaving, current }) => {
+    leaving.socket.destroy();
+    current.socket.destroy();
+  });
+  lease.validUntil = Date.now() - 1;
   // The lease is expired and the current generation contains the tailnet route.
   const starts = async () =>
     (await logsOf(stack.edgeL4)).split("\n").filter((line) => line.includes("launch guard: starting from"));
@@ -1593,7 +1614,12 @@ async function launchGuardTest(report: Report) {
   // Freeze a live watchdog (hung HTTP, not connection refusal) at several polling phases.
   // Remove the last route during the final freeze while both old/current workers retain sessions.
   for (const phase of [0, 400, 900]) {
-    const { leaving, current } = await sessionsAcrossWorkers();
+    const { leaving, current } = await sessionsAcrossWorkers().catch((cause: unknown) => {
+      throw new Error(
+        `Could not establish sessions before watchdog freeze at phase ${phase}: ${cause instanceof Error ? cause.message : String(cause)}`,
+        { cause },
+      );
+    });
     await Bun.sleep(phase);
     if (phase === 900) {
       const applied = await probe<{ error?: string }>([
@@ -1639,8 +1665,20 @@ async function launchGuardTest(report: Report) {
     current.socket.destroy();
   });
 
+  // Establish the positive control after restore/reload before starting the shutdown deadline.
+  // Closing the setup pair lets a leaving worker exit, so wait for a relaying accepting worker.
+  const session = await waitFor(
+    "a live session before stopping the watchdog",
+    async () => {
+      const opened = await tlsSession().catch(() => undefined);
+      if (!opened) return undefined;
+      if ((await opened.echo("before-stop").catch(() => "")) === "before-stop") return opened;
+      opened.socket.destroy();
+      return undefined;
+    },
+    15_000,
+  );
   // Losing the watchdog while a tailnet route exists stops HAProxy (listeners and sessions).
-  const session = await tlsSession();
   const restarts = Number(await docker("inspect", "--format", "{{.RestartCount}}", stack.edgeL4));
   const stoppedAt = Date.now();
   await docker("stop", "--time", "1", watchdogName);

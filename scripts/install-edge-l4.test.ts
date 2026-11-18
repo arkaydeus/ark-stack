@@ -13,10 +13,14 @@ test("seeds one initial generation and points current at it, idempotently", asyn
   const dir = await mkdtemp(join(tmpdir(), "ark-install-edge-l4-"));
   const first = await seedEdgeL4(dir);
   expect(first.seeded).toBe(true);
+  expect((await lstat(join(dir, "front-ingress"))).isDirectory()).toBe(true);
   expect(await readlink(join(dir, "current"))).toBe(`generations/${first.generation}`);
   expect(await hashGenerationDir(join(dir, "generations", first.generation))).toBe(first.generation);
   expect((await lstat(join(dir, "current", "haproxy.closed.cfg"))).isFile()).toBe(true);
   expect(await seedEdgeL4(dir)).toEqual({ generation: first.generation, seeded: false });
+  await rm(join(dir, "front-ingress"), { recursive: true });
+  expect(await seedEdgeL4(dir)).toEqual({ generation: first.generation, seeded: false });
+  expect((await lstat(join(dir, "front-ingress"))).isDirectory()).toBe(true);
   await rm(dir, { recursive: true, force: true });
 });
 

@@ -2,9 +2,11 @@
 // from infra/platform/docker-compose.yml in a disposable Compose project. Only what cannot run on a
 // test machine is overridden: host paths (fixture directories instead of tmp/, and a project volume
 // seeded by the installer's edge-l4 step instead of tmp/edge-l4), published ports (ephemeral loopback
-// ports instead of the host's 80/443/41642), and whatever environment the caller passes. Everything
-// else (image pins, kernel mode, capabilities, /dev/net/tun, networks, the edge-admin alias,
+// ports instead of the host's 80/443/41642), and whatever environment the caller passes. Test networks use explicit private /24s to avoid exhausting Docker's default pools. The optional
+// host firewall runs in a separate forwarding namespace with DNAT to the real edge. Everything
+// else (image pins, kernel mode, capabilities, /dev/net/tun, network isolation, the edge-admin alias,
 // network_mode, the launch guards, group 4400 and the socket volumes) is the shipped definition.
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
 import type { EdgeTestRuntime } from "./runtime.ts";
@@ -39,6 +41,8 @@ export type EdgeStackOptions = {
   edgeTsCommand?: string[];
   /** Also build and start the restricted `haproxy-validator` service from the Dockerfile target. */
   validator?: boolean;
+  /** Run the shipped host reconciler in an isolated DNAT gateway for firewall tests. */
+  ingress?: boolean;
 };
 
 export type EdgeStack = {
@@ -77,9 +81,13 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
   // External networks (mail, monitoring) are checked even for services that do not start; make
   // them project-local so the test needs nothing from the host.
   const document = Bun.YAML.parse(source) as { networks?: Record<string, { external?: boolean } | null> };
-  const external = Object.entries(document.networks ?? {})
-    .filter(([, network]) => network?.external)
-    .map(([name]) => name);
+  const testSubnet = `10.${100 + (randomBytes(1)[0]! % 80)}`;
+  const networkOffset = randomBytes(1)[0]! % 220;
+  const external = new Set(
+    Object.entries(document.networks ?? {})
+      .filter(([, network]) => network?.external)
+      .map(([name]) => name),
+  );
   const environment = Object.entries(options.edgeTsEnvironment ?? {});
   const edgeEnvironment = Object.entries(options.edgeEnvironment ?? {});
   const l4Volume = `${project}_edge_l4_config`;
@@ -117,20 +125,37 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
           `      - ${yamlString("edge_l4_config:/usr/local/etc/haproxy:ro")}`,
         ]
       : []),
+    ...(options.ingress
+      ? [
+          "  database-ingress:",
+          "    network_mode: !reset null",
+          "    networks: [edge-control]",
+          "    sysctls:",
+          '      net.ipv4.ip_forward: "1"',
+          "    environment:",
+          "      ARK_PGBOUNCER_DIR: /tmp/pgbouncer",
+          "      ARK_DB_INGRESS_METRICS_DIR: /tmp/db-ingress",
+          "      ARK_FRONT_INGRESS_DIR: /var/lib/ark/front-ingress",
+          "    volumes: !override",
+          "      - type: volume",
+          "        source: edge_l4_config",
+          "        target: /var/lib/ark/front-ingress",
+          "        volume:",
+          "          subpath: front-ingress",
+        ]
+      : []),
     "volumes:",
     "  edge_l4_config:",
     "    external: true",
     `    name: ${yamlString(l4Volume)}`,
-    ...(external.length
-      ? [
-          "networks:",
-          ...external.flatMap((name) => [
-            `  ${name}:`,
-            "    external: false",
-            `    name: ${yamlString(`${project}_${name}`)}`,
-          ]),
-        ]
-      : []),
+    "networks:",
+    ...Object.keys(document.networks ?? {}).flatMap((name, index) => [
+      `  ${name}:`,
+      ...(external.has(name) ? ["    external: false", `    name: ${yamlString(`${project}_${name}`)}`] : []),
+      "    ipam:",
+      "      config:",
+      `        - subnet: ${testSubnet}.${networkOffset + index}.0/24`,
+    ]),
     "",
   ].join("\n");
   const overrideFile = join(directory, `${project}.override.yml`);
@@ -175,6 +200,11 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
     await compose("build", "haproxy-validator");
     runtime.containers.push(`${project}-haproxy-validator-1`);
     services.push("haproxy-validator");
+  }
+  if (options.ingress) {
+    await compose("build", "database-ingress");
+    runtime.containers.push(`${project}-database-ingress-1`);
+    services.push("database-ingress");
   }
   // --no-deps: `edge` also depends on `api` and the watchdog, which the edge tests replace or start
   // themselves. Without a tailnet route both launch guards start without asking the watchdog.

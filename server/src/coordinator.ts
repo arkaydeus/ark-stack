@@ -58,7 +58,14 @@ import {
   type TargetEvidence,
 } from "./modules/offsite-backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
-import { edgeL4Configured, haproxyAdapter, missingL4Routes, writeEdgeL4 } from "./modules/edge-l4.ts";
+import { applyFrontIngress } from "./modules/front-ingress.ts";
+import {
+  edgeL4Configured,
+  edgeL4Settings,
+  haproxyAdapter,
+  missingL4Routes,
+  writeEdgeL4,
+} from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import { edgeL4Routes, enabledSniPorts, type OmittedL4Route } from "./modules/l4-routes.ts";
 import { refreshRouteCrls, routeCrlsDue } from "./modules/route-pki.ts";
@@ -341,7 +348,11 @@ async function insertEnqueued(
     WHERE idempotency_key = ${base} OR idempotency_key LIKE ${`${base}:%`}
     ORDER BY created_at DESC
   `;
-  const inflight = related.map(mapOperation).find((row) => isInFlight(row.status));
+  // A running edge apply may already have captured an older desired state. Reuse only queued
+  // successors: every mutation during a running apply must leave durable work behind it.
+  const inflight = related
+    .map(mapOperation)
+    .find((row) => (input.kind === "edge.l4_apply" ? row.status === "queued" : isInFlight(row.status)));
   if (inflight) return inflight;
   const idempotencyKey = related.length ? `${base}:${createId("idem")}` : base;
   try {
@@ -1652,7 +1663,10 @@ export async function reconcileDatabaseIngressOnStartup() {
     .select({ id: managedDatabases.id })
     .from(managedDatabases)
     .where(eq(managedDatabases.exposure, "public"));
-  if (!publicDatabases.length) return null;
+  if (!publicDatabases.length) {
+    if (poolerEdgeManaged()) return enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+    return null;
+  }
   return enqueue({
     kind: "pgbouncer.reload",
     targetIds: [],
@@ -1698,15 +1712,16 @@ export async function fencePoolerListener(
   reason: string,
   { timeoutMs = 10_000, wait = true }: { timeoutMs?: number; wait?: boolean } = {},
 ) {
+  const fencedAt = new Date();
   await db
     .update(platformSettings)
-    .set({ poolerFencedAt: new Date(), poolerFenceReason: reason, updatedAt: new Date() })
+    .set({ poolerFencedAt: fencedAt, poolerFenceReason: reason, updatedAt: fencedAt })
     .where(eq(platformSettings.id, "default"));
   if (!poolerEdgeManaged()) return;
   const operation = await enqueue({
     kind: "edge.l4_apply",
     targetIds: ["platform"],
-    payload: { reason: "pooler-fence" },
+    payload: { reason: "pooler-fence", fencedAt: fencedAt.toISOString() },
   });
   if (!wait) return;
   const deadline = Date.now() + timeoutMs;
@@ -1715,7 +1730,19 @@ export async function fencePoolerListener(
       .select({ status: operations.status })
       .from(operations)
       .where(eq(operations.id, operation.id));
-    if (row?.status === "succeeded") return;
+    if (row?.status === "succeeded") {
+      const [step] = await db
+        .select()
+        .from(operationSteps)
+        .where(and(eq(operationSteps.operationId, operation.id), eq(operationSteps.name, "edge-l4-apply")))
+        .orderBy(desc(operationSteps.createdAt))
+        .limit(1);
+      const detail = step?.evidence as
+        | { applied?: boolean; poolerPolicy?: { fence?: { at?: string } } }
+        | undefined;
+      if (detail?.applied && detail.poolerPolicy?.fence?.at === fencedAt.toISOString()) return;
+      break;
+    }
     if (row?.status === "failed") break;
     await Bun.sleep(100);
   }
@@ -2554,6 +2581,12 @@ export function edgeL4Input(
 }
 
 async function applyEdgeL4(operation: OperationRow) {
+  // Load desired state after taking the lock, so a delayed older operation cannot overwrite a
+  // newer generation. Mutations during this apply enqueue a successor rather than reusing it.
+  return withEdgeLock(() => applyEdgeL4Locked(operation));
+}
+
+async function applyEdgeL4Locked(operation: OperationRow) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
@@ -2565,10 +2598,17 @@ async function applyEdgeL4(operation: OperationRow) {
   const l4 = await edgeL4Routes({ policyRoutes: (await edgePolicy()).routes, sniPorts });
   // PgBouncer on 5432 (FD-26): only while the pooler-wide policy is publishable and not fenced.
   const pooler = await poolerEdgeInput();
-  const written = await withEdgeLock(() => writeEdgeL4(edgeL4Input(plan, l4, sniPorts, pooler.pooler)));
+  const input = edgeL4Input(plan, l4, sniPorts, pooler.pooler);
+  if (edgeL4Configured() && !edgeL4Settings().validatorSocket)
+    throw new Error("ARK_HAPROXY_VALIDATOR_SOCKET is required to apply edge-l4.");
+  const firewall = edgeL4Configured()
+    ? await applyFrontIngress(input, platformDbIngressLimits(settings))
+    : null;
+  const written = await writeEdgeL4(input);
   const omitted: OmittedL4Route[] = l4.omitted;
   await addStep(operation.id, "edge-l4-apply", {
     ...written,
+    firewall,
     omittedL4Routes: omitted,
     crls,
     poolerPolicy: {
@@ -2603,7 +2643,9 @@ async function observeEdge(operation: OperationRow) {
   if (edgeL4Configured() && l4Adapter) {
     try {
       const missing = await missingL4Routes((await edgePolicy()).routes, l4Adapter.master);
-      if (missing.length) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+      // Also reconcile the pooler and its durable fence. Route-server presence alone cannot
+      // detect a stale source policy or a missed pooler mutation after a worker restart.
+      await queuePoolerEdgeApply();
       l4Recovery = { missing };
     } catch (error) {
       // Inspection uncertainty needs a durable retry, too.

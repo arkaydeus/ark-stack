@@ -407,9 +407,12 @@ services:
     environment:
       ARK_PGBOUNCER_DIR: /var/lib/ark/pgbouncer
       ARK_DB_INGRESS_METRICS_DIR: /var/lib/ark/db-ingress
+      ARK_FRONT_INGRESS_DIR: /var/lib/ark/front-ingress
     volumes:
       - ../../tmp/pgbouncer:/var/lib/ark/pgbouncer
       - ../../tmp/db-ingress:/var/lib/ark/db-ingress
+      # Policy and acknowledgement only; the domain worker never mounts PgBouncer credentials.
+      - ../../tmp/edge-l4/front-ingress:/var/lib/ark/front-ingress
     restart: unless-stopped
     pids_limit: 64
 

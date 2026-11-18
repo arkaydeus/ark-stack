@@ -100,6 +100,12 @@ describe("edge-l4 compose policy", () => {
       .filter(([, service]) => (service.volumes ?? []).some((mount) => /tmp\/edge-l4:[^:]+$/.test(mount)))
       .map(([name]) => name);
     expect(writers).toEqual(["domain-worker"]);
+    expect(services["database-ingress"]!.volumes).toContain(
+      "../../tmp/edge-l4/front-ingress:/var/lib/ark/front-ingress",
+    );
+    expect(services["database-ingress"]!.environment).toMatchObject({
+      ARK_FRONT_INGRESS_DIR: "/var/lib/ark/front-ingress",
+    });
     const worker = services["domain-worker"]!;
     expect((worker.volumes ?? []).some((mount) => mount.includes("docker.sock"))).toBe(false);
     expect(worker.environment).toMatchObject({

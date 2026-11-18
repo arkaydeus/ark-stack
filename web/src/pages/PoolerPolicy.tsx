@@ -21,6 +21,7 @@ const STATUS: Record<
   PoolerPolicyStatus,
   { label: string; variant: "success" | "warning" | "danger" | "neutral" }
 > = {
+  fenced: { label: "closed by safety fence", variant: "danger" },
   published: { label: "published", variant: "success" },
   no_public_databases: { label: "no public databases", variant: "neutral" },
   review_required: { label: "review required", variant: "warning" },

@@ -187,7 +187,47 @@ function runMigration() {
   });
 }
 
+async function verifyPoolerMigrationBranches() {
+  for (const conflict of [false, true]) {
+    const name = `${databaseName}_${conflict ? "conflict" : "restricted"}`;
+    await admin.unsafe(`CREATE DATABASE "${name}"`);
+    const url = new URL(sourceUrl!);
+    url.pathname = `/${name}`;
+    const target = postgres(url.toString(), { max: 1 });
+    try {
+      const files = (await readdir(join(root, "server", "drizzle")))
+        .filter((file) => file.endsWith(".sql") && file < "0030")
+        .toSorted();
+      for (const file of files)
+        await target.unsafe(await Bun.file(join(root, "server", "drizzle", file)).text());
+      await target`INSERT INTO platform_settings (id) VALUES ('default') ON CONFLICT DO NOTHING`;
+      await target`INSERT INTO database_clusters (id, name) VALUES ('dcl_migration', 'migration')`;
+      await target`INSERT INTO managed_databases (id, cluster_id, name, exposure, source_cidrs) VALUES
+        ('mdb_a', 'dcl_migration', 'a', 'public', '["198.51.100.0/24", "203.0.113.0/24"]'),
+        ('mdb_b', 'dcl_migration', 'b', 'public', ${target.json(conflict ? ["192.0.2.0/24"] : ["203.0.113.0/24", "198.51.100.0/24"])}::jsonb)`;
+      await target.unsafe(await Bun.file(join(root, "server/drizzle/0030_pg5432_router.sql")).text());
+      const [policy] =
+        await target`SELECT pooler_source_cidrs, pooler_allow_internet, pooler_internet_confirmed_at FROM platform_settings WHERE id = 'default'`;
+      assert.equal(policy!.pooler_allow_internet, false);
+      assert.equal(policy!.pooler_internet_confirmed_at, null);
+      assert.deepEqual(
+        [...policy!.pooler_source_cidrs].toSorted(),
+        conflict ? [] : ["198.51.100.0/24", "203.0.113.0/24"],
+      );
+      const audit = await target`SELECT id FROM audit_events WHERE action = 'pooler_policy.migrated'`;
+      assert.equal(audit.length, conflict ? 0 : 1);
+      console.log(
+        `0030 ${conflict ? "conflicting requests remain deny-all" : "identical restricted requests are adopted regardless of ordering"}: passed`,
+      );
+    } finally {
+      await target.end();
+      await admin.unsafe(`DROP DATABASE "${name}"`);
+    }
+  }
+}
+
 try {
+  await verifyPoolerMigrationBranches();
   await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
   const target = postgres(databaseUrl.toString(), { max: 1 });
   try {

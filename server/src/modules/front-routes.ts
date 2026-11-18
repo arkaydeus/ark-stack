@@ -1220,8 +1220,15 @@ export async function routesCertificateFailed(endpointId: string, message: strin
 
 async function mtlsRoute(routeId: string) {
   const { route, endpoint } = await loadRoute(routeId);
-  if (route.kind !== "tls" || route.tlsMode !== "terminate_mtls" || !route.clientCaId) {
-    throw new FrontRouteError(409, "Client certificates exist only for tls routes in terminate_mtls mode.");
+  if (
+    (route.kind !== "tls" && route.kind !== "postgres") ||
+    route.tlsMode !== "terminate_mtls" ||
+    !route.clientCaId
+  ) {
+    throw new FrontRouteError(
+      409,
+      "Client certificates exist only for tls or postgres routes in terminate_mtls mode.",
+    );
   }
   return { route, endpoint, caId: route.clientCaId };
 }

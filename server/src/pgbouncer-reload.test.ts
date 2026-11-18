@@ -354,7 +354,54 @@ test("revoking the last client fences public admission at the edge before a fail
     payload: { nonce: createId("n") },
   });
   operationIds.push(operation.id);
-  const result = await runOperation("pgbouncer.reload", operation).catch((error: unknown) => error);
+  // Exercise the real domain-worker operation while the database worker waits for closure.
+  const edgeModule = await import("./modules/edge-l4.ts");
+  const ingress = await import("./modules/front-ingress.ts");
+  const { processQueued } = await import("./coordinator.ts");
+  const previousRoot = process.env.ARK_EDGE_L4_DIR;
+  const previousValidator = process.env.ARK_HAPROXY_VALIDATOR_SOCKET;
+  process.env.ARK_EDGE_L4_DIR = join(work, "managed-edge");
+  process.env.ARK_HAPROXY_VALIDATOR_SOCKET = "/unused-test-validator";
+  let closed = false;
+  const firewall = spyOn(ingress, "applyFrontIngress").mockResolvedValue({
+    applied: true,
+    file: "/test",
+    hash: "test",
+  });
+  const writer = spyOn(edgeModule, "writeEdgeL4").mockImplementation(async (input) => {
+    expect(input.pooler).toBeNull();
+    closed = true;
+    return { applied: true, reloaded: true } as Awaited<ReturnType<typeof edgeModule.writeEdgeL4>>;
+  });
+  const admin = spyOn(pooler, "reloadPgbouncerAdmin").mockImplementation(async () => {
+    expect(closed).toBe(true);
+    throw new Error("simulated admin reload failure after confirmed edge closure");
+  });
+  let done = false;
+  let result: unknown;
+  const reloading = runOperation("pgbouncer.reload", operation)
+    .catch((error: unknown) => error)
+    .finally(() => {
+      done = true;
+    });
+  try {
+    for (let i = 0; i < 100; i++) {
+      if (done) break;
+      await processQueued(1, "edge.l4_apply");
+      await Bun.sleep(20);
+    }
+    result = await reloading;
+    expect(closed).toBe(true);
+  } finally {
+    await reloading;
+    writer.mockRestore();
+    firewall.mockRestore();
+    admin.mockRestore();
+    if (previousRoot === undefined) delete process.env.ARK_EDGE_L4_DIR;
+    else process.env.ARK_EDGE_L4_DIR = previousRoot;
+    if (previousValidator === undefined) delete process.env.ARK_HAPROXY_VALIDATOR_SOCKET;
+    else process.env.ARK_HAPROXY_VALIDATOR_SOCKET = previousValidator;
+  }
   expect(result).toBeInstanceOf(PgbouncerReloadError);
   const edge = await poolerEdgeInput();
   expect(edge.fence?.reason).toBe("no-admitted-client");

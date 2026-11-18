@@ -7,7 +7,7 @@
 // - seeds `tmp/edge-l4` with an initial generation (no tailnet route: every hostname goes to Caddy)
 //   and the `current` symlink, so edge-l4 can start before the domain worker's first edge.l4_apply;
 // - as root on Linux, gives the tree to the worker's uid and group 4400: directories 2750, files 0640.
-import { chmod, chown, lstat, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -22,6 +22,9 @@ import {
 
 /** Writes the initial generation unless `current` already points at one. */
 export async function seedEdgeL4(root: string) {
+  // The host reconciler mounts only this policy directory, never the writable generation tree.
+  // Create it before Compose mounts its subdirectory (also when upgrading an existing generation).
+  await mkdir(join(root, "front-ingress"), { recursive: true, mode: 0o2750 });
   const existing = await currentGeneration(root);
   if (existing) return { generation: existing, seeded: false };
   const generation = renderEdgeL4Generation({ httpHostnames: [] });

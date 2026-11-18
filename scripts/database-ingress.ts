@@ -1,6 +1,7 @@
 // Host-namespace reconciler for the public database port's nftables policy (docs/design/front-door.md
 // §3.8.3, §3.11). It applies `inet ark_db_ingress` (FD-18 per-source limits on tcp/5432, matched on
-// both the input and forward hooks) from the policy file the database worker writes, acknowledges the
+// both the input and forward hooks) from the database-worker policy, and `inet ark_front_raw` plus
+// the same 5432 limits from the domain-worker publication policy. It acknowledges the
 // exact bytes in `allowlist.status`, and exports the drop counters for /api/metrics/prometheus.
 //
 // Since FD-26 it no longer listens on 5432: HAProxy's `fe_pg5432` in edge-ts owns the public port and
@@ -13,7 +14,13 @@ import { watch } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-import { DB_INGRESS_TABLE, dbIngressAllowlistEnforced, parseNftCounters, sha256Hex } from "@ark-stack/shared";
+import {
+  FRONT_RAW_TABLE,
+  DB_INGRESS_TABLE,
+  dbIngressAllowlistEnforced,
+  parseNftCounters,
+  sha256Hex,
+} from "@ark-stack/shared";
 
 const dir = process.env.ARK_PGBOUNCER_DIR ?? join(process.cwd(), "tmp", "pgbouncer");
 const nftFile = join(dir, "allowlist.nft");
@@ -29,6 +36,7 @@ let reconciling = false;
 let dirty = false;
 let appliedRules: string | null = null;
 let attemptedRules: string | null = null;
+let frontApplied: string | null = null;
 
 function run(command: string, args: string[], input?: string) {
   return new Promise<string>((resolve, reject) => {
@@ -59,6 +67,8 @@ async function applyNft() {
   const listed = await run("nft", ["list", "table", "inet", DB_INGRESS_TABLE]);
   if (!listed.includes("ark_db")) throw new Error("nft readback did not show ark_db_ingress");
   appliedRules = rules;
+  // A legacy database-worker update must not leave the domain worker's acknowledged 5432 policy stale.
+  frontApplied = null;
 }
 
 async function exportCounters() {
@@ -145,3 +155,51 @@ setInterval(() => {
     if (desired !== appliedRules) await reconcile();
   })().catch((error) => console.error(`database ingress refresh failed: ${String(error)}`));
 }, 1500);
+
+// Domain-worker policies live outside PgBouncer's credentials mount. Apply both the 5432 limits
+// and all raw ports in one nft transaction before acknowledging publication. Polling also retries
+// a failed apply; failed and stale hashes cannot release the worker's publication barrier.
+const frontDir = process.env.ARK_FRONT_INGRESS_DIR;
+let frontBusy = false;
+let frontAcknowledged: string | null = null;
+async function reconcileFront() {
+  if (!frontDir || frontBusy) return;
+  frontBusy = true;
+  try {
+    const rules = await readFile(join(frontDir, "policy.nft"), "utf8");
+    const hash = sha256Hex(rules);
+    const request = JSON.parse(await readFile(join(frontDir, "policy.request"), "utf8")) as {
+      id: string;
+      hash: string;
+    };
+    if (request.hash !== hash || !/^[a-f0-9-]{36}$/.test(request.id)) return;
+    if (rules === frontApplied && request.id === frontAcknowledged) return;
+    let error = "";
+    try {
+      if (rules !== frontApplied) await run("nft", ["-f", "-"], rules);
+      await run("nft", ["list", "table", "inet", DB_INGRESS_TABLE]);
+      await run("nft", ["list", "table", "inet", FRONT_RAW_TABLE]);
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+    }
+    const status = join(frontDir, "policy.status");
+    const temporary = `${status}.${crypto.randomUUID()}.tmp`;
+    await writeFile(
+      temporary,
+      `applied=${!error}\npolicy_hash=${hash}\nrequest_id=${request.id}\nerror=${error}\n`,
+      { mode: 0o644 },
+    );
+    await rename(temporary, status);
+    if (!error) {
+      frontApplied = rules;
+      frontAcknowledged = request.id;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+      console.error(`Front ingress refresh failed: ${String(error)}`);
+  } finally {
+    frontBusy = false;
+  }
+}
+await reconcileFront();
+setInterval(() => void reconcileFront(), 250);

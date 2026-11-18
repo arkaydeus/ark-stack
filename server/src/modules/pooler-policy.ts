@@ -49,7 +49,11 @@ export async function loadPoolerState(executor: Executor = db) {
       databaseClients,
       and(eq(databaseClients.id, vercelIntegrations.databaseClientId), eq(databaseClients.status, "active")),
     );
+  const fence = settings?.poolerFencedAt
+    ? { at: settings.poolerFencedAt.toISOString(), reason: settings.poolerFenceReason ?? null }
+    : null;
   const evaluation = evaluatePoolerPolicy({
+    fence,
     requests: poolerRequests({ databases, vercelClients }),
     policy: {
       sourceCidrs: Array.isArray(settings?.poolerSourceCidrs) ? settings.poolerSourceCidrs.map(String) : [],
@@ -59,12 +63,7 @@ export async function loadPoolerState(executor: Executor = db) {
       reviewedRequests: settings?.poolerPolicyReviewedRequests ?? null,
     },
   });
-  return {
-    evaluation,
-    fence: settings?.poolerFencedAt
-      ? { at: settings.poolerFencedAt.toISOString(), reason: settings.poolerFenceReason ?? null }
-      : null,
-  };
+  return { evaluation, fence };
 }
 
 /** The Ark database hostname (the `database` endpoint): direct TLS with this SNI goes to PgBouncer. */

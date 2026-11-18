@@ -8,7 +8,7 @@
 // - `postgres` routes: 5432 only, TLS modes, the passthrough-only compatibility port and its
 //   collision with raw TCP routes, the lease policy fingerprint, and the `edge.l4_apply` input.
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -314,6 +314,26 @@ describe("pooler-wide policy (§3.8.3)", () => {
     });
   });
 
+  test("a durable fence closes publication and admission without discarding the saved policy", async () => {
+    await sql`UPDATE platform_settings SET pooler_fenced_at = now(), pooler_fence_reason = 'test-watchdog' WHERE id = 'default'`;
+    try {
+      const status = await call(owner, "GET", "/api/databases/pooler-policy");
+      expect(status.body).toMatchObject({
+        status: "fenced",
+        publishable: false,
+        policyPublishable: true,
+        fence: { reason: "test-watchdog" },
+      });
+      expect((await poolerEdgeInput()).pooler).toBeNull();
+      expect(
+        (await call(owner, "GET", `/api/databases/${databaseA}/admission?ip=203.0.113.9`)).body,
+      ).toMatchObject({ allowed: false, reason: "pooler-fenced" });
+    } finally {
+      await sql`UPDATE platform_settings SET pooler_fenced_at = NULL, pooler_fence_reason = NULL WHERE id = 'default'`;
+    }
+    expect((await call(owner, "GET", "/api/databases/pooler-policy")).body.status).toBe("published");
+  });
+
   test("a restricted common policy renders exactly the saved CIDRs, and a new request needs a new review", async () => {
     // Drop the Vercel client: the remaining requests still differ (two disjoint CIDR lists).
     await sql`UPDATE database_clients SET status = 'revoked' WHERE id = ${clientId}`;
@@ -339,6 +359,26 @@ describe("pooler-wide policy (§3.8.3)", () => {
 });
 
 describe("postgres routes (§3.8.3)", () => {
+  test("postgres mTLS certificates can be issued, listed and revoked through the API", async () => {
+    const route = await create(pgRequest("pg-mtls", { tlsMode: "terminate_mtls" }));
+    const path = `/api/front/routes/${route.id}/client-certificates`;
+    const listing = await call(owner, "GET", path);
+    expect(listing.status).toBe(200);
+    expect(listing.body.ca.certPem).toContain("BEGIN CERTIFICATE");
+    const body = { name: "pg-api-client" };
+    await stepUp("credential.rotate", { routeId: route.id, ...body });
+    const issued = await call(owner, "POST", path, body);
+    expect([issued.status, issued.body.error]).toEqual([201, undefined]);
+    expect(issued.body.certPem).toContain("BEGIN CERTIFICATE");
+    expect((await call(owner, "GET", path)).body.certificates).toEqual([
+      expect.objectContaining({ id: issued.body.id, status: "issued" }),
+    ]);
+    const revoked = await call(owner, "POST", `${path}/${issued.body.id}/revoke`);
+    expect([revoked.status, revoked.body.error]).toEqual([200, undefined]);
+    expect((await call(owner, "GET", path)).body.certificates).toEqual([
+      expect.objectContaining({ id: issued.body.id, status: "revoked" }),
+    ]);
+  });
   test("5432 only, passthrough-only compatibility port, raw-port collisions refused", async () => {
     await refused(pgRequest("wrong-port", { listenPort: 443 }), 422, /5432/);
     await refused(pgRequest("plain", { tlsMode: "plain" }), 422, /plain/);
@@ -391,6 +431,12 @@ describe("postgres routes (§3.8.3)", () => {
       `use_backend be_${id}_pg if tls_client_hello { req.ssl_sni -i pg-home.${zone} }`,
     );
     expect(config).toContain(`frontend fe_${id}_compat\n    bind :20017`);
+    const { frontIngressRules } = await import("./modules/front-ingress.ts");
+    const { DB_INGRESS_LIMIT_DEFAULTS } = await import("@ark-stack/shared");
+    const firewall = frontIngressRules(edgeL4Input({ certificates: [] }, l4), DB_INGRESS_LIMIT_DEFAULTS);
+    expect(firewall).toContain("chain ark_db_limits");
+    expect(firewall).toContain("# ark-front-raw: port=20017 policy=allowlist");
+    expect(firewall).toContain("ip saddr 198.51.100.0/24 goto port_20017_limits");
     // Without a published pooler, classic connections have no backend on the same port.
     expect(config).not.toContain("be_pgbouncer");
     // Removing the compatibility port is a tightening (no step-up) that changes the fingerprint.
@@ -415,3 +461,162 @@ describe("postgres routes (§3.8.3)", () => {
     });
   });
 });
+
+test("a pooler mutation during a captured apply leaves a durable successor with the newest policy", async () => {
+  const edgeModule = await import("./modules/edge-l4.ts");
+  const ingress = await import("./modules/front-ingress.ts");
+  const { queuePoolerEdgeApply, processQueued } = await import("./coordinator.ts");
+  const previous = { root: process.env.ARK_EDGE_L4_DIR, validator: process.env.ARK_HAPROXY_VALIDATOR_SOCKET };
+  process.env.ARK_EDGE_L4_DIR = "/unused-regression";
+  process.env.ARK_HAPROXY_VALIDATOR_SOCKET = "/unused-regression.sock";
+  let captured!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    captured = resolve;
+  });
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const policies: string[][] = [];
+  const firewall = spyOn(ingress, "applyFrontIngress").mockResolvedValue({
+    applied: true,
+    file: "/test",
+    hash: "test",
+  });
+  const writer = spyOn(edgeModule, "writeEdgeL4").mockImplementation(async (input) => {
+    policies.push(input.pooler?.sourceCidrs ?? []);
+    if (policies.length === 1) {
+      captured();
+      await barrier;
+    }
+    return { applied: false, reason: "test transport" };
+  });
+  let worker: Promise<void> | undefined;
+  try {
+    await sql`UPDATE operations SET status = 'failed' WHERE kind = 'edge.l4_apply' AND status = 'queued'`;
+    const evaluation = (await call(owner, "GET", "/api/databases/pooler-policy")).body;
+    await sql`UPDATE platform_settings SET pooler_source_cidrs = '["198.51.100.0/24"]', pooler_allow_internet = false,
+      pooler_policy_reviewed_at = now(), pooler_policy_reviewed_requests = ${evaluation.requestsFingerprint} WHERE id = 'default'`;
+    await queuePoolerEdgeApply();
+    worker = processQueued(1, "edge.l4_apply");
+    await ready;
+    await sql`UPDATE platform_settings SET pooler_source_cidrs = '["198.51.100.7/32"]' WHERE id = 'default'`;
+    await queuePoolerEdgeApply();
+    await queuePoolerEdgeApply();
+    const queued = await sql`SELECT id FROM operations WHERE kind = 'edge.l4_apply' AND status = 'queued'`;
+    expect(queued).toHaveLength(1);
+    release();
+    await worker;
+    await processQueued(1, "edge.l4_apply");
+    expect(policies).toEqual([["198.51.100.0/24"], ["198.51.100.7/32"]]);
+    const config = renderEdgeL4Generation(
+      edgeL4Input({ certificates: [] }, {}, [], (await poolerEdgeInput()).pooler),
+    );
+    expect(config.files[POOLER_ALLOWLIST_FILE]).toBe("198.51.100.7/32\n");
+    // A missed enqueue (for example a worker crash after saving) is repaired by observation even
+    // when every tailnet route server is already present.
+    const oldMaster = process.env.ARK_HAPROXY_MASTER_SOCKET;
+    process.env.ARK_HAPROXY_MASTER_SOCKET = "/unused-recovery";
+    const present = spyOn(edgeModule, "missingL4Routes").mockResolvedValue([]);
+    try {
+      await sql`UPDATE platform_settings SET pooler_source_cidrs = '["198.51.100.8/32"]' WHERE id = 'default'`;
+      await runOperation(
+        "edge.observe",
+        await enqueue({
+          kind: "edge.observe",
+          targetIds: ["tailnet:edge"],
+          payload: { fixture: "pooler-recovery" },
+        }),
+      );
+      await processQueued(1, "edge.l4_apply");
+      expect(policies.at(-1)).toEqual(["198.51.100.8/32"]);
+    } finally {
+      present.mockRestore();
+      if (oldMaster === undefined) delete process.env.ARK_HAPROXY_MASTER_SOCKET;
+      else process.env.ARK_HAPROXY_MASTER_SOCKET = oldMaster;
+    }
+  } finally {
+    release();
+    await worker;
+    writer.mockRestore();
+    firewall.mockRestore();
+    if (previous.root === undefined) delete process.env.ARK_EDGE_L4_DIR;
+    else process.env.ARK_EDGE_L4_DIR = previous.root;
+    if (previous.validator === undefined) delete process.env.ARK_HAPROXY_VALIDATOR_SOCKET;
+    else process.env.ARK_HAPROXY_VALIDATOR_SOCKET = previous.validator;
+  }
+}, 15_000);
+
+test.each(["success", "failed", "timeout", "stale", "unapplied"])(
+  "managed-edge fence requires a confirmed matching generation (%s)",
+  async (mode) => {
+    const edgeModule = await import("./modules/edge-l4.ts");
+    const ingress = await import("./modules/front-ingress.ts");
+    const { fencePoolerListener, processQueued } = await import("./coordinator.ts");
+    const previous = {
+      root: process.env.ARK_EDGE_L4_DIR,
+      validator: process.env.ARK_HAPROXY_VALIDATOR_SOCKET,
+    };
+    process.env.ARK_EDGE_L4_DIR = "/unused-fence";
+    process.env.ARK_HAPROXY_VALIDATOR_SOCKET = "/unused-fence.sock";
+    const firewall = spyOn(ingress, "applyFrontIngress").mockResolvedValue({
+      applied: true,
+      file: "/test",
+      hash: "test",
+    });
+    let applied = false;
+    const writer = spyOn(edgeModule, "writeEdgeL4").mockImplementation(async (input) => {
+      expect(input.pooler).toBeNull();
+      if (mode === "failed") throw new Error("simulated reload failure");
+      applied = true;
+      return (
+        mode === "unapplied" ? { applied: false, reason: "missing edge" } : { applied: true, reloaded: true }
+      ) as Awaited<ReturnType<typeof edgeModule.writeEdgeL4>>;
+    });
+    try {
+      await sql`UPDATE operations SET status = 'failed' WHERE kind = 'edge.l4_apply' AND status = 'queued'`;
+      let settled = false;
+      const fenced = fencePoolerListener(`test-${mode}`, { timeoutMs: mode === "timeout" ? 150 : 2000 }).then(
+        () => {
+          settled = true;
+          return null;
+        },
+        (error: Error) => {
+          settled = true;
+          return error;
+        },
+      );
+      let queued = false;
+      for (let i = 0; i < 100; i++) {
+        const [row] = await sql`SELECT id FROM operations WHERE kind = 'edge.l4_apply' AND status = 'queued'`;
+        if (row) {
+          queued = true;
+          break;
+        }
+        await Bun.sleep(10);
+      }
+      expect(queued).toBe(true);
+      expect(settled).toBe(false);
+      if (mode === "stale")
+        await sql`UPDATE platform_settings SET pooler_fenced_at = pooler_fenced_at + interval '1 second' WHERE id = 'default'`;
+      if (mode !== "timeout") await processQueued(1, "edge.l4_apply");
+      const result = await fenced;
+      if (mode === "success") {
+        expect(result).toBeNull();
+        expect(applied).toBe(true);
+      } else expect(result?.message).toContain("did not confirm");
+      expect((await poolerEdgeInput()).pooler).toBeNull();
+      expect((await call(owner, "GET", "/api/databases/pooler-policy")).body.status).toBe("fenced");
+    } finally {
+      writer.mockRestore();
+      firewall.mockRestore();
+      await sql`UPDATE operations SET status = 'failed' WHERE kind = 'edge.l4_apply' AND status = 'queued'`;
+      await sql`UPDATE platform_settings SET pooler_fenced_at = NULL, pooler_fence_reason = NULL WHERE id = 'default'`;
+      if (previous.root === undefined) delete process.env.ARK_EDGE_L4_DIR;
+      else process.env.ARK_EDGE_L4_DIR = previous.root;
+      if (previous.validator === undefined) delete process.env.ARK_HAPROXY_VALIDATOR_SOCKET;
+      else process.env.ARK_HAPROXY_VALIDATOR_SOCKET = previous.validator;
+    }
+  },
+  10_000,
+);

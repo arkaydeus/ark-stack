@@ -50,7 +50,8 @@ export type PoolerPolicyStatus =
   | "deny_all"
   | "unconfirmed_internet"
   | "review_required"
-  | "published";
+  | "published"
+  | "fenced";
 
 export type PoolerConflict = {
   reason: "different_cidrs" | "restricted_with_unrestricted";
@@ -152,6 +153,7 @@ function admits(policy: Pick<PoolerPolicySettings, "sourceCidrs" | "allowInterne
 export function evaluatePoolerPolicy(input: {
   requests: readonly PoolerRequest[];
   policy: PoolerPolicySettings;
+  fence?: { at: string; reason: string | null } | null;
 }) {
   const requests = [...input.requests];
   const policy = {
@@ -201,9 +203,13 @@ export function evaluatePoolerPolicy(input: {
   }
   return {
     scope: "pooler-wide" as const,
-    status,
-    publishable: status === "published",
-    message,
+    status: input.fence ? ("fenced" as const) : status,
+    publishable: status === "published" && !input.fence,
+    policyPublishable: status === "published",
+    fence: input.fence ?? null,
+    message: input.fence
+      ? `PgBouncer is closed at the edge (${input.fence.reason ?? "safety fence"}) until a confirmed reload lifts the fence.`
+      : message,
     boundary: POOLER_POLICY_BOUNDARY,
     policy: {
       ...policy,
