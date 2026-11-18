@@ -28,7 +28,7 @@ const platformDir = join(root, "infra/platform");
 const platformFile = "/work/infra/platform/docker-compose.yml";
 const mailFile = "/work/infra/mail/docker-compose.yml";
 
-async function ready(check: () => Promise<unknown>, label: string, timeout = 30_000) {
+async function ready<T>(check: () => Promise<T>, label: string, timeout = 30_000) {
   let error: unknown;
   const deadline = Date.now() + timeout;
   do {
@@ -295,21 +295,26 @@ EOF`,
   );
   await host("systemctl", "start", "dbus");
   await host("systemctl", "start", "systemd-networkd");
-  await ready(async () => {
-    assert.match(
-      await host("ip", "-6", "address", "show", "dev", "fd20-client"),
-      /inet6 fd20::1[\da-f]{2}\//,
-    );
-  }, "DHCPv6 lease with the boot firewall in place");
+  const acquired = await ready(dhcpv6LeaseExpiry, "DHCPv6 lease with the boot firewall in place");
   console.log("Ubuntu networkd acquired a DHCPv6 address under the boot firewall.");
+  return acquired;
 }
 
-async function checkDhcpv6Renewal() {
+async function dhcpv6LeaseExpiry() {
+  const [link] = JSON.parse(await host("ip", "-6", "-j", "address", "show", "dev", "fd20-client")) as {
+    addr_info: { local: string; valid_life_time: number }[];
+  }[];
+  const lease = link?.addr_info.find(({ local }) => /^fd20::1[\da-f]{2}$/.test(local));
+  assert.ok(lease && lease.valid_life_time > 0, "The DHCPv6 client has a live lease.");
+  return Date.now() + lease.valid_life_time * 1000;
+}
+
+async function checkDhcpv6Renewal(acquired: number) {
   await ready(
     async () => {
       const log = await host("cat", "/tmp/fd20-dhcp.log");
-      assert.match(log, /DHCPRENEW/);
-      assert.ok((log.match(/DHCPREPLY/g)?.length ?? 0) >= 2);
+      assert.match(log, /DHCP(?:RENEW|REBIND)/);
+      assert.ok((await dhcpv6LeaseExpiry()) > acquired + 30_000, "The client extended its DHCPv6 lease.");
     },
     "DHCPv6 renewal",
     90_000,
@@ -439,7 +444,7 @@ EOF`,
   await host("rm", "/etc/apt/apt.conf.d/99ark-fixture");
   await docker("exec", ...env, vps, "bun", fixture, "harden");
   console.log(await host("bun", fixture, "reboot-metric"));
-  await checkDhcpv6();
+  const dhcpv6Expiry = await checkDhcpv6();
   assert.match(
     await host("systemctl", "show", "docker.service", "-p", "Requires"),
     /ark-host-firewall\.service/,
@@ -566,7 +571,7 @@ EOF`,
     "Local audit rejected both the unexpected Docker publication and the host's public SSH listener.",
   );
   console.log(await externalAudit(addresses, true));
-  await checkDhcpv6Renewal();
+  await checkDhcpv6Renewal(dhcpv6Expiry);
   await nested(
     "run",
     "-d",
@@ -614,7 +619,7 @@ EOF`,
   } finally {
     await host("nft", "delete", "table", "inet", "test_provider");
   }
-  await host("kill", String(udpPid));
+  await host("kill", udpPid);
   await applyPolicy("on");
   await Promise.all(
     addresses.map(async (address) => console.log(await scan("bun", fixture, "mail", address))),
