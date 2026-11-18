@@ -385,7 +385,7 @@ esac
     stdout: "ignore",
     stderr: "pipe",
   });
-  const stderr = ingress.stderr.text();
+  const stderr = new Response(ingress.stderr).text();
   process.env.ARK_PGBOUNCER_DIR = dir;
   try {
     let reply: string | undefined;
