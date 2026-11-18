@@ -72,6 +72,10 @@ export async function writeEdgeL4(input: EdgeL4Input, env: Record<string, string
     sniPorts: generation.manifest.sniPorts,
     tlsRoutes: generation.manifest.routes.filter((route) => route.kind === "tls").map((route) => route.id),
     tcpRoutes: generation.manifest.routes.filter((route) => route.kind === "tcp").map((route) => route.id),
+    postgresRoutes: generation.manifest.routes
+      .filter((route) => route.kind === "postgres")
+      .map((route) => route.id),
+    pooler: generation.manifest.pooler ?? null,
   };
 }
 
@@ -87,7 +91,7 @@ export async function missingL4Routes(routes: EdgePolicyRoute[], master: Haproxy
   return routes
     .filter(
       (route) =>
-        (route.kind === "tls" || route.kind === "tcp") &&
+        (route.kind === "tls" || route.kind === "tcp" || route.kind === "postgres") &&
         !servers.some((server) => server.server === haproxyServerName(route) && !(server.adminState & 1)),
     )
     .map((route) => route.id);

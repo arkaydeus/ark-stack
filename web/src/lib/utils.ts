@@ -12,6 +12,14 @@ export function formatDate(value: string | Date | null | undefined) {
   );
 }
 
+/** Splits a CIDR list typed one per line or comma-separated. */
+export function parseCidrList(value: string) {
+  return value
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: "include",

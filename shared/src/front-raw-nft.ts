@@ -4,9 +4,9 @@
 // `forward` (Docker DNAT to a published port) hooks, the allowlist before the per-source limits, IPv6
 // sources grouped by /64. Every port of the dedicated range is covered: a port without an enabled
 // route drops all traffic, an enabled route with an empty allowlist drops all traffic (deny all), and
-// only an explicit `allowInternet` renders no source restriction. The general `ark_front` table for
-// the shared ports, and applying it through the `database-ingress` reconciler, are FD-15; this table
-// is the raw-port part it absorbs.
+// only an explicit `allowInternet` renders no source restriction. Since FD-26 the domain worker
+// publishes this table with the 5432 limits through the `database-ingress` reconciler, and waits for
+// its exact hash acknowledgement before reloading HAProxy. General shared-port policy remains FD-15.
 
 import { parseCidr } from "./cidr.ts";
 import { TCP_ROUTE_PORTS, isTcpRoutePort, l4Limits, routeAllowlist, type L4Limits } from "./edge-l4.ts";

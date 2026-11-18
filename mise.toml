@@ -66,7 +66,7 @@ description = "Run native mail lifecycle checks against a disposable pinned Stal
 run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts"
 
 [tasks."test:edge"]
-description = "Check edge harness cleanup and pins, Caddy configurations, edge behaviour, database port nftables rules, LocalAPI deployment, route withdrawal, HAProxy SNI routing and TLS-TCP/raw-TCP routes (FD-14), and login gate routing, Origin contract, bypass guard and revocation (FD-11)"
+description = "Check edge harness cleanup and pins, Caddy configurations, edge behaviour, database port nftables rules, LocalAPI deployment, route withdrawal, HAProxy SNI routing and TLS-TCP/raw-TCP routes (FD-14), the PostgreSQL router on 5432 with PgBouncer and postgres routes (FD-26), and login gate routing, Origin contract, bypass guard and revocation (FD-11)"
 run = [
   "bun test scripts/edge-test scripts/edge-l4-guard.test.ts scripts/maintain.test.ts",
   "bun scripts/test-edge-config.ts",
@@ -74,6 +74,7 @@ run = [
   "bun scripts/test-edge-observer.ts",
   "bun scripts/test-edge-l4.ts",
   "bun scripts/test-edge-l4-routes.ts",
+  "bun scripts/test-edge-pg5432.ts",
   "bun scripts/test-edge-gate.ts",
 ]
 

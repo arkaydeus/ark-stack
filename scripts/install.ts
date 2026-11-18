@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { chmod, chown, mkdir, readdir, stat } from "node:fs/promises";
+import { chmod, chown, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
@@ -100,7 +100,8 @@ const parsed = Object.fromEntries(
 await seedPgbouncerBootstrap(join(root, "tmp", "pgbouncer"), {
   adminPassword: parsed.ARK_PGBOUNCER_ADMIN_PASSWORD,
 });
-await Bun.write(join(root, "tmp", "pgbouncer", "expose"), "0\n");
+// FD-26: 5432 belongs to edge-l4 (fe_pg5432); the old relay's exposure toggle is gone.
+await rm(join(root, "tmp", "pgbouncer", "expose"), { force: true });
 await Bun.write(join(root, "tmp", "metrics.token"), `${parsed.ARK_METRICS_TOKEN}\n`);
 await chmod(join(root, "tmp", "metrics.token"), 0o600);
 
@@ -173,6 +174,9 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "/docker-entrypoint-initdb.d/10-runtime.sh",
   ]);
   await run("docker", [...compose, "run", "--rm", "migrate"]);
+  // Recreate the host-namespace reconciler first: before FD-26 its relay listened on host 5432, which
+  // edge-ts now publishes for edge-l4's PostgreSQL router.
+  await run("docker", [...compose, "up", "-d", "database-ingress"]);
   await run("docker", [
     ...compose,
     "up",

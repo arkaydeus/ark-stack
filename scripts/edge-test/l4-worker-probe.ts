@@ -14,6 +14,7 @@ import { lstat, stat, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+  DB_INGRESS_LIMIT_DEFAULTS,
   adminShowStat,
   currentGeneration,
   generationId,
@@ -25,6 +26,7 @@ import {
   writeGeneration,
 } from "@ark-stack/shared";
 
+import { applyFrontIngress } from "../../server/src/modules/front-ingress.ts";
 import { writeEdgeL4 } from "../../server/src/modules/edge-l4.ts";
 
 const root = process.env.ARK_EDGE_L4_DIR ?? "/usr/local/etc/haproxy";
@@ -33,7 +35,7 @@ const adminSocket = process.env.ARK_HAPROXY_ADMIN_SOCKET ?? "/var/run/haproxy/ad
 const validatorSocket =
   process.env.ARK_HAPROXY_VALIDATOR_SOCKET ?? "/var/run/haproxy-validator/validate.sock";
 const master = new HaproxyMaster(masterSocket);
-const [command = "", argument = "", flag = ""] = process.argv.slice(2);
+const [command = "", argument = "", flag = "", limitsJson = ""] = process.argv.slice(2);
 
 async function masterReloads() {
   const text = await master.command("show proc");
@@ -63,8 +65,13 @@ async function describe(path: string) {
 async function run(): Promise<unknown> {
   switch (command) {
     case "apply": {
+      if (flag === "protected")
+        await applyFrontIngress(
+          JSON.parse(argument),
+          limitsJson ? JSON.parse(limitsJson) : DB_INGRESS_LIMIT_DEFAULTS,
+        );
       const result = await writeEdgeL4(JSON.parse(argument), { ...process.env, NODE_ENV: "production" });
-      if (flag === "force" && result.applied && !result.reloaded)
+      if ((flag === "force" || flag === "protected") && result.applied && !result.reloaded)
         return { ...result, forced: await master.reload() };
       return result;
     }
