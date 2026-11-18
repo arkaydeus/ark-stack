@@ -33,7 +33,11 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts"
+
+[tasks."docs:check"]
+description = "Check that the operator docs and guides name only existing files, links, anchors, mise tasks, API endpoints, env vars and ports"
+run = "bun scripts/check-docs.ts"
 
 [tasks."test:db"]
 description = "Run the DB-backed server tests (or the bun test arguments given) against a throwaway, migrated postgres:17.6 container that is always removed"
@@ -133,7 +137,7 @@ run = "ARK_DOCKER_INTEGRATION=1 go test -run TestDisposableDockerDeploymentAndDu
 dir = "agent"
 
 [tasks.typecheck]
-description = "Typecheck every TypeScript workspace, the image publisher and PgBouncer probes"
+description = "Typecheck every TypeScript workspace, the image publisher, PgBouncer probes and the docs check"
 run = [
   "bunx tsc --noEmit -p shared/tsconfig.json",
   "bunx tsc --noEmit -p server/tsconfig.json",
@@ -143,6 +147,7 @@ run = [
   "bunx tsc --noEmit -p scripts/tsconfig.pgbouncer.json",
   "bunx tsc --noEmit -p scripts/tsconfig.test-db.json",
   "bunx tsc --noEmit -p scripts/tsconfig.backups.json",
+  "bunx tsc --noEmit -p scripts/tsconfig.docs.json",
 ]
 
 [tasks.lint]

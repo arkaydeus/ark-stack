@@ -55,7 +55,7 @@ PgBouncer runtime probes also have a dedicated TypeScript check in CI and `mise 
 
 ## Publishing images
 
-`mise run images:publish` builds all nine Bake targets for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing.
+`mise run images:publish` builds all eleven Bake targets of the default group (`imageTargets` in `scripts/check-image-plan.ts`) for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing.
 
 Set both `GHCR_TOKEN` and `GHCR_USER` to use an explicit token without a GitHub CLI login. Otherwise, log in with `gh` and grant its token package access using `gh auth refresh -h github.com -s write:packages`. Login and push use a temporary Docker configuration, removed on success or failure; the existing Docker context and Buildx builder are preserved.
 
@@ -86,5 +86,7 @@ templates/  Reviewed application service definitions
 ```
 
 Public administration and public database endpoints are independent. Tailnet-only admin mode does not publish a public dashboard route.
+
+Documentation: [architecture](docs/architecture.md), [operating runbooks](docs/operating.md), [security review](docs/security-review.md), and the guides for the [front door](docs/guides/front-door.md), [database access from Vercel](docs/guides/vercel-database.md) and [off-VPS backups](docs/guides/backups.md). The front-door design and its as-built summary are in [docs/design/front-door.md](docs/design/front-door.md).
 
 Local and live-integration evidence is recorded in [`docs/fix1-verification.md`](docs/fix1-verification.md). Public DNS, ACME, external CIDR, SES, off-host receiver, and fresh-host restore checks are deployment acceptance gates rather than unit-test substitutes.

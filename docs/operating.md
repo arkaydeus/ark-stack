@@ -1,5 +1,19 @@
 # Operating
 
+This is the operator reference. The task-oriented guides are:
+
+- [Front door](guides/front-door.md): public routes, Postgres routes, ACL snippet, DNS and IPv6.
+- [Database access from Vercel](guides/vercel-database.md): client certificates, env vars and rollover.
+- [Off-VPS backups](guides/backups.md).
+
+Runbooks in this file:
+
+- [Edge Tailscale node](#edge-tailscale-node) (enrolment)
+- [Revocation](#revocation)
+- [Certificate rollover](#certificate-rollover)
+- [Third-party image pins](#third-party-image-pins)
+- [Opt-in live test suites](#opt-in-live-test-suites)
+
 ## Fresh install
 
 1. Install Docker and pin tools with `mise install`.
@@ -92,10 +106,10 @@ The existing admin node, `tailscale` with `tailnet-gateway` (profile `tailnet`, 
 
 2. Under **Settings → Keys → Generate auth key**, create a key with **Reusable** off (one-off), **Ephemeral** off (the node keeps its state across restarts), **Pre-approved** on, **Tags** `tag:ark-edge`, and an expiry of 1 day.
 3. Put it in `.env` as `TS_EDGE_AUTHKEY=tskey-auth-…`. Running `mise run host:install` asks for it on a terminal without echoing it, or takes it from `TS_EDGE_AUTHKEY` in the environment. The installer never replaces a value that is already in `.env`, and never prints it.
-4. Start the node and put `edge` back in its namespace:
+4. Start the node, then put `edge` and `edge-l4` back in its namespace:
 
    ```sh
-   docker compose --env-file .env -f infra/platform/docker-compose.yml up -d edge-ts edge
+   docker compose --env-file .env -f infra/platform/docker-compose.yml up -d edge-ts edge edge-l4
    mise run edge:rejoin
    docker compose --env-file .env -f infra/platform/docker-compose.yml exec edge-ts \
      tailscale --socket=/var/run/tailscale/tailscaled.sock status --json | jq '.Self.Tags'
@@ -104,6 +118,9 @@ The existing admin node, `tailscale` with `tailnet-gateway` (profile `tailnet`, 
    The last command should print `["tag:ark-edge"]`.
 
 5. Delete the key from `.env` (leave `TS_EDGE_AUTHKEY=` empty) and revoke it in the console. The node authenticates from its state volume (`ark_edge_ts_state`) from then on. Tagged devices have key expiry disabled by default.
+6. With Tailnet Lock enabled, sign the new node from a trusted signing node (`tailscale lock sign <node key>`). Then check `GET /api/front/tailnet`: the next `edge.observe` (or `POST /api/front/tailnet/observe`) must commit a generation whose self node carries `tag:ark-edge`. Routes then wait in `awaiting_acl` until their grants from [Tailnet policy snippet](#tailnet-policy-snippet) are merged.
+
+**Re-enrolling or replacing the edge node.** Never reuse a failed node identity. Remove the old `ark-edge` device in the admin console, then create a fresh one-off key and repeat steps 2–6. The `ark_edge_ts_state` Compose volume (`ark-platform_ark_edge_ts_state` in Docker) holds the old identity, so stop `edge-ts` and remove that one volume first. Every route's pinned target stays valid, because pins name the target machines, not the edge. Routes are withdrawn while the lease has no valid generation and return after the first observation of the new node.
 
 Allow UDP 41642 in the host and provider firewalls so the edge node can make direct WireGuard connections. Without it, tailnet traffic is relayed through DERP. The host's own tailscaled keeps UDP 41641.
 
@@ -317,6 +334,49 @@ An unsettled-write warning also means an earlier request may still reach Vercel.
 
 **Upgrading.** `mise run maintain` stops `database-ingress` (whose old relay held host 5432) before `edge-ts` is recreated with the new port and network; run `mise run edge:rejoin` if `edge-ts` was restarted by other means. `mise run test:edge` runs `scripts/test-edge-pg5432.ts`.
 
+## Revocation
+
+Every revocation below is owner-only with MFA. Tightening needs no step-up; the calls that need one say so. Run API calls from the admin origin (see the console helper in [the Vercel guide](guides/vercel-database.md#1-before-you-start)) or use the matching UI page.
+
+**A public route** (HTTP, TLS, TCP or Postgres; **Front door routes**):
+
+| Goal                               | Call                                                                                                                                                                                                                                                                             |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stop serving now, keep the route   | `POST /api/front/routes/:id/disable` (no step-up). The backend is fenced and its sessions closed within the withdrawal bound; other routes keep serving.                                                                                                                         |
+| Remove the route                   | `DELETE /api/front/routes/:id` (`resource.delete` bound to `{ routeId }`). It drains the route. Removing the endpoint's final route also removes its certificates and leaves the address records as pending removals in the DNS review (publish or remove them at the provider). |
+| Narrow who may connect (L4 routes) | `PATCH /api/front/routes/:id` with a smaller `sourceCidrs` or lower `limits` (no step-up). The HAProxy server names change, so the watchdog fences the old servers and `edge.drain` closes their sessions.                                                                       |
+| Revoke one `terminate_mtls` client | `POST /api/front/routes/:id/client-certificates/:certificateId/revoke` (no step-up). The CRL is regenerated and the route's servers are renamed; sessions with the revoked certificate are closed.                                                                               |
+| Cut the tailnet path entirely      | Remove the route's grant from the tailnet policy. The next `edge.observe` probe fails and the route returns to `awaiting_acl` (withdrawn).                                                                                                                                       |
+
+**A gate user** (SSO routes; **Gate users**):
+
+- Remove the user from one route with `PUT /api/front/routes/:id/access` and the reduced `{ "userIds": [...] }` (`role.grant` bound to `{ routeId, userIds }`). Their next request is denied.
+- Delete the user everywhere with `DELETE /api/gate/users/:id` (`role.grant` bound to `{ gateUsers: "delete", userId }`). This deletes the user's sessions and every route session.
+
+Each revocation is journalled in the same transaction and queues an `edge.drain` (`reason: gate_revocation`) of every affected route. Open WebSockets on that route close for every user, and reconnecting users pass the gate again. If the drain is not applied within 5 s, the watchdog withdraws the route and the API raises `Gate revocation not applied within 5 s` ([Login gate for SSO routes](#login-gate-for-sso-routes-fd-11)).
+
+**A database client** (Vercel and other PgBouncer clients): `POST /api/databases/:id/clients/:clientId/revoke` (`credential.rotate` bound to `{ databaseId, clientId }`). `database.client_revoke` removes every CA generation of the client, rotates the role password and sets it `NOLOGIN`, reloads PgBouncer, runs `KILL_CLIENT` on the role's live sessions and deletes any Vercel integration credentials. New handshakes fail with `unknown ca`. Other clients and their sessions are untouched. Narrowing the pooler-wide policy does **not** close live sessions; revoke the client for that.
+
+**The edge or backup node itself**: remove the device in the Tailscale admin console. The observation lease then expires and every tailnet route is withdrawn within 6 minutes + 5 s. Re-enrol as in [Edge Tailscale node](#edge-tailscale-node).
+
+## Certificate rollover
+
+**Database client certificates (90 days).** Ark issues the successor at T−30 from a fresh CA and reloads PgBouncer with both CAs. It raises `db-client-rollover:<client>`: info, then warning at T−14 (`ArkDatabaseClientRolloverWarning`) and critical at T−7 (`ArkDatabaseClientRolloverCritical`). The predecessor is retired at `not_after`, and its role is drained by `not_after + 5 s`. The step-by-step manual delivery is in [the Vercel guide, §7](guides/vercel-database.md#7-manual-rollover):
+
+1. reveal the successor;
+2. replace `ARK_DB_CLIENT_CERT_B64` and `ARK_DB_CLIENT_KEY_B64`;
+3. redeploy;
+4. check access;
+5. `POST …/rollover/confirm`.
+
+To start one early (for a drill or a suspected key leak), use `POST /api/databases/:id/clients/:clientId/rollover` (`credential.rotate`). A CSR client must send a new `csrPem`.
+
+If `ArkDatabaseClientRetirementFailed` fires (`db-client-retire:<certificate>`), the database worker could not drain the old generation. The independent watchdog has already disabled the database and stopped PgBouncer, or closed the public listener when the admin socket was unusable. Check the database worker and `pgbouncer-public` logs, and the `client_certificate_retirements` row's error. The task retries with backoff. Clients reconnect once PgBouncer is back with the reduced bundle. For a mismatched Vercel push, see [Vercel certificate rollover recovery](#vercel-certificate-rollover-recovery).
+
+**Route client CAs (`terminate_mtls`).** Route CA CRLs last 14 days. `edge.l4_apply` regenerates any CRL with less than 7 days left, and `edge.observe` queues it when one is due. Nothing needs to be done by hand. Route client certificates are reissued through `POST /api/front/routes/:id/client-certificates`, followed by revoking the old one.
+
+**Public Let's Encrypt certificates** (routes, the login and admin hosts, and the database endpoint). `ArkCertificateExpiry` fires when a managed certificate expires within 14 days. Domain verification (`POST /api/domains/:id/verify`, or **Recheck** on the Domains screen) renews any ready endpoint whose certificate is missing, unusable or within 30 days of expiry. No scheduled job queues that renewal by itself, so run verification when the window opens or the alert fires. A renewed database certificate is served only after a successful `pgbouncer.reload` that verifies the served fingerprint. Caddy and HAProxy pick up renewed certificates through `edge.apply`.
+
 ## Recovery
 
 `mise run recover -- status` prints bootstrap state without changing data. Setup cannot be reopened while users exist. Keep local recovery codes and the generated `ARK_MFA_RECOVERY_TOKEN` off-host. If an owner loses every factor, run `mise run recover:mfa -- owner@example.com RESET:owner@example.com "$ARK_MFA_RECOVERY_TOKEN"` on the host. It revokes every session and step-up grant before permitting re-enrollment.
@@ -362,7 +422,16 @@ Third-party images (Caddy, HAProxy, Tailscale, PgBouncer, PostgreSQL, Stalwart a
 
    `edge-ts` uses an unreachable login server, so the run never contacts Tailscale. The run takes about 2 minutes.
 
-5. In the PR, record the full digest, how it was resolved and verified, and the integration-task output. Roll the release out through `mise run maintain` (above).
+   For other images, run the matching task instead:
+
+   - HAProxy: `mise run test:edge` (`scripts/test-edge-l4.ts` and `server/src/edge-l4-policy.test.ts` compare their pin with Compose and the validator stage).
+   - PgBouncer: `mise run test:pgbouncer`, which checks the `PgBouncer 1.26.1` banner.
+   - Tailscale for `backup-ts`: `mise run test:backups-tailnet`.
+   - The PostgreSQL base of `postgres`/`app-postgres`: `mise run test:backups`, which builds and runs the actual Compose clusters, and `mise run test:pgbouncer`.
+   - Stalwart: `mise run test:stalwart`.
+
+5. **Check the first-party build plan.** The `oven/bun`, HAProxy validator and PostgreSQL base pins are build inputs of the first-party Bake targets. Run `bun scripts/check-image-plan.ts`. It runs `docker buildx bake --print` and fails unless the default group has exactly the expected targets (`imageTargets`), each with the repository source label and annotation and minimal provenance. CI runs it as well, together with a `--no-cache` build of every target. Then `mise run images:publish -- --dry-run` shows the tags and labels a release would push.
+6. In the PR, record the full digest, how it was resolved and verified, and the integration-task output. Roll the release out through `mise run maintain` (above). The release bundle's image list must contain the new digest. `scripts/edge-test/pins.ts` checks that `infra/platform/release.json` carries the tested Caddy pin and a matching `bundleDigest`.
 
 ## Tailnet policy snippet
 
@@ -392,3 +461,34 @@ The snippet's syntax and tests can be checked against a real tailnet with an opt
 `mise run test:db` runs the DB-backed server tests against a throwaway `postgres:17.6` container that it migrates as `ark_migration` and removes on completion or interruption (cleanup failure returns nonzero). `mise run test:db:up` keeps one running and prints shell exports plus the `ark_test_db <file>` helper, which isolates follow-up tests from inherited provider settings (see the README).
 
 `mise run test:e2e` refuses non-loopback PostgreSQL, creates a uniquely named disposable database, migrates it from empty, drives Chromium through owner creation, pre-MFA denial, invalid and valid TOTP, recovery-code acknowledgement, custom domain setup and one-time recovery-code use, then removes the database. The provider/Linux release checks in `security-review.md` remain separate opt-in acceptance work.
+
+These Docker-only container harnesses need no external credentials:
+
+- `mise run test:edge`
+- `mise run test:db-ingress`
+- `mise run test:pgbouncer`, which needs the migrated platform database in `DATABASE_URL`, for example from `eval "$(mise run test:db:up)"`
+- `mise run test:e2e-gate`
+- `mise run test:host-hardening`
+- `mise run test:ipv6-preflight`
+- `mise run test:backups`
+- `mise run test:backups-tailnet`
+- `mise run test:upgrade`
+- `mise run test:stalwart`
+
+## Opt-in live test suites
+
+These suites need real external accounts, so CI never runs them. Each one prints a skip message and exits 0 unless its variables are set. Use scratch accounts, never production, pass credentials only through the environment, and revoke them afterwards.
+
+| Suite                                                  | Run                                                     | Required variables                                                                                                                                                                                                                                                                                                                    | Covers                                                                                                                         |
+| ------------------------------------------------------ | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Vercel scope proof and refusals (FD-29)                | `bun --no-env-file test server/src/vercel-live.test.ts` | `ARK_TEST_VERCEL_PROJECT_ID`, `ARK_TEST_VERCEL_TEAM_ID`, `ARK_TEST_VERCEL_OTHER_PROJECT_ID`, `ARK_TEST_VERCEL_PROJECT_TOKEN`. Refusal fixtures as available: `ARK_TEST_VERCEL_TEAM_TOKEN`, `ARK_TEST_VERCEL_ACCOUNT_TOKEN`, `ARK_TEST_VERCEL_OTHER_PROJECT_TOKEN`, `ARK_TEST_VERCEL_EXPIRED_TOKEN`, `ARK_TEST_VERCEL_NO_EXPIRY_TOKEN` | The four exact probe statuses and metadata shape needed before connection can be enabled in `server/src/modules/vercel-api.ts` |
+| Vercel hook delivery                                   | same file                                               | `ARK_TEST_VERCEL_DEPLOY_HOOK` (production branch), `ARK_TEST_VERCEL_PREVIEW_DEPLOY_HOOK` (non-production branch)                                                                                                                                                                                                                      | Exact READY match, target, custom-environment exclusion and branch filtering                                                   |
+| Vercel env inheritance on redeploy                     | same file                                               | `ARK_TEST_VERCEL_REDEPLOY_TOKEN` (or the project token), `ARK_TEST_VERCEL_BASELINE_DEPLOYMENT_ID`, `ARK_TEST_VERCEL_CANARY_BASELINE`, optional `ARK_TEST_VERCEL_AUTOMATION_BYPASS`                                                                                                                                                    | Whether `POST /v13/deployments` with `deploymentId` picks up changed env vars (design §3.10.5)                                 |
+| Edge node on a real tailnet                            | `mise run test:edge-tailnet`                            | `ARK_TEST_TS_EDGE_AUTHKEY`; optional `ARK_TEST_TS_PEER_AUTHKEY`, `ARK_TEST_TS_GRANTED_PORT`, `ARK_TEST_TS_UDP_PORT`, `ARK_TEST_TS_REQUIRE_DIRECT`                                                                                                                                                                                     | Tags, grant-less isolation, shields-up, UDP 41642, LocalAPI read and probe ([Edge Tailscale node](#edge-tailscale-node))       |
+| Tailnet ACL snippet                                    | `mise run test:tailnet-acl`                             | `ARK_TEST_TS_POLICY_API_KEY` (`policy_file:read`); optional `ARK_TEST_TS_TAILNET`                                                                                                                                                                                                                                                     | `POST /acl/validate` accepts the snippet and its tests reject broad rules ([Tailnet policy snippet](#tailnet-policy-snippet))  |
+| Home backup on a real tailnet                          | `mise run test:backups-tailnet-live`                    | `ARK_TEST_TS_BACKUP_AUTHKEY` and `ARK_TEST_TS_HOME_AUTHKEY` (ephemeral, pre-approved); optional `ARK_TEST_TS_EDGE_AUTHKEY`, `ARK_TEST_TS_POLICY_API_KEY`, `ARK_TEST_TS_TAILNET`                                                                                                                                                       | Backup through `backup-ts` with only `tag:ark-backup → home:8000`, edge deny                                                   |
+| Hosted S3 (AWS, B2, R2)                                | `mise run test:backups-hosted`                          | `ARK_TEST_S3_PROVIDER`, `ARK_TEST_S3_ENDPOINT`, `ARK_TEST_S3_BUCKET`, `ARK_TEST_S3_ACCESS_KEY_ID`, `ARK_TEST_S3_SECRET_ACCESS_KEY`; set `ARK_TEST_S3_REGION` for B2; R2 lock evidence needs `ARK_TEST_R2_ACCOUNT_ID` and `ARK_TEST_R2_VERIFIER_TOKEN`                                                                                 | Backup and off-VPS restore against the real provider ([backups guide](guides/backups.md#testing))                              |
+| Real VPS hardening                                     | `mise run test:host-hardening-live`                     | `ARK_TEST_VPS_IPV4`, `ARK_TEST_VPS_IPV6`, `ARK_TEST_VPS_INVENTORY`, `ARK_TEST_VPS_SSH_ADDRESS`, `ARK_TEST_VPS_SSH_USER`, `ARK_TEST_VPS_ROOT`, `ARK_TEST_VPS_TAILNET_OWNER`, `ARK_TEST_VPS_TAILNET_STATE_FILE`                                                                                                                         | Owner Tailscale SSH, local audit, external scan and UDP receipt ([Provider firewall and audit](#provider-firewall-and-audit))  |
+| IPv6 preflight on a real VPS and Let's Encrypt staging | `mise run test:ipv6-preflight-live`                     | VPS: `ARK_TEST_IPV6_VPS_ORIGIN`, `ARK_TEST_IPV6_VPS_ADDRESS`, `ARK_TEST_IPV6_VPS_SESSION_FILE`, `ARK_IPV6_PROBE_CREDENTIALS`. Staging: `ARK_TEST_IPV6_STAGING_HOSTNAME`, `ARK_TEST_IPV6_STAGING_ADDRESS`, `ARK_TEST_IPV6_STAGING_EMAIL`, `ARK_TEST_IPV6_STAGING_SSH`, `ARK_TEST_IPV6_STAGING_WEBROOT`                                 | Preflight from outside the VPS and HTTP-01 over IPv6 ([Native IPv6 and AAAA publication](#native-ipv6-and-aaaa-publication))   |
+
+Record the redacted output of a live run in the PR or in [`docs/fix1-verification.md`](fix1-verification.md). The Vercel scope proof is the gate for enabling the FD-29 integration.

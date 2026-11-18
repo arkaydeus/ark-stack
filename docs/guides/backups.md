@@ -23,7 +23,7 @@ flowchart LR
 - **The executor** answers a fixed set of token-authenticated actions on the internal `backup-management` network: `status`, `stanza-create`, `check`, `backup` (full, diff or incr), `stage`, `release-stage` and `prune-stages`. There is no generic command, no shell and no Docker socket, and **`pgbackrest expire` is never run on the VPS** (enforced by `tests/security/backup-no-expire.test.ts`).
 - **Staging.** Every repo2 writer takes the executor lock: `archive-push` and `backup` shared, staging exclusive. A stage forces a WAL switch, waits until that segment is in repo2, then copies the completed repository under the exclusive lock (`cp --reflink=auto`, which clones where the filesystem can and copies otherwise). While the copy runs, `archive-push` waits; PostgreSQL keeps the segment in `pg_wal` and retries, so WAL is fenced, never dropped. The stage's `manifest.json` records the stanza, backup labels, WAL segment and the **last recoverable time**: the instant of the WAL switch, claimed only when a backup finished before it.
 - **Export.** The backup worker (on `backup-egress`) uploads each stage as an immutable restic snapshot to `s3:<endpoint>/<bucket>/<prefix>/restic`, tagged `source=pg:<stanza>` and `stage=<id>`, and records a per-destination manifest (`backup_exports`). Each target has its own export operation, and bounded export lanes let healthy destinations continue while another destination stalls. Mail snapshots and reviewed volumes go to the same restic repository.
-- **Schedules.** Weekly full and daily differential backups per cluster, an export to every target every five minutes, and the append-only canary weekly and whenever a target is saved.
+- **Schedules.** Weekly full and daily differential backups per cluster, an export to every target every five minutes, and the append-only canary weekly and whenever a target is saved. **Nothing runs until execution is switched on:** set `ARK_BACKUP_EXECUTE=1` in `.env` and recreate `backup-worker` (`docker compose --env-file .env -f infra/platform/docker-compose.yml up -d backup-worker`). The Compose default is `0`, and the installer does not set it. With `0`, no schedule is queued, and an explicitly queued job fails instead of reporting success. Set `ARK_BACKUP_REQUIRED=1` as well to make the API refuse to start while execution is off.
 
 Live pgBackRest `*.info` files are never put under a lock or in the bucket: they are mutable. Only completed, staged copies are exported, so each restic snapshot keeps its own `backup.info` and `archive.info`, and the metadata history is immutable too.
 
@@ -31,17 +31,30 @@ Live pgBackRest `*.info` files are never put under a lock or in the bucket: they
 
 In **Backups → Add an S3-compatible target** (owner only; saving needs your password), pick the provider recipe, then enter:
 
-| Field               | Notes                                                                                                          |
-| ------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Endpoint            | `https://host[:port]`. Examples below. `http://` is accepted for a local MinIO only.                           |
-| Region              | Suggested from the region setting (FD-03), for example `us-east-1` for US East. R2 uses `auto`.                |
-| Bucket, prefix      | The restic repository lives at `<prefix>/restic`; canaries at `<prefix>/ark-canary/` and in each policy class. |
-| Path style          | On for MinIO; off (virtual-host style) for AWS, B2 and R2.                                                     |
-| Recovery window     | Days of history the lock or retention must cover. A shorter retention makes the target unhealthy.              |
-| Keys                | The writer credential from the recipe. Write-only: Ark seals them and never shows them again.                  |
-| Repository password | The restic password. Generate it, **store it off-host**, and never change it (a new prefix means a new repo).  |
+| Field (API key)                                    | Notes                                                                                                                                                                                           |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Name (`name`), provider (`provider`)               | Provider is `aws`, `b2`, `r2`, `minio` or `other` (any other S3-compatible store; checks it cannot prove keep the target unverified).                                                           |
+| Endpoint (`endpoint`)                              | `https://host[:port]`. Examples below. Use `http://` only for a MinIO on a private network: the schema does not stop it for other providers, but credentials would then travel in clear text.   |
+| Region (`region`)                                  | Suggested from the region setting (FD-03), for example `us-east-1` for US East. R2 uses `auto`. **B2:** type the region from the endpoint (for example `us-east-005`); the suggestion is AWS's. |
+| Bucket, prefix (`bucket`, `prefix`)                | The prefix defaults to `ark` (1–4 segments). The restic repository lives at `<prefix>/restic`; canaries at `<prefix>/ark-canary/` and in each policy class.                                     |
+| Path style (`pathStyle`)                           | On for MinIO; off (virtual-host style) for AWS, B2 and R2.                                                                                                                                      |
+| Recovery window (`recoveryWindowDays`)             | Days of history the lock or retention must cover (default 30, 1–3650). A shorter retention makes the target unhealthy.                                                                          |
+| Keys (`accessKeyId`, `secretAccessKey`)            | The writer credential from the recipe. Write-only: Ark seals them and never shows them again. On update, omit both to keep them or send both to replace them.                                   |
+| Repository password (`repositoryPassword`)         | The restic password, at least 24 characters. Generate it, **store it off-host**, and never change it (a new prefix means a new repo; Ark refuses a different password for the same repository). |
+| R2 verifier (`verifierAccountId`, `verifierToken`) | R2 only: the Cloudflare account ID and a separate **read-only** API token that can read the bucket's lock rules (`GET /accounts/{id}/r2/buckets/{bucket}/lock`). Never a writer credential.     |
 
-The API is `GET /api/backups/targets`, `PUT /api/backups/targets/s3` (with `id` to update) and `POST /api/backups/targets/:id/verify`. More than one S3 target may be configured; each is exported and checked independently.
+**Order of steps.** The generated writer and bucket protection policies are computed for a saved target, so:
+
+1. Create the bucket with its lock or retention as in the recipe.
+2. Create the writer credential with a temporary policy from the recipe.
+3. Save the target.
+4. Copy **Writer policy** and **Bucket protection policy** from the target card, or `writerPolicy` and `bucketProtectionPolicy` from `GET /api/backups/targets`.
+5. Apply them at the provider.
+6. Select **Run append-only check** (`POST /api/backups/targets/:id/verify`).
+
+The target stays unhealthy until the check reports **append-only: yes**.
+
+The API is `GET /api/backups/targets`, `PUT /api/backups/targets/s3` (with `id` to update) and `POST /api/backups/targets/:id/verify`. The PUT needs a `credential.rotate` step-up bound to `{ backupTarget: "s3", ...body }` (`POST /api/step-up` with your account password). More than one S3 target may be configured; each is exported and checked independently.
 
 ### Provider recipes
 
@@ -50,9 +63,9 @@ The UI shows the same recipes (`PROVIDER_RECIPES` in `shared/src/backup-targets.
 **AWS S3** (`https://s3.<region>.amazonaws.com`, virtual-host style)
 
 1. Create the bucket with Object Lock enabled (this enables versioning). Set a default retention in COMPLIANCE mode, or GOVERNANCE mode with no principal holding `s3:BypassGovernanceRetention`, of at least the recovery window.
-2. Create an IAM user for Ark with only the generated policy (including read-only `GetBucketPolicy`): `PutObject`, `GetObject`, `GetObjectVersion`, `GetObjectRetention` and listing under the prefix; `DeleteObject` **only** on `<prefix>/restic/locks/*`; and an explicit deny of `DeleteObjectVersion`, `BypassGovernanceRetention`, `PutObjectRetention`, `PutObjectLegalHold`, `PutBucketVersioning`, `PutBucketObjectLockConfiguration`, `PutLifecycleConfiguration`, `PutBucketPolicy`, `DeleteBucketPolicy` and `DeleteBucket`.
+2. Create an IAM user for Ark with only the generated writer policy. On the bucket it allows `ListBucket`, `ListBucketVersions`, `GetBucketLocation`, `GetBucketVersioning`, `GetBucketPolicy` and `GetBucketObjectLockConfiguration`. Under the prefix it allows `PutObject`, `GetObject`, `GetObjectVersion` and `GetObjectRetention`. It allows `DeleteObject` **only** on `<prefix>/restic/locks/*`, and it explicitly denies `DeleteObjectVersion`, `BypassGovernanceRetention`, `PutObjectRetention`, `PutObjectLegalHold`, `PutBucketVersioning`, `PutBucketObjectLockConfiguration`, `PutLifecycleConfiguration`, `PutBucketPolicy`, `DeleteBucketPolicy` and `DeleteBucket`.
 
-3. Attach the generated `bucketProtectionPolicy` from `GET /api/backups/targets` as a **bucket policy** too. Its unconditional all-principal denies cover permanent version deletion and retention changes/bypass on the exact config key and prevent deleting this policy. Keep permission to replace the policy on an independent off-host administrator; the VPS writer must have neither replacement nor deletion permission. A sibling canary alone cannot prove exact-key permissions. If the policy cannot be read and evaluated, verification stays unknown.
+3. Attach the generated `bucketProtectionPolicy` from `GET /api/backups/targets` as a **bucket policy** too. Its unconditional all-principal denies cover `DeleteObjectVersion`, `PutObjectRetention`, `BypassGovernanceRetention` and `PutObjectLegalHold` on everything under `<prefix>/` (the exact `restic/config` key included), and `DeleteBucketPolicy` on the bucket. Keep permission to replace the policy on an independent off-host administrator; the VPS writer must have neither replacement nor deletion permission. A sibling canary alone cannot prove exact-key permissions. If the policy cannot be read and evaluated, verification stays unknown.
 
 restic deletes its own lock files under `locks/` when a backup ends, so a credential with no delete permission at all would break `restic backup`. On a versioned bucket that delete only adds a delete marker.
 
@@ -63,16 +76,25 @@ restic deletes its own lock files under `locks/` when a backup ends, so a creden
 
 **Cloudflare R2** (`https://<account-id>.r2.cloudflarestorage.com`, region `auto`, virtual-host style)
 
-1. Add bucket lock rules on `<prefix>/restic/data/`, `index/`, `snapshots/`, `keys/`, `<prefix>/restic/config` and `<prefix>/ark-canary/` with **Indefinite** retention. Finite Age/Date rules expire on old config, keys and reused packs even when recent snapshots still depend on them. **Do not lock `<prefix>/restic/locks/`**: restic must remove its lock files.
+1. Add bucket lock rules on `<prefix>/restic/data/`, `index/`, `snapshots/`, `keys/`, `<prefix>/restic/config` and `<prefix>/ark-canary/` with **Indefinite** retention. Finite Age/Date rules expire on old config, keys and reused packs even when recent snapshots still depend on them. **Do not lock `<prefix>/restic/locks/`**: restic must remove its lock files. The canary ignores disabled rules, non-Indefinite rules and any rule whose prefix also covers `locks/` (for example a single rule on `<prefix>/` or `<prefix>/restic/`), so such rules count as no protection.
 2. R2 tokens have no no-delete level ("Object Read & Write"), so the lock rules are the only control. Scope the token to this bucket.
-3. Give Ark a separate **read-only** Cloudflare API token (with the account ID) so the canary can read the lock rules. Without it the target stays "unknown", never healthy.
+3. Give Ark a separate **read-only** Cloudflare API token with R2 read access, and the account ID, as `verifierToken` and `verifierAccountId`, so the canary can read the lock rules. Without it the target stays "unknown", never healthy.
 
 A direct, live pgBackRest S3 repository (`repo1`) is never the R2 recipe: `backup.info`, `backup.info.copy` and `archive.info` are rewritten in place and cannot sit under a non-overwrite lock.
 
 **MinIO** (path style)
 
 1. `mc mb --with-lock <alias>/<bucket>` (object locking turns on versioning), then `mc retention set --default COMPLIANCE <days>d <alias>/<bucket>`.
-2. Create a user with the same IAM-style policy as AWS (`mc admin policy create`, then `mc admin policy attach … --user …`), and attach the generated protection document as a bucket policy as described above.
+2. Create the writer user and save the target, then apply the generated documents with the MinIO root or an administrator credential that the VPS never holds:
+
+   ```sh
+   mc admin user add <alias> ark-writer '<secret>'
+   mc admin policy create <alias> ark-writer writer-policy.json            # writerPolicy from GET /api/backups/targets
+   mc admin policy attach <alias> ark-writer --user ark-writer
+   mc anonymous set-json bucket-protection.json <alias>/<bucket>          # bucketProtectionPolicy as the bucket policy (or S3 PUT ?policy as an administrator)
+   ```
+
+   `mise run test:backups` checks this recipe (`scripts/backup-test/provider-policies.test.ts`). An IAM exception on the exact `<prefix>/restic/config` key keeps the target `unknown` until the bucket policy's denial is attached, and then it becomes `append_only`.
 
 ## Home machine over the tailnet (FD-30)
 
@@ -107,14 +129,14 @@ The second destination is a restic REST repository on a machine you own, served 
 
    ```sh
    docker run -d --name rest-server --restart unless-stopped --network host \
-     -v /srv/restic:/data restic/rest-server:0.14.0 \
-     rest-server --path /data --listen "$(tailscale ip -4):8000" \
-       --append-only --private-repos --htpasswd-file /data/.htpasswd
+     -v /srv/restic:/data --entrypoint rest-server restic/rest-server:0.14.0 \
+     --path /data --listen "$(tailscale ip -4):8000" \
+     --append-only --private-repos --htpasswd-file /data/.htpasswd
    ```
 
-   Keep it running under systemd or the container's restart policy. Never point Ark at an instance without `--append-only`.
+   `--entrypoint rest-server` matters: the image's default entrypoint script builds its own command line, so flags placed after the image name would not reliably reach `rest-server` (Ark's own test overrides the entrypoint the same way). Keep it running under systemd or the container's restart policy. Never point Ark at an instance without `--append-only`; the canary reports such a server as **deletable**. Port 8000 is a convention: any explicit port works, and the generated grant follows the saved URL.
 
-5. **Create the backup node's key.** In the Tailscale admin console, add `tag:ark-backup` to `tagOwners` (the generated snippet declares it) and create a **one-off, pre-approved, non-ephemeral** auth key tagged `tag:ark-backup`. Never reuse the edge key. Put it in `.env` as `TS_BACKUP_AUTHKEY=tskey-auth-…` and start the node: `docker compose -f infra/platform/docker-compose.yml up -d backup-ts backup-worker`. After the first join, empty `TS_BACKUP_AUTHKEY` and revoke the key; the node keeps its identity in `ark_backup_ts_state`.
+5. **Create the backup node's key.** In the Tailscale admin console, add `tag:ark-backup` to `tagOwners` (the generated snippet declares it) and create a **one-off, pre-approved, non-ephemeral** auth key tagged `tag:ark-backup`. Never reuse the edge key. Put it in `.env` as `TS_BACKUP_AUTHKEY=tskey-auth-…` and start the node: `docker compose --env-file .env -f infra/platform/docker-compose.yml up -d backup-ts backup-worker`. The `--env-file` is required: the Compose file lives in `infra/platform/`, so Compose would not read the root `.env` by itself. After the first join, empty `TS_BACKUP_AUTHKEY` and revoke the key; the node keeps its identity in the `ark_backup_ts_state` volume (`ark-platform_ark_backup_ts_state` in Docker).
 6. **Bootstrap the ACL grant before observing or saving.** Merge this grant into the tailnet policy first, replacing `100.66.2.9` with the home machine's actual Tailscale IPv4 address. No saved target is needed for this manual grant. Add `tag:ark-backup` to `tagOwners` if it is not already declared:
 
    ```jsonc
@@ -130,7 +152,7 @@ The second destination is a restic REST repository on a machine you own, served 
 
    Never give `tag:ark-edge` a grant to the home machine, and never give `tag:ark-backup` anything else: backup reach and route reach must not share grants (§3.7).
 
-7. **Observe and add the target in Ark** (owner, MFA and your password): `PUT /api/backups/targets/tailnet_rest` with
+7. **Observe and add the target in Ark** (owner, MFA and a `credential.rotate` step-up bound to `{ backupTarget: "tailnet_rest", ...body }`; the step-up takes your **account** password, while `password` in the body is the **htpasswd** password): `PUT /api/backups/targets/tailnet_rest` with
 
    ```json
    {
@@ -141,15 +163,22 @@ The second destination is a restic REST repository on a machine you own, served 
    }
    ```
 
-   Home targets require `http://` over the encrypted tailnet. HTTPS is rejected until pinned-IP dialing with hostname verification is supported for restic. The URL must be the home machine's MagicDNS name or Tailscale address, with an explicit port and a path starting with the htpasswd user; credentials never go in the URL. Saving pins the machine from `backup-ts`'s current observation, so it fails until `backup-ts` is logged in **and** the bootstrap grant above is in place (`POST /api/backups/tailnet/observe` refreshes the observation; `GET /api/backups/tailnet` shows what `backup-ts` sees and each target's identity). Saving queues the canary. The **Backups** page has the same form.
+   The htpasswd `password` needs at least 8 characters and `repositoryPassword` at least 24. Home targets require `http://` over the encrypted tailnet. HTTPS is rejected until pinned-IP dialing with hostname verification is supported for restic. The URL must be the home machine's MagicDNS name or Tailscale address, with an explicit port and a path starting with the htpasswd user; credentials never go in the URL. Saving pins the machine from `backup-ts`'s current observation, so it fails until `backup-ts` is logged in **and** the bootstrap grant above is in place (`POST /api/backups/tailnet/observe` refreshes the observation; `GET /api/backups/tailnet` shows what `backup-ts` sees and each target's identity). Saving queues the canary. The **Backups** page has the same form.
 
-8. **Confirm the generated policy.** After saving, open **Front door ACL** (`GET /api/front/acl`) and merge or compare the generated home-target sections with the bootstrap grant. Keep only the backup-node-to-home TCP port grant and the generated edge deny tests.
+8. **Confirm the generated policy.** After saving, open **Front door ACL** (`GET /api/front/acl`) and merge or compare the generated home-target sections with the bootstrap grant. Keep only the backup-node-to-home TCP port grant and the generated tests (edge deny tests, UDP deny tests and tag probes).
 
 ### Pruning and recovery from the home machine
 
 Pruning happens **on the home machine**, never from the VPS: append-only mode refuses Ark's deletes (V-18: `restic forget` from the VPS leaves every snapshot in place). Run `restic forget --prune` there directly against `/srv/restic/ark` (or through a second, non-append-only rest-server instance bound to localhost), with the repository password you stored off-host.
 
-To recover, a machine on the tailnet uses the same repository with `restic -r rest:http://backup-home.<tailnet>.ts.net:8000/ark/ restore …` (`RESTIC_REST_USERNAME`, `RESTIC_REST_PASSWORD`, `RESTIC_PASSWORD`), or restores directly from `/srv/restic/ark` on the home machine. PostgreSQL snapshots have the same layout as on S3 (`source=pg:<stanza>`, `stage=<id>`), so the pgBackRest restore steps below apply after `restic restore`.
+To recover, a machine on the tailnet uses the same repository with `restic -r rest:http://backup-home.<tailnet>.ts.net:8000/ark/ restore …` (`RESTIC_REST_USERNAME`, `RESTIC_REST_PASSWORD`, `RESTIC_PASSWORD`), or restores directly from `/srv/restic/ark` on the home machine. PostgreSQL snapshots have the same layout as on S3 (`source=pg:<stanza>`, `stage=<id>`). `scripts/offsite-restore.ts` (below) reads only S3 repositories, so a PostgreSQL recovery from the home machine is manual:
+
+1. `restic restore <snapshot> --target /tmp/ark-restore` the stage you want. Its `repo2/` tree and `manifest.json` are inside.
+2. Run the matching `ark-postgres` or `ark-app-postgres` image with `--network none`. Mount the restored tree and an empty PGDATA volume, and set `PGBACKREST_REPO2_PATH=<restored>/repo2` and `PGBACKREST_REPO2_CIPHER_PASS=<ARK_PLATFORM_PG_REPO_CIPHER_PASS or ARK_APP_PG_REPO_CIPHER_PASS>`.
+3. As `postgres` (`gosu postgres`), run `pgbackrest --stanza=<stanza> --repo=2 --type=time --target=<time> --target-action=promote restore`. These are the same commands `scripts/offsite-restore.ts` runs after its own `restic restore`.
+4. Start PostgreSQL on that PGDATA with no network.
+
+The automated PITR proof (`mise run test:backups`) covers the S3 path only. No test restores from the REST repository.
 
 ## The append-only canary (S3)
 
@@ -191,7 +220,7 @@ Store these somewhere that does not depend on the VPS:
 
 - the restic repository password of each target (you generated it when saving the target), and the home rest-server's htpasswd password;
 - `ARK_PLATFORM_PG_REPO_CIPHER_PASS` and `ARK_APP_PG_REPO_CIPHER_PASS` from `.env` (generated by the installer);
-- a **read-only** key for the bucket (list and get only), separate from the writer;
+- a **read-only** key for the bucket (list and get only), separate from the writer. Ark generates no policy for it: create it at the provider with only `ListBucket`, `ListBucketVersions`, `GetObject` and `GetObjectVersion` on the bucket and prefix;
 - the image references `ark-postgres` and `ark-app-postgres` for the running Ark version.
 
 ## Off-VPS point-in-time restore
@@ -218,8 +247,14 @@ It picks the newest snapshot whose manifest covers the target time (or `ARK_REST
 
 - `mise run test:backups` runs the required suite locally against a pinned MinIO, the actual Compose clusters and a throwaway control database. It covers the append-only policy classes, the R2 lock recipe emulated with MinIO object lock, an unavailable destination, and full PITR recovery of both clusters after every VPS-local copy is deleted, all path-style. It also runs the deployed backup worker through API claims with blocked jobs, validates its private executor interface, restores exact mail/volume snapshots, checks restic parent reuse, and exercises idle and microsecond recovery boundaries.
 - `mise run test:backups-tailnet` runs the FD-30 suite locally: the shipped `backup-ts` service (offline tailscaled, userspace, SOCKS5), `rest-server --append-only --private-repos` on a Docker network inside 100.64.0.0/10 that only `backup-ts` joins, a mocked LocalAPI for `backup-ts`'s tailnet view, MinIO and a throwaway control database. It checks LocalAPI uid-1000 read access and write denial, pinning from the backup observation with disjoint edge and backup views, that the worker has no direct tailnet route and that REST traffic reaches rest-server only from `backup-ts` while S3 subprocesses and API calls get no proxy, the canary and V-18 (`restic forget` removes nothing), active transfers stopping within 5 s after replacement, removal or lease expiry, and two-destination health.
-- `mise run test:backups-tailnet-live` is opt-in: with `ARK_TEST_TS_BACKUP_AUTHKEY` and `ARK_TEST_TS_HOME_AUTHKEY` (and optionally `ARK_TEST_TS_EDGE_AUTHKEY`, `ARK_TEST_TS_POLICY_API_KEY`) for a scratch tailnet whose policy holds only the generated snippet, it backs up to a real home `rest-server` through `backup-ts` with only the `tag:ark-backup → home:8000` grant and shows that an ungranted port and the edge node cannot reach it. It skips with a message otherwise. The generated snippet's edge isolation is also asserted locally by `shared/src/tailnet-acl.test.ts`.
-- `mise run test:backups-hosted` runs the same backup and restore scenario against AWS S3, B2 or R2 (virtual-host style) when `ARK_TEST_S3_*` credentials are set, and skips with a message otherwise. See the header of `scripts/test-backups-hosted.ts`.
+- `mise run test:backups-tailnet-live` is opt-in: with `ARK_TEST_TS_BACKUP_AUTHKEY` and `ARK_TEST_TS_HOME_AUTHKEY` (and optionally `ARK_TEST_TS_EDGE_AUTHKEY`, `ARK_TEST_TS_POLICY_API_KEY`) (and optionally `ARK_TEST_TS_TAILNET`) for a scratch tailnet whose policy holds only the generated snippet, it backs up to a real home `rest-server` through `backup-ts` with only the `tag:ark-backup → home:8000` grant and shows that an ungranted port and the edge node cannot reach it. It skips with a message otherwise. The generated snippet's edge isolation is also asserted locally by `shared/src/tailnet-acl.test.ts`.
+- `mise run test:backups-hosted` runs the same backup and restore scenario against AWS S3, B2 or R2 (virtual-host style), and skips with a message unless these are set: `ARK_TEST_S3_PROVIDER` (`aws`, `b2` or `r2`), `ARK_TEST_S3_ENDPOINT`, `ARK_TEST_S3_BUCKET`, `ARK_TEST_S3_ACCESS_KEY_ID` and `ARK_TEST_S3_SECRET_ACCESS_KEY`. `ARK_TEST_S3_REGION` defaults to `auto` for R2 and `us-east-1` otherwise, so set it for B2. Optional variables:
+  - `ARK_TEST_S3_RECOVERY_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` (a read-only recovery key);
+  - `ARK_TEST_S3_PREFIX_BASE`;
+  - `ARK_TEST_S3_RECOVERY_WINDOW_DAYS`;
+  - `ARK_TEST_R2_ACCOUNT_ID` / `ARK_TEST_R2_VERIFIER_TOKEN`.
+
+  It records the canary verdict but does not require `append_only`, so judge it from the output. It leaves its prefix in the bucket for the provider's lifecycle. See the header of `scripts/test-backups-hosted.ts`.
 
 ## Execution and restore safeguards
 
