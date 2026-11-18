@@ -13,6 +13,7 @@ import { generateKeyPairSync, randomBytes, sign, type KeyObject } from "node:cry
 
 import {
   buildCsr,
+  challengePasswordAttribute,
   extensionRequest,
   headerOffsets,
   loadCorpus,
@@ -431,7 +432,7 @@ function cases(): Case[] {
     "unknown critical extension",
     "challengePassword attribute",
     signed({
-      attributes: [x509.sequence(x509.oid("1.2.840.113549.1.9.7"), x509.set(x509.utf8String("pw")))],
+      attributes: [challengePasswordAttribute()],
     }),
     /attribute 1\.2\.840\.113549\.1\.9\.7/,
   );

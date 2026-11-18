@@ -1,11 +1,10 @@
-// Test-only helpers for the FD-17 CSR hardening suites (x509-csr-malformed.test.ts and
-// csr-fuzz.test.ts). Nothing in production imports this file.
+// Test-only helpers for the FD-17 CSR hardening suites. Nothing in production imports this file.
 //
 // `buildCsr` assembles a PKCS#10 request from parts and signs it, so a test can place one
 // malformed element inside an otherwise valid, correctly signed request: the parser must then
 // reject the structure itself rather than relying on the signature check.
 
-import { createHash, sign, type KeyObject } from "node:crypto";
+import { sign, type KeyObject } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -37,6 +36,9 @@ export const rawOid = (content: number[] | Buffer) => x509.tlv(0x06, Buffer.from
 export function extensionRequest(extensions: Buffer[]) {
   return x509.sequence(x509.oid(x509.OID.extensionRequest), x509.set(x509.sequence(...extensions)));
 }
+
+export const challengePasswordAttribute = () =>
+  x509.sequence(x509.oid("1.2.840.113549.1.9.7"), x509.set(x509.utf8String("pw")));
 
 export type CsrParts = {
   key: KeyObject;
@@ -131,5 +133,3 @@ export function prng(seed: number) {
     bytes: (count: number) => Buffer.from(Array.from({ length: count }, () => Math.floor(next() * 256))),
   };
 }
-
-export const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
