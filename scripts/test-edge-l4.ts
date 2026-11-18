@@ -1443,9 +1443,10 @@ async function guardMode() {
 /**
  * Allow every tailnet route again and wait until the launch guard runs the full configuration. When
  * the guard was closed (a previous case withdrew a route), it reopens with its own master-CLI
- * `reload`. HAProxy's master re-executes on a reload and drops a concurrent CLI client, so a test
- * reload racing it gets no answer ("the master CLI did not answer the reload"). A fixed pause does
- * not cover a slow host; waiting for the guard's confirmed switch does.
+ * `reload`. That reload and the probe's share the reload lock, so they no longer race at the master
+ * (HAProxy re-executes on a reload and drops a concurrent CLI client unanswered). The next case still
+ * needs the full configuration: a fixed pause does not cover a slow host; waiting for the guard's
+ * confirmed switch does.
  */
 async function allowAllTailnetRoutes() {
   lease.routes = [webRoute, mqttRoute, ...fd09Policy];

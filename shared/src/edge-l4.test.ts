@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   allowedServerIndex,
+  edgeL4ConfigVersion,
   generationId,
   haproxyConfigServers,
   haproxyHttpServerName,
@@ -13,6 +14,7 @@ import {
   haproxyServerName,
   parseReload,
   parseServersState,
+  parseShowInfoVersion,
   parseShowProc,
   parseShowSess,
   parseShowStat,
@@ -21,6 +23,7 @@ import {
 } from "./edge-l4.ts";
 import { routeIdentityKey } from "./edge-withdrawal.ts";
 import {
+  acquireReloadLock,
   currentGeneration,
   hashGenerationDir,
   HaproxyMaster,
@@ -649,6 +652,9 @@ describe("HaproxyWithdrawalAdapter", () => {
   });
 });
 
+/** Two requests per reload and short confirmation windows keep the retry tests fast. */
+const fastRetries = { reloadAttempts: 2, confirmMs: 30, backoffMs: 1 };
+
 async function scratch() {
   return mkdtemp(join(tmpdir(), "ark-edge-l4-"));
 }
@@ -693,7 +699,8 @@ describe("generation install (§3.8.6)", () => {
     expect(await readlink(join(root, "current"))).toBe(`generations/${first.id}`);
     expect(await hashGenerationDir(join(root, "generations", first.id))).toBe(first.id);
     expect(await readFile(join(root, "current", "haproxy.cfg"), "utf8")).toBe(first.files["haproxy.cfg"]!);
-    expect(commands).toEqual(["reload", "show proc"]);
+    // The process snapshot before `reload` is what an unanswered request is confirmed against.
+    expect(commands).toEqual(["show proc", "reload", "show proc"]);
     // Re-applying the same generation changes nothing and sends no reload.
     commands.length = 0;
     expect(
@@ -768,20 +775,29 @@ describe("generation install (§3.8.6)", () => {
             await installEdgeL4Generation({ root, generation: good, validatorSocket: "/v", validate: valid });
           const candidate = renderEdgeL4Generation({ httpHostnames: ["new.example.com"] });
           let attempts = 0;
-          const master = new HaproxyMaster("/fake", async (_socket, command) => {
-            if (command !== "reload") return "#<PID> <type>\n1 master 0\n# workers\n9 worker 0\n";
-            if (++attempts === 1) {
-              if (failure === "empty") return "";
-              if (failure === "Success=0") return "Success=0\n--\n";
-              throw new Error(failure);
-            }
-            return "Success=1\n--\n";
-          });
+          // An ambiguous request is sent again within the call (bounded); Success=0 never is.
+          const failing = failure === "Success=0" ? 1 : 2;
+          const master = new HaproxyMaster(
+            "/fake",
+            async (_socket, command) => {
+              if (command !== "reload") return "#<PID> <type>\n1 master 0\n# workers\n9 worker 0\n";
+              if (++attempts <= failing) {
+                if (failure === "empty") return "";
+                if (failure === "Success=0") return "Success=0\n--\n";
+                throw new Error(failure);
+              }
+              return "Success=1\n--\n";
+            },
+            3_000,
+            fastRetries,
+          );
           const input = { root, generation: candidate, validatorSocket: "/v", validate: valid, master };
-          await expect(installEdgeL4Generation(input)).rejects.toThrow();
+          await expect(installEdgeL4Generation(input)).rejects.toThrow(
+            failure === "Success=0" ? /old workers keep serving/ : /did not answer the reload/,
+          );
           expect(await currentGeneration(root)).toBe(initial ? good.id : null);
           expect((await installEdgeL4Generation(input)).reloaded).toBe(true);
-          expect(attempts).toBe(2);
+          expect(attempts).toBe(failing + 1);
           expect(await currentGeneration(root)).toBe(candidate.id);
         } finally {
           await rm(root, { recursive: true, force: true });
@@ -796,11 +812,16 @@ describe("generation install (§3.8.6)", () => {
       const generation = renderEdgeL4Generation({ httpHostnames: [] });
       await installEdgeL4Generation({ root, generation, validatorSocket: "/v", validate: valid });
       let attempts = 0;
-      const master = new HaproxyMaster("/fake", async (_socket, command) => {
-        if (command !== "reload") return "#<PID>\n1 master 0\n";
-        if (++attempts === 1) throw new Error("ambiguous timeout");
-        return "Success=1\n--\n";
-      });
+      const master = new HaproxyMaster(
+        "/fake",
+        async (_socket, command) => {
+          if (command !== "reload") return "#<PID>\n1 master 0\n";
+          if (++attempts <= 2) throw new Error("ambiguous timeout");
+          return "Success=1\n--\n";
+        },
+        3_000,
+        fastRetries,
+      );
       const input = { root, generation, validatorSocket: "/v", validate: valid, master };
       await expect(installEdgeL4Generation({ ...input, force: true })).rejects.toThrow();
       expect((await installEdgeL4Generation(input)).reloaded).toBe(true);
@@ -899,5 +920,239 @@ describe("HaproxyWithdrawalAdapter with terminated routes (FD-14)", () => {
     expect(log).toContain(`@!70 disable server be_rt_p7q2_tls/${loop}`);
     expect(log).not.toContain("@!70 disable server be_caddy/caddy");
     expect(workers[0]!.sessions.map((session) => session.id)).toEqual(["0x3"]);
+  });
+});
+
+describe("master-CLI reload under concurrency (lost replies, FD-25)", () => {
+  const versionA = "a".repeat(64);
+  const versionB = "b".repeat(64);
+
+  /**
+   * A master CLI with one current worker. Each scripted `reload` step either answers or loses the
+   * reply, optionally starting a new worker that loaded a given version (as a racing reload does).
+   */
+  function fakeHaproxy(
+    steps: Array<{ answer: string; worker?: { version: string | null } } | "throw">,
+    initial: { version: string | null } = { version: versionA },
+  ) {
+    let pid = 100;
+    let current = { pid, version: initial.version };
+    const old: number[] = [];
+    let reloads = 0;
+    const cli: HaproxyCli = async (_socket, command) => {
+      if (command === "show proc") {
+        return [
+          "#<PID>          <type>          <reloads>       <uptime>        <version>",
+          `1               master          ${reloads} [failed: 0]  0d00h00m05s     3.2.26`,
+          "# workers",
+          `${current.pid}             worker          0               0d00h00m01s     3.2.26`,
+          ...(old.length
+            ? ["# old workers", ...old.map((item) => `${item} worker 1 0d00h00m09s 3.2.26`)]
+            : []),
+          "",
+        ].join("\n");
+      }
+      const info = /^@!(\d+) show info$/.exec(command);
+      if (info) {
+        if (Number(info[1]) !== current.pid) return "Can't find the target PID\n";
+        return `Name: HAProxy\nPid: ${current.pid}\n${current.version ? `description: ark-edge-l4 generation ${current.version}\n` : ""}`;
+      }
+      if (command !== "reload") throw new Error(`unexpected command ${command}`);
+      const step = steps[reloads++];
+      if (!step) throw new Error("no more scripted reloads");
+      if (step === "throw") throw new Error("HAProxy CLI reload timed out");
+      if (step.worker) {
+        old.push(current.pid);
+        current = { pid: ++pid, version: step.worker.version };
+      }
+      return step.answer;
+    };
+    return { cli, reloadCount: () => reloads, current: () => current };
+  }
+
+  test("an answered Success=0 is reported at once, never retried or confirmed into success", async () => {
+    // Even a racing reload that started a worker with the expected version cannot turn it around.
+    const fake = fakeHaproxy([{ answer: "Success=0\n--\n[ALERT] parse error\n" }]);
+    const master = new HaproxyMaster("/fake", fake.cli, 3_000, fastRetries);
+    const outcome = await master.reload({ expect: versionB });
+    expect(outcome).toMatchObject({ success: false, answered: true, confirmedBy: "answer", attempts: 1 });
+    expect(fake.reloadCount()).toBe(1);
+    expect(fake.current()).toMatchObject({ pid: 100, version: versionA });
+  });
+
+  test("a reply lost to a racing reload is confirmed from the new worker's version", async () => {
+    const fake = fakeHaproxy([{ answer: "", worker: { version: versionB } }]);
+    const master = new HaproxyMaster("/fake", fake.cli, 3_000, fastRetries);
+    expect(await master.reload({ expect: versionB })).toMatchObject({
+      success: true,
+      answered: false,
+      confirmedBy: "workers",
+      attempts: 1,
+    });
+    expect(fake.reloadCount()).toBe(1);
+  });
+
+  test("a new worker serving another version is not proof: the reload is sent again", async () => {
+    const fake = fakeHaproxy([
+      { answer: "", worker: { version: versionA } },
+      { answer: "Success=1\n--\n", worker: { version: versionB } },
+    ]);
+    const master = new HaproxyMaster("/fake", fake.cli, 3_000, fastRetries);
+    expect(await master.reload({ expect: versionB })).toMatchObject({
+      success: true,
+      confirmedBy: "answer",
+      attempts: 2,
+    });
+  });
+
+  test("the expected version on the old worker is not proof either (a same-generation forced reload)", async () => {
+    const fake = fakeHaproxy([{ answer: "" }, { answer: "Success=1\n--\n", worker: { version: versionA } }]);
+    const master = new HaproxyMaster("/fake", fake.cli, 3_000, fastRetries);
+    expect(await master.reload({ expect: versionA })).toMatchObject({ confirmedBy: "answer", attempts: 2 });
+  });
+
+  test("a failed reload hidden behind a lost reply still ends as Success=0", async () => {
+    // No new worker ever starts for an invalid configuration, so nothing confirms the lost request.
+    const fake = fakeHaproxy([{ answer: "" }, "throw", { answer: "Success=0\n--\n[ALERT] bad\n" }]);
+    const master = new HaproxyMaster("/fake", fake.cli, 3_000, { ...fastRetries, reloadAttempts: 3 });
+    expect(await master.reload({ expect: versionB })).toMatchObject({
+      success: false,
+      answered: true,
+      attempts: 3,
+    });
+    expect(fake.current().pid).toBe(100);
+  });
+
+  test("without a version, worker turnover is not proof: the request is only sent again", async () => {
+    // The new worker may come from a racing reload that read the files before they changed.
+    const fake = fakeHaproxy(
+      [
+        { answer: "", worker: { version: null } },
+        { answer: "Success=1\n--\n", worker: { version: null } },
+      ],
+      { version: null },
+    );
+    const master = new HaproxyMaster("/fake", fake.cli, 3_000, fastRetries);
+    expect(await master.reload()).toMatchObject({ success: true, confirmedBy: "answer", attempts: 2 });
+  });
+
+  test("a reload refused as busy is not an invalid configuration: confirmed or sent again", async () => {
+    const busy = "Success=0\n--\nAnother reload is still in progress.\n\n";
+    // The racing reload that made it busy finishes and serves the expected version.
+    const confirmed = fakeHaproxy([{ answer: busy, worker: { version: versionB } }]);
+    expect(
+      await new HaproxyMaster("/fake", confirmed.cli, 3_000, fastRetries).reload({ expect: versionB }),
+    ).toMatchObject({ success: true, confirmedBy: "workers", attempts: 1 });
+    // Without proof it is sent again, and HAProxy's own answer decides.
+    const resent = fakeHaproxy([
+      { answer: busy },
+      { answer: "Success=1\n--\n", worker: { version: versionB } },
+    ]);
+    expect(
+      await new HaproxyMaster("/fake", resent.cli, 3_000, fastRetries).reload({ expect: versionB }),
+    ).toMatchObject({ success: true, confirmedBy: "answer", attempts: 2 });
+    // Busy until the attempts run out is a failure to reload, never a success.
+    const stuck = fakeHaproxy([{ answer: busy }, { answer: busy }]);
+    await expect(
+      new HaproxyMaster("/fake", stuck.cli, 3_000, fastRetries).reload({ expect: versionB }),
+    ).rejects.toThrow(/another reload was still in progress; another reload was still in progress/);
+  });
+
+  test("bounded: requests that stay unanswered and unconfirmed fail as before", async () => {
+    const fake = fakeHaproxy([{ answer: "" }, "throw"]);
+    const master = new HaproxyMaster("/fake", fake.cli, 3_000, fastRetries);
+    await expect(master.reload({ expect: versionB })).rejects.toThrow(
+      /did not answer the reload and no worker confirmed it after 2 attempt\(s\): connection closed without an answer; HAProxy CLI reload timed out/,
+    );
+    expect(fake.reloadCount()).toBe(2);
+  });
+
+  test("the reload lock excludes a second holder until released, in-process as across processes", async () => {
+    const root = await scratch();
+    try {
+      const path = join(root, "reload.lock");
+      const release = await acquireReloadLock(path);
+      await expect(acquireReloadLock(path, 150)).rejects.toThrow(/still held after 150 ms/);
+      // Another process (as the launch guard is) cannot take it either.
+      const other = Bun.spawn(
+        [
+          process.execPath,
+          "-e",
+          `const { acquireReloadLock } = await import(${JSON.stringify(join(import.meta.dir, "haproxy-control.ts"))});
+           try { await acquireReloadLock(${JSON.stringify(path)}, 150); console.log("acquired"); }
+           catch { console.log("busy"); }`,
+        ],
+        { stdout: "pipe", stderr: "inherit" },
+      );
+      expect((await new Response(other.stdout).text()).trim()).toBe("busy");
+      const waiting = acquireReloadLock(path, 5_000);
+      await Bun.sleep(50);
+      release();
+      (await waiting)();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reload holds the lock for the whole request, including confirmation", async () => {
+    const root = await scratch();
+    try {
+      const lock = join(root, "reload.lock");
+      const held: boolean[] = [];
+      const fake = fakeHaproxy([{ answer: "", worker: { version: versionB } }]);
+      const cli: HaproxyCli = async (socket, command, timeout) => {
+        held.push(
+          await acquireReloadLock(lock, 0).then(
+            (release) => (release(), false),
+            () => true,
+          ),
+        );
+        return fake.cli(socket, command, timeout);
+      };
+      const master = new HaproxyMaster("/fake", cli, 3_000, { ...fastRetries, lock });
+      expect((await master.reload({ expect: versionB })).confirmedBy).toBe("workers");
+      expect(held.length).toBeGreaterThanOrEqual(3);
+      expect(held.every(Boolean)).toBe(true);
+      // Released afterwards.
+      (await acquireReloadLock(lock, 0))();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("both variants carry one content version that tracks every file of the generation", () => {
+    const generation = renderEdgeL4Generation({
+      httpHostnames: ["www.example.com"],
+      tlsRoutes: [route],
+      sniPorts: [8883],
+    });
+    const version = generation.version!;
+    expect(version).toMatch(/^[a-f0-9]{64}$/);
+    expect(edgeL4ConfigVersion(generation.files["haproxy.cfg"])).toBe(version);
+    expect(edgeL4ConfigVersion(generation.files["haproxy.closed.cfg"])).toBe(version);
+    expect(generation.files["haproxy.cfg"]).toContain(
+      `global\n    description ark-edge-l4 generation ${version}\n`,
+    );
+    // The ID still hashes the stamped files; the version hashes them without the stamp.
+    const unstamped = Object.fromEntries(
+      Object.entries(generation.files).map(([path, text]) => [
+        path,
+        text.replace(/^ {4}description ark-edge-l4 generation [a-f0-9]{64}\n/m, ""),
+      ]),
+    );
+    expect(generationId(unstamped)).toBe(version);
+    expect(generationId(generation.files)).toBe(generation.id);
+    // An allowlist-only change (the configuration text is identical) is a different version.
+    const narrowed = renderEdgeL4Generation({
+      httpHostnames: ["www.example.com"],
+      tlsRoutes: [{ ...route, sourceCidrs: ["198.51.100.0/24"] }],
+      sniPorts: [8883],
+    });
+    expect(narrowed.version).not.toBe(version);
+    expect(edgeL4ConfigVersion("global\n    maxconn 10\n")).toBeNull();
+    expect(
+      parseShowInfoVersion(`Name: HAProxy\ndescription: ark-edge-l4 generation ${version}\nnode: x\n`),
+    ).toBe(version);
+    expect(parseShowInfoVersion("Name: HAProxy\nnode: x\n")).toBeNull();
   });
 });

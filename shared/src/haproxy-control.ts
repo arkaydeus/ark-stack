@@ -11,6 +11,8 @@
 // - `installEdgeL4Generation` writes a complete immutable generation, has the validator check it,
 //   verifies no byte changed, swaps `current` atomically and reloads through the master CLI. An
 //   invalid candidate never changes `current` and no reload is sent.
+// - `HaproxyMaster.reload` serialises every reloader on one `flock(2)` file shared with the edge-l4
+//   launch guard and confirms an unanswered reload from the workers (see its comment for the race).
 
 import {
   lstat,
@@ -24,8 +26,9 @@ import {
   chmod,
   writeFile,
 } from "node:fs/promises";
+import { closeSync, constants, fchmodSync, openSync } from "node:fs";
 import { createConnection } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
 import {
@@ -36,8 +39,10 @@ import {
   haproxyServerDenied,
   haproxyServerProtected,
   loopTargetServer,
+  edgeL4ConfigVersion,
   parseReload,
   parseServersState,
+  parseShowInfoVersion,
   parseShowProc,
   parseShowSess,
   parseShowStat,
@@ -84,11 +89,19 @@ export class WorkerGoneError extends Error {}
 
 /** Thin master-CLI client used by the adapter, the domain worker and tests. */
 export class HaproxyMaster {
+  private readonly options: HaproxyMasterOptions;
+
   constructor(
     readonly socket: string,
     private readonly cli: HaproxyCli = haproxyCli,
     private readonly timeoutMs = 3_000,
-  ) {}
+    options: HaproxyMasterOptions = {},
+  ) {
+    // A lock only means something next to a real master socket; injected CLIs (tests) opt in.
+    const lock =
+      options.lock === undefined ? (cli === haproxyCli ? haproxyReloadLockPath(socket) : null) : options.lock;
+    this.options = { ...options, lock };
+  }
 
   command(command: string, timeoutMs = this.timeoutMs) {
     return this.cli(this.socket, command, timeoutMs);
@@ -161,12 +174,224 @@ export class HaproxyMaster {
     return parseShowStat(await this.worker(pid, "show stat"));
   }
 
-  /** Synchronous master reload: `Success=1` once the new worker is up, `Success=0` otherwise. */
-  async reload(timeoutMs = 60_000) {
-    const answer = parseReload(await this.command("reload", timeoutMs));
-    if (!answer.answered) throw new Error("the master CLI did not answer the reload");
-    return answer;
+  /** The content version (`EDGE_L4_VERSION_MARKER`) a worker loaded, or null when it is unmarked. */
+  async loadedVersion(pid: number) {
+    const text = await this.worker(pid, "show info");
+    // A connection dropped by a racing reload answers nothing; that is not an unmarked worker.
+    if (!/^Pid: \d+/m.test(text)) throw new Error("incomplete show info answer");
+    return parseShowInfoVersion(text);
   }
+
+  /**
+   * Synchronous master reload: `Success=1` once the new worker is up, `Success=0` otherwise.
+   *
+   * Every reloader (this method, so `edge.l4_apply`, and the edge-l4 launch guard) holds the shared
+   * reload lock (`haproxyReloadLockPath`) for the whole request, so two reloads never meet at the master.
+   * Why that matters (FD-25, HAProxy 3.2): the master re-executes itself as soon as it parses a
+   * `reload`. Only the connection that sent it survives the exec and is answered. Every other master
+   * CLI connection the old master had accepted is closed with no reply, including a second `reload`,
+   * which is never executed at all (two concurrent reloads advance the master's reload count by one).
+   * That is how `edge.l4_apply` used to fail with "the master CLI did not answer the reload" while the
+   * launch guard's own reopen reload succeeded on the very configuration the worker had just swapped in.
+   *
+   * A request that lost such a race ends one of three ways, depending on when it reached the master,
+   * and in none of them did it run: the connection closes with no bytes (accepted by the old master),
+   * the connect is refused (during the exec), or the new master answers `Success=0` with "Another
+   * reload is still in progress." (before the new worker is ready). The last one is not an invalid
+   * configuration and is handled like the first two.
+   *
+   * Such a request (unanswered, refused, timed out or refused as busy) is ambiguous, not a failure:
+   * a reloader outside the lock can still cause it. It is confirmed from the workers instead. It counts
+   * as succeeded only when every current worker is new since the request and reports the `expect`ed
+   * content version in `show info`. Without `expect` (an unmarked configuration) nothing can prove
+   * which configuration a new worker read, so the request is only sent again. Either way an unconfirmed
+   * request is sent again, up to `reloadAttempts` times with doubling backoff. An answered `Success=0` (an invalid configuration: the old workers
+   * keep serving) is returned at once and never retried or confirmed into a success.
+   */
+  async reload(options: { expect?: string | null; timeoutMs?: number } = {}): Promise<ReloadOutcome> {
+    const release = this.options.lock
+      ? await acquireReloadLock(this.options.lock, this.options.lockWaitMs)
+      : null;
+    try {
+      return await this.reloadLocked(options.expect ?? null, options.timeoutMs ?? 60_000);
+    } finally {
+      release?.();
+    }
+  }
+
+  private async reloadLocked(expect: string | null, timeoutMs: number): Promise<ReloadOutcome> {
+    const attempts = Math.max(1, this.options.reloadAttempts ?? 5);
+    const problems: string[] = [];
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      // Taken after the caller's file changes: a worker missing here parsed the configuration later.
+      const before = await this.processIds().catch(() => null);
+      let text = "";
+      let problem = "";
+      try {
+        text = await this.command("reload", timeoutMs);
+      } catch (error) {
+        problem = (error as Error).message;
+      }
+      const answer = parseReload(text);
+      if (answer.answered && !RELOAD_BUSY.test(answer.log)) {
+        return { ...answer, confirmedBy: "answer", attempts: attempt };
+      }
+      problems.push(
+        problem ||
+          (answer.answered
+            ? "another reload was still in progress"
+            : text
+              ? `answer without Success= (${text.length} bytes)`
+              : "connection closed without an answer"),
+      );
+      if (await this.confirmReload(before, expect)) {
+        return {
+          success: true,
+          answered: false,
+          log: "",
+          confirmedBy: "workers",
+          attempts: attempt,
+        };
+      }
+      if (attempt < attempts) {
+        await sleep(Math.min((this.options.backoffMs ?? 250) * 2 ** (attempt - 1), 2_000));
+      }
+    }
+    throw new Error(
+      `the master CLI did not answer the reload and no worker confirmed it after ${attempts} attempt(s): ${problems.join("; ")}`,
+    );
+  }
+
+  /** Every listed process ID (master, current and leaving workers). */
+  private async processIds() {
+    const text = await this.command("show proc");
+    if (!/<PID>|master/.test(text)) throw new Error("unexpected show proc answer");
+    return new Set(parseShowProc(text).map((process) => process.pid));
+  }
+
+  /**
+   * True once every current worker started after `before` was taken (when that snapshot exists) and
+   * serves the `expect`ed content version. A failed reload never starts a new worker, so it is never
+   * confirmed. Worker turnover alone is not proof: a racing reload may have read the files before the
+   * caller changed them, so an unmarked configuration is never confirmed this way.
+   */
+  private async confirmReload(before: Set<number> | null, expect: string | null) {
+    if (!expect) return false;
+    const deadline = Date.now() + (this.options.confirmMs ?? 10_000);
+    for (;;) {
+      try {
+        const current = (await this.workers()).filter((worker) => worker.section === "current");
+        if (current.length && current.every((worker) => !before?.has(worker.pid))) {
+          const versions = await Promise.all(current.map((worker) => this.loadedVersion(worker.pid)));
+          if (versions.every((version) => version === expect)) return true;
+        }
+      } catch {
+        // The master may still be re-executing; keep asking until the deadline.
+      }
+      if (Date.now() >= deadline) return false;
+      await sleep(100);
+    }
+  }
+}
+
+/** HAProxy 3.2's answer to a `reload` that arrived while another one was still starting its worker. */
+const RELOAD_BUSY = /^Another reload is still in progress\.?$/m;
+
+export type ReloadOutcome = ReturnType<typeof parseReload> & {
+  /** `answer`: HAProxy's `Success=` line; `workers`: an unanswered request confirmed from the workers. */
+  confirmedBy: "answer" | "workers";
+  /** Reload requests sent, including unanswered ones. */
+  attempts: number;
+};
+
+export type HaproxyMasterOptions = {
+  /** Shared reload lock file; null disables it. Defaults to `haproxyReloadLockPath` for a real socket. */
+  lock?: string | null;
+  /** How long `reload` waits for the lock. */
+  lockWaitMs?: number;
+  /** Reload requests per `reload` call when a request stays unanswered and unconfirmed. */
+  reloadAttempts?: number;
+  /** How long an unanswered request is confirmed from the workers before it is sent again. */
+  confirmMs?: number;
+  /** First retry delay; it doubles per attempt. */
+  backoffMs?: number;
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---- Reload lock ----------------------------------------------------------------------------------------
+
+/**
+ * The lock file every master-CLI reloader holds, beside the master socket on the shared
+ * `ark_haproxy_run` tmpfs (uid 99, group 4400, mode 2770): the domain worker (uid 1000) and the
+ * edge-l4 launch guard (uid 99, BusyBox `flock`) both open it. It is an advisory `flock(2)` lock, so
+ * the kernel releases it when a holder exits or crashes; there is no stale lock to recover.
+ */
+export const HAPROXY_RELOAD_LOCK_NAME = "reload.lock";
+
+export function haproxyReloadLockPath(masterSocket: string) {
+  return join(dirname(masterSocket), HAPROXY_RELOAD_LOCK_NAME);
+}
+
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+const LOCK_UN = 8;
+let flockCall: Promise<(fd: number, operation: number) => number> | undefined;
+
+/** libc `flock(2)` through Bun's FFI (glibc, musl or macOS). Loaded only by a reloader. */
+function loadFlock() {
+  flockCall ??= (async () => {
+    const { dlopen, FFIType } = await import("bun:ffi");
+    const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
+    const libraries =
+      process.platform === "darwin"
+        ? ["libSystem.B.dylib", "/usr/lib/libSystem.B.dylib"]
+        : ["libc.so.6", `libc.musl-${arch}.so.1`, `/lib/ld-musl-${arch}.so.1`];
+    for (const library of libraries) {
+      try {
+        const { symbols } = dlopen(library, {
+          flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+        });
+        return (fd: number, operation: number) => Number(symbols.flock(fd, operation));
+      } catch {
+        // Try the next C library name.
+      }
+    }
+    throw new Error("flock(2) is unavailable: no C library could be loaded");
+  })();
+  flockCall.catch(() => (flockCall = undefined));
+  return flockCall;
+}
+
+/**
+ * Takes the exclusive reload lock, waiting up to `waitMs`, and returns its release function. Locks
+ * are per open file, so two holders in one process exclude each other as two processes do.
+ */
+export async function acquireReloadLock(path: string, waitMs = 120_000) {
+  const flock = await loadFlock();
+  // Read-only is enough for flock(2), whichever of uid 1000 and uid 99 created the file.
+  const fd = openSync(path, constants.O_RDONLY | constants.O_CREAT, 0o660);
+  try {
+    fchmodSync(fd, 0o660);
+  } catch {
+    // Owned by the other identity; its group bits already allow reading.
+  }
+  const deadline = Date.now() + waitMs;
+  for (let delay = 10; ; delay = Math.min(delay * 2, 200)) {
+    if (flock(fd, LOCK_EX | LOCK_NB) === 0) break;
+    if (Date.now() >= deadline) {
+      closeSync(fd);
+      throw new Error(`the HAProxy reload lock ${path} is still held after ${waitMs} ms`);
+    }
+    await sleep(delay);
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    flock(fd, LOCK_UN);
+    closeSync(fd);
+  };
 }
 
 /** Verification passes per enforcement; a racing reload or a slow session close gets this many tries. */
@@ -586,6 +811,9 @@ export type InstallResult = {
   changed: boolean;
   reloaded: boolean;
   reloadLog?: string;
+  /** `workers` when HAProxy's answer was lost and the reload was confirmed from the serving worker. */
+  reloadConfirmedBy?: ReloadOutcome["confirmedBy"];
+  reloadAttempts?: number;
   pruned: string[];
 };
 
@@ -603,7 +831,8 @@ export class InvalidGenerationError extends Error {
  * 1. write the complete immutable generation;
  * 2. the restricted validator checks it (`haproxy -c` on the same build) and returns its hash;
  * 3. re-hash: no byte may have changed since validation;
- * 4. swap `current` atomically, then `reload` on the master CLI;
+ * 4. swap `current` atomically, then `reload` on the master CLI under the shared reload lock; an
+ *    unanswered request is confirmed from the serving worker's content version or sent again;
  * 5. Any failed or unconfirmed reload restores `current` and leaves a durable retry marker.
  */
 export async function installEdgeL4Generation(input: {
@@ -639,9 +868,11 @@ export async function installEdgeL4Generation(input: {
   if (!input.master) {
     return { generation: generation.id, previous, changed: true, reloaded: false, pruned: [] };
   }
-  let reload: Awaited<ReturnType<HaproxyMaster["reload"]>>;
+  let reload: ReloadOutcome;
   try {
-    reload = await input.master.reload();
+    // The version stamped into the generation lets an unanswered reload be confirmed from the
+    // worker that serves (unmarked hand-written generations fall back to worker turnover alone).
+    reload = await input.master.reload({ expect: edgeL4ConfigVersion(generation.files["haproxy.cfg"]) });
     if (!reload.success)
       throw new Error(`HAProxy reload failed (old workers keep serving): ${reload.log.slice(-1_000)}`);
   } catch (error) {
@@ -664,6 +895,8 @@ export async function installEdgeL4Generation(input: {
     changed: true,
     reloaded: true,
     reloadLog: reload.log,
+    reloadConfirmedBy: reload.confirmedBy,
+    reloadAttempts: reload.attempts,
     pruned,
   };
 }

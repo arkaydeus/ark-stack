@@ -20,6 +20,15 @@
 # - Started closed, the guard re-asks the watchdog and switches to the full variant (link + reload)
 #   once the lease allows it; told `closed` while full, it points the link back at the closed variant
 #   so no later reload re-admits a withdrawn backend.
+#
+# Reload lock (FD-25): HAProxy's master re-executes as soon as it parses a `reload`, answering only the
+# connection that sent it. Any other master-CLI connection it had accepted is closed unanswered, and a
+# second `reload` on it never runs. Concurrent reloads by this guard and the domain worker's
+# `edge.l4_apply` therefore made one of them report "the master CLI did not answer the reload".
+# Every reloader holds an exclusive flock(2) on `reload.lock` beside the master socket (the shared
+# `ark_haproxy_run` tmpfs) for the whole request: this guard with BusyBox `flock`, the worker through
+# `HaproxyMaster.reload` (shared/src/haproxy-control.ts). The kernel drops the lock when a holder exits.
+# `ark-edge-l4-launch-guard reload` runs only this guard's locked reload, once, and prints the answer.
 set -eu
 
 root="${ARK_EDGE_L4_DIR:-/usr/local/etc/haproxy}"
@@ -42,6 +51,30 @@ point() {
   ln -s "$1" "$link.next"
   mv -f "$link.next" "$link"
 }
+reload_lock="${ARK_HAPROXY_RELOAD_LOCK:-${master%/*}/reload.lock}"
+# Prints the master's answer to `reload`, sent under the reload lock. With an argument, the launch link
+# is first pointed at it inside the same lock. Waits at most 60 s for the lock (another reloader holds
+# it for at most its own bounded request and confirmation); prints nothing when it cannot be taken.
+locked_reload() {
+  [ -e "$reload_lock" ] || (umask 007 && : >>"$reload_lock") 2>/dev/null || true
+  (
+    tries=0
+    until flock -n 9; do
+      tries=$((tries + 1))
+      if [ "$tries" -ge 600 ]; then
+        echo "ark edge-l4 launch guard: the reload lock $reload_lock is busy" >&2
+        exit 1
+      fi
+      sleep 0.1
+    done
+    if [ -n "${1:-}" ]; then point "$1"; fi
+    echo reload | socat -t 30 - "UNIX-CONNECT:$master" 2>&1
+  ) 9<"$reload_lock"
+}
+if [ "${1:-}" = reload ]; then
+  locked_reload
+  exit
+fi
 
 if [ ! -r "$full" ]; then
   echo "ark edge-l4 launch guard: $full is missing; refusing to start" >&2
@@ -120,8 +153,7 @@ reopen() {
     if guarded; then
       decision="$(ask "&cached=1")"
       if [ "$mode" = closed ] && [ "$decision" = "open" ]; then
-        point "$full"
-        answer="$(echo reload | socat -t 30 - "UNIX-CONNECT:$master" 2>&1 || true)"
+        answer="$(locked_reload "$full" || true)"
         if printf '%s\n' "$answer" | grep -q '^Success=1$'; then
           mode=full
           echo "ark edge-l4 launch guard: lease valid; switched to the full configuration" >&2

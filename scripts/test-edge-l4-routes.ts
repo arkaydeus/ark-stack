@@ -595,8 +595,9 @@ async function apply(input: { tlsRoutes?: EdgeL4TlsRoute[]; tcpRoutes?: EdgeL4Tc
   lease.routes = next;
   await settle();
   const full: EdgeL4Input = { httpHostnames: [appHost], sniPorts: [8883], ...input };
-  // The launch guard reacts to the lease too (it re-points or reloads); a reload racing it can go
-  // unanswered, which the installer reports and restores, exactly as edge.l4_apply then retries.
+  // The launch guard reacts to the lease too (it re-points or reloads). Its reload and this one share
+  // the reload lock, and an unanswered reload is confirmed from the serving worker; a reload that still
+  // fails is reported and restored, and is retried here exactly as edge.l4_apply then retries.
   for (let attempt = 0; ; attempt++) {
     const result = await probe<{ applied?: boolean; error?: string }>([
       "apply",
