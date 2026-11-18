@@ -216,10 +216,10 @@ import {
   connectVercel,
   disconnectVercel,
   testVercelConnection,
-  vercelConnectBinding,
   vercelConnectInput,
   vercelIntegrationStatus,
 } from "./modules/vercel-integrations.ts";
+import { vercelConnectBinding } from "./modules/vercel-api.ts";
 import { CLIENT_KEY_SECRET_KIND, PkiPolicyError, validateCsr } from "./modules/pki.ts";
 import { cancelWorkspaceQuery } from "./modules/database.ts";
 import { writeApprovedCompose } from "./modules/docker.ts";
@@ -2348,32 +2348,44 @@ app.put("/api/databases/pooler-policy", async (c) => {
     "exposure.public",
     privilegedRequestHash("exposure.public", request),
   );
-  const [previous] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
-  const now = new Date();
-  const keepConfirmation =
-    checked.allowInternet && previous?.poolerAllowInternet && previous.poolerInternetConfirmedAt;
-  const values = {
-    poolerSourceCidrs: checked.allowInternet ? [] : checked.sourceCidrs,
-    poolerAllowInternet: checked.allowInternet,
-    poolerInternetConfirmedBy: checked.allowInternet
-      ? keepConfirmation
-        ? previous!.poolerInternetConfirmedBy
-        : access.userId
-      : null,
-    poolerInternetConfirmedAt: checked.allowInternet
-      ? keepConfirmation
-        ? previous!.poolerInternetConfirmedAt
-        : now
-      : null,
-    poolerPolicyReviewedBy: access.userId,
-    poolerPolicyReviewedAt: now,
-    poolerPolicyReviewedRequests: current.requestsFingerprint,
-    updatedAt: now,
-  };
-  await db
-    .insert(platformSettings)
-    .values({ id: "default", ...values })
-    .onConflictDoUpdate({ target: platformSettings.id, set: values });
+  const previous = await db.transaction(async (tx) => {
+    const [saved] = await tx
+      .select()
+      .from(platformSettings)
+      .where(eq(platformSettings.id, "default"))
+      .for("update");
+    if (input.reviewedRequests !== (await loadPoolerPolicy(tx)).requestsFingerprint) {
+      throw new HTTPException(409, {
+        message: "The databases' requests changed. Reload and review them again.",
+      });
+    }
+    const now = new Date();
+    const keepConfirmation =
+      checked.allowInternet && saved?.poolerAllowInternet && saved.poolerInternetConfirmedAt;
+    const values = {
+      poolerSourceCidrs: checked.allowInternet ? [] : checked.sourceCidrs,
+      poolerAllowInternet: checked.allowInternet,
+      poolerInternetConfirmedBy: checked.allowInternet
+        ? keepConfirmation
+          ? saved!.poolerInternetConfirmedBy
+          : access.userId
+        : null,
+      poolerInternetConfirmedAt: checked.allowInternet
+        ? keepConfirmation
+          ? saved!.poolerInternetConfirmedAt
+          : now
+        : null,
+      poolerPolicyReviewedBy: access.userId,
+      poolerPolicyReviewedAt: now,
+      poolerPolicyReviewedRequests: current.requestsFingerprint,
+      updatedAt: now,
+    };
+    await tx
+      .insert(platformSettings)
+      .values({ id: "default", ...values })
+      .onConflictDoUpdate({ target: platformSettings.id, set: values });
+    return saved;
+  });
   const loosened = poolerPolicyLoosens(
     {
       sourceCidrs: Array.isArray(previous?.poolerSourceCidrs) ? previous.poolerSourceCidrs : [],

@@ -526,7 +526,7 @@ export async function recordRolloverDelivery(tx: Executor, input: DeliveryInput)
       .where(
         and(
           eq(vercelIntegrations.databaseClientId, client.id),
-          eq(vercelIntegrations.lastPushStatus, "pushing"),
+          inArray(vercelIntegrations.lastPushStatus, ["pushing", "failed"]),
           eq(vercelIntegrations.pushCertificateId, successor.id),
         ),
       );

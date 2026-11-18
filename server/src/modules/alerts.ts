@@ -179,6 +179,7 @@ export async function notifyExternal(title: string, severity: string) {
   if (!webhook) return false;
   return fetch(webhook, {
     method: "POST",
+    signal: AbortSignal.timeout(10_000),
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ title, severity, source: "ark-stack" }),
   })

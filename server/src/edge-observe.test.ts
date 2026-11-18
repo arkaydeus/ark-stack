@@ -419,6 +419,83 @@ describe("lease expiry", () => {
 });
 
 describe("schedule", () => {
+  test("the domain worker renews the edge lease while a Vercel deployment is building", async () => {
+    const { runDomainJobs } = await import("../../workers/src/domains.ts");
+    const provider = Promise.withResolvers<void>();
+    const edgeCompleted = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    const previousUrl = process.env.ARK_API_URL;
+    const previousToken = process.env.ARK_WORKER_TOKEN;
+    const previousName = process.env.ARK_WORKER_NAME;
+    const before = new Date();
+    await observe(before);
+    const oldLease = (await snapshotRow())!.valid_until.getTime();
+    const observationAt = new Date(before.getTime() + 5 * 60_000);
+    let started = false;
+    let edgeClaimed = false;
+    const workerApi = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path.endsWith("/jobs")) {
+          const kinds = request.headers.get("x-ark-worker-kinds")?.split(",") ?? [];
+          if (!started && kinds.includes("integration.")) {
+            return Response.json({ jobs: [{ id: "vercel", kind: "integration.vercel_push" }] });
+          }
+          if (started && !edgeClaimed && kinds.includes("edge.")) {
+            edgeClaimed = true;
+            return Response.json({ jobs: [{ id: "edge", kind: "edge.observe" }] });
+          }
+          return Response.json({ jobs: [] });
+        }
+        if (path.endsWith("/edge/complete")) edgeCompleted.resolve();
+        return Response.json({ ok: true });
+      },
+    });
+    process.env.ARK_API_URL = workerApi.url.origin;
+    process.env.ARK_WORKER_TOKEN = "test-worker-token";
+    const workers = runDomainJobs(
+      async (job) => {
+        if (job.kind === "integration.vercel_push") {
+          started = true;
+          await provider.promise;
+        } else {
+          await observe(observationAt);
+        }
+        return { complete: true };
+      },
+      { signal: controller.signal, pollMs: 5 },
+    );
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        edgeCompleted.promise,
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => reject(new Error("The edge job was starved")), 2000);
+        }),
+      ]);
+      const renewed = await snapshotRow();
+      expect(renewed?.completed_at).toEqual(observationAt);
+      expect(observationAt.getTime()).toBeLessThan(oldLease);
+      expect(renewed!.valid_until.getTime()).toBeGreaterThan(oldLease);
+    } finally {
+      clearTimeout(deadline);
+      controller.abort();
+      provider.resolve();
+      await workers;
+      workerApi.stop(true);
+      for (const [name, value] of Object.entries({
+        ARK_API_URL: previousUrl,
+        ARK_WORKER_TOKEN: previousToken,
+        ARK_WORKER_NAME: previousName,
+      })) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   test("enqueues edge.observe immediately and then every interval", async () => {
     const calls: Queued[] = [];
     const timer = startEdgeObserveSchedule({

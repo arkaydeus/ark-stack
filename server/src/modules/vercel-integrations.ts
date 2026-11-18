@@ -2,11 +2,12 @@ import {
   createId,
   decryptSecret,
   encryptSecret,
+  isInFlight,
   planHash,
-  sha256Hex,
   VERCEL_ENV_NAMES,
+  vercelCredentialBundle,
 } from "@ark-stack/shared";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 
 import { db, type DbTransaction } from "../db.ts";
@@ -22,6 +23,7 @@ import {
 } from "./db-client-rollover.ts";
 import { auditEvent, certificateChain, DatabaseClientError, loadLinkedCertificates } from "./db-clients.ts";
 import { CLIENT_KEY_SECRET_KIND } from "./pki.ts";
+import { removeVercelIntegration } from "./pooler-policy.ts";
 import {
   deployHookBranch,
   deployHookUrl,
@@ -30,7 +32,7 @@ import {
   reviewedVercelScopeProof,
   teamIdPattern,
   triggerVercelHook,
-  upsertVercelVariables,
+  upsertVercelVariable,
   VercelApi,
   type VercelCall,
   type VercelScopeProof,
@@ -60,14 +62,6 @@ export const vercelConnectInput = z
     deployHook: z.string().min(1).max(512),
   })
   .strict();
-
-export function vercelConnectBinding({
-  token,
-  deployHook,
-  ...selection
-}: z.infer<typeof vercelConnectInput>) {
-  return { ...selection, credentialDigest: sha256Hex(JSON.stringify([token, deployHook])) };
-}
 
 type Integration = typeof vercelIntegrations.$inferSelect;
 type VerifiedIntegration = Integration & {
@@ -348,11 +342,7 @@ export async function testVercelConnection(ref: ActorRef, runtime: ConnectionRun
 export async function disconnectVercel(ref: ActorRef) {
   const row = await db.transaction(async (tx) => {
     if (!(await lockedClient(tx, ref))) throw new DatabaseClientError(404, "Database client not found.");
-    const [removed] = await tx
-      .delete(vercelIntegrations)
-      .where(eq(vercelIntegrations.databaseClientId, ref.clientId))
-      .returning();
-    return removed;
+    return removeVercelIntegration(tx, ref.clientId);
   });
   if (row)
     await auditEvent({
@@ -372,13 +362,30 @@ async function enqueuePush(
   now: Date,
 ) {
   if (!cert.trustAppliedAt || !cert.keySecretId || cert.notAfter <= now) return;
+  if (row.tokenExpiresAt <= now) return;
+  // A retry can check an identified deployment. An ambiguous hook must never be dispatched twice.
+  if (row.pushCertificateId === cert.id && row.hookRequestedAt && !row.hookJobId) return;
   const payload = {
     integrationId: row.id,
     clientId: row.databaseClientId,
     certificateId: cert.id,
     databaseId,
   };
-  // The integration ID serializes its pushes without holding up unrelated database work or revocation.
+  // The caller holds the client lock, so concurrent schedulers reuse the same pending attempt.
+  const base = `integration.vercel_push:${row.id}:${cert.id}`;
+  const prior = await tx
+    .select({ status: operations.status })
+    .from(operations)
+    .where(
+      and(
+        eq(operations.kind, "integration.vercel_push"),
+        sql`${operations.payload}->>'integrationId' = ${row.id}`,
+        sql`${operations.payload}->>'certificateId' = ${cert.id}`,
+      ),
+    )
+    .orderBy(desc(operations.createdAt));
+  if (prior.some(({ status }) => isInFlight(status)) || (prior.length && prior[0]?.status !== "failed"))
+    return;
   await tx
     .insert(operations)
     .values({
@@ -386,7 +393,7 @@ async function enqueuePush(
       kind: "integration.vercel_push",
       targetIds: [row.id],
       payload,
-      idempotencyKey: `integration.vercel_push:${row.id}:${cert.id}`,
+      idempotencyKey: prior.length ? `${base}:${createId("idem")}` : base,
       planHash: planHash(payload),
       status: "queued",
     })
@@ -449,7 +456,13 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
       const row = await integrationFor(client.id, tx);
       if (!isVerified(row) || row.id !== ref.integrationId) return;
       const cert = await pendingCertificate(client, tx);
-      if (cert?.id !== ref.certificateId || !cert.trustAppliedAt || cert.notAfter <= now()) return;
+      if (
+        cert?.id !== ref.certificateId ||
+        !cert.trustAppliedAt ||
+        !cert.keySecretId ||
+        cert.notAfter <= now()
+      )
+        return;
       if (!operation.claimToken) return;
       const [claim] = await tx
         .select({ id: operations.id })
@@ -460,7 +473,8 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
             eq(operations.status, "running"),
             eq(operations.claimToken, operation.claimToken),
           ),
-        );
+        )
+        .for("update");
       if (claim) return fn({ tx, row, cert });
     });
   }
@@ -480,52 +494,77 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
   try {
     const prepared = await withPending(async ({ tx, row, cert }) => {
       if (!proof) throw new Error("Vercel connection awaits live verification of project token scope.");
-      const { token, hook } = await credentials(tx, row);
       if (row.pushCertificateId === cert.id && row.hookRequestedAt) {
         if (!row.hookJobId)
           throw new Error("Vercel hook receipt is unknown. Use manual certificate rollover.");
-        return { requestedAt: row.hookRequestedAt, jobId: row.hookJobId };
+        return {
+          requestedAt: row.hookRequestedAt,
+          jobId: row.hookJobId,
+          retry: row.lastPushStatus === "failed",
+        };
       }
+      const { token, hook } = await credentials(tx, row);
       if (!cert.keySecretId || !cert.certPem) return;
-      const verified = await verifyConnection(audit.api, selection, proof, token, hook, now);
-      if (verified.branch !== row.hookBranch) throw new Error("The Vercel deploy hook has changed branch.");
       const key = await openSecret(tx, cert.keySecretId, CLIENT_KEY_SECRET_KIND);
-      await upsertVercelVariables(audit.api, selection, token, {
-        [VERCEL_ENV_NAMES.cert]: Buffer.from(cert.certPem).toString("base64"),
-        [VERCEL_ENV_NAMES.key]: Buffer.from(key).toString("base64"),
-      });
-      // Commit dispatch intent before calling the non-idempotent hook. After an unknown receipt
-      // a reclaimed worker leaves the successor pending instead of issuing a second deployment.
-      const requestedAt = now();
       await tx
         .update(vercelIntegrations)
         .set({
           pushCertificateId: cert.id,
-          lastPushAt: requestedAt,
+          lastPushAt: now(),
           lastPushStatus: "pushing",
-          hookRequestedAt: requestedAt,
+          hookRequestedAt: null,
           hookJobId: null,
         })
         .where(eq(vercelIntegrations.id, row.id));
-      return { requestedAt, jobId: null };
-    }).finally(audit.flush);
+      return { token, hook, bundle: vercelCredentialBundle(cert.certPem, key) };
+    });
     if (!prepared) return { skipped: true };
 
-    const jobId =
-      prepared.jobId ??
-      (await withPending(async ({ tx, row }) => {
-        const { hook } = await credentials(tx, row);
-        const receiptId = await triggerVercelHook(audit.api, hook);
+    let { requestedAt, jobId } = prepared;
+    if (prepared.hook && proof) {
+      const { token, hook, bundle } = prepared;
+      const verified = await verifyConnection(audit.api, selection, proof, token, hook, now).finally(
+        audit.flush,
+      );
+      if (verified.branch !== integration.hookBranch)
+        throw new Error("The Vercel deploy hook has changed branch.");
+      if (!(await withPending(async () => true))) return { skipped: true };
+      await upsertVercelVariable(audit.api, selection, token, VERCEL_ENV_NAMES.bundle, bundle).finally(
+        audit.flush,
+      );
+
+      // Commit dispatch intent before the non-idempotent call. An unknown receipt requires
+      // manual delivery because the provider may already have accepted the hook.
+      requestedAt = await withPending(async ({ tx, row }) => {
+        const at = now();
         await tx
           .update(vercelIntegrations)
-          .set({ hookJobId: receiptId })
+          .set({ hookRequestedAt: at })
           .where(eq(vercelIntegrations.id, row.id));
-        return receiptId;
-      }).finally(audit.flush));
-    if (!jobId) return { skipped: true };
+        return at;
+      });
+      if (!requestedAt || !(await withPending(async () => true))) return { skipped: true };
+      jobId = await triggerVercelHook(audit.api, hook).finally(audit.flush);
+      const receipt = jobId;
+      const recorded = await withPending(async ({ tx, row }) => {
+        await tx
+          .update(vercelIntegrations)
+          .set({ hookJobId: receipt })
+          .where(eq(vercelIntegrations.id, row.id));
+        return true;
+      });
+      if (!recorded) return { skipped: true };
+    }
+    if (!requestedAt || !jobId) return { skipped: true };
 
-    const deadline = prepared.requestedAt.getTime() + PUSH_WINDOW_MS;
-    while (now().getTime() < deadline) {
+    const deadline = requestedAt.getTime() + PUSH_WINDOW_MS;
+    // A later attempt can check the recorded deployment once after the original polling window.
+    // New deployments are only created before dispatch intent is recorded.
+    let retry = prepared.retry;
+    while (true) {
+      const finalCheck = now().getTime() >= deadline;
+      if (finalCheck && !retry) break;
+      retry = false;
       const token = await withPending(async ({ tx, row }) => (await credentials(tx, row)).token);
       if (!token) return { skipped: true };
       const deploymentId = await vercelHookDeployment(
@@ -533,9 +572,9 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
         { ...selection, gitBranch: integration.hookBranch },
         token,
         jobId,
-        prepared.requestedAt,
+        requestedAt,
       ).finally(audit.flush);
-      if (now().getTime() >= deadline) break;
+      if (!finalCheck && now().getTime() >= deadline) break;
       if (deploymentId) {
         const deliveredAt = now();
         const delivered = await withPending(async ({ tx, row }) => {
@@ -555,6 +594,7 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
         await evaluateRolloverAlerts(deliveredAt, ref.clientId);
         return { certificateId: ref.certificateId, deploymentId, deliveredAt: deliveredAt.toISOString() };
       }
+      if (finalCheck) break;
       await sleep(Math.min(5_000, deadline - now().getTime()));
     }
     throw new Error("The Vercel deployment was not ready within 30 minutes.");

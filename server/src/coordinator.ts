@@ -496,8 +496,11 @@ export function isDelegatedPayload(operation: Pick<OperationRow, "kind" | "paylo
   return typeof payload.composeHash === "string" && payload.composeHash.length > 0;
 }
 
-export async function processQueued(limit = 8, kindPrefix?: string) {
-  const excludePrefix = !env.embeddedWorkers && !kindPrefix ? "service." : undefined;
+export async function processQueued(
+  limit = 8,
+  kindPrefix?: string,
+  excludePrefix = !env.embeddedWorkers && !kindPrefix ? "service." : undefined,
+) {
   for (let index = 0; index < limit; index++) {
     const { token, rows } = await claimQueued({ limit: 1, kindPrefix, excludePrefix });
     if (!rows.length) break;
@@ -535,7 +538,7 @@ export async function processQueued(limit = 8, kindPrefix?: string) {
       clearInterval(heartbeat);
     }
   }
-  await evaluateAlerts().catch(() => undefined);
+  if (kindPrefix !== "integration.") await evaluateAlerts().catch(() => undefined);
 }
 
 async function addStep(operationId: string, name: string, evidence: Record<string, unknown> = {}) {
@@ -2669,6 +2672,13 @@ export async function queueDailyRollover(now: Date) {
   return row ?? null;
 }
 
+type RolloverTickState = {
+  lastAlerts?: number;
+  alertTask?: Promise<void>;
+  timers?: Map<string, ReturnType<typeof setTimeout>>;
+  tickMs?: number;
+};
+
 /**
  * One scheduler tick (database worker, or the embedded coordinator): queue the daily job,
  * re-evaluate rollover alerts hourly, run due retirements immediately, and watch deadlines.
@@ -2676,15 +2686,22 @@ export async function queueDailyRollover(now: Date) {
  */
 export async function rolloverTick(
   overrides: Partial<ClientOperationRuntime> = {},
-  state: { lastAlerts?: number; timers?: Map<string, ReturnType<typeof setTimeout>>; tickMs?: number } = {},
+  state: RolloverTickState = {},
 ) {
   const runtime = { ...clientOperationRuntime, ...overrides };
   const now = runtime.now();
   const queued = await queueDailyRollover(now);
-  if (!state.lastAlerts || now.getTime() - state.lastAlerts >= 3_600_000) {
-    await evaluateRolloverAlerts(now);
-    await evaluateVercelTokenAlerts(now);
+  if (!state.alertTask && (!state.lastAlerts || now.getTime() - state.lastAlerts >= 3_600_000)) {
     state.lastAlerts = now.getTime();
+    state.alertTask = Promise.allSettled([evaluateRolloverAlerts(now), evaluateVercelTokenAlerts(now)])
+      .then((results) => {
+        for (const result of results) {
+          if (result.status === "rejected") console.error("Rollover alert evaluation failed");
+        }
+      })
+      .finally(() => {
+        state.alertTask = undefined;
+      });
   }
   const timers = state.timers;
   if (timers) {
@@ -3168,16 +3185,30 @@ export function revealSecret(row: typeof secrets.$inferSelect) {
   return decryptSecret(env.rootKey, row);
 }
 
-let tickInFlight: Promise<void> | null = null;
+function reportCoordinatorError(error: unknown) {
+  console.error(error instanceof Error ? error.message : error);
+}
 
 export function startCoordinator() {
+  let coreInFlight = false;
+  let integrationInFlight = false;
   const tick = () => {
-    if (tickInFlight) return;
-    tickInFlight = processQueued()
-      .catch((error) => console.error(error instanceof Error ? error.message : error))
-      .finally(() => {
-        tickInFlight = null;
-      });
+    if (!coreInFlight) {
+      coreInFlight = true;
+      void processQueued(8, undefined, "integration.")
+        .catch(reportCoordinatorError)
+        .finally(() => {
+          coreInFlight = false;
+        });
+    }
+    if (!integrationInFlight) {
+      integrationInFlight = true;
+      void processQueued(1, "integration.")
+        .catch(reportCoordinatorError)
+        .finally(() => {
+          integrationInFlight = false;
+        });
+    }
   };
   tick();
   // Embedded workers include the database worker's duties, so they run the rollover scheduler.

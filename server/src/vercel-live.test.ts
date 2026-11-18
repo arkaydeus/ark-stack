@@ -13,7 +13,7 @@ import {
   reviewedVercelScopeProof,
   teamIdPattern,
   triggerVercelHook,
-  upsertVercelVariables,
+  upsertVercelVariable,
   VercelApi,
   type VercelScopeProof,
   type VercelSelection,
@@ -50,65 +50,134 @@ function validateSelection() {
 
 type ScopeResponses = Awaited<ReturnType<typeof readScopeProbes>>;
 type Probe = ScopeResponses[number];
+const dynamicIdentifier = /^(?:prj|team|dpl|vcp|hook|tok|usr)_/i;
+
+function proofSensitiveValues(token: string) {
+  return [
+    token,
+    projectId,
+    teamId,
+    otherProjectId,
+    env.ARK_TEST_VERCEL_DEPLOY_HOOK?.split("/").at(-1)?.split("?")[0] ?? "",
+  ];
+}
+
 function denialCode(response: Probe, token: string) {
   const code = object(object(response.body)?.error)?.code;
-  return typeof code === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(code) && !code.includes(token)
+  return typeof code === "string" &&
+    /^[a-z][a-z0-9_]{0,79}$/.test(code) &&
+    !dynamicIdentifier.test(code) &&
+    !proofSensitiveValues(token).some((secret) => secret && code.includes(secret))
     ? code
     : null;
 }
 
-const shape = (value: unknown, keys: string[]) =>
-  Object.fromEntries(keys.map((key) => [key, typeof object(value)?.[key]]));
+type FieldShape =
+  | string
+  | { type: "array"; entries: FieldShape[] }
+  | { type: "object"; fields: Record<string, FieldShape>; redacted: number };
 
-function logProof(label: string, [metadata, selected, list, other]: ScopeResponses, token: string) {
+function metadataShape(value: unknown, sensitive: string[], depth = 0, budget = { fields: 120 }): FieldShape {
+  if (value === null) return "null";
+  if (Array.isArray(value)) {
+    if (depth >= 5 || budget.fields <= 0) return "array";
+    return {
+      type: "array",
+      entries: value.slice(0, 4).map((entry) => metadataShape(entry, sensitive, depth + 1, budget)),
+    };
+  }
+  const row = object(value);
+  if (!row || depth >= 5 || budget.fields <= 0) return typeof value;
+  const fields: Record<string, FieldShape> = Object.create(null);
+  let redacted = 0;
+  for (const key of Object.keys(row).slice(0, 32)) {
+    // Emit schema-like names. Dynamic IDs, credential-shaped names and known fixture values
+    // are suppressed even when the provider uses them as property names.
+    if (
+      !/^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(key) ||
+      dynamicIdentifier.test(key) ||
+      /[a-zA-Z0-9]{24,}/.test(key) ||
+      sensitive.some((secret) => secret && key.includes(secret))
+    ) {
+      redacted++;
+    } else {
+      if (budget.fields <= 0) break;
+      budget.fields--;
+      fields[key] = metadataShape(row[key], sensitive, depth + 1, budget);
+    }
+  }
+  return { type: "object", fields, redacted };
+}
+
+function scopeProof(label: string, [metadata, selected, list, other]: ScopeResponses, token: string) {
   const row = object(object(metadata.body)?.token);
   const scopes = Array.isArray(row?.scopes) ? row.scopes : [];
-  console.log(
-    "[FD-29 live scope proof]",
-    JSON.stringify({
-      checkedAt: new Date().toISOString(),
-      fixture: label,
-      "GET /v5/user/tokens/current": {
-        status: metadata.status,
-        tokenFields: shape(row, ["scopes", "expiresAt", "revokedAt"]),
-        scopeCount: Array.isArray(row?.scopes) ? scopes.length : null,
-        scopeFields: scopes
-          .slice(0, 10)
-          .map((scope) =>
-            shape(scope, [
-              "type",
-              "projectId",
-              "teamId",
-              "expiresAt",
-              "createdAt",
-              "origin",
-              "resource",
-              "resourceId",
-            ]),
-          ),
-        firstScopeIsProject: object(scopes[0])?.type === "project",
-        scopeBindsSelectedProjectAndTeam:
-          scopes.length === 1 &&
-          object(scopes[0])?.projectId === projectId &&
-          object(scopes[0])?.teamId === teamId,
-        expiryIsFutureEpochMs:
-          typeof row?.expiresAt === "number" &&
-          Number.isSafeInteger(row.expiresAt) &&
-          row.expiresAt > Date.now(),
-      },
-      "GET /v9/projects/{selectedProjectId}?teamId={teamId}": {
-        status: selected.status,
-        idAndAccountMatch:
-          object(selected.body)?.id === projectId && object(selected.body)?.accountId === teamId,
-      },
-      "GET /v9/projects?teamId={teamId}": { status: list.status, denialCode: denialCode(list, token) },
-      "GET /v9/projects/{knownOtherProjectId}?teamId={teamId}": {
-        status: other.status,
-        denialCode: denialCode(other, token),
-      },
-    }),
-  );
+  const sensitive = proofSensitiveValues(token);
+  return {
+    checkedAt: new Date().toISOString(),
+    fixture: label,
+    "GET /v5/user/tokens/current": {
+      status: metadata.status,
+      metadataFields: metadataShape(metadata.body, sensitive),
+      scopeCount: Array.isArray(row?.scopes) ? scopes.length : null,
+      firstScopeIsProject: object(scopes[0])?.type === "project",
+      scopeBindsSelectedProjectAndTeam:
+        scopes.length === 1 &&
+        object(scopes[0])?.projectId === projectId &&
+        object(scopes[0])?.teamId === teamId,
+      expiryIsFutureEpochMs:
+        typeof row?.expiresAt === "number" &&
+        Number.isSafeInteger(row.expiresAt) &&
+        row.expiresAt > Date.now(),
+    },
+    "GET /v9/projects/{selectedProjectId}?teamId={teamId}": {
+      status: selected.status,
+      idAndAccountMatch:
+        object(selected.body)?.id === projectId && object(selected.body)?.accountId === teamId,
+    },
+    "GET /v9/projects?teamId={teamId}": { status: list.status, denialCode: denialCode(list, token) },
+    "GET /v9/projects/{knownOtherProjectId}?teamId={teamId}": {
+      status: other.status,
+      denialCode: denialCode(other, token),
+    },
+  };
 }
+
+function logProof(label: string, probes: ScopeResponses, token: string) {
+  console.log("[FD-29 live scope proof]", JSON.stringify(scopeProof(label, probes, token)));
+}
+
+test("live proof reports new metadata field names and types without credential values or dynamic keys", () => {
+  const token = "vcp_CanaryProof";
+  const project = "prj_CanaryProof";
+  const hook = "https://api.vercel.com/v1/integrations/deploy/prj_CanaryProof/HookCanaryProof";
+  const probes: ScopeResponses = [
+    {
+      status: 200,
+      body: {
+        token: {
+          expiryMillis: 123,
+          projectScopes: [{ projectBinding: project, nestedBinding: { account: "team_CanaryProof" } }],
+          [token]: "credential-key",
+          [project]: true,
+          [hook]: true,
+          hookRef: hook,
+        },
+      },
+    },
+    { status: 200, body: { id: project } },
+    { status: 403, body: { error: { code: "project_scope_denied" } } },
+    { status: 403, body: { error: { code: "prj_hiddenid" } } },
+  ];
+  const proof = JSON.stringify(scopeProof("mock", probes, token));
+  expect(proof).toContain('"expiryMillis":"number"');
+  expect(proof).toContain('"projectBinding":"string"');
+  expect(proof).toContain('"account":"string"');
+  expect(proof).toContain("project_scope_denied");
+  expect(proof).not.toContain("prj_hiddenid");
+  for (const privateValue of [token, project, "team_CanaryProof", "HookCanaryProof", "credential-key"])
+    expect(proof).not.toContain(privateValue);
+});
 
 let projectProbes: Promise<ScopeResponses> | undefined;
 function readProjectProbes() {
@@ -247,7 +316,7 @@ test.skipIf(!redeployToken || !projectId || !teamId || !baselineId || !baselineC
 
     const updatedCanary = randomBytes(32).toString("hex");
     try {
-      await upsertVercelVariables(api, selection, redeployToken, { [canaryName]: updatedCanary });
+      await upsertVercelVariable(api, selection, redeployToken, canaryName, updatedCanary);
       const { status, body } = await api.request({
         endpoint: "/v13/deployments",
         url: vercelUrl("/v13/deployments", teamId),
@@ -295,7 +364,7 @@ test.skipIf(!redeployToken || !projectId || !teamId || !baselineId || !baselineC
       }
       throw new Error("The scratch redeployment did not become READY within 30 minutes.");
     } finally {
-      await upsertVercelVariables(api, selection, redeployToken, { [canaryName]: baselineCanary! });
+      await upsertVercelVariable(api, selection, redeployToken, canaryName, baselineCanary!);
     }
   },
   31 * 60_000,

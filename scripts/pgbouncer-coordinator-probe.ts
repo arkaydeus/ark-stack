@@ -117,6 +117,6 @@ try {
   }
   if (daily) await sql`DELETE FROM operations WHERE id = ${daily.id}`;
   // pgbouncer.reload queues edge.l4_apply for the domain worker (FD-26); none runs here.
-  await sql`DELETE FROM operations WHERE kind = 'edge.l4_apply' AND status = 'queued' AND created_at >= ${startedAt}`;
+  await sql`DELETE FROM operations WHERE kind = 'edge.l4_apply' AND status = 'queued' AND created_at >= ${startedAt.toISOString()}::timestamptz`;
   await sql.end({ timeout: 2 });
 }

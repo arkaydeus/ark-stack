@@ -1,3 +1,5 @@
+import { sha256Hex } from "@ark-stack/shared";
+
 // FD-29 provider calls. The audit observer receives endpoint templates and statuses only.
 export const VERCEL_ORIGIN = "https://api.vercel.com";
 export const projectIdPattern = /^prj_[A-Za-z0-9]+$/;
@@ -12,6 +14,17 @@ export type VercelSelection = {
   target: "production" | "preview";
   gitBranch?: string | null;
 };
+
+export function vercelConnectBinding({
+  token,
+  deployHook,
+  ...selection
+}: VercelSelection & {
+  token: string;
+  deployHook: string;
+}) {
+  return { ...selection, credentialDigest: sha256Hex(JSON.stringify([token, deployHook])) };
+}
 
 export type VercelScopeProof = {
   evidence: string;
@@ -195,50 +208,43 @@ export function deployHookBranch(project: Record<string, unknown>, hook: URL, se
   return ref;
 }
 
-export async function upsertVercelVariables(
+export async function upsertVercelVariable(
   api: VercelApi,
   selection: VercelSelection,
   token: string,
-  variables: Record<string, string>,
+  key: string,
+  value: string,
 ) {
   const url = vercelUrl(`/v10/projects/${selection.projectId}/env`, selection.teamId);
   url.searchParams.set("upsert", "true");
-  const entries = Object.entries(variables).map(([key, value]) => ({
+  const entry = {
     key,
     value,
     type: "sensitive",
     target: [selection.target],
     ...(selection.gitBranch ? { gitBranch: selection.gitBranch } : {}),
-  }));
+  };
   const { status, body } = await api.request({
     endpoint: "/v10/projects/{projectId}/env",
     url,
     method: "POST",
     token,
-    body: entries,
+    body: entry,
   });
   const { created, failed } = object(body) ?? {};
+  const row = object(created);
   if (
     status !== 201 ||
-    !Array.isArray(created) ||
     !Array.isArray(failed) ||
     failed.length !== 0 ||
-    created.length !== entries.length ||
-    !entries.every(({ key, gitBranch, target }) =>
-      created.some((item: unknown) => {
-        const row = object(item);
-        return (
-          row?.key === key &&
-          row.type === "sensitive" &&
-          Array.isArray(row.target) &&
-          row.target.length === 1 &&
-          row.target[0] === target[0] &&
-          (row.gitBranch ?? undefined) === gitBranch
-        );
-      }),
-    )
+    row?.key !== key ||
+    row.type !== "sensitive" ||
+    !Array.isArray(row.target) ||
+    row.target.length !== 1 ||
+    row.target[0] !== selection.target ||
+    (row.gitBranch ?? undefined) !== entry.gitBranch
   ) {
-    throw new Error("Vercel did not confirm all sensitive environment variable updates.");
+    throw new Error("Vercel did not confirm the sensitive environment variable update.");
   }
 }
 

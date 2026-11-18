@@ -48,10 +48,10 @@ import {
   platformSettings,
   privateCas,
   secrets,
-  vercelIntegrations,
 } from "../schema.ts";
 import { appRoleExists, applyClientRole, revokeClientRole } from "./database.ts";
 import * as pki from "./pki.ts";
+import { removeVercelIntegration } from "./pooler-policy.ts";
 
 /** Sealed password of a client login role. Revealed once with the bundle; never deleted while active. */
 export const CLIENT_PASSWORD_SECRET_KIND = "postgres.client";
@@ -586,7 +586,7 @@ export async function queueClientRevocation(input: {
       .update(databaseClients)
       .set({ revokedAt: client.revokedAt ?? new Date(), revokedBy: client.revokedBy ?? input.actorId })
       .where(eq(databaseClients.id, input.clientId));
-    await tx.delete(vercelIntegrations).where(eq(vercelIntegrations.databaseClientId, client.id));
+    await removeVercelIntegration(tx, client.id);
     const payload = { clientId: input.clientId };
     const [operation] = await tx
       .insert(operations)
@@ -630,6 +630,12 @@ export async function revokeDatabaseClient(
   const caIds = [...new Set([client.caId, ...certificates.map((item) => item.caId)])];
   await db.transaction(async (tx) => {
     await tx
+      .select({ id: databaseClients.id })
+      .from(databaseClients)
+      .where(eq(databaseClients.id, client.id))
+      .for("update");
+    await removeVercelIntegration(tx, client.id);
+    await tx
       .update(databaseClients)
       .set({
         status: "revoked",
@@ -637,7 +643,6 @@ export async function revokeDatabaseClient(
         revokedBy: client.revokedBy ?? input.actorId ?? null,
       })
       .where(eq(databaseClients.id, client.id));
-    await tx.delete(vercelIntegrations).where(eq(vercelIntegrations.databaseClientId, client.id));
   });
   for (const certificate of certificates) {
     await pki.revokeClientCertificate({ id: certificate.id, reason: "cessationOfOperation", now });

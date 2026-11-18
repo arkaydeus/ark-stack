@@ -61,6 +61,10 @@ export function VercelRolloverPanel({ database }: { database: Database }) {
           token and audits every use. Disconnecting deletes Ark’s copy of the token and deploy hook. Manual
           rollover is available for production apps that hold sensitive user data.
         </p>
+        <p className="text-muted-foreground">
+          Before connecting, deploy an app that reads <code>ARK_DB_CLIENT_BUNDLE</code> and confirm that the
+          reviewed database ingress policy admits its Vercel traffic.
+        </p>
       </div>
       {error && (
         <p role="alert" className="text-sm text-destructive">
