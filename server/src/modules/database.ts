@@ -196,6 +196,10 @@ export async function executeWorkspaceQuery(input: {
     max: 1,
     connect_timeout: 8,
     idle_timeout: 5,
+    types: {
+      // Keep rendering unzoned timestamps in the worker's local timezone as in postgres.js 3.
+      timestamp: { from: [1114], parse: (value: string) => new Date(value) },
+    },
   });
   try {
     await client`SET statement_timeout = 8000`;

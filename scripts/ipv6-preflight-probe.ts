@@ -1,6 +1,6 @@
 import { once } from "node:events";
 import { createConnection, type Socket } from "node:net";
-import { connect as connectTls } from "node:tls";
+import { connect as connectTls, type TLSSocket } from "node:tls";
 
 import postgres from "postgres";
 import {
@@ -25,6 +25,28 @@ export type ProbeCredential = {
 
 const timeoutMs = 8_000;
 const sslRequest = Buffer.from("0000000804d2162f", "hex");
+
+export async function queryPostgresOverTls(tls: TLSSocket, hostname: string, credential: ProbeCredential) {
+  const sql = postgres({
+    // TLSSocket implements SocketLike.end at runtime with separate overloads for data and no data.
+    socket: () => tls as TLSSocket & postgres.SocketLike,
+    host: hostname,
+    username: credential.username,
+    password: credential.password ?? "",
+    database: credential.database,
+    ssl: false, // PostgreSQL runs over the already verified TLS transport.
+    max: 1,
+    fetch_types: false,
+    connect_timeout: timeoutMs / 1_000,
+    connection: { application_name: "ark-ipv6-preflight" },
+  });
+  try {
+    const [row] = await sql`SELECT 1 AS ready`;
+    if (row?.ready !== 1) throw new Error("Unexpected PostgreSQL probe response.");
+  } finally {
+    await sql.end({ timeout: 1 });
+  }
+}
 
 async function probe(
   request: Ipv6ProbeRequest,
@@ -119,26 +141,7 @@ async function probe(
 
       if (database) {
         reason = "postgres";
-        // postgres.js 3.4 accepts a connected custom socket at runtime.
-        const options = {
-          socket: async () => tls,
-          host: check.hostname,
-          username: credential!.username,
-          password: credential!.password ?? "",
-          database: credential!.database,
-          ssl: false as const, // PostgreSQL runs over the already verified TLS transport above.
-          max: 1,
-          fetch_types: false,
-          connect_timeout: timeoutMs / 1_000,
-          connection: { application_name: "ark-ipv6-preflight" },
-        };
-        const sql = postgres(options);
-        try {
-          const [row] = await sql`SELECT 1 AS ready`;
-          if (row?.ready !== 1) throw new Error("Unexpected PostgreSQL probe response.");
-        } finally {
-          await sql.end({ timeout: 1 });
-        }
+        await queryPostgresOverTls(tls, check.hostname, credential!);
       } else {
         // Give a TLS terminator time to connect upstream. The independently collected
         // backend log is what confirms the connection.
