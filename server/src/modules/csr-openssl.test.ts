@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { createPrivateKey } from "node:crypto";
 
-import { buildCsr, extensionRequest, rawTlv, toCsrPem } from "./csr-test-kit.ts";
+import { buildCsr, challengePasswordAttribute, extensionRequest, rawTlv, toCsrPem } from "./csr-test-kit.ts";
 import { testOpenSsl } from "./test-openssl.ts";
 import * as x509 from "./x509.ts";
 
@@ -189,6 +189,12 @@ test(
     );
 
     const p256Key = createPrivateKey(p256);
+    stricter(
+      "challengePassword attribute",
+      buildCsr({ key: p256Key, attributes: [challengePasswordAttribute()] }).der,
+      /attribute 1\.2\.840\.113549\.1\.9\.7, which is not accepted/,
+      "Ark accepts only the extensionRequest PKCS#10 attribute.",
+    );
     const withSubject = (value: Buffer) =>
       buildCsr({
         key: p256Key,

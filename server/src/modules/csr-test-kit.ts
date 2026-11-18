@@ -37,6 +37,9 @@ export function extensionRequest(extensions: Buffer[]) {
   return x509.sequence(x509.oid(x509.OID.extensionRequest), x509.set(x509.sequence(...extensions)));
 }
 
+export const challengePasswordAttribute = () =>
+  x509.sequence(x509.oid("1.2.840.113549.1.9.7"), x509.set(x509.utf8String("pw")));
+
 export type CsrParts = {
   key: KeyObject;
   /** SubjectPublicKeyInfo DER. Defaults to the key's own. */

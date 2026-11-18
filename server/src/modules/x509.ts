@@ -467,6 +467,12 @@ export function decodeAuthorityKeyIdentifier(value: Buffer) {
   return keyId ? Buffer.from(keyId.content) : null;
 }
 
+function parseExplicitExtensions(wrapper: Node) {
+  const fields = children(wrapper);
+  if (fields.length !== 1) throw new DerError("Malformed extensions wrapper.");
+  return parseExtensions(fields[0]);
+}
+
 /** The parts of a DER certificate the PKI module and its tests need. */
 export function parseCertificate(der: Buffer) {
   const parts = children(expectTag(decode(der), 0x30, "a Certificate"));
@@ -477,18 +483,23 @@ export function parseCertificate(der: Buffer) {
   let index = 0;
   let version = 1;
   if (fields[0]?.tag === 0xa0) {
-    version = Number(decodeInteger(children(fields[0])[0], "a certificate version", { maxBytes: 1 })) + 1;
+    const versionFields = children(fields[0]);
+    if (versionFields.length !== 1) throw new DerError("Malformed certificate version.");
+    version = Number(decodeInteger(versionFields[0], "a certificate version", { maxBytes: 1 })) + 1;
     index = 1;
   }
-  const serial = serialHex(fields[index]);
-  const issuer = expectTag(fields[index + 2], 0x30, "an issuer Name");
-  const validity = children(expectTag(fields[index + 3], 0x30, "a Validity"));
+  const serial = serialHex(fields[index++]);
+  expectTag(fields[index++], 0x30, "a TBSCertificate signature AlgorithmIdentifier");
+  const issuer = expectTag(fields[index++], 0x30, "an issuer Name");
+  const validity = children(expectTag(fields[index++], 0x30, "a Validity"));
   if (validity.length !== 2) throw new DerError("Malformed certificate Validity.");
   const [notBefore, notAfter] = validity;
-  const subject = expectTag(fields[index + 4], 0x30, "a subject Name");
-  const spki = expectTag(fields[index + 5], 0x30, "a SubjectPublicKeyInfo");
-  const extensionsWrapper = fields.slice(index + 6).find((field) => field.tag === 0xa3);
-  const extensions = extensionsWrapper ? parseExtensions(children(extensionsWrapper)[0]) : [];
+  const subject = expectTag(fields[index++], 0x30, "a subject Name");
+  const spki = expectTag(fields[index++], 0x30, "a SubjectPublicKeyInfo");
+  if (fields[index]?.tag === 0x81) index += 1; // issuerUniqueID
+  if (fields[index]?.tag === 0x82) index += 1; // subjectUniqueID
+  const extensions = fields[index]?.tag === 0xa3 ? parseExplicitExtensions(fields[index++]!) : [];
+  if (index !== fields.length) throw new DerError("Unexpected TBSCertificate field.");
   return {
     version,
     serial,
@@ -514,7 +525,7 @@ export function parseCrl(der: Buffer) {
   const certList = expectTag(tbs, 0x30, "a TBSCertList");
   const fields = children(certList);
   let index = fields[0]?.tag === 0x02 ? 1 : 0;
-  index += 1; // signature AlgorithmIdentifier
+  expectTag(fields[index++], 0x30, "a TBSCertList signature AlgorithmIdentifier");
   const issuer = expectTag(fields[index++], 0x30, "an issuer Name");
   const thisUpdate = decodeTime(fields[index++]);
   const nextUpdate =
@@ -522,7 +533,9 @@ export function parseCrl(der: Buffer) {
   const revoked =
     fields[index]?.tag === 0x30
       ? children(fields[index++]!).map((entry) => {
-          const [serial, revokedAt, entryExtensions] = children(entry);
+          const entryFields = children(expectTag(entry, 0x30, "a revoked certificate entry SEQUENCE"));
+          if (entryFields.length > 3) throw new DerError("Unexpected revoked certificate entry field.");
+          const [serial, revokedAt, entryExtensions] = entryFields;
           const reason = entryExtensions
             ? parseExtensions(entryExtensions).find((item) => item.id === OID.crlReason)
             : undefined;
@@ -533,8 +546,8 @@ export function parseCrl(der: Buffer) {
           };
         })
       : [];
-  const extensionsWrapper = fields[index]?.tag === 0xa0 ? fields[index] : undefined;
-  const extensions = extensionsWrapper ? parseExtensions(children(extensionsWrapper)[0]) : [];
+  const extensions = fields[index]?.tag === 0xa0 ? parseExplicitExtensions(fields[index++]!) : [];
+  if (index !== fields.length) throw new DerError("Unexpected TBSCertList field.");
   const numberExtension = extensions.find((item) => item.id === OID.crlNumber);
   const crlNumber = numberExtension
     ? decodeInteger(decode(numberExtension.value), "a CRLNumber", { nonNegative: true })
