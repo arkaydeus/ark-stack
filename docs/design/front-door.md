@@ -49,7 +49,7 @@ The user's revision 2 answers are listed in [§0.1](#01-resolved-decisions).
 | HTTP access gate             | Caddy `forward_auth` calls the Ark API, and a one-time-code handshake sets a host-only `__Host-` cookie on each route domain. Login happens on the **public `login.<domain>` origin**, which exposes only sign-in, MFA and gate endpoints.                                                                                                                                                                                                                        |
 | SSRF guard                   | Targets must be Tailscale addresses that appear in the edge node's own netmap. Each route is pinned to the target's `StableNodeID`, Ark renders only the IP, and Tailscale ACL grants enforce the same boundary on the receiving node.                                                                                                                                                                                                                            |
 | PgBouncer mTLS               | `client_tls_sslmode = verify-full`, with **one private CA per app environment and certificate generation** in one bundle. Preview deployments use a **read-only role**. Revocation removes the CA, rotates the password, then sends `RELOAD` and `KILL_CLIENT` (V-8). PgBouncer is upgraded to 1.26.1 (FD-01, started separately).                                                                                                                                |
-| Client certificates          | **90-day lifetime with automatic rollover.** The next certificate is issued 30 days before expiry, both are valid during the overlap, and Ark raises a "rollover pending" alert. An optional **Vercel integration** uses a project-scoped, expiring Vercel token to deliver a sensitive credential bundle and redeploy (§3.10.5).                                                                                                                                 |
+| Client certificates          | **90-day lifetime with automatic rollover.** The next certificate is issued 30 days before expiry, both are valid during the overlap, and Ark raises a "rollover pending" alert. An optional **Vercel integration** uses a project-scoped, expiring Vercel token to deliver the certificate and key as sensitive env vars and redeploy (§3.10.5).                                                                                                                 |
 | Public DB and TCP limits     | nftables per-source `ct count` and `limit rate` meters on every public TCP port. Per-route CIDR allowlists are enforced in HAProxy, because nftables cannot see SNI and Docker's native IPv6 keeps real client addresses.                                                                                                                                                                                                                                         |
 | DNS                          | Plain hostnames, including the apex and `www`. A and AAAA records come from the existing reviewed-diff flow. **AAAA is published only after an IPv6 preflight passes**, with a per-domain off switch.                                                                                                                                                                                                                                                             |
 | Backups                      | **Both** an S3-compatible store (AWS S3, Backblaze B2, Cloudflare R2, MinIO) and a home machine over the tailnet (`rest-server --append-only`). Credentials cannot delete existing backups.                                                                                                                                                                                                                                                                       |
@@ -67,7 +67,7 @@ The user answered every revision 1 open question. Each decision below is applied
 | R3  | **Plain hostnames, not `host:port`.** HTTP(S) and WebSocket by hostname on 80/443, including the apex and `www`. TLS-based TCP is routed by SNI on shared standard ports: 443, and 5432 for PostgreSQL. Dedicated ports from 20000–20049 are only for protocols without TLS.                                        | §2.1, §3.5, §3.8 (rewritten), §3.11, §3.13, FD-14, FD-25, FD-26 |
 | R4  | **Caddy upgraded to the current 2.11.x (2.11.9), digest-pinned. HAProxy remains the TCP/SNI proxy.** The upgrade ticket re-runs the header-stripping, `Via` removal, WebSocket-reload and certificate-reload tests.                                                                                                 | §3.5, §3.14, §3.16, FD-24 (re-runs recorded as V-16, V-17)      |
 | R5  | **One CA per app environment, plus a read-only role for preview deployments.**                                                                                                                                                                                                                                      | §3.1, §3.10.3, FD-17                                            |
-| R6  | **Client certificates last 90 days with automatic rollover.** Issued about 30 days before expiry, with overlapping validity and a rollover-pending alert. An optional Vercel integration (token stored encrypted) pushes a sensitive credential bundle and redeploys. Without it, rollover is a guided manual step. | §3.10.4, §3.10.5, §3.12, FD-28, FD-29                           |
+| R6  | **Client certificates last 90 days with automatic rollover.** Issued about 30 days before expiry, with overlapping validity and a rollover-pending alert. An optional Vercel integration (token stored encrypted) sets sensitive cert and key env vars and redeploys. Without it, rollover is a guided manual step. | §3.10.4, §3.10.5, §3.12, FD-28, FD-29                           |
 | R7  | **Up to about 5 minutes of WebSocket access after revocation is acceptable.**                                                                                                                                                                                                                                       | §2.3 residual risks, §3.5                                       |
 | R8  | **Backups go to both destinations:** any S3-compatible store (configurable endpoint, region, bucket and path style) and a home machine over the tailnet, using append-only or write-only credentials.                                                                                                               | §3.18 (rewritten), FD-21, FD-30                                 |
 | R9  | **IPv6: AAAA by default, but only after a preflight.** The preflight checks for a public IPv6 address and that 80, 443, 5432 and the TCP route ports are reachable over it. Otherwise A only, with a warning. Per-domain AAAA toggle. Docker native IPv6 with `userland-proxy` off.                                 | §3.13, §3.17, FD-27                                             |
@@ -1711,7 +1711,7 @@ day 0                         day 60 (T−30)                     day 90 (T)
 
 1. **Issue the successor at T−30 days.** Under a per-client transaction lock, select an unsuperseded `current` certificate with no successor, issue N+1 with a fresh key **and a fresh generation CA**, and set N.superseded_by once. A uniqueness constraint prevents duplicate successors on retries. Add both CAs to the bundle and `RELOAD` PgBouncer before delivery. N+1 is `pending`, valid for 90 days from issue. `database_clients.ca_id` tracks the promoted generation; historical certificate rows retain their own CA. An owner can also trigger rollover early (`POST …/rollover`).
 2. **Deliver it.**
-   - **With the Vercel integration** (§3.10.5): `integration.vercel_push` writes the credential bundle, redeploys, waits for the deployment to become ready, and records delivery of N+1.
+   - **With the Vercel integration** (§3.10.5): `integration.vercel_push` writes the certificate and key env vars, redeploys, waits for the deployment to become ready, and records delivery of N+1.
    - **Without it:** Ark raises a **rollover-pending alert**. The UI shows a guided step: reveal the new bundle once (`secret.reveal` step-up), the exact `vercel env add …` commands, then "Redeploy and confirm". The operator's confirmation records delivery. In the same idempotent transaction, set `delivered_at` once, mark N `superseded`, promote N+1 through `delivered` to `current`, and update the client CA pointer. The daily job can then select N+1 at day 120; `delivered` must never remain a scheduler dead end.
 3. **Escalate if not delivered.** The pending alert becomes a warning at T−14 days and critical at T−7 days, through the existing alert pipeline (`server/src/modules/alerts.ts`).
 4. **Retire the predecessor and bound live access.** TLS expiry rejects new handshakes only. At N.not_after, a durable retirement task removes N's generation CA, reloads and drains **all sessions for this client's role**, including successor sessions, because PgBouncer cannot identify the certificate serial. Under a serialized pooler lock, first fence new admission in `be_pgbouncer` across all HAProxy generations; close unauthenticated PgBouncer clients that could complete a pre-retirement handshake, reload the reduced CA bundle, kill the role's clients, verify no role or pre-auth clients remain, then reopen admission. Existing sessions for other roles remain alive; new pooler connections may briefly retry. Reconnecting with N+1 succeeds, N fails. The retirement deadline is **not_after + 5 seconds**; an independent watchdog fences admission and stops PgBouncer if the drain/reload cannot meet it. No claim of a ≤90-day exposure bound is made without this enforcement. Idle timeouts and `server_lifetime` are not absolute client lifetimes.
@@ -1746,9 +1746,10 @@ The integration automates delivery for active production and preview clients wit
 
 **Flow** (`integration.vercel_push`, domain worker):
 
-1. `POST https://api.vercel.com/v10/projects/{projectId}/env?upsert=true` with one `ARK_DB_CLIENT_BUNDLE` variable. The JSON value contains `version: 1` and the PEM strings `cert` and `key`, so a Git build receives a matching pair even if Ark loses the provider's acknowledgement.
-   - Use `type: "sensitive"` and the client environment as the target (`production`, or `preview` with an optional `gitBranch`). [Create env vars](https://vercel.com/docs/rest-api/projects/create-one-or-more-environment-variables)
-   - Before connecting, deploy an application that reads this bundle and confirm the reviewed pooler policy admits its Vercel egress. The examples in §3.12 read the bundle and fall back to the separate variables for manual-only projects. Connection leaves the reviewed source policy in effect.
+1. `POST https://api.vercel.com/v10/projects/{projectId}/env?upsert=true` with both `ARK_DB_CLIENT_CERT_B64` and `ARK_DB_CLIENT_KEY_B64` in one request. Each value is a base64-encoded PEM.
+   - Use `type: "sensitive"` for both variables and the client environment as the target (`production`, or `preview` with an optional `gitBranch`). [Create env vars](https://vercel.com/docs/rest-api/projects/create-one-or-more-environment-variables)
+   - Vercel can accept part of a batch. Ark triggers the deploy hook only after Vercel confirms both writes. Existing deployments keep their env vars. Before starting a separate deployment after a failed update, complete both writes through retry or manual rollover so the build receives a matching pair.
+   - Before connecting, deploy an application that reads both variables (§3.12) and confirm the reviewed pooler policy admits its Vercel egress. Connection leaves the reviewed source policy in effect.
    - Revoking the database client disables its role and removes the integration credentials.
 2. **Redeploy**, because env changes "only apply to new deployments" ([env vars](https://vercel.com/docs/environment-variables)).
    - **Enabled path:** the deploy hook. It builds the branch head as a new deployment, which picks up current env vars, but it is limited to 60 triggers per hour per project and needs a Git-connected project.
@@ -1877,9 +1878,6 @@ import { Pool } from "pg";
 import { attachDatabasePool } from "@vercel/functions";
 
 const pem = (name: string) => Buffer.from(process.env[name] ?? "", "base64").toString("utf8");
-const credential = process.env.ARK_DB_CLIENT_BUNDLE
-  ? JSON.parse(process.env.ARK_DB_CLIENT_BUNDLE)
-  : { cert: pem("ARK_DB_CLIENT_CERT_B64"), key: pem("ARK_DB_CLIENT_KEY_B64") };
 
 export const pool = new Pool({
   host: process.env.ARK_DB_HOST, // hostname, not IP: node-postgres then sets SNI itself
@@ -1890,8 +1888,8 @@ export const pool = new Pool({
   ssl: {
     rejectUnauthorized: true, // server cert is public Let's Encrypt; no custom CA needed
     minVersion: "TLSv1.3",
-    cert: credential.cert,
-    key: credential.key,
+    cert: pem("ARK_DB_CLIENT_CERT_B64"),
+    key: pem("ARK_DB_CLIENT_KEY_B64"),
   },
   max: 5,
   idleTimeoutMillis: 5_000,
@@ -1909,9 +1907,6 @@ attachDatabasePool(pool);
 ```ts
 import postgres from "postgres";
 const pem = (name: string) => Buffer.from(process.env[name] ?? "", "base64").toString("utf8");
-const credential = process.env.ARK_DB_CLIENT_BUNDLE
-  ? JSON.parse(process.env.ARK_DB_CLIENT_BUNDLE)
-  : { cert: pem("ARK_DB_CLIENT_CERT_B64"), key: pem("ARK_DB_CLIENT_KEY_B64") };
 
 export const sql = postgres({
   host: process.env.ARK_DB_HOST,
@@ -1923,8 +1918,8 @@ export const sql = postgres({
     rejectUnauthorized: true,
     minVersion: "TLSv1.3",
     servername: process.env.ARK_DB_HOST,
-    cert: credential.cert,
-    key: credential.key,
+    cert: pem("ARK_DB_CLIENT_CERT_B64"),
+    key: pem("ARK_DB_CLIENT_KEY_B64"),
   },
   max: 5,
   idle_timeout: 5, // seconds; closes idle sockets quickly since there is no suspend hook
@@ -1947,13 +1942,9 @@ Ark fills this in from the platform region setting (§3.15).
 
 **90-day certificates, rollover at T−30 days (R6).** The env var names never change: rollover replaces the values.
 
-- **With the Vercel integration** (§3.10.5), Ark pushes the new bundle about 30 days before expiry and redeploys. For manual recovery on a bundle-aware project, write the revealed successor to `ARK_DB_CLIENT_BUNDLE` before redeploying and confirming. The command below uses the PEM files from the reveal. Replace `production` with your preview target and select the configured branch when applicable.
+- **With the Vercel integration** (§3.10.5), Ark updates both variables about 30 days before expiry and redeploys.
 
-  ```bash
-  node -e 'const {readFileSync: read} = require("node:fs"); process.stdout.write(JSON.stringify({version: 1, cert: read("client-next.crt", "utf8"), key: read("client-next.key", "utf8")}));' | vercel env add ARK_DB_CLIENT_BUNDLE production --sensitive --force
-  ```
-
-- **Without it**, Ark raises a rollover-pending alert, and the client page shows the exact commands:
+- **For manual rollover or recovery after a failed push**, the client page shows the commands to update both variables before redeploying and confirming. Use the configured target and branch for preview deployments.
 
 ```bash
 # Reveal the new bundle once in Ark (step-up), then:
@@ -2791,13 +2782,13 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - The `vercel_integrations` model.
   - Connect, test and disconnect endpoints (owner, step-up).
   - Project-scoped token validation, then sealed storage.
-  - `integration.vercel_push` (domain worker, new `integration.` prefix): upsert one sensitive certificate and key bundle, redeploy through the verified hook, poll until ready, atomically record delivery and promote to `current`.
+  - `integration.vercel_push` (domain worker, new `integration.` prefix): upsert both sensitive certificate and key env vars, redeploy through the verified hook, poll until ready, atomically record delivery and promote to `current`.
   - Token-expiry alert. The security trade-off text in the UI.
 - **Depends on:** FD-28.
 - **Acceptance criteria:**
   - [ ] Mock project-only, team-, account-, cross-project, expired and no-expiry tokens and run the live checks when test credentials are supplied: only the positively verified selected-project token is accepted. For every refusal assert no secret/integration row, queue job, disk/log copy or external mutation exists. Network failures/ambiguous metadata are refusal, never evidence of scope.
   - [ ] Attach redacted real-API status/metadata-shape proof for GET /v5/user/tokens/current and the exact /v9/projects probes before enabling connect. If project token metadata is unavailable, connection remains disabled and manual rollover works.
-  - [ ] Against a mocked Vercel API, a push upserts the credential bundle with `type: "sensitive"` and the right target, triggers one redeploy, and records delivery and promotes the certificate to `current` only after the deployment is ready.
+  - [ ] Against a mocked Vercel API, a push upserts both certificate and key env vars with `type: "sensitive"` and the right target, triggers one redeploy, and records delivery and promotes the certificate to `current` only after the deployment is ready.
   - [ ] A team- or account-scoped token is refused at connect time, and so is a token without an expiry.
   - [ ] Against a real test Vercel project, it is established whether `/v13/deployments` with `deploymentId` picks up changed env vars. If not, only the deploy-hook path is enabled.
   - [ ] A failed push leaves the certificate `pending`, raises the alert, and the old certificate still works.

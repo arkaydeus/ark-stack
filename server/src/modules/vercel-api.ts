@@ -208,43 +208,50 @@ export function deployHookBranch(project: Record<string, unknown>, hook: URL, se
   return ref;
 }
 
-export async function upsertVercelVariable(
+export async function upsertVercelVariables(
   api: VercelApi,
   selection: VercelSelection,
   token: string,
-  key: string,
-  value: string,
+  variables: readonly { key: string; value: string }[],
 ) {
   const url = vercelUrl(`/v10/projects/${selection.projectId}/env`, selection.teamId);
   url.searchParams.set("upsert", "true");
-  const entry = {
-    key,
-    value,
+  const gitBranch = selection.gitBranch ?? undefined;
+  const entries = variables.map((variable) => ({
+    ...variable,
     type: "sensitive",
     target: [selection.target],
-    ...(selection.gitBranch ? { gitBranch: selection.gitBranch } : {}),
-  };
+    ...(gitBranch ? { gitBranch } : {}),
+  }));
   const { status, body } = await api.request({
     endpoint: "/v10/projects/{projectId}/env",
     url,
     method: "POST",
     token,
-    body: entry,
+    body: entries.length === 1 ? entries[0] : entries,
   });
   const { created, failed } = object(body) ?? {};
-  const row = object(created);
+  const rows = Array.isArray(created) ? created : [created];
+  const unconfirmed = new Set(variables.map(({ key }) => key));
   if (
     status !== 201 ||
     !Array.isArray(failed) ||
     failed.length !== 0 ||
-    row?.key !== key ||
-    row.type !== "sensitive" ||
-    !Array.isArray(row.target) ||
-    row.target.length !== 1 ||
-    row.target[0] !== selection.target ||
-    (row.gitBranch ?? undefined) !== entry.gitBranch
+    rows.length !== variables.length ||
+    !rows.every((value: unknown) => {
+      const row = object(value);
+      return (
+        row?.type === "sensitive" &&
+        Array.isArray(row.target) &&
+        row.target.length === 1 &&
+        row.target[0] === selection.target &&
+        (row.gitBranch ?? undefined) === gitBranch &&
+        typeof row.key === "string" &&
+        unconfirmed.delete(row.key)
+      );
+    })
   ) {
-    throw new Error("Vercel did not confirm the sensitive environment variable update.");
+    throw new Error("Vercel did not confirm every sensitive environment variable update.");
   }
 }
 

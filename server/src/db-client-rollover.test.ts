@@ -25,7 +25,6 @@ import {
   renderEdgeL4Generation,
   ROLLOVER_ALERT_PREFIX,
   VERCEL_ENV_NAMES,
-  vercelCredentialBundle,
   type Role,
 } from "@ark-stack/shared";
 import { makeSignature } from "better-auth/crypto";
@@ -1427,7 +1426,7 @@ describe("FD-29 Vercel delivery", () => {
     const calls: Array<{
       method: string;
       path: string;
-      body?: Record<string, unknown>;
+      body?: Record<string, unknown>[];
       authenticated: boolean;
     }> = [];
     let polls = 0;
@@ -1437,7 +1436,7 @@ describe("FD-29 Vercel delivery", () => {
       const headers = new Headers(init.headers);
       const authenticated = headers.get("authorization") === `Bearer ${input.token}`;
       const path = url.pathname + url.search;
-      const body = init.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
+      const body = init.body ? (JSON.parse(String(init.body)) as Record<string, unknown>[]) : undefined;
       calls.push({ method, path, body, authenticated });
       if (
         method === "GET" &&
@@ -1497,15 +1496,15 @@ describe("FD-29 Vercel delivery", () => {
       if (url.pathname === `/v10/projects/${projectId}/env`) {
         await options.beforeEnv?.();
         if (options.push === "upsertUnavailable") return Response.json({}, { status: 503 });
-        const entries = Array.isArray(body) ? body : [body];
-        // Simulate an upstream partial acknowledgement: any accepted entry is visible to a Git build.
-        const accepted = options.push === "partial" ? entries.slice(0, 1) : entries;
+        if (!Array.isArray(body)) return Response.json({}, { status: 400 });
+        // Vercel may accept one entry and refuse the other. Existing deployments keep their env.
+        const accepted = options.push === "partial" ? body.slice(0, 1) : body;
         for (const entry of accepted) {
           options.environment?.set(String(entry?.key), String(entry?.value));
         }
         return Response.json(
           {
-            created: accepted[0],
+            created: accepted.map(({ key, type, target, gitBranch }) => ({ key, type, target, gitBranch })),
             failed: options.push === "partial" ? [{ error: { message: input.token } }] : [],
           },
           { status: 201 },
@@ -1738,6 +1737,10 @@ describe("FD-29 Vercel delivery", () => {
           rolloverState: "pending",
           deliveredAt: null,
         });
+        expect((await vercel.vercelIntegrationStatus(ref)).integration).toMatchObject({
+          lastPushStatus: "pushing",
+          lastDeploymentId: null,
+        });
       },
     });
     const outcome = await coordinator.runOperation("integration.vercel_push", operationRow(op!), {
@@ -1753,16 +1756,18 @@ describe("FD-29 Vercel delivery", () => {
       { path: `/v10/projects/${projectId}/env?teamId=${teamId}&upsert=true`, authenticated: true },
       { path: new URL(deployHook).pathname, authenticated: false },
     ]);
-    const env = mutations[0]!.body!;
-    expect(env).toMatchObject({
-      key: VERCEL_ENV_NAMES.bundle,
+    const target = {
       type: "sensitive",
       target: ["preview"],
       gitBranch: input.gitBranch,
-    });
-    const bundle = JSON.parse(String(env.value));
-    expect(bundle).toMatchObject({ version: 1, cert: pending.certPem! });
-    expect(new X509Certificate(bundle.cert).checkPrivateKey(createPrivateKey(bundle.key))).toBe(true);
+    };
+    const env = mutations[0]!.body!;
+    expect(env).toEqual([
+      { ...target, key: VERCEL_ENV_NAMES.cert, value: Buffer.from(pending.certPem!).toString("base64") },
+      { ...target, key: VERCEL_ENV_NAMES.key, value: expect.any(String) },
+    ]);
+    const key = Buffer.from(String(env[1]!.value), "base64");
+    expect(new X509Certificate(pending.certPem!).checkPrivateKey(createPrivateKey(key))).toBe(true);
     expect(push.calls.filter(({ path }) => path.startsWith("/v7/deployments"))).toHaveLength(2);
     const certificates = await chain(clientId);
     const original = certificates.find((row) => row.id === first.id);
@@ -2188,8 +2193,10 @@ describe("FD-29 Vercel delivery", () => {
       const input = inputFor(mode);
       const pending = await issueEarly(clientId);
       const current = await clients.revealDatabaseClient(ref);
+      const oldKey = Buffer.from(current.privateKey!).toString("base64");
       const environment = new Map([
-        [VERCEL_ENV_NAMES.bundle, vercelCredentialBundle(current.certificate.pem!, current.privateKey!)],
+        [VERCEL_ENV_NAMES.cert, Buffer.from(current.certificate.pem!).toString("base64")],
+        [VERCEL_ENV_NAMES.key, oldKey],
       ]);
       const mock = mockApi(input, { push: mode, environment });
       await vercel.connectVercel(ref, input, mock);
@@ -2226,16 +2233,15 @@ describe("FD-29 Vercel delivery", () => {
         keySecretId: pending.keySecretId,
       });
       if (mode === "partial") {
-        const effective = JSON.parse(environment.get(VERCEL_ENV_NAMES.bundle)!);
-        const leaf = new X509Certificate(effective.cert);
-        const trusted = [old!, next!].find(({ certPem }) => effective.cert === certPem);
-        expect(trusted).toBeDefined();
-        expect(leaf.checkPrivateKey(createPrivateKey(effective.key))).toBe(true);
-        expect(await bundleFile()).toContain(await caPem(trusted!.caId));
+        expect(environment.get(VERCEL_ENV_NAMES.cert)).toBe(Buffer.from(next!.certPem!).toString("base64"));
+        expect(environment.get(VERCEL_ENV_NAMES.key) === oldKey).toBe(true);
+        expect(mock.calls.some(({ path }) => path.startsWith("/v7/deployments"))).toBe(false);
       }
       const oldCa = await caPem(first.caId);
       expect(await bundleFile()).toContain(oldCa);
-      expect(new X509Certificate(old!.certPem!).verify(new X509Certificate(oldCa).publicKey)).toBe(true);
+      const oldLeaf = new X509Certificate(old!.certPem!);
+      expect(oldLeaf.verify(new X509Certificate(oldCa).publicKey)).toBe(true);
+      expect(oldLeaf.checkPrivateKey(createPrivateKey(current.privateKey!))).toBe(true);
       expect(old!.notAfter > clock).toBe(true);
       expect(await openAlert(rollover.vercelPushAlertKey(clientId))).toMatchObject({
         severity: "warning",

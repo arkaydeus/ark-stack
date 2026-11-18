@@ -13,7 +13,7 @@ import {
   reviewedVercelScopeProof,
   teamIdPattern,
   triggerVercelHook,
-  upsertVercelVariable,
+  upsertVercelVariables,
   VercelApi,
   type VercelScopeProof,
   type VercelSelection,
@@ -316,7 +316,7 @@ test.skipIf(!redeployToken || !projectId || !teamId || !baselineId || !baselineC
 
     const updatedCanary = randomBytes(32).toString("hex");
     try {
-      await upsertVercelVariable(api, selection, redeployToken, canaryName, updatedCanary);
+      await upsertVercelVariables(api, selection, redeployToken, [{ key: canaryName, value: updatedCanary }]);
       const { status, body } = await api.request({
         endpoint: "/v13/deployments",
         url: vercelUrl("/v13/deployments", teamId),
@@ -364,7 +364,9 @@ test.skipIf(!redeployToken || !projectId || !teamId || !baselineId || !baselineC
       }
       throw new Error("The scratch redeployment did not become READY within 30 minutes.");
     } finally {
-      await upsertVercelVariable(api, selection, redeployToken, canaryName, baselineCanary!);
+      await upsertVercelVariables(api, selection, redeployToken, [
+        { key: canaryName, value: baselineCanary! },
+      ]);
     }
   },
   31 * 60_000,

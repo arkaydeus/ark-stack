@@ -131,12 +131,7 @@ export const VERCEL_ENV_NAMES = {
   password: "ARK_DB_PASSWORD",
   cert: "ARK_DB_CLIENT_CERT_B64",
   key: "ARK_DB_CLIENT_KEY_B64",
-  bundle: "ARK_DB_CLIENT_BUNDLE",
 } as const;
-
-export function vercelCredentialBundle(cert: string, key: string) {
-  return JSON.stringify({ version: 1, cert, key });
-}
 
 /**
  * §3.12's node-postgres module, verbatim: a module-scope `Pool` with the client certificate and
@@ -148,9 +143,6 @@ import { Pool } from "pg";
 import { attachDatabasePool } from "@vercel/functions";
 
 const pem = (name: string) => Buffer.from(process.env[name] ?? "", "base64").toString("utf8");
-const credential = process.env.ARK_DB_CLIENT_BUNDLE
-  ? JSON.parse(process.env.ARK_DB_CLIENT_BUNDLE)
-  : { cert: pem("ARK_DB_CLIENT_CERT_B64"), key: pem("ARK_DB_CLIENT_KEY_B64") };
 
 export const pool = new Pool({
   host: process.env.ARK_DB_HOST, // hostname, not IP: node-postgres then sets SNI itself
@@ -161,8 +153,8 @@ export const pool = new Pool({
   ssl: {
     rejectUnauthorized: true, // server cert is public Let's Encrypt; no custom CA needed
     minVersion: "TLSv1.3",
-    cert: credential.cert,
-    key: credential.key,
+    cert: pem("ARK_DB_CLIENT_CERT_B64"),
+    key: pem("ARK_DB_CLIENT_KEY_B64"),
   },
   max: 5,
   idleTimeoutMillis: 5_000,
@@ -384,7 +376,6 @@ export function databaseClientRolloverGuide(input: {
     env,
     commands: `${commands}\n`,
     notes: [
-      "If your app uses ARK_DB_CLIENT_BUNDLE, update that sensitive variable with the new certificate and key together. Otherwise update ARK_DB_CLIENT_CERT_B64 and ARK_DB_CLIENT_KEY_B64.",
       "The old certificate admits new connections until its expiry, and its role's sessions are closed by expiry + 5 s; redeploy any time before then.",
       "Clients must reconnect and refresh their pools after the redeploy. Check the --force and --sensitive flag spellings against your Vercel CLI version.",
     ],

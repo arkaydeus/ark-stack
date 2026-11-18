@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   deployHookBranch,
+  upsertVercelVariables,
   VercelApi,
   vercelHookDeployment,
   type VercelSelection,
@@ -17,6 +18,36 @@ const selection: VercelSelection = {
 const hook = new URL("https://api.vercel.com/v1/integrations/deploy/prj_Selected/FixtureHook");
 
 const project = (deployHooks: object[]) => ({ link: { productionBranch: "main", deployHooks } });
+const envResponse = (created: unknown) =>
+  new VercelApi(async () => Response.json({ created, failed: [] }, { status: 201 }));
+
+test("an env batch requires one sensitive acknowledgement per key at the requested target and branch", async () => {
+  const variables = [
+    { key: "ARK_DB_CLIENT_CERT_B64", value: "mock-cert" },
+    { key: "ARK_DB_CLIENT_KEY_B64", value: "mock-key" },
+  ];
+  const [cert, privateKey] = variables.map(({ key }) => ({
+    key,
+    type: "sensitive",
+    target: ["preview"],
+    gitBranch: selection.gitBranch,
+  }));
+  await expect(
+    upsertVercelVariables(envResponse([privateKey, cert]), selection, "mock-token", variables),
+  ).resolves.toBeUndefined();
+  for (const created of [
+    cert,
+    [cert],
+    [cert, cert],
+    [cert, { ...privateKey, type: "plain" }],
+    [cert, { ...privateKey, target: ["production"] }],
+    [cert, { ...privateKey, gitBranch: "other" }],
+  ]) {
+    await expect(
+      upsertVercelVariables(envResponse(created), selection, "mock-token", variables),
+    ).rejects.toThrow(/did not confirm every sensitive environment variable update/);
+  }
+});
 
 test("deploy hook verification refuses the wrong ref, target and duplicate hooks", () => {
   const valid = { url: hook.href, ref: "preview" };

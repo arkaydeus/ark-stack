@@ -5,7 +5,6 @@ import {
   isInFlight,
   planHash,
   VERCEL_ENV_NAMES,
-  vercelCredentialBundle,
 } from "@ark-stack/shared";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -32,7 +31,7 @@ import {
   reviewedVercelScopeProof,
   teamIdPattern,
   triggerVercelHook,
-  upsertVercelVariable,
+  upsertVercelVariables,
   VercelApi,
   type VercelCall,
   type VercelScopeProof,
@@ -516,22 +515,24 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
           hookJobId: null,
         })
         .where(eq(vercelIntegrations.id, row.id));
-      return { token, hook, bundle: vercelCredentialBundle(cert.certPem, key) };
+      const variables = [
+        { key: VERCEL_ENV_NAMES.cert, value: Buffer.from(cert.certPem).toString("base64") },
+        { key: VERCEL_ENV_NAMES.key, value: Buffer.from(key).toString("base64") },
+      ];
+      return { token, hook, variables };
     });
     if (!prepared) return { skipped: true };
 
     let { requestedAt, jobId } = prepared;
     if (prepared.hook && proof) {
-      const { token, hook, bundle } = prepared;
+      const { token, hook, variables } = prepared;
       const verified = await verifyConnection(audit.api, selection, proof, token, hook, now).finally(
         audit.flush,
       );
       if (verified.branch !== integration.hookBranch)
         throw new Error("The Vercel deploy hook has changed branch.");
       if (!(await withPending(async () => true))) return { skipped: true };
-      await upsertVercelVariable(audit.api, selection, token, VERCEL_ENV_NAMES.bundle, bundle).finally(
-        audit.flush,
-      );
+      await upsertVercelVariables(audit.api, selection, token, variables).finally(audit.flush);
 
       // Commit dispatch intent before the non-idempotent call. An unknown receipt requires
       // manual delivery because the provider may already have accepted the hook.

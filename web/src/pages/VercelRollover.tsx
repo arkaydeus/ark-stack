@@ -62,8 +62,9 @@ export function VercelRolloverPanel({ database }: { database: Database }) {
           rollover is available for production apps that hold sensitive user data.
         </p>
         <p className="text-muted-foreground">
-          Before connecting, deploy an app that reads <code>ARK_DB_CLIENT_BUNDLE</code> and confirm that the
-          reviewed database ingress policy admits its Vercel traffic.
+          Before connecting, deploy an app that reads <code>ARK_DB_CLIENT_CERT_B64</code> and{" "}
+          <code>ARK_DB_CLIENT_KEY_B64</code> and confirm that the reviewed database ingress policy admits its
+          Vercel traffic.
         </p>
       </div>
       {error && (
