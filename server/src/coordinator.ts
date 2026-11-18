@@ -149,7 +149,7 @@ import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
 import { poolerEdgeInput } from "./modules/pooler-policy.ts";
 import {
-  applyDatabaseAllowlist,
+  applyDatabaseIngress,
   applyStalwartDevice,
   publishCloudflare,
   reconcileSes,
@@ -1683,7 +1683,7 @@ export async function reconcileDatabaseIngressOnStartup() {
 async function applyCurrentDatabaseIngress(dir: string) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const limits = platformDbIngressLimits(settings);
-  const allowlist = await applyDatabaseAllowlist(dir, [], 5432, { limits });
+  const allowlist = await applyDatabaseIngress(dir, limits);
   return { limits, allowlist };
 }
 

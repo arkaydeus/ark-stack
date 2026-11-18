@@ -3,7 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { assertCidrs, clientAllowed, parseCidr, parseIpv6 } from "./cidr.ts";
-import { dbIngressAllowlistEnforced, nftAllowlist } from "./db-ingress.ts";
+import { renderDbIngress } from "./db-ingress.ts";
 import { chooseCloudflareMutation } from "./cloudflare.ts";
 import { canonicalizeComposeSource, validateComposeSource } from "./compose-policy.ts";
 import { generatePassword } from "./crypto.ts";
@@ -103,16 +103,12 @@ describe("CIDR parsing and the generated nft policy", () => {
     expect(clientAllowed(["10.0.0.0/8"], "192.0.2.1").allowed).toBe(false);
   });
 
-  test("an empty allowlist still installs a readable table", () => {
-    const open = nftAllowlist([]);
+  test("5432 still installs a readable limits table after moving CIDRs to HAProxy", () => {
+    const open = renderDbIngress();
     expect(open).toContain("table inet ark_db_ingress {");
     // Only the per-source limits drop; neither hook jumps to an allowlist chain.
     expect(open).not.toContain("jump ark_db_allow");
-    expect(dbIngressAllowlistEnforced(open)).toBe(false);
-    const enforced = nftAllowlist(["10.0.0.0/8"]);
-    expect(enforced).toContain("ip saddr 10.0.0.0/8 return");
-    expect(enforced).toContain('    counter name "drop_allowlist" drop');
-    expect(dbIngressAllowlistEnforced(enforced)).toBe(true);
+    expect(open).toContain("jump ark_db_limits");
   });
 });
 

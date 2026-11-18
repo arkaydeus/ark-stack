@@ -24,7 +24,7 @@
 //   the same port admits that source; an empty policy denies everybody; only allowInternet opens it;
 // - no public database (no pooler rendered): SSLRequest connections are rejected, routes keep working;
 // - the compatibility port relays classic SSLRequest TLS to the PG 17 target behind the route's
-//   allowlist, and the raw-port nftables table drops sources outside the route's CIDR list;
+//   allowlist, and ark_front drops sources outside the route's CIDR list;
 // - real API route enable/removal flows through the domain worker and host nft reconciler, and a
 //   managed pooler fence is confirmed against HAProxy before a failed PgBouncer reload;
 // - app-postgres is unreachable from the edge-ts namespace, while PgBouncer is reachable by name;
@@ -1145,7 +1145,7 @@ async function compatPortTest(report: Report) {
   expect(
     report,
     outside.status !== 0,
-    "HAProxy refuses a source outside the route's CIDR list on the compatibility port",
+    "the compatibility port refuses a source outside the route's CIDR list",
     brief(outside),
   );
 
@@ -1156,7 +1156,7 @@ async function compatPortTest(report: Report) {
     "list",
     "counter",
     "inet",
-    "ark_front_raw",
+    "ark_front",
     "drop_allowlist",
   );
   expect(
@@ -1176,7 +1176,7 @@ async function compatPortTest(report: Report) {
     "list",
     "table",
     "inet",
-    "ark_front_raw",
+    "ark_front",
   );
   expect(
     report,
@@ -1425,7 +1425,7 @@ async function publicationTest(report: Report) {
     "list",
     "counter",
     "inet",
-    "ark_front_raw",
+    "ark_front",
     "drop_allowlist",
   );
   expect(
@@ -1445,7 +1445,7 @@ async function publicationTest(report: Report) {
     "list",
     "table",
     "inet",
-    "ark_front_raw",
+    "ark_front",
   );
   expect(
     report,

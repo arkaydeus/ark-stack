@@ -60,9 +60,27 @@ test("route-only limits and compatibility policies update and close removed port
   };
   const first = frontIngressRules({ httpHostnames: [], postgresRoutes: [route] }, DB_INGRESS_LIMIT_DEFAULTS);
   expect(first).toContain("ct count over 128");
+  expect(first).toContain("ct count over 256");
+  expect(first).toContain("limit rate over 50/second burst 100 packets");
   expect(first).toContain("ct status dnat tcp dport 5432");
   expect(first).toContain("ip saddr 198.51.100.7/32 goto port_20007_limits");
   const next = frontIngressRules({ httpHostnames: [] }, DB_INGRESS_LIMIT_DEFAULTS, first);
-  expect(next).toContain("# ark-front-raw: port=20007 policy=closed");
+  expect(next).toContain("# ark-front: port=20007 policy=closed");
   expect(next).not.toContain("set conn4_20007");
+});
+
+test("the combined policy covers enabled SNI ports and keeps shared limits independent of 5432", () => {
+  const rules = frontIngressRules(
+    { httpHostnames: [], sniPorts: [8883, 636, 8883] },
+    DB_INGRESS_LIMIT_DEFAULTS,
+    "",
+    { maxConnectionsPerSource: 10, newConnectionsPerSecond: 3, newConnectionBurst: 8 },
+  );
+  expect(rules).toContain("tcp dport { 80, 443, 636, 8883 } jump shared_limits");
+  expect(rules).toContain("ct count over 128");
+  expect(rules).toContain("ct count over 10");
+  expect(rules).toContain("limit rate over 3/second burst 8 packets");
+  expect(() => frontIngressRules({ httpHostnames: [], sniPorts: [5432] }, DB_INGRESS_LIMIT_DEFAULTS)).toThrow(
+    "Shared SNI port 5432 is not supported",
+  );
 });

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 
-import { dbIngressAllowlistEnforced, sha256Hex } from "@ark-stack/shared";
+import { sha256Hex } from "@ark-stack/shared";
 
 const file = process.argv[2] ?? join(process.cwd(), "tmp", "pgbouncer", "allowlist.nft");
 const dir = join(file, "..");
@@ -40,13 +40,9 @@ try {
   await run("nft", ["-f", file]);
   const listed = await run("nft", ["list", "table", "inet", "ark_db_ingress"]);
   if (!listed.includes("ark_db")) throw new Error("nft readback did not show ark_db_ingress");
-  // An empty allowlist installs only the per-source limits, so the table exists but no CIDR
-  // allowlist is enforced. Report that honestly rather than claiming enforcement.
-  await writeFile(
-    statusFile,
-    `applied=true\nenforced=${dbIngressAllowlistEnforced(rules)}\npolicy_hash=${sha256Hex(rules)}\nerror=\n`,
-    { mode: 0o600 },
-  );
+  await writeFile(statusFile, `applied=true\nenforced=false\npolicy_hash=${sha256Hex(rules)}\nerror=\n`, {
+    mode: 0o600,
+  });
 } catch (error) {
   await writeFile(
     statusFile,

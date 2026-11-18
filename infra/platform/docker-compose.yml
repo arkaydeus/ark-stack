@@ -237,6 +237,9 @@ services:
       ARK_HAPROXY_ADMIN_SOCKET: /var/run/haproxy/admin.sock
       # Shared SNI ports enabled at install time (FD-14): edge.l4_apply renders tls routes only there.
       ARK_EDGE_SNI_PORTS: ${ARK_EDGE_SNI_PORTS:-}
+      ARK_FRONT_MAX_CONNECTIONS: ${ARK_FRONT_MAX_CONNECTIONS:-256}
+      ARK_FRONT_RATE_PER_SECOND: ${ARK_FRONT_RATE_PER_SECOND:-50}
+      ARK_FRONT_RATE_BURST: ${ARK_FRONT_RATE_BURST:-100}
     group_add: ["4400"]
     volumes:
       - ../../tmp/certs:/var/lib/ark/certs
@@ -396,8 +399,7 @@ services:
       target: database-ingress
     command: [bun, run, --cwd, scripts, database-ingress.ts]
     network_mode: host
-    # The host-namespace nftables reconciler (ark_db_ingress: per-source limits on tcp/5432, matched on
-    # the input and forward hooks). It no longer listens on 5432: edge-l4 owns the public port (FD-26).
+    # Host-namespace reconciler for ark_front and the FD-18 limits on tcp/5432.
     # nft needs NET_ADMIN as root across exec. DAC_OVERRIDE permits this writer to read
     # the 0600 policy and write snapshots in the installer-owned (1000:1000) directories.
     # The API still sees only the dedicated read-only metrics mount.
@@ -408,6 +410,7 @@ services:
       ARK_PGBOUNCER_DIR: /var/lib/ark/pgbouncer
       ARK_DB_INGRESS_METRICS_DIR: /var/lib/ark/db-ingress
       ARK_FRONT_INGRESS_DIR: /var/lib/ark/front-ingress
+      ARK_EDGE_SNI_PORTS: ${ARK_EDGE_SNI_PORTS:-}
     volumes:
       - ../../tmp/pgbouncer:/var/lib/ark/pgbouncer
       - ../../tmp/db-ingress:/var/lib/ark/db-ingress

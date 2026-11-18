@@ -1,32 +1,21 @@
-// `mise run test:db-ingress`: runtime tests of the public database port ruleset, `inet
-// ark_db_ingress` (docs/design/front-door.md §3.11, FD-18), in a privileged Linux container.
-//
-// 1. Renders the ruleset with the production renderer (`nftAllowlist`) at the defaults, at small
-//    test limits, and with an allowlist, and checks every file with `nft -c`.
-// 2. In the container, builds client, host and backend network namespaces and checks with real
-//    TCP connections, on both the `input` hook (host listener) and the `forward` hook (DNAT):
-//    the per-source concurrent-connection cap, the per-source new-connection rate, /64 grouping
-//    for IPv6, the allowlist, and the named drop counters.
-// 3. Feeds the kernel's counter JSON through `parseNftCounters` and `dbIngressCounterMetrics`,
-//    the code behind /api/metrics/prometheus.
-// 4. Runs the real `scripts/database-ingress.ts` reconciler against a rendered file and checks its
-//    status file and counter snapshot, and that it no longer listens on 5432 (FD-26: edge-l4's
-//    fe_pg5432 owns the public port; the `forward`-hook checks in 2 are the path Docker DNAT to
-//    edge-ts's published 5432 takes, so these limits keep applying after the move).
-// 5. Checks `infra/monitoring/alerts.yml` with promtool, including unit tests of the drop alert.
+// `mise run test:db-ingress`: syntax and live socket tests of the public port policies in §3.11.
+// Inside an isolated Docker network namespace, exercise the literal ark_front example and the
+// production renderers on the input and DNAT forward paths. Also test reconciler acknowledgements,
+// fail-closed recovery, the installer-owned metrics mount and the Prometheus alert rules.
 //
 // Needs Docker with privileged containers (Docker Desktop or a Linux host). No Python.
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import {
   DB_INGRESS_LIMIT_DEFAULTS,
-  dbIngressCounterMetrics,
-  nftAllowlist,
+  ingressCounterMetrics,
   parseNftCounters,
-  type DbIngressCounterSnapshot,
+  renderDbIngress,
+  renderFrontIngress,
+  type IngressCounterSnapshot,
 } from "@ark-stack/shared";
 
 // Same pin as the Dockerfile runtime stage, which the database-ingress image builds on.
@@ -35,7 +24,6 @@ const bunImage =
 // Same pin as infra/monitoring/docker-compose.yml.
 const prometheusImage =
   "prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996";
-const testImage = "ark-db-ingress-test:local";
 const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "db-ingress-test");
 
@@ -45,10 +33,12 @@ const TEST_RATE = 2;
 const TEST_BURST = 5;
 
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
+const testImage = `ark-db-ingress-test:${suffix}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-db-ingress-${suffix}-`));
 const containers: string[] = [];
 const stateVolume = `ark-db-ingress-state-${suffix}`;
 let failures = 0;
+let builtImage = false;
 
 async function docker(args: string[], options: { stdin?: string; allowFailure?: boolean } = {}) {
   const child = Bun.spawn(["docker", ...args], {
@@ -70,6 +60,7 @@ async function docker(args: string[], options: { stdin?: string; allowFailure?: 
 async function cleanup() {
   if (containers.length) await docker(["rm", "--force", ...containers], { allowFailure: true });
   await docker(["volume", "rm", "--force", stateVolume], { allowFailure: true });
+  if (builtImage) await docker(["image", "rm", testImage], { allowFailure: true });
   await rm(directory, { recursive: true, force: true });
 }
 
@@ -98,25 +89,40 @@ try {
   section("Rendered rulesets");
   const rules = join(directory, "rules");
   await mkdir(rules, { recursive: true });
+  const design = await readFile(join(root, "docs/design/front-door.md"), "utf8");
+  const example = design.match(/^table inet ark_front \{\n[\s\S]*?^\}$/m)?.[0];
+  if (!example) throw new Error("Could not find the literal ark_front example in §3.11.");
+  const front = renderFrontIngress(
+    [
+      { id: "rt_t001", listenPort: 20001, sourceCidrs: ["198.51.100.0/24", "2001:db8:100::/48"] },
+      { id: "rt_t002", listenPort: 20002, sourceCidrs: [] },
+      { id: "rt_t003", listenPort: 20003, sourceCidrs: [], allowInternet: true },
+    ],
+    [8883],
+  );
   const files: Record<string, string> = {
     "legacy.nft": `table inet ark_db_ingress
 delete table inet ark_db_ingress
 table inet ark_db_ingress {
-  chain input { type filter hook input priority -1; policy accept; tcp dport 5432 accept; }
-  chain forward { type filter hook forward priority -1; policy accept; ct status dnat tcp dport 5432 accept; }
+  counter drop_allowlist {}
+  chain ark_db_allow { ip saddr 192.0.2.1 return; counter name "drop_allowlist" drop; }
+  chain input { type filter hook input priority -1; policy accept; tcp dport 5432 jump ark_db_allow; }
+  chain forward { type filter hook forward priority -1; policy accept; ct status dnat tcp dport 5432 jump ark_db_allow; }
 }
 `,
-    "defaults.nft": nftAllowlist([], 5432),
-    "defaults-allowlist.nft": nftAllowlist(["198.51.100.0/24", "2001:db8:100::/48"], 5432),
-    "conn.nft": nftAllowlist([], 5432, limits(TEST_CONN, 1000, 1000)),
-    "conn-lower.nft": nftAllowlist(
-      [],
-      5432,
+    "defaults.nft": renderDbIngress(),
+    "conn.nft": renderDbIngress(limits(TEST_CONN, 1000, 1000)),
+    "conn-lower.nft": renderDbIngress(
       limits(TEST_CONN - 1, 1000, 1000),
-      nftAllowlist([], 5432, limits(TEST_CONN, 1000, 1000)),
+      renderDbIngress(limits(TEST_CONN, 1000, 1000)),
     ),
-    "rate.nft": nftAllowlist([], 5432, limits(1000, TEST_RATE, TEST_BURST)),
-    "allowlist.nft": nftAllowlist(["10.10.0.3/32", "2001:db8:10:2::/64"], 5432, limits(1000, 1000, 1000)),
+    "rate.nft": renderDbIngress(limits(1000, TEST_RATE, TEST_BURST)),
+    "front-example.nft": `${example}\n`,
+    "front-defaults.nft": front,
+    "front-limits.nft": renderFrontIngress([], [8883], limits(2, TEST_RATE, TEST_BURST)),
+    "front-rate.nft": renderFrontIngress([], [8883], limits(1000, TEST_RATE, TEST_BURST)),
+
+    "combined.nft": renderDbIngress() + "\n" + front,
   };
   for (const [name, content] of Object.entries(files)) await writeFile(join(rules, name), content);
   console.log(
@@ -133,7 +139,17 @@ RUN apt-get update \\
   && rm -rf /var/lib/apt/lists/*
 `,
   });
+  builtImage = true;
   console.log("  built");
+
+  // Bundle the real reconciler. Host workspace symlinks can point outside the bind mount.
+  const bundle = join(directory, "bundle");
+  const built = await Bun.build({
+    entrypoints: [join(root, "scripts", "database-ingress.ts")],
+    outdir: bundle,
+    target: "bun",
+  });
+  if (!built.success) throw new Error(`bundling database-ingress.ts failed: ${built.logs.join("\n")}`);
 
   section("Runtime checks in a privileged container");
   const name = `ark-db-ingress-${suffix}`;
@@ -154,6 +170,8 @@ RUN apt-get update \\
       `${rules}:/rules:ro`,
       "-v",
       `${fixtures}:/t:ro`,
+      "-v",
+      `${bundle}:/bundle:ro`,
       testImage,
       "bun",
       "/t/inside.ts",
@@ -168,15 +186,14 @@ RUN apt-get update \\
   check(run.status === 0, "every in-container check passed", `exit ${run.status}`);
 
   // ------------------------------------------------------------------ 3. counters -> metrics
-  section("Kernel counters through parseNftCounters and dbIngressCounterMetrics");
+  section("Kernel counters through parseNftCounters and ingressCounterMetrics");
   const expected: Record<string, string[]> = {
     "input-concurrent": ['reason="concurrent",family="ipv4"', 'reason="concurrent",family="ipv6"'],
     "input-rate": ['reason="rate",family="ipv4"', 'reason="rate",family="ipv6"'],
-    "input-allowlist": ['chain="ark_db_allow",reason="allowlist",family="any"'],
     "forward-concurrent": ['reason="concurrent",family="ipv4"', 'reason="concurrent",family="ipv6"'],
     "forward-rate": ['reason="rate",family="ipv4"', 'reason="rate",family="ipv6"'],
   };
-  const snapshots = new Map<string, DbIngressCounterSnapshot>();
+  const snapshots = new Map<string, IngressCounterSnapshot>();
   for (const line of output.filter((item) => item.startsWith("@@counters "))) {
     const [, label, ...json] = line.split(" ");
     snapshots.set(label, parseNftCounters(json.join(" ")));
@@ -185,7 +202,7 @@ RUN apt-get update \\
     const snapshot = snapshots.get(label);
     check(Boolean(snapshot), `${label}: counter snapshot captured`, snapshot ? "present" : "missing");
     if (!snapshot) continue;
-    const metrics = dbIngressCounterMetrics(snapshot);
+    const metrics = ingressCounterMetrics(snapshot);
     for (const needle of needles) {
       const line = metrics.find((item) => item.includes(needle));
       const value = Number(line?.split(" ").at(-1));
@@ -195,7 +212,7 @@ RUN apt-get update \\
   const sample = snapshots.get("forward-concurrent");
   if (sample) {
     console.log("\nSample /api/metrics/prometheus lines (forward-concurrent):");
-    for (const line of dbIngressCounterMetrics(sample)) console.log(`  ${line}`);
+    for (const line of ingressCounterMetrics(sample)) console.log(`  ${line}`);
   }
 
   // ------------------------------------------------------------------ 4. the real reconciler
@@ -204,16 +221,7 @@ RUN apt-get update \\
   await mkdir(join(state, "pgbouncer"), { recursive: true });
   await mkdir(join(state, "metrics"), { recursive: true });
   await chmod(state, 0o777);
-  await writeFile(join(state, "pgbouncer", "allowlist.nft"), files["defaults-allowlist.nft"]);
-  // Bundle the reconciler with its @ark-stack/shared imports: host node_modules may link into a
-  // global cache outside the repository, so it cannot simply be mounted into the container.
-  const bundle = join(directory, "bundle");
-  const built = await Bun.build({
-    entrypoints: [join(root, "scripts", "database-ingress.ts")],
-    outdir: bundle,
-    target: "bun",
-  });
-  if (!built.success) throw new Error(`bundling database-ingress.ts failed: ${built.logs.join("\n")}`);
+  await writeFile(join(state, "pgbouncer", "allowlist.nft"), files["defaults.nft"]);
   // Use a Linux volume so Docker Desktop cannot mask DAC ownership semantics on a macOS
   // bind mount. This is the installer's 1000:1000 ownership, 0700 PgBouncer state and 0755
   // metrics directory, including 0600 policy files.
@@ -314,7 +322,7 @@ cat /state/metrics/counters.json`,
     reader.stderr || "readable",
   );
   check(
-    dbIngressCounterMetrics(JSON.parse(reader.stdout || "null")).includes(
+    ingressCounterMetrics(JSON.parse(reader.stdout || "null")).includes(
       'ark_nft_counters_present{table="ark_db_ingress"} 1',
     ),
     "API formatter reports counters present from the reader's snapshot",
@@ -324,9 +332,9 @@ cat /state/metrics/counters.json`,
   console.log(statusText.trimEnd().replace(/^/gm, "  "));
   check(
     statusText.includes("applied=true") &&
-      statusText.includes("enforced=true") &&
+      statusText.includes("enforced=false") &&
       !statusText.includes("exposed="),
-    "status file reports applied=true, enforced=true for an allowlist, and no relay exposure",
+    "status file confirms the 5432 limits with no CIDR enforcement or relay exposure",
     statusText.replace(/\n/g, " ").trim() || reconciler.stderr.trim().slice(-500),
   );
   let snapshot: unknown = null;
@@ -335,15 +343,15 @@ cat /state/metrics/counters.json`,
   } catch {
     snapshot = null;
   }
-  const metrics = dbIngressCounterMetrics(snapshot);
+  const metrics = ingressCounterMetrics(snapshot);
   check(
     metrics.includes('ark_nft_counters_present{table="ark_db_ingress"} 1'),
-    "counters.json is a readable snapshot of all five named counters",
-    `${(snapshot as DbIngressCounterSnapshot | null)?.counters?.length ?? 0} counters`,
+    "counters.json is a readable snapshot of the named counters",
+    `${(snapshot as IngressCounterSnapshot | null)?.counters?.length ?? 0} counters`,
   );
   check(
-    (snapshot as DbIngressCounterSnapshot | null)?.counters?.length === 5,
-    "the snapshot includes drop_allowlist alongside the four limit counters",
+    (snapshot as IngressCounterSnapshot | null)?.counters?.length === 4,
+    "the snapshot includes all four limit counters",
     countersText.trim().slice(0, 300),
   );
 
