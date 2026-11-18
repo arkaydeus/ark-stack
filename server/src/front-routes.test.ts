@@ -1988,6 +1988,30 @@ describe("FD-19 reviewed DNS", () => {
     }
   }, 20_000);
 
+  test("unowned Cloudflare withdrawals also stop polling without clearing removal evidence", async () => {
+    const fixture = await dnsFixture("cloudflare");
+    try {
+      const { route } = await createRoute(fixture.name);
+      await deleteDnsRoute(route.id);
+      await sql`UPDATE dns_records SET withdrawal_started_at = now() - interval '31 minutes'
+        WHERE domain_id = ${fixture.domainId} AND withdrawal_reason IS NOT NULL`;
+      await runDnsMaintenance();
+      const jobs =
+        await sql`SELECT id FROM operations WHERE idempotency_key = ${"dns.maintenance:" + fixture.domainId}`;
+      expect(jobs).toHaveLength(0);
+      const review = (await call(actors.owner, "GET", fixture.path + "/dns")).body;
+      expect(review.records).toContainEqual(
+        expect.objectContaining({
+          type: "A",
+          value: publicIpv4,
+          providerRemoval: "manual",
+        }),
+      );
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
   test("wizard mail MX conflict leaves independent Cloudflare addresses publishable", async () => {
     const fixture = await dnsFixture("cloudflare");
     try {

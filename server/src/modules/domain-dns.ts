@@ -1209,7 +1209,8 @@ export async function domainsDueForDns() {
       (record) =>
         !stored.includes(record) ||
         (pendingWithdrawal(record) &&
-          (domain.dnsProvider === "cloudflare" ||
+          ((domain.dnsProvider === "cloudflare" &&
+            (record.providerOwnership !== null || record.providerUpdateIntent !== null)) ||
             watching ||
             (record.withdrawalStartedAt !== null && recent(record.withdrawalStartedAt)))),
     );
