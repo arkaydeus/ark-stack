@@ -53,7 +53,11 @@ if (import.meta.main) {
   const observeSchedule = scheduleEdgeObserve();
   const dnsSchedule = scheduleDnsMaintenance();
   try {
-    await runWorker("domains", ["domain.", "dns.", "certificate.", "edge.", "admin."], executeClaimedJob);
+    await runWorker(
+      "domains",
+      ["domain.", "dns.", "certificate.", "edge.", "admin.", "integration."],
+      executeClaimedJob,
+    );
   } finally {
     if (observeSchedule) clearInterval(observeSchedule);
     clearInterval(dnsSchedule);

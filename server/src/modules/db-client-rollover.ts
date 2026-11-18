@@ -43,6 +43,7 @@ import {
   operations,
   privateCas,
   secrets,
+  vercelIntegrations,
 } from "../schema.ts";
 import { raiseAlert, resolveAlert } from "./alerts.ts";
 import { DatabaseClientError, auditEvent, certificateChain, loadLinkedCertificates } from "./db-clients.ts";
@@ -55,6 +56,7 @@ type Executor = pki.Executor;
 const DAY_MS = 86_400_000;
 
 export const rolloverAlertKey = (clientId: string) => `${ROLLOVER_ALERT_PREFIX}${clientId}`;
+export const vercelPushAlertKey = (clientId: string) => `vercel-push:${clientId}`;
 export const retirementAlertKey = (certificateId: string) => `${RETIREMENT_ALERT_PREFIX}${certificateId}`;
 
 function isUniqueViolation(error: unknown) {
@@ -93,7 +95,7 @@ async function roleName(client: Pick<ClientRow, "roleId">, executor: Pick<Execut
   return role.name;
 }
 
-const lockClient = (tx: Executor, clientId: string) =>
+export const lockRolloverClient = (tx: Executor, clientId: string) =>
   tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`client-rollover:${clientId}`}))`);
 
 /** Active, fully issued clients that are not being revoked: the only ones that roll over. */
@@ -143,7 +145,7 @@ export async function issueSuccessor(input: {
   };
   try {
     return await db.transaction(async (tx) => {
-      await lockClient(tx, input.clientId);
+      await lockRolloverClient(tx, input.clientId);
       const [client] = await tx
         .select()
         .from(databaseClients)
@@ -285,7 +287,7 @@ export async function queueEarlyRollover(input: {
 }) {
   if (input.csrPem !== undefined) pki.validateCsr(input.csrPem);
   return db.transaction(async (tx) => {
-    await lockClient(tx, input.clientId);
+    await lockRolloverClient(tx, input.clientId);
     const [client] = await tx
       .select()
       .from(databaseClients)
@@ -355,7 +357,7 @@ export async function revealRolloverSuccessor(input: {
   const { rootKey } = loadEnv();
   const now = input.now ?? new Date();
   return db.transaction(async (tx) => {
-    await lockClient(tx, input.clientId);
+    await lockRolloverClient(tx, input.clientId);
     const [client] = await tx
       .select()
       .from(databaseClients)
@@ -450,7 +452,7 @@ export async function revealRolloverSuccessor(input: {
  * The rollover alert is cleared. Confirming an already delivered successor changes nothing.
  * The trusted generations do not change, so PgBouncer needs no reload.
  */
-export async function confirmRolloverDelivery(input: {
+type DeliveryInput = {
   databaseId: string;
   clientId: string;
   certificateId: string;
@@ -458,89 +460,115 @@ export async function confirmRolloverDelivery(input: {
   actorRole?: string;
   source?: "manual" | "integration";
   now: Date;
-}) {
-  const result = await db.transaction(async (tx) => {
-    await lockClient(tx, input.clientId);
-    const [client] = await tx
-      .select()
-      .from(databaseClients)
-      .where(and(eq(databaseClients.id, input.clientId), eq(databaseClients.databaseId, input.databaseId)))
-      .for("update");
-    if (!client) throw new DatabaseClientError(404, "Database client not found.");
-    if (client.status !== "active" || client.revokedAt)
-      throw new DatabaseClientError(409, "This client was revoked; it cannot roll over.");
-    const chain = certificateChain(client.caId, await loadLinkedCertificates([client.caId], tx));
-    const successor = chain.find((row) => row.id === input.certificateId);
-    if (!successor) throw new DatabaseClientError(404, "That certificate does not belong to this client.");
-    const predecessor = predecessorOf(chain, successor);
-    if (!predecessor) throw new DatabaseClientError(409, "That certificate is not a rollover successor.");
-    if (successor.deliveredAt && successor.rolloverState !== "pending")
-      return { client, successor, predecessor, alreadyDelivered: true };
-    assertTrustApplied(successor);
-    if (successor.status !== "issued" || successor.rolloverState !== "pending")
-      throw new DatabaseClientError(409, `The successor is ${successor.status}/${successor.rolloverState}.`);
-    if (successor.notAfter.getTime() <= input.now.getTime())
-      throw new DatabaseClientError(409, "The successor has already expired.");
-    if ((input.source ?? "manual") === "manual" && successor.keySecretId)
-      throw new DatabaseClientError(
-        409,
-        "Reveal the successor bundle and deploy it before confirming delivery.",
-      );
-    // Through `delivered` (durable delivered_at) to `current`, in this one transaction.
+};
+
+export async function recordRolloverDelivery(tx: Executor, input: DeliveryInput) {
+  await lockRolloverClient(tx, input.clientId);
+  const [client] = await tx
+    .select()
+    .from(databaseClients)
+    .where(and(eq(databaseClients.id, input.clientId), eq(databaseClients.databaseId, input.databaseId)))
+    .for("update");
+  if (!client) throw new DatabaseClientError(404, "Database client not found.");
+  if (client.status !== "active" || client.revokedAt)
+    throw new DatabaseClientError(409, "This client was revoked; it cannot roll over.");
+  const chain = certificateChain(client.caId, await loadLinkedCertificates([client.caId], tx));
+  if (!chain.some((row) => row.id === input.certificateId))
+    throw new DatabaseClientError(404, "That certificate does not belong to this client.");
+  const [successor] = await tx
+    .select()
+    .from(clientCertificates)
+    .where(eq(clientCertificates.id, input.certificateId))
+    .for("update");
+  if (!successor) throw new DatabaseClientError(404, "That certificate does not belong to this client.");
+  const predecessor = predecessorOf(chain, successor);
+  if (!predecessor) throw new DatabaseClientError(409, "That certificate is not a rollover successor.");
+  if (successor.deliveredAt && successor.rolloverState !== "pending")
+    return { client, successor, predecessor, alreadyDelivered: true };
+  assertTrustApplied(successor);
+  if (successor.status !== "issued" || successor.rolloverState !== "pending")
+    throw new DatabaseClientError(409, `The successor is ${successor.status}/${successor.rolloverState}.`);
+  if (successor.notAfter.getTime() <= input.now.getTime())
+    throw new DatabaseClientError(409, "The successor has already expired.");
+  if ((input.source ?? "manual") === "manual" && successor.keySecretId)
+    throw new DatabaseClientError(
+      409,
+      "Reveal the successor bundle and deploy it before confirming delivery.",
+    );
+  // Through `delivered` (durable delivered_at) to `current`, in this one transaction.
+  await tx
+    .update(clientCertificates)
+    .set({
+      rolloverState: "delivered",
+      ...(input.source === "integration" ? { keySecretId: null } : {}),
+      deliveredAt: sql`COALESCE(${clientCertificates.deliveredAt}, ${input.now.toISOString()}::timestamptz)`,
+    })
+    .where(eq(clientCertificates.id, successor.id));
+  await tx
+    .update(clientCertificates)
+    .set({ rolloverState: "current" })
+    .where(and(eq(clientCertificates.id, successor.id), eq(clientCertificates.rolloverState, "delivered")));
+  await tx
+    .update(clientCertificates)
+    .set({ rolloverState: "superseded" })
+    .where(
+      and(
+        eq(clientCertificates.id, predecessor.id),
+        inArray(clientCertificates.rolloverState, ["current", "delivered"]),
+      ),
+    );
+  if (input.source === "integration" && successor.keySecretId)
+    await tx.delete(secrets).where(eq(secrets.id, successor.keySecretId));
+  if ((input.source ?? "manual") === "manual") {
     await tx
-      .update(clientCertificates)
-      .set({
-        rolloverState: "delivered",
-        deliveredAt: sql`COALESCE(${clientCertificates.deliveredAt}, ${input.now.toISOString()}::timestamptz)`,
-      })
-      .where(eq(clientCertificates.id, successor.id));
-    await tx
-      .update(clientCertificates)
-      .set({ rolloverState: "current" })
-      .where(and(eq(clientCertificates.id, successor.id), eq(clientCertificates.rolloverState, "delivered")));
-    await tx
-      .update(clientCertificates)
-      .set({ rolloverState: "superseded" })
+      .update(vercelIntegrations)
+      .set({ lastPushStatus: "cancelled" })
       .where(
         and(
-          eq(clientCertificates.id, predecessor.id),
-          inArray(clientCertificates.rolloverState, ["current", "delivered"]),
+          eq(vercelIntegrations.databaseClientId, client.id),
+          eq(vercelIntegrations.lastPushStatus, "pushing"),
+          eq(vercelIntegrations.pushCertificateId, successor.id),
         ),
       );
-    await tx.update(databaseClients).set({ caId: successor.caId }).where(eq(databaseClients.id, client.id));
-    const [updatedSuccessor] = await tx
-      .select()
-      .from(clientCertificates)
-      .where(eq(clientCertificates.id, successor.id));
-    const [updatedPredecessor] = await tx
-      .select()
-      .from(clientCertificates)
-      .where(eq(clientCertificates.id, predecessor.id));
-    await tx.insert(auditEvents).values({
-      id: createId("aud"),
-      actorId: input.actorId ?? null,
-      action: "database.client_rollover_delivered",
-      resourceType: "database",
-      resourceId: input.databaseId,
-      role: input.actorRole,
-      detail: {
-        clientId: client.id,
-        source: input.source ?? "manual",
-        successorId: successor.id,
-        successorSerial: successor.serial,
-        successorCaId: successor.caId,
-        predecessorId: predecessor.id,
-        predecessorSerial: predecessor.serial,
-        deliveredAt: updatedSuccessor?.deliveredAt?.toISOString() ?? null,
-      },
-    });
-    return {
-      client,
-      successor: updatedSuccessor!,
-      predecessor: updatedPredecessor!,
-      alreadyDelivered: false,
-    };
+  }
+  await tx.update(databaseClients).set({ caId: successor.caId }).where(eq(databaseClients.id, client.id));
+  const [updatedSuccessor] = await tx
+    .select()
+    .from(clientCertificates)
+    .where(eq(clientCertificates.id, successor.id));
+  const [updatedPredecessor] = await tx
+    .select()
+    .from(clientCertificates)
+    .where(eq(clientCertificates.id, predecessor.id));
+  await tx.insert(auditEvents).values({
+    id: createId("aud"),
+    actorId: input.actorId ?? null,
+    action: "database.client_rollover_delivered",
+    resourceType: "database",
+    resourceId: input.databaseId,
+    role: input.actorRole,
+    detail: {
+      clientId: client.id,
+      source: input.source ?? "manual",
+      successorId: successor.id,
+      successorSerial: successor.serial,
+      successorCaId: successor.caId,
+      predecessorId: predecessor.id,
+      predecessorSerial: predecessor.serial,
+      deliveredAt: updatedSuccessor?.deliveredAt?.toISOString() ?? null,
+    },
   });
+  return {
+    client,
+    successor: updatedSuccessor!,
+    predecessor: updatedPredecessor!,
+    alreadyDelivered: false,
+  };
+}
+
+export async function confirmRolloverDelivery(input: DeliveryInput) {
+  const result = await db.transaction((tx) => recordRolloverDelivery(tx, input));
+  if (!result.alreadyDelivered) await resolveAlert(vercelPushAlertKey(input.clientId), input.now);
   await evaluateRolloverAlerts(input.now, input.clientId);
   return {
     clientId: input.clientId,

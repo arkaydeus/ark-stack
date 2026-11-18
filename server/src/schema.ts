@@ -948,6 +948,7 @@ export const vercelIntegrations = pgTable(
       .references(() => databaseClients.id, { onDelete: "cascade" }),
     vercelProjectId: text("vercel_project_id").notNull(),
     vercelTeamId: text("vercel_team_id"),
+    otherProjectId: text("other_project_id"),
     tokenSecretId: text("token_secret_id")
       .notNull()
       .references(() => secrets.id),
@@ -955,6 +956,11 @@ export const vercelIntegrations = pgTable(
     deployHookSecretId: text("deploy_hook_secret_id").references(() => secrets.id),
     envTarget: text("env_target").$type<"production" | "preview">().notNull(),
     gitBranch: text("git_branch"),
+    hookBranch: text("hook_branch"),
+    scopeVerifiedAt: timestamp("scope_verified_at", { withTimezone: true }),
+    pushCertificateId: text("push_certificate_id"),
+    hookRequestedAt: timestamp("hook_requested_at", { withTimezone: true }),
+    hookJobId: text("hook_job_id"),
     lastPushAt: timestamp("last_push_at", { withTimezone: true }),
     lastPushStatus: text("last_push_status"),
     lastDeploymentId: text("last_deployment_id"),
@@ -963,6 +969,24 @@ export const vercelIntegrations = pgTable(
   },
   (table) => [
     check("vercel_integrations_env_target_check", sql`${table.envTarget} IN ('production', 'preview')`),
+    check(
+      "vercel_integrations_verified_shape_check",
+      sql`
+      ${table.scopeVerifiedAt} IS NULL OR (
+        ${table.vercelTeamId} IS NOT NULL AND ${table.tokenExpiresAt} IS NOT NULL AND
+        ${table.deployHookSecretId} IS NOT NULL AND ${table.hookBranch} IS NOT NULL AND
+        ${table.otherProjectId} IS NOT NULL AND ${table.otherProjectId} <> ${table.vercelProjectId} AND
+        (${table.gitBranch} IS NULL OR ${table.envTarget} = 'preview') AND
+        (${table.lastPushStatus} IS NULL OR ${table.lastPushStatus} IN ('pushing', 'failed', 'delivered', 'cancelled'))
+      )
+    `,
+    ),
+    uniqueIndex("vercel_integrations_project_target_key")
+      .on(table.vercelProjectId, table.envTarget, sql`COALESCE(${table.gitBranch}, '')`)
+      .where(sql`${table.scopeVerifiedAt} IS NOT NULL`),
+    uniqueIndex("vercel_integrations_hook_branch_key")
+      .on(table.vercelProjectId, table.envTarget, table.hookBranch)
+      .where(sql`${table.scopeVerifiedAt} IS NOT NULL`),
   ],
 );
 

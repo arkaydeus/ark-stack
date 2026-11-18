@@ -48,6 +48,7 @@ import {
   platformSettings,
   privateCas,
   secrets,
+  vercelIntegrations,
 } from "../schema.ts";
 import { appRoleExists, applyClientRole, revokeClientRole } from "./database.ts";
 import * as pki from "./pki.ts";
@@ -585,6 +586,7 @@ export async function queueClientRevocation(input: {
       .update(databaseClients)
       .set({ revokedAt: client.revokedAt ?? new Date(), revokedBy: client.revokedBy ?? input.actorId })
       .where(eq(databaseClients.id, input.clientId));
+    await tx.delete(vercelIntegrations).where(eq(vercelIntegrations.databaseClientId, client.id));
     const payload = { clientId: input.clientId };
     const [operation] = await tx
       .insert(operations)
@@ -626,14 +628,17 @@ export async function revokeDatabaseClient(
   const now = input.now ?? new Date();
   const certificates = await linkedCertificates(client);
   const caIds = [...new Set([client.caId, ...certificates.map((item) => item.caId)])];
-  await db
-    .update(databaseClients)
-    .set({
-      status: "revoked",
-      revokedAt: client.revokedAt ?? now,
-      revokedBy: client.revokedBy ?? input.actorId ?? null,
-    })
-    .where(eq(databaseClients.id, client.id));
+  await db.transaction(async (tx) => {
+    await tx
+      .update(databaseClients)
+      .set({
+        status: "revoked",
+        revokedAt: client.revokedAt ?? now,
+        revokedBy: client.revokedBy ?? input.actorId ?? null,
+      })
+      .where(eq(databaseClients.id, client.id));
+    await tx.delete(vercelIntegrations).where(eq(vercelIntegrations.databaseClientId, client.id));
+  });
   for (const certificate of certificates) {
     await pki.revokeClientCertificate({ id: certificate.id, reason: "cessationOfOperation", now });
   }

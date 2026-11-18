@@ -145,6 +145,11 @@ import {
   type IssueSuccessorResult,
 } from "./modules/db-client-rollover.ts";
 import {
+  evaluateVercelTokenAlerts,
+  pushVercelRollover,
+  queueVercelPush,
+} from "./modules/vercel-integrations.ts";
+import {
   commitDnsSnapshot,
   confirmWithdrawals,
   desiredDns,
@@ -555,6 +560,7 @@ type ClientOperationRuntime = {
   reloadRequired: typeof pgbouncerReloadRequired;
   /** FD-28: the clock every rollover decision uses; tests inject a timeline. */
   now: () => Date;
+  vercelPush: typeof pushVercelRollover;
   /** FD-28: successor issuance (db-client-rollover.issueSuccessor). */
   issueSuccessor: typeof issueSuccessor;
   /** FD-28: fence, reduced reload, role and pre-auth drain, reopen (pgbouncer.retireGeneration). */
@@ -570,6 +576,7 @@ const clientOperationRuntime: ClientOperationRuntime = {
   reloadRequired: pgbouncerReloadRequired,
   now: () => new Date(),
   issueSuccessor,
+  vercelPush: pushVercelRollover,
   retire: retireGeneration,
   watchdog: {
     fence: (database) => socketAdmin(pgbouncerSocket())(`DISABLE ${database}`).then(() => undefined),
@@ -586,6 +593,7 @@ export async function runOperation(
 ) {
   const runtime = { ...clientOperationRuntime, ...overrides };
   await assertExecutionAuthorized(operation);
+  if (kind === "integration.vercel_push") return runtime.vercelPush(operation);
   if (kind === "domain.verify") return verifyDomain(operation);
   if (kind === "certificate.issue" || kind === "certificate.renew") return issueCertificate(operation);
   if (kind === "database.provision") return provisionDatabase(operation);
@@ -641,7 +649,12 @@ export async function assertExecutionAuthorized(operation: OperationRow) {
   if (access.role === "viewer") throw new Error("Operation actor no longer has mutation permission.");
   if (access.role === "owner") return;
   if (
-    ["database.client_issue", "database.client_revoke", "database.client_rollover"].includes(operation.kind)
+    [
+      "database.client_issue",
+      "database.client_revoke",
+      "database.client_rollover",
+      "integration.vercel_push",
+    ].includes(operation.kind)
   )
     throw new Error("Only owners may execute database client operations.");
   for (const targetId of operation.targetIds) {
@@ -2372,6 +2385,9 @@ async function rolloverDatabaseClientsOp(operation: OperationRow, runtime: Clien
       now,
     );
   }
+  for (const { databaseId, clientId, successor } of deliverable) {
+    if (databaseId && successor) await queueVercelPush({ databaseId, clientId }, successor.id, now);
+  }
   for (const result of issued) await auditRolloverIssued(result, operation);
   const alertsRaised = await evaluateRolloverAlerts(now);
   const retired = payload.clientId ? [] : await runDueRetirements(runtime, { operation });
@@ -2667,6 +2683,7 @@ export async function rolloverTick(
   const queued = await queueDailyRollover(now);
   if (!state.lastAlerts || now.getTime() - state.lastAlerts >= 3_600_000) {
     await evaluateRolloverAlerts(now);
+    await evaluateVercelTokenAlerts(now);
     state.lastAlerts = now.getTime();
   }
   const timers = state.timers;

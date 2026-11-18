@@ -212,6 +212,14 @@ import {
   revealRolloverSuccessor,
   rolloverStatus,
 } from "./modules/db-client-rollover.ts";
+import {
+  connectVercel,
+  disconnectVercel,
+  testVercelConnection,
+  vercelConnectBinding,
+  vercelConnectInput,
+  vercelIntegrationStatus,
+} from "./modules/vercel-integrations.ts";
 import { CLIENT_KEY_SECRET_KIND, PkiPolicyError, validateCsr } from "./modules/pki.ts";
 import { cancelWorkspaceQuery } from "./modules/database.ts";
 import { writeApprovedCompose } from "./modules/docker.ts";
@@ -2627,6 +2635,94 @@ app.post("/api/databases/:id/clients/:clientId/rollover/confirm", async (c) => {
       source: "manual",
       now: new Date(),
     }),
+  );
+});
+
+const vercelIntegrationPath = "/api/databases/:id/clients/:clientId/vercel-integration";
+
+app.get(vercelIntegrationPath, async (c) => {
+  requireOwner(c.get("access"));
+  c.header("cache-control", "no-store");
+  return c.json(
+    await vercelIntegrationStatus({
+      databaseId: c.req.param("id"),
+      clientId: c.req.param("clientId"),
+    }),
+  );
+});
+
+app.put(vercelIntegrationPath, async (c) => {
+  const access = c.get("access");
+  const session = c.get("session");
+  requireOwner(access);
+  requireMfa(session);
+  const databaseId = c.req.param("id");
+  const clientId = c.req.param("clientId");
+  const request = vercelConnectInput.safeParse(await c.req.json().catch(() => null));
+  if (!request.success) throw new HTTPException(422, { message: "Invalid Vercel connection settings." });
+  await requirePrivileged(
+    access,
+    session,
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", {
+      databaseId,
+      clientId,
+      vercelIntegration: "connect",
+      ...vercelConnectBinding(request.data),
+    }),
+  );
+  c.header("cache-control", "no-store");
+  return c.json(
+    await connectVercel(
+      { databaseId, clientId, actorId: access.userId, actorRole: access.role },
+      request.data,
+    ),
+  );
+});
+
+app.post(`${vercelIntegrationPath}/test`, async (c) => {
+  const access = c.get("access");
+  const session = c.get("session");
+  requireOwner(access);
+  requireMfa(session);
+  const databaseId = c.req.param("id");
+  const clientId = c.req.param("clientId");
+  await requirePrivileged(
+    access,
+    session,
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", {
+      databaseId,
+      clientId,
+      vercelIntegration: "test",
+    }),
+  );
+  c.header("cache-control", "no-store");
+  return c.json(
+    await testVercelConnection({ databaseId, clientId, actorId: access.userId, actorRole: access.role }),
+  );
+});
+
+app.delete(vercelIntegrationPath, async (c) => {
+  const access = c.get("access");
+  const session = c.get("session");
+  requireOwner(access);
+  requireMfa(session);
+  const databaseId = c.req.param("id");
+  const clientId = c.req.param("clientId");
+  await requirePrivileged(
+    access,
+    session,
+    "credential.rotate",
+    privilegedRequestHash("credential.rotate", {
+      databaseId,
+      clientId,
+      vercelIntegration: "disconnect",
+    }),
+  );
+  c.header("cache-control", "no-store");
+  return c.json(
+    await disconnectVercel({ databaseId, clientId, actorId: access.userId, actorRole: access.role }),
   );
 });
 

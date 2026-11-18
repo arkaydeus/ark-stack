@@ -9,15 +9,22 @@
 // retirement (fence, drain, pre-auth races, the +5 s deadline) is injected here and runs for real
 // in scripts/test-pgbouncer-public.ts.
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { generateKeyPairSync } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { generateKeyPairSync, X509Certificate } from "node:crypto";
 import { buildCsr } from "./modules/csr-test-kit.ts";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createId, parseEnvFile, PGBOUNCER_FILES, ROLLOVER_ALERT_PREFIX, type Role } from "@ark-stack/shared";
+import {
+  createId,
+  parseEnvFile,
+  PGBOUNCER_FILES,
+  ROLLOVER_ALERT_PREFIX,
+  VERCEL_ENV_NAMES,
+  type Role,
+} from "@ark-stack/shared";
 import { makeSignature } from "better-auth/crypto";
 import postgres from "postgres";
 
@@ -32,6 +39,8 @@ const { withPgbouncerLock } = await import("./modules/pgbouncer-lock.ts");
 const clients = await import("./modules/db-clients.ts");
 const rollover = await import("./modules/db-client-rollover.ts");
 const coordinator = await import("./coordinator.ts");
+const vercel = await import("./modules/vercel-integrations.ts");
+import type { VercelTransport } from "./modules/vercel-api.ts";
 const { RetirementError, retireGeneration } = await import("./modules/pgbouncer.ts");
 
 const DAY = 86_400_000;
@@ -50,6 +59,7 @@ const endpointId = createId("end");
 const hostname = `db-${suffix}.example.com`;
 const saved: Record<string, string | undefined> = {};
 let work = "";
+const vercelExpiryKeys = new Set<string>();
 
 type Actor = { userId: string; cookie: string };
 const actors = {} as Record<Role | "ownerWithoutMfa", Actor>;
@@ -172,14 +182,17 @@ function operationRow(row: Record<string, unknown>) {
 }
 
 /** Claim and execute exactly this queued operation, as the database worker does. */
-async function runQueued(operationId: string) {
+async function runQueued(
+  operationId: string,
+  overrides: Parameters<typeof coordinator.runOperation>[2] = runtime,
+) {
   const [row] = await sql`
     UPDATE operations SET status = 'running', claim_token = ${createId("claim")}, heartbeat_at = now()
     WHERE id = ${operationId} AND status = 'queued' RETURNING *
   `;
   expect(row).toBeDefined();
   try {
-    const evidence = await coordinator.runOperation(row!.kind as never, operationRow(row!), runtime);
+    const evidence = await coordinator.runOperation(row!.kind as never, operationRow(row!), overrides);
     await sql`UPDATE operations SET status = 'succeeded' WHERE id = ${operationId}`;
     return evidence as Record<string, unknown>;
   } catch (error) {
@@ -297,6 +310,8 @@ afterAll(async () => {
   `;
   const caIds = cas.map((row) => String(row.id));
   const alertKeys = [
+    ...vercelExpiryKeys,
+    ...clientIds.map(rollover.vercelPushAlertKey),
     ...clientIds.map((id) => `${ROLLOVER_ALERT_PREFIX}${id}`),
     ...(caIds.length
       ? (await sql`SELECT id FROM client_certificates WHERE ca_id IN ${sql(caIds)}`).map(
@@ -304,7 +319,7 @@ afterAll(async () => {
         )
       : []),
   ];
-  await sql`DELETE FROM operations WHERE target_ids ? ${databaseId}`;
+  await sql`DELETE FROM operations WHERE target_ids ? ${databaseId} OR (kind = 'integration.vercel_push' AND payload->>'databaseId' = ${databaseId})`;
   await sql`DELETE FROM operations WHERE kind IN ('database.client_rollover', 'database.client_retire')`;
   if (clientIds.length)
     await sql`DELETE FROM client_certificate_retirements WHERE client_id IN ${sql(clientIds)}`;
@@ -1342,4 +1357,524 @@ describe("rollover recovery and concurrency", () => {
     }
     await park(a.clientId, b.clientId);
   });
+});
+
+describe("FD-29 Vercel delivery", () => {
+  const projectId = "prj_SelectedFD29";
+  const teamId = "team_FD29";
+  const otherProjectId = "prj_ComparatorFD29";
+  const deployHook = `https://api.vercel.com/v1/integrations/deploy/${projectId}/hookSecretFD29`;
+  const jobId = "VercelHookJobFD29001";
+  const deploymentId = "dpl_NewFD29";
+  const proof = {
+    evidence: "mock-only",
+    listDenialCode: "project_scope_resource_denied",
+    otherProjectDenialCode: "project_scope_project_denied",
+  };
+  const actorRef = (clientId: string) => ({
+    databaseId,
+    clientId,
+    actorId: actors.owner.userId,
+    actorRole: "owner",
+  });
+  const inputFor = (name: string, target: "production" | "preview" = "production") => ({
+    projectId,
+    teamId,
+    otherProjectId,
+    deployHook,
+    target,
+    token: `vcp_RefusalSentinel_FD29_${name}`,
+    ...(target === "preview" ? { gitBranch: "fd29-preview" } : {}),
+  });
+  const endpoint = (clientId: string) =>
+    `/api/databases/${databaseId}/clients/${clientId}/vercel-integration`;
+  const expectedProbes = [
+    "/v5/user/tokens/current",
+    `/v9/projects/${projectId}?teamId=${teamId}`,
+    `/v9/projects?teamId=${teamId}`,
+    `/v9/projects/${otherProjectId}?teamId=${teamId}`,
+  ].toSorted();
+
+  type Refusal =
+    | "team"
+    | "account"
+    | "crossProject"
+    | "expired"
+    | "noExpiry"
+    | "network"
+    | "ambiguous"
+    | "genericDenial"
+    | "otherProjectVisible"
+    | "listVisible"
+    | "wrongTeam"
+    | "invalidToken";
+  type Options = {
+    refusal?: Refusal;
+    push?: "ready" | "error" | "partial" | "unknownReceipt" | "timeout";
+    onPoll?: (poll: number) => Promise<void>;
+    beforeProbe?: () => Promise<void>;
+    expiresAt?: Date;
+  };
+  function mockApi(input: ReturnType<typeof inputFor>, options: Options = {}) {
+    const calls: Array<{
+      method: string;
+      path: string;
+      body?: Record<string, unknown>[];
+      authenticated: boolean;
+    }> = [];
+    let polls = 0;
+    const branch = input.gitBranch ?? "main";
+    const transport: VercelTransport = async (url, init) => {
+      const method = init.method ?? "GET";
+      const headers = new Headers(init.headers);
+      const authenticated = headers.get("authorization") === `Bearer ${input.token}`;
+      const path = url.pathname + url.search;
+      const body = init.body ? (JSON.parse(String(init.body)) as Record<string, unknown>[]) : undefined;
+      calls.push({ method, path, body, authenticated });
+      if (
+        method === "GET" &&
+        (url.pathname.startsWith("/v9/projects") || url.pathname === "/v5/user/tokens/current")
+      ) {
+        await options.beforeProbe?.();
+        if (!authenticated) return Response.json({}, { status: 401 });
+      }
+      if (url.pathname === "/v5/user/tokens/current") {
+        const expiresAt = options.expiresAt ?? at(clock, 60);
+        const scope = { type: "project", teamId, projectId, createdAt: clock.getTime() };
+        if (options.refusal === "team") scope.type = "team";
+        if (options.refusal === "account") scope.type = "user";
+        if (options.refusal === "crossProject") scope.projectId = otherProjectId;
+        if (options.refusal === "wrongTeam") scope.teamId = "team_Other";
+        return Response.json({
+          token: {
+            expiresAt:
+              options.refusal === "noExpiry"
+                ? undefined
+                : options.refusal === "expired"
+                  ? clock.getTime() - 1
+                  : expiresAt.getTime(),
+            scopes: options.refusal === "ambiguous" ? [scope, { type: "user" }] : [scope],
+            name: input.token, // Provider bodies may echo secret values.
+          },
+        });
+      }
+      if (url.pathname === `/v9/projects/${projectId}`) {
+        return Response.json({
+          id: projectId,
+          accountId: teamId,
+          link: { productionBranch: "main", deployHooks: [{ url: deployHook, ref: branch }] },
+        });
+      }
+      if (url.pathname === "/v9/projects") {
+        if (options.refusal === "network") throw new Error(`Network failure: ${input.token}`);
+        if (options.refusal === "listVisible") return Response.json({ projects: [{ id: otherProjectId }] });
+        return Response.json(
+          {
+            error: {
+              code: options.refusal === "genericDenial" ? "forbidden" : proof.listDenialCode,
+              invalidToken: options.refusal === "invalidToken" ? true : undefined,
+              message: input.token,
+            },
+          },
+          { status: 403 },
+        );
+      }
+      if (url.pathname === `/v9/projects/${otherProjectId}`) {
+        if (options.refusal === "otherProjectVisible") return Response.json({ id: otherProjectId });
+        return Response.json(
+          { error: { code: proof.otherProjectDenialCode, message: input.token } },
+          { status: 403 },
+        );
+      }
+      if (url.pathname === `/v10/projects/${projectId}/env`) {
+        if (options.push === "partial")
+          return Response.json(
+            { created: body?.slice(0, 1), failed: [{ error: { message: input.token } }] },
+            { status: 201 },
+          );
+        return Response.json({ created: body, failed: [] }, { status: 201 });
+      }
+      if (url.pathname === new URL(deployHook).pathname) {
+        if (options.push === "unknownReceipt")
+          throw new Error(`Provider request may have been sent to ${deployHook}`);
+        return Response.json({ job: { id: jobId, state: "PENDING" } }, { status: 201 });
+      }
+      if (url.pathname === "/v7/deployments") {
+        await options.onPoll?.(++polls);
+        const readyState =
+          options.push === "error"
+            ? "ERROR"
+            : options.push === "timeout" || polls <= 1
+              ? "BUILDING"
+              : "READY";
+        const expected = {
+          source: "git-deploy-hook",
+          projectId,
+          target: input.target === "preview" ? null : "production",
+        };
+        return Response.json({
+          deployments: [
+            { ...expected, uid: "dpl_UnrelatedFD29", readyState: "READY" },
+            { ...expected, uid: deploymentId, meta: { deployHookJobId: jobId }, readyState },
+          ],
+        });
+      }
+      return Response.json({}, { status: 500 });
+    };
+    return { calls, transport, now: () => clock, proof };
+  }
+
+  async function noConnection(clientId: string) {
+    expect(await sql`SELECT id FROM vercel_integrations WHERE database_client_id = ${clientId}`).toHaveLength(
+      0,
+    );
+    expect(await sql`SELECT id FROM secrets WHERE resource_type = 'vercel_integration'`).toHaveLength(0);
+    expect(
+      await sql`SELECT id FROM operations WHERE kind = 'integration.vercel_push' AND payload->>'clientId' = ${clientId}`,
+    ).toHaveLength(0);
+  }
+
+  async function assertNoCopies(token: string) {
+    const rows = await sql`
+      SELECT detail FROM audit_events WHERE resource_id = ${databaseId} AND action LIKE 'integration.vercel_%'
+    `;
+    for (const value of [token, deployHook]) {
+      expect(JSON.stringify(rows).includes(value)).toBe(false);
+      for (const file of await readdir(work, { recursive: true, withFileTypes: true })) {
+        if (file.isFile())
+          expect((await readFile(join(file.parentPath, file.name))).includes(value)).toBe(false);
+      }
+    }
+  }
+
+  async function issueEarly(clientId: string) {
+    const { operation } = await rollover.queueEarlyRollover({
+      databaseId,
+      clientId,
+      actorId: actors.owner.userId,
+    });
+    await runQueued(operation.id);
+    return (await chain(clientId)).find((row) => row.rolloverState === "pending")!;
+  }
+
+  async function queuedPushId(clientId: string) {
+    const queued =
+      await sql`SELECT id FROM operations WHERE kind = 'integration.vercel_push' AND payload->>'clientId' = ${clientId}`;
+    expect(queued).toHaveLength(1);
+    return String(queued[0]!.id);
+  }
+
+  const refusals: Refusal[] = [
+    "team",
+    "account",
+    "crossProject",
+    "expired",
+    "noExpiry",
+    "network",
+    "ambiguous",
+    "genericDenial",
+    "otherProjectVisible",
+    "listVisible",
+    "wrongTeam",
+    "invalidToken",
+  ];
+  test("refuses every unproven token without writing secrets, integrations, jobs, disk copies, logs or Vercel mutations", async () => {
+    clock = new Date();
+    const { clientId } = await issueClient("vercelscope");
+    await issueEarly(clientId); // A pass would queue a push immediately.
+    const spies = [spyOn(console, "error"), spyOn(console, "warn"), spyOn(console, "log")];
+    try {
+      for (const refusal of refusals) {
+        const input = inputFor(refusal);
+        const mock = mockApi(input, { refusal, beforeProbe: () => noConnection(clientId) });
+        await expect(vercel.connectVercel(actorRef(clientId), input, mock)).rejects.toThrow(
+          /sole project scope/,
+        );
+        expect(mock.calls.map((request) => request.path).toSorted(), refusal).toEqual(expectedProbes);
+        expect(
+          mock.calls.every((request) => request.method === "GET" && request.authenticated),
+          refusal,
+        ).toBe(true);
+        await noConnection(clientId);
+        await assertNoCopies(input.token);
+        const logged = spies
+          .flatMap((spy) => spy.mock.calls.flat())
+          .map(String)
+          .join("\n");
+        expect(logged.includes(input.token) || logged.includes(deployHook), refusal).toBe(false);
+      }
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+      await park(clientId);
+    }
+  });
+
+  test("applies owner, MFA and single-use step-up to every endpoint and preserves manual rollover with connect disabled", async () => {
+    clock = new Date();
+    const { clientId, first } = await issueClient("vercelgated");
+    const ref = { databaseId, clientId };
+    const input = inputFor("gate");
+    const path = endpoint(clientId);
+    expect(await (await call(actors.owner, path)).json()).toMatchObject({
+      connectEnabled: false,
+      eligible: true,
+      integration: null,
+    });
+    for (const [method, tail, intent] of [
+      ["PUT", "", "connect"],
+      ["POST", "/test", "test"],
+      ["DELETE", "", "disconnect"],
+    ] as const) {
+      const request = { method, ...(intent === "connect" ? { body: input } : {}) };
+      for (const actor of [actors.operator, actors.viewer, actors.ownerWithoutMfa, actors.owner])
+        expect((await call(actor, path + tail, request)).status, `${actor.userId} ${intent}`).toBe(403);
+      const binding = intent === "connect" ? vercel.vercelConnectBinding(input) : {};
+      await stepUp(actors.owner, "credential.rotate", { ...ref, vercelIntegration: intent, ...binding });
+      const response = await call(actors.owner, path + tail, request);
+      expect(response.status).toBe(intent === "disconnect" ? 200 : 409);
+      const body = await response.text();
+      expect(body.includes(input.token) || body.includes(deployHook)).toBe(false);
+      expect((await call(actors.owner, path + tail, request)).status).toBe(403);
+    }
+    await noConnection(clientId);
+    const pending = await issueEarly(clientId);
+    await stepUp(actors.owner, "secret.reveal", { ...ref, rollover: true });
+    const rolloverPath = `/api/databases/${databaseId}/clients/${clientId}/rollover`;
+    expect((await call(actors.owner, `${rolloverPath}/reveal`, { method: "POST" })).status).toBe(200);
+    expect(
+      (
+        await call(actors.owner, `${rolloverPath}/confirm`, {
+          method: "POST",
+          body: { certificateId: pending.id },
+        })
+      ).status,
+    ).toBe(200);
+    const certificates = await chain(clientId);
+    expect(certificates.find((row) => row.id === first.id)?.rolloverState).toBe("superseded");
+    expect(certificates.find((row) => row.id === pending.id)?.rolloverState).toBe("current");
+    await noConnection(clientId);
+    await park(clientId);
+  });
+
+  test("seals only a project-verified token and hook, queues after trust reload, delivers only after READY and cleans up on disconnect", async () => {
+    clock = new Date();
+    const { clientId, first } = await issueClient("vercelready", "preview");
+    const input = inputFor("verified", "preview");
+    const ref = actorRef(clientId);
+    const mock = mockApi(input, {
+      beforeProbe: () => noConnection(clientId),
+      expiresAt: at(clock, 30),
+    });
+    const connected = await vercel.connectVercel(ref, input, mock);
+    expect(connected).toMatchObject({
+      projectId,
+      target: "preview",
+      gitBranch: input.gitBranch,
+      tokenExpiresAt: at(clock, 30),
+    });
+    expect(mock.calls.map(({ path }) => path).toSorted()).toEqual(expectedProbes);
+    const [record] = await sql`
+      SELECT id, token_secret_id, deploy_hook_secret_id, scope_verified_at FROM vercel_integrations
+      WHERE database_client_id = ${clientId}
+    `;
+    expect(record?.scope_verified_at).toBeTruthy();
+    const secretIds = [String(record?.token_secret_id), String(record?.deploy_hook_secret_id)];
+    const stored = await sql`SELECT * FROM secrets WHERE id IN ${sql(secretIds)}`;
+    expect(stored.map((row) => row.sensitivity)).toEqual(["provider", "provider"]);
+    expect(JSON.stringify(stored).includes(input.token) || JSON.stringify(stored).includes(deployHook)).toBe(
+      false,
+    );
+    const expiryKey = `vercel-token-expiry:${record!.id}`;
+    vercelExpiryKeys.add(expiryKey);
+    expect(await openAlert(expiryKey)).toMatchObject({ severity: "warning", resolved_at: null });
+    await vercel.evaluateVercelTokenAlerts(at(clock, 30));
+    expect(await openAlert(expiryKey)).toMatchObject({ severity: "critical", resolved_at: null });
+    const probe = mockApi(input);
+    expect(await vercel.testVercelConnection(ref, probe)).toMatchObject({ ok: true });
+    expect(probe.calls.map((request) => request.path).toSorted()).toEqual(expectedProbes);
+    expect(probe.calls.every((request) => request.method === "GET")).toBe(true);
+
+    const pending = await issueEarly(clientId);
+    expect(pending.trustAppliedAt).toBeTruthy();
+    expect(await bundleFile()).toContain(await caPem(first.caId));
+    expect(await bundleFile()).toContain(await caPem(pending.caId));
+    const pushId = await queuedPushId(clientId);
+    await vercel.queueVercelPush(ref, pending.id, clock);
+    expect(await queuedPushId(clientId)).toBe(pushId);
+    const workerRequest = (token: string) =>
+      app.request(`${origin}/api/internal/jobs`, {
+        headers: { authorization: `Bearer ${token}`, "x-ark-worker-kinds": "integration." },
+      });
+    expect((await workerRequest(process.env.ARK_DATABASE_WORKER_TOKEN!)).status).toBe(403);
+    const claim = await workerRequest(process.env.ARK_DOMAIN_WORKER_TOKEN!);
+    expect(claim.status).toBe(200);
+    expect(await claim.json()).toMatchObject({ jobs: [{ id: pushId, kind: "integration.vercel_push" }] });
+    const [op] = await sql`SELECT * FROM operations WHERE id = ${pushId}`;
+
+    const push = mockApi(input, {
+      push: "ready",
+      onPoll: async () => {
+        const certificates = await chain(clientId);
+        expect(certificates.find((row) => row.id === first.id)?.rolloverState).toBe("current");
+        expect(certificates.find((row) => row.id === pending.id)).toMatchObject({
+          rolloverState: "pending",
+          deliveredAt: null,
+        });
+      },
+    });
+    const outcome = await coordinator.runOperation("integration.vercel_push", operationRow(op!), {
+      vercelPush: (operation) => vercel.pushVercelRollover(operation, { ...push, sleep: async () => {} }),
+    });
+    expect(outcome).toMatchObject({
+      certificateId: pending.id,
+      deploymentId,
+      deliveredAt: clock.toISOString(),
+    });
+    const mutations = push.calls.filter((request) => request.method === "POST");
+    expect(mutations.map(({ path, authenticated }) => ({ path, authenticated }))).toEqual([
+      { path: `/v10/projects/${projectId}/env?teamId=${teamId}&upsert=true`, authenticated: true },
+      { path: new URL(deployHook).pathname, authenticated: false },
+    ]);
+    const env = mutations[0]!.body!;
+    expect(env.map(({ key, type, target, gitBranch }) => ({ key, type, target, gitBranch }))).toEqual(
+      [VERCEL_ENV_NAMES.cert, VERCEL_ENV_NAMES.key].map((key) => ({
+        key,
+        type: "sensitive",
+        target: ["preview"],
+        gitBranch: input.gitBranch,
+      })),
+    );
+    expect(Buffer.from(String(env[0]!.value), "base64").toString()).toBe(pending.certPem!);
+    expect(Buffer.from(String(env[1]!.value), "base64").toString()).toContain("PRIVATE KEY");
+    expect(push.calls.filter(({ path }) => path.startsWith("/v7/deployments"))).toHaveLength(2);
+    const certificates = await chain(clientId);
+    const original = certificates.find((row) => row.id === first.id);
+    const successor = certificates.find((row) => row.id === pending.id);
+    expect(original).toMatchObject({ status: "issued", rolloverState: "superseded" });
+    expect(successor).toMatchObject({
+      id: pending.id,
+      rolloverState: "current",
+      deliveredAt: clock,
+      keySecretId: null,
+    });
+    expect(await sql`SELECT id FROM secrets WHERE id = ${pending.keySecretId!}`).toHaveLength(0);
+    expect((await vercel.vercelIntegrationStatus(ref)).integration).toMatchObject({
+      lastPushStatus: "delivered",
+      lastDeploymentId: deploymentId,
+    });
+    expect(await vercel.pushVercelRollover(operationRow(op!), push)).toEqual({ skipped: true });
+    expect(push.calls.filter((request) => request.method === "POST")).toHaveLength(2);
+
+    for (const id of secretIds) {
+      const response = await call(actors.owner, `/api/secrets/${id}/reveal`, { method: "POST" });
+      expect(response.status).toBe(403);
+    }
+    await stepUp(actors.owner, "credential.rotate", {
+      databaseId,
+      clientId,
+      vercelIntegration: "disconnect",
+    });
+    expect(await (await call(actors.owner, endpoint(clientId), { method: "DELETE" })).json()).toEqual({
+      disconnected: true,
+    });
+    expect(await sql`SELECT id FROM secrets WHERE id IN ${sql(secretIds)}`).toHaveLength(0);
+    expect(await sql`SELECT id FROM vercel_integrations WHERE id = ${record!.id}`).toHaveLength(0);
+    expect((await openAlert(expiryKey))?.resolved_at).toBeTruthy();
+    const [audit] = await sql`
+      SELECT count(*)::int AS count FROM audit_events WHERE operation_id = ${pushId}
+        AND action = 'integration.vercel_call' AND detail ?& ARRAY['endpoint', 'projectId', 'target', 'status']
+    `;
+    expect(audit!.count).toBe(push.calls.length);
+    await assertNoCopies(input.token);
+    await park(clientId);
+  });
+
+  test("a reclaimed push resumes the recorded hook job without sending another deployment", async () => {
+    clock = new Date();
+    const { clientId } = await issueClient("vercelresume");
+    const ref = actorRef(clientId);
+    const input = inputFor("resume");
+    const pending = await issueEarly(clientId);
+    await vercel.connectVercel(ref, input, mockApi(input));
+    const pushId = await queuedPushId(clientId);
+    const originalClaim = createId("claim");
+    const nextClaim = createId("claim");
+    const [op] = await sql`
+      UPDATE operations SET status = 'running', claim_token = ${originalClaim}, heartbeat_at = now()
+      WHERE id = ${pushId} RETURNING *
+    `;
+    const mock = mockApi(input, {
+      onPoll: async (poll) => {
+        if (poll === 1) await sql`UPDATE operations SET claim_token = ${nextClaim} WHERE id = ${pushId}`;
+      },
+    });
+    const pushRuntime = { ...mock, sleep: async () => {} };
+    expect(await vercel.pushVercelRollover(operationRow(op!), pushRuntime)).toEqual({ skipped: true });
+    expect((await chain(clientId)).find((row) => row.id === pending.id)?.deliveredAt).toBeNull();
+    expect(
+      await vercel.pushVercelRollover({ ...operationRow(op!), claimToken: nextClaim }, pushRuntime),
+    ).toMatchObject({ certificateId: pending.id, deploymentId });
+    expect(mock.calls.filter((request) => request.method === "POST").map((request) => request.path)).toEqual([
+      `/v10/projects/${projectId}/env?teamId=${teamId}&upsert=true`,
+      new URL(deployHook).pathname,
+    ]);
+    await vercel.disconnectVercel(ref);
+    await park(clientId);
+  });
+
+  for (const mode of ["partial", "error", "timeout", "unknownReceipt"] as const) {
+    test(`leaves the old certificate usable after a ${mode} delivery failure`, async () => {
+      clock = new Date();
+      const { clientId, first } = await issueClient(`vercel${mode.toLowerCase()}`);
+      const ref = actorRef(clientId);
+      const input = inputFor(mode);
+      const pending = await issueEarly(clientId);
+      const mock = mockApi(input, { push: mode });
+      await vercel.connectVercel(ref, input, mock);
+      const job = await queuedPushId(clientId);
+      const pushRuntime = {
+        ...runtime,
+        vercelPush: (operation: Parameters<typeof vercel.pushVercelRollover>[0]) =>
+          vercel.pushVercelRollover(operation, {
+            ...mock,
+            sleep: async () => {
+              clock = new Date(clock.getTime() + 30 * 60_000);
+            },
+          }),
+      };
+      await expect(runQueued(job, pushRuntime)).rejects.toThrow(/Manual rollover is available/);
+      if (mode === "unknownReceipt") {
+        await sql`UPDATE operations SET status = 'queued' WHERE id = ${job}`;
+        await expect(runQueued(job, pushRuntime)).rejects.toThrow(/Manual rollover is available/);
+      }
+      expect(
+        mock.calls.filter(({ method, path }) => method === "POST" && path.startsWith("/v1/")),
+      ).toHaveLength(mode === "partial" ? 0 : 1);
+      expect((await vercel.vercelIntegrationStatus(ref)).integration?.lastPushStatus).toBe("failed");
+      const certificates = await chain(clientId);
+      const old = certificates.find((row) => row.id === first.id);
+      const next = certificates.find((row) => row.id === pending.id);
+      expect(old).toMatchObject({ status: "issued", rolloverState: "current" });
+      expect(next).toMatchObject({
+        id: pending.id,
+        rolloverState: "pending",
+        deliveredAt: null,
+        keySecretId: pending.keySecretId,
+      });
+      const oldCa = await caPem(first.caId);
+      expect(await bundleFile()).toContain(oldCa);
+      expect(new X509Certificate(old!.certPem!).verify(new X509Certificate(oldCa).publicKey)).toBe(true);
+      expect(old!.notAfter > clock).toBe(true);
+      expect(await openAlert(rollover.vercelPushAlertKey(clientId))).toMatchObject({
+        severity: "warning",
+        resolved_at: null,
+      });
+      await assertNoCopies(input.token);
+      await revealSuccessor(clientId);
+      await rollover.confirmRolloverDelivery({ databaseId, clientId, certificateId: pending.id, now: clock });
+      expect((await openAlert(rollover.vercelPushAlertKey(clientId)))?.resolved_at).toBeTruthy();
+      await vercel.disconnectVercel(ref);
+      await park(clientId);
+    }, 15_000);
+  }
 });
