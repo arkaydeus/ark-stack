@@ -1,0 +1,92 @@
+import { expect, test } from "bun:test";
+
+import {
+  hostRoutesFromFront,
+  providerFirewallRules,
+  publicHostPorts,
+  renderEdgeL4Generation,
+  renderFrontIngress,
+} from "@ark-stack/shared";
+import { unexpectedPorts } from "../../scripts/host-audit.ts";
+
+test("the provider rules use the same ports as the host and exclude empty raw port reservations", () => {
+  const routes = hostRoutesFromFront(
+    renderFrontIngress(
+      [
+        { id: "rt_open", listenPort: 20007, sourceCidrs: [], allowInternet: true },
+        { id: "rt_restricted", listenPort: 20009, sourceCidrs: ["198.51.100.9/32"] },
+      ],
+      [8883],
+    ),
+  );
+  const config = { mailEnabled: true, sniPorts: [8883], routes };
+  expect(publicHostPorts(config)).toEqual({
+    tcp: [25, 80, 443, 465, 587, 993, 5432, 8883, 20007, 20009],
+    udp: [41641, 41642],
+  });
+  expect(providerFirewallRules({ ...config, mailEnabled: false })).toEqual([
+    { protocol: "tcp", ports: [80, 443, 5432, 8883, 20007, 20009], sourceCidrs: ["0.0.0.0/0", "::/0"] },
+    { protocol: "udp", ports: [41641, 41642], sourceCidrs: ["0.0.0.0/0", "::/0"] },
+  ]);
+});
+
+test("a configured SNI frontend is present with or without leased routes and rejects unknown SNI", () => {
+  const generation = renderEdgeL4Generation({ httpHostnames: [], sniPorts: [8883] });
+  for (const file of ["haproxy.cfg", "haproxy.closed.cfg"]) {
+    expect(generation.files[file]).toMatch(
+      /frontend fe_tls8883\n    bind :8883\n[\s\S]+default_backend be_reject/,
+    );
+    expect(generation.files[file]).not.toContain("frontend fe_tls5671");
+  }
+});
+
+test("audit distinguishes edge raw reservations from unrelated listeners and publications", () => {
+  const config = { mailEnabled: false, sniPorts: [] };
+  const sockets = [
+    'tcp LISTEN 0 128 0.0.0.0:20001 0.0.0.0:* users:(("docker-proxy",pid=1,fd=1))',
+    'tcp LISTEN 0 128 [::]:20001 [::]:* users:(("dockerd",pid=1,fd=1))',
+    'tcp LISTEN 0 128 [::]:20001 [::]:* users:(("sshd",pid=1,fd=1))',
+    'tcp LISTEN 0 128 127.0.0.1:3000 0.0.0.0:* users:(("bun",pid=1,fd=1))',
+    'udp UNCONN 0 0 100.64.0.5:10101 0.0.0.0:* users:(("test",pid=1,fd=1))',
+    'udp UNCONN 0 0 [::]:24444 [::]:* users:(("test",pid=1,fd=1))',
+  ].join("\n");
+  expect(
+    unexpectedPorts(
+      config,
+      sockets,
+      [
+        {
+          container: "/ark-platform-edge-ts-1",
+          arkEdge: true,
+          protocol: "tcp",
+          address: "0.0.0.0",
+          port: 20001,
+          target: 20001,
+        },
+        {
+          container: "/ark-platform-edge-ts-1",
+          arkEdge: true,
+          protocol: "tcp",
+          address: "::",
+          port: 20001,
+          target: 20001,
+        },
+        { container: "/unexpected", protocol: "tcp", address: "::", port: 20003, target: 8080 },
+        {
+          container: "/unexpected",
+          arkEdge: true,
+          protocol: "tcp",
+          address: "::",
+          port: 20004,
+          target: 8080,
+        },
+      ],
+      new Set(["100.64.0.5"]),
+    ),
+  ).toEqual([
+    "Unexpected TCP [::]:20003 published by /unexpected.",
+    "Unexpected TCP [::]:20004 published by /unexpected.",
+    "Unexpected TCP [::]:20001 listening on the host.",
+    "Unexpected UDP [::]:24444 listening on the host.",
+  ]);
+});

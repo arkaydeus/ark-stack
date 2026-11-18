@@ -36,6 +36,13 @@ groups:
           severity: critical
         annotations:
           summary: An Ark Stack worker heartbeat is stale
+      - alert: ArkHostRebootRequired
+        expr: ark_host_reboot_required == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The Ark VPS needs a reboot after installing updates
       # Public database port per-source limits (docs/design/front-door.md §3.11, FD-18).
       # Counters reset whenever the ruleset is reapplied; rate() handles the reset.
       - alert: ArkDatabaseIngressDrops

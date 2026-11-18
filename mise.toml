@@ -211,9 +211,23 @@ description = "Install tools and workspace dependencies"
 run = ["mise install", "bun install"]
 
 [tasks."host:install"]
-description = "Generate host secrets, start Postgres, and apply migrations"
+description = "Install the platform, or prepare and harden the Ubuntu VPS with --enroll-vps and --harden-vps"
 run = "bun scripts/install.ts"
 env = { _.file = ".env" }
+raw_args = true
+
+[tasks."host:audit"]
+description = "Audit VPS listeners and published ports, export provider firewall rules or scan from off-host"
+run = "bun scripts/host-audit.ts"
+raw_args = true
+
+[tasks."test:host-hardening"]
+description = "Check FD-20 in isolated Docker containers with nftables, Stalwart and an external scanner"
+run = "bun --no-env-file scripts/test-host-hardening.ts"
+
+[tasks."test:host-hardening-live"]
+description = "Opt-in scan and owner Tailscale SSH against a scratch VPS and scratch tailnet"
+run = "bun --no-env-file scripts/test-host-hardening-live.ts"
 
 [tasks.import]
 description = "Compare an Orkmail or PgStack inventory without importing owners"
@@ -225,8 +239,8 @@ description = "Print the host-loss recovery checklist"
 run = "bun --env-file=.env scripts/recover-host.ts"
 
 [tasks."mail:up"]
-description = "Start the Stalwart mail engine"
-run = "docker compose -f infra/mail/docker-compose.yml up -d"
+description = "Start the Stalwart mail engine and ensure STARTTLS submission on TCP 587"
+run = "bun scripts/install-mail-submission.ts"
 
 [tasks."monitor:up"]
 description = "Start Prometheus with 14-day retention"

@@ -42,7 +42,7 @@ The user's revision 2 answers are listed in [§0.1](#01-resolved-decisions).
 | Area                         | Recommendation                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Edge-to-tailnet transport    | A **kernel-mode Tailscale container `edge-ts`** owns a network namespace. HAProxy and Caddy share it through `network_mode: service:edge-ts`. Userspace SOCKS5 cannot carry raw TCP: neither caddy-l4 nor HAProxy can dial through SOCKS5 (V-2b).                                                                                                                                                                                                                 |
-| Public listeners and routing | **HAProxy (`edge-l4`) owns every public TCP port except 80.** On 443 it routes by TLS SNI: HTTPS hostnames go to Caddy over PROXY protocol v2 on `127.0.0.1:8443`, and TLS-TCP hostnames go to their tailnet targets. On 5432 it routes PostgreSQL: classic `SSLRequest` clients go to PgBouncer, and direct-TLS clients go by SNI. Dedicated ports 20000–20049 are only for protocols without TLS. Caddy keeps `:80`. All of this was prototyped (V-13 to V-15). |
+| Public listeners and routing | **HAProxy (`edge-l4`) owns the public front-door TCP listeners apart from Caddy's port 80.** Stalwart owns the mail ports. On 443 HAProxy routes by TLS SNI: HTTPS hostnames go to Caddy over PROXY protocol v2 on `127.0.0.1:8443`, and TLS-TCP hostnames go to their tailnet targets. On 5432 it routes PostgreSQL: classic `SSLRequest` clients go to PgBouncer, and direct-TLS clients go by SNI. Dedicated ports 20000–20049 are only for protocols without TLS. All of this was prototyped (V-13 to V-15). |
 | HTTP edge                    | **Caddy upgraded to 2.11.9**, official image, digest-pinned, with no plugins. Header stripping, `Via` removal, the forward-auth gate, WebSocket survival across reloads and certificate reload were all re-run on 2.11.9 (V-16, V-17).                                                                                                                                                                                                                            |
 | TCP and SNI proxy            | **HAProxy 3.2 LTS**, official image, digest-pinned. It handles SNI routing, CRL-checked client certificates, per-source limits, forced session shutdown, and synchronous master-CLI reloads (V-14). caddy-l4 was rejected (§3.8).                                                                                                                                                                                                                                 |
 | PostgreSQL by hostname       | `psql "host=pg.example.com sslnegotiation=direct sslmode=verify-full"` reaches a tailnet Postgres on the normal port 5432. Supported by libpq 17+, node-postgres 8.22+, postgres.js 4.1.1, pgJDBC 42.7.4+, Npgsql 9+ and pgx 5.7.5+. PgBouncer 1.26.1 shares 5432: it is the default for classic clients and also accepts direct TLS itself (V-13).                                                                                                               |
@@ -2197,7 +2197,7 @@ Notes:
 
 ### 3.17 VPS hardening
 
-These steps are delivered as an installer step (`scripts/install.ts`) plus `docs/operating.md` sections. FD-20 covers them.
+The installer has separate VPS enrollment and hardening phases. See [VPS hardening](../operating.md#vps-hardening) for the commands and verification steps.
 
 1. **Host Tailscale and SSH.**
    - Install tailscaled on the host. Join with a `tag:ark-vps` key and enable SSH with `tailscale set --ssh`.
@@ -2224,8 +2224,8 @@ These steps are delivered as an installer step (`scripts/install.ts`) plus `docs
    This also removes 50 `docker-proxy` processes for the raw-TCP range. **Whether DNAT really preserves the IPv6 source address is unverified in documentation**; the preflight's source-address check proves it on each host (§3.13.4).
 
 4. **Unattended upgrades.** Keep the Ubuntu default `unattended-upgrades` security origin enabled ([Ubuntu automatic updates](https://ubuntu.com/server/docs/how-to/software/automatic-updates/)). Set `Automatic-Reboot "true"` with a maintenance window, and add a Prometheus alert when `/var/run/reboot-required` exists.
-5. **Provider firewall.** Mirror the public port list at the cloud provider as a second layer.
-6. **Verification script** (`mise run host:audit`, new). It compares `ss -lntup` and `nft list ruleset` against the expected public set, and runs an external probe from the off-host heartbeat runner: 22 closed, 2019/3000/15432 closed, and only the expected ports open on IPv4 and IPv6. This turns the security review's "Test forged forwarding headers … through the deployed Caddy/Tailscale paths" item (`docs/security-review.md`, "Deployment acceptance still required") into a repeatable check.
+5. **Provider firewall.** Export the shared inventory as inbound TCP and UDP rules with `mise run host:audit --inventory` and mirror them at the cloud provider.
+6. **Verification script.** `mise run host:audit` checks host sockets, Docker publications and the installed `ark_host` rules. Run `mise run host:audit --external` with the same inventory and public addresses on the off-host heartbeat runner. It scans TCP on IPv4 and IPv6 and probes UDP. A source-restricted raw route can be filtered from the scanner. WireGuard may appear as `open|filtered` to an unauthenticated probe.
 
 ### 3.18 Backups off the VPS (R8: both destinations, append-only)
 
@@ -2839,11 +2839,11 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Generate the allowed public inventory as the union of enabled platform services; include mail TCP 25/465/587/993 when enabled in host nft, provider rules and audit.
   - Installer and docs: host Tailscale with `tag:ark-vps` and SSH; the `ark_host` nft baseline; unattended-upgrades checks; the reboot-required alert; and the `mise run host:audit` external probe.
   - Docker IPv6 daemon settings are in FD-27.
-- **Depends on:** FD-14, FD-25, FD-26 (for the final port list).
+- **Depends on:** FD-14, FD-25, FD-26 (for the final port list) and FD-15 (host front policy).
 - **Acceptance criteria:**
   - [ ] With mail enabled, external SMTP delivery on 25, submission on 465/587 and IMAP on 993 work, while an unexpected published port is rejected. With mail disabled those ports are outside the inventory.
-  - [ ] On a fresh test VPS, an external scan (IPv4, and IPv6 if present) matches the enabled-service inventory: 80, 443, 5432, enabled SNI/raw/compat ports, UDP 41641/41642, plus TCP 25/465/587/993 when mail is enabled.
-  - [ ] Public 22 is closed, and Tailscale SSH works for the owner.
+  - [ ] An external scan of the isolated VPS (IPv4, and IPv6 when available) matches the enabled-service inventory: 80, 443, 5432, enabled SNI/raw/compat ports, UDP 41641/41642, plus TCP 25/465/587/993 when mail is enabled.
+  - [ ] Public 22 is closed in the isolated VPS. An opt-in run on a fresh scratch VPS repeats the external scan and verifies Tailscale SSH for the scratch tailnet owner.
   - [ ] `host:audit` fails when an unexpected port is listening or published.
   - [ ] `unattended-upgrades --dry-run` succeeds, and the reboot-required metric is exported.
 

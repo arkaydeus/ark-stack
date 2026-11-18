@@ -179,7 +179,7 @@ describe("TLS-TCP routes (§3.8.5)", () => {
     );
   });
 
-  test("the closed variant keeps HTTP but renders no route, frontend or key material", () => {
+  test("the closed variant keeps HTTP and drops route-specific config and key material", () => {
     const closed = generation.files["haproxy.closed.cfg"]!;
     expect(closed).toContain("frontend fe_tls443");
     expect(closed).not.toContain("rt_p7q2");

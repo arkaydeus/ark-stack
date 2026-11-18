@@ -1,0 +1,21 @@
+rule_files:
+  - /alerts.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: ark_host_reboot_required
+        values: 0 1 1 1 1 1 1 0
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ArkHostRebootRequired
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ArkHostRebootRequired
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: The Ark VPS needs a reboot after installing updates
+      - eval_time: 7m
+        alertname: ArkHostRebootRequired
+        exp_alerts: []

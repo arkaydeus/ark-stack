@@ -731,15 +731,14 @@ function renderSniFrontend(port: number, routes: TlsRoute[]) {
 
 function renderConfig(input: {
   httpHostnames: string[];
+  sniPorts: number[];
   routes: TlsRoute[];
   tcpRoutes: TcpRoute[];
   postgresRoutes: PostgresRoute[];
   pooler: Pooler | null;
 }) {
   const on443 = input.routes.filter((route) => route.listenPort === SNI_ROUTER_PORT);
-  const sharedPorts = [...new Set(input.routes.map((route) => route.listenPort))]
-    .filter((port) => port !== SNI_ROUTER_PORT)
-    .toSorted((a, b) => a - b);
+  const sharedPorts = input.sniPorts;
   const routeRules = on443.map(
     (route) => `    use_backend ${route.backend} if { req.ssl_sni -i ${route.hostname} }`,
   );
@@ -953,10 +952,11 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
     pooler: pooler ? { hostname: pooler.hostname, server: pooler.server, admits: pooler.admits } : null,
   };
   const files: Record<string, string> = {
-    "haproxy.cfg": renderConfig({ httpHostnames, routes, tcpRoutes, postgresRoutes, pooler }),
+    "haproxy.cfg": renderConfig({ httpHostnames, sniPorts, routes, tcpRoutes, postgresRoutes, pooler }),
     // PgBouncer is not a tailnet backend: the closed configuration keeps serving it without a lease.
     "haproxy.closed.cfg": renderConfig({
       httpHostnames,
+      sniPorts,
       routes: [],
       tcpRoutes: [],
       postgresRoutes: [],

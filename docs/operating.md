@@ -3,13 +3,55 @@
 ## Fresh install
 
 1. Install Docker and pin tools with `mise install`.
-2. Run `mise run host:install` to generate secrets, build the application images, migrate, and start the platform, pinned Stalwart engine, and Prometheus topology. Existing `.env` values are kept.
+2. On an Ubuntu VPS, follow [VPS hardening](#vps-hardening) to enroll the host and install the platform. For a local install, run `mise run host:install` to generate secrets, build the images, migrate, and start the platform, pinned Stalwart engine, and Prometheus. Existing `.env` values are kept.
 3. Open the printed setup URL over an SSH tunnel if the host is remote. The raw API bootstrap listener is bound only to `127.0.0.1:3000`; public administration is served only through the configured edge after domain and certificate reconciliation.
 4. Create the owner, enroll MFA, then run the domain wizard.
 5. Copy the generated DNS records, or publish the reviewed Cloudflare diff after MFA.
 6. Recheck until endpoints leave `awaiting_dns`. Incoming mail can become ready while SES stays paused.
 
 For local development, `mise run db:up` adds `infra/platform/docker-compose.dev.yml`, which binds the two PostgreSQL engines only on loopback ports 5433 and 5434. The production manifest has no host binding for either engine; public database access is exclusively through the TLS pooler profile and its separately enforced source policy.
+
+## VPS hardening
+
+1. Keep the provider console or rescue access working. Configure the [Tailscale Ubuntu package source](https://tailscale.com/kb/1347/installation) so the installer can install the host package. In the tailnet policy, declare `tag:ark-vps` and merge the owner-only grant for TCP 22 and the SSH rule in `check` mode from [Front door ACL](#tailnet-policy-snippet). Use the owner's untagged device for SSH.
+2. Create a one-off, pre-approved, non-ephemeral key tagged `tag:ark-vps`. Put it in a private file on the VPS with mode `0600`, then run the enrollment phase as root. After enrollment, remove the key file and revoke the key.
+
+   ```sh
+   sudo TS_VPS_AUTHKEY_FILE=/root/ark-vps-authkey mise run host:install --enroll-vps
+   ```
+
+3. From the owner's device, verify a new `tailscale ssh <user>@<vps-magicdns-name>` session and keep it open. From that session or the provider console, run the hardening phase. Set `ARK_MAIL_ENABLED=0` in `.env` if this install should run without Stalwart. The default maintenance window is 04:00 in the server's time zone. Set `ARK_HOST_REBOOT_TIME=HH:MM` in the installer environment or `.env` to change it.
+
+   ```sh
+   sudo mise run host:install --harden-vps
+   ```
+
+   This installs the `ark_host` nftables baseline before Docker starts at boot. Incoming connections are allowed on loopback and the host's `tailscale0`, and public traffic is limited to the enabled service ports. IP control traffic such as IPv6 neighbor discovery and path MTU discovery is allowed. The forward chain checks the original destination port of DNAT traffic, including Docker publications. The front policy still applies source restrictions and connection limits, and restores active raw and compatibility ports after a reboot. On an already hardened host, run subsequent installer updates as root.
+
+   The installer leaves Ubuntu's security update origin enabled and checks `unattended-upgrades --dry-run`. Prometheus raises `ArkHostRebootRequired` when the reboot-required flag persists for five minutes. The host refreshes the flag roughly every 30 seconds and the API exports it as `ark_host_reboot_required`.
+
+4. After confirming a new Tailscale SSH session works with the baseline active, remove public TCP 22 at the provider. Stop Ubuntu's legacy public OpenSSH listener or bind it to a private address before running the audit. Tailscale SSH is served by `tailscaled`. Use nftables for the Ark host firewall and remove conflicting UFW rules. Keep the provider's required ICMP and ICMPv6 allowances.
+
+### Provider firewall and audit
+
+Generate the inbound TCP and UDP rules from the VPS after the front policy has reconciled. Apply the generated `providerRules` to the VPS in your provider's firewall console or infrastructure configuration. The rules include both address families. Keep the provider firewall in sync when mail, shared SNI ports or raw/compatibility routes change.
+
+```sh
+sudo mise run host:audit --inventory > ark-host-inventory.json
+sudo mise run host:audit
+```
+
+The inventory covers 80, 443 and 5432, enabled SNI and dedicated route ports, and UDP 41641 and 41642. TCP 25, 465, 587 and 993 belong to Stalwart and appear only with mail enabled. The local audit checks the installed nftables baseline, `ss` and Docker port mappings. An unexpected public bind or publication fails even if the firewall has blocked it. The firewall-gated raw range reserved by `edge-ts` remains valid. The 5432 listener is served once a pooler endpoint or PostgreSQL route is active.
+
+Copy the inventory to the off-host heartbeat runner or another external machine with Nmap and IPv4 and IPv6 access to the VPS. Run the external check there with permission to send raw probes. Give it the VPS's public address literals.
+
+```sh
+sudo mise run host:audit --external ark-host-inventory.json <public-ipv4> <public-ipv6>
+```
+
+The probe scans every TCP port and samples UDP. Internet-enabled services must answer the TCP scan. A source-restricted raw route can be filtered from the runner's address. WireGuard can silently discard unauthenticated UDP probes, so Nmap may report its ports as `open|filtered`. The local audit checks the firewall and publications for those ports.
+
+`mise run test:host-hardening` runs against a disposable Ubuntu VPS, a separate scanner on its public test network, and the pinned Stalwart image in the VPS's own Docker daemon. For a real fresh scratch VPS, `mise run test:host-hardening-live` also verifies owner Tailscale SSH. Run it from an off-host machine with Nmap and Docker. Supply the public literals in `ARK_TEST_VPS_IPV4` and `ARK_TEST_VPS_IPV6`, an inventory export in `ARK_TEST_VPS_INVENTORY`, and the VPS's MagicDNS name and local username in `ARK_TEST_VPS_SSH_ADDRESS` and `ARK_TEST_VPS_SSH_USER`. Supply the scratch tailnet owner's login email in `ARK_TEST_VPS_TAILNET_OWNER` and an absolute path to the private state file of a disposable, untagged owner device in `ARK_TEST_VPS_TAILNET_STATE_FILE`. Stop that device's daemon before copying its state, and complete the SSH check-mode reauthentication on it before export. The live task skips unless all values are present.
 
 ## Public certificates
 
@@ -158,7 +200,7 @@ Two more route kinds use `edge-l4` (docs/design/front-door.md §3.8, FD-14). Cre
 
 **Revocation and disable.** A route's admission policy (CIDRs, limits, TLS mode, client CA and its revoked serials) is part of its lease identity and its HAProxy server names. Any policy change, a client certificate revocation, a disable or a delete therefore makes the running servers unauthorised. Within a second, the edge watchdog fences them and shuts their sessions down in every current and leaving worker, admission first; `edge.drain` does the same. `edge.l4_apply` then reloads the restricted generation. Other routes' sessions are untouched. Route CA CRLs are 14-day CRLs. `edge.l4_apply` regenerates any that are missing or have less than 7 days left, and `edge.observe` queues it when one is due. Revocation status, the regenerated CRL and durable apply/drain jobs commit atomically. The renderer uses one policy/material snapshot and refuses a CRL missing any committed revocation. Stale or malformed CRLs are refreshed regardless of expiry. Observation also restores missing or fenced L4 routes.
 
-**Shared SNI ports.** Select them at install time: set `ARK_EDGE_SNI_PORTS` (a comma-separated subset of 8883, 5671, 636, 6380) in `.env` or in the environment, then run `mise run host:install`. The installer writes one `ARK_EDGE_SNI_PORT_<n>=<n>:<n>` entry per enabled port, and the `edge-ts` port list publishes exactly those. A disabled port is published only on an ephemeral loopback port, where nothing listens. The API and domain worker read the same `ARK_EDGE_SNI_PORTS`. Changing the set recreates `edge-ts`; run `mise run edge:rejoin` afterwards. The raw range 20000–20049 is always published. A range port without an enabled route has no listener.
+**Shared SNI ports.** Select them at install time: set `ARK_EDGE_SNI_PORTS` (a comma-separated subset of 8883, 5671, 636, 6380) in `.env` or in the environment, then run `mise run host:install`. The installer writes one `ARK_EDGE_SNI_PORT_<n>=<n>:<n>` entry per enabled port, and the `edge-ts` port list publishes exactly those. HAProxy keeps the enabled frontends in both generations and rejects unmatched SNI. A disabled port is published only on an ephemeral loopback port, where nothing listens. The API and domain worker read the same `ARK_EDGE_SNI_PORTS`. Changing the set recreates `edge-ts`; run `mise run edge:rejoin` afterwards. The raw range 20000–20049 is always published. A range port without an enabled route has no listener.
 
 **Host nftables.** `renderFrontIngress` (`shared/src/front-nft.ts`) renders `inet ark_front`. TCP 80, 443 and the enabled SNI ports share a per-source budget of 256 concurrent connections and 50 new connections per second with a burst of 100. Set `ARK_FRONT_MAX_CONNECTIONS`, `ARK_FRONT_RATE_PER_SECOND` and `ARK_FRONT_RATE_BURST` in the platform environment to change it.
 

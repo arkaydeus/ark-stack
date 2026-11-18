@@ -43,6 +43,9 @@ async function fixture() {
     "install.ts",
     "install-edge-auth.ts",
     "install-edge-l4.ts",
+    "install-host-hardening.ts",
+    "install-mail-submission.ts",
+    "host-inventory.ts",
     "edge-namespace.ts",
     "pgbouncer-bootstrap.ts",
   ]) {
@@ -67,6 +70,11 @@ async function fixture() {
     join(directory, "bin/docker"),
     `#!${process.execPath}
 import { appendFileSync } from "node:fs";
+if (process.argv.includes("--config")) console.log(JSON.stringify({
+  methodResponses: [["x:NetworkListener/get", {
+    list: [{ protocol: "smtp", bind: { "[::]:587": true }, useTls: true, tlsImplicit: false }],
+  }, "op"]],
+}));
 if (process.argv.some((arg) => arg.includes("id -u"))) console.log(process.argv.some((arg) => arg.startsWith("haproxy:")) ? "99\\n---" : "1000\\n---");
 appendFileSync(process.env.INSTALL_CALLS, JSON.stringify({args:process.argv.slice(2), key:process.env.TS_EDGE_AUTHKEY}) + "\\n");
 `,
