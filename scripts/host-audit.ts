@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { join } from "node:path";
 
@@ -11,6 +10,7 @@ import {
   type HostPortConfig,
 } from "@ark-stack/shared";
 
+import { auditExternal, readExternalInventory } from "./host-audit-external.ts";
 import { appliedHostConfig } from "./host-inventory.ts";
 import { hostCommand } from "./install-host-hardening.ts";
 
@@ -25,12 +25,20 @@ type PublishedPort = {
 };
 
 function unbracket(address: string) {
-  return address.replace(/^\[(.*)\]$/, "$1").replace(/^::ffff:(?=\d+\.)/, "");
+  return address.replace(/^\[([^\]]+)\](%.*)?$/, "$1$2").replace(/^::ffff:(?=\d+\.)/, "");
 }
 
 function privateBind(address: string, tailnet: Set<string>) {
   const ip = unbracket(address).split("%")[0]!;
-  return ip === "::1" || ip.startsWith("127.") || tailnet.has(ip);
+  return ip === "::1" || (isIP(ip) === 4 && ip.startsWith("127.")) || tailnet.has(ip);
+}
+
+function dhcpClientSocket(protocol: Protocol, address: string, port: number, line: string) {
+  const ip = unbracket(address).split("%")[0]!;
+  const family = port === 68 ? 4 : port === 546 ? 6 : 0;
+  if (protocol !== "udp" || !family || (ip !== "*" && isIP(ip) !== family)) return false;
+  const owners = [...line.matchAll(/\("([^"]+)",pid=\d+,fd=\d+\)/g)];
+  return owners.length > 0 && owners.every(([, owner]) => /^(?:systemd-networkd?|dhclient)$/.test(owner!));
 }
 
 function endpoint(address: string, port: number) {
@@ -74,8 +82,15 @@ export function unexpectedPorts(
     const address = unbracket(match[2]!);
     const port = Number(match[3]);
     const dockerReservation =
-      protocol === "tcp" && /"(?:dockerd|docker-proxy)"/.test(line) && reserved.has(endpoint(address, port));
-    if (!privateBind(address, tailnet) && !expected[protocol].includes(port) && !dockerReservation) {
+      protocol === "tcp" &&
+      /"(?:dockerd|docker-proxy)"/.test(line) &&
+      (reserved.has(endpoint(address, port)) || (address === "*" && reserved.has(endpoint("::", port))));
+    if (
+      !privateBind(address, tailnet) &&
+      !expected[protocol].includes(port) &&
+      !dockerReservation &&
+      !dhcpClientSocket(protocol, address, port, line)
+    ) {
       problems.push(`Unexpected ${protocol.toUpperCase()} ${endpoint(address, port)} listening on the host.`);
     }
   }
@@ -140,68 +155,6 @@ export async function auditLocal(config: HostPortConfig) {
   assertHostFirewall(rules, config);
   const problems = unexpectedPorts(config, sockets, publications, tailnet);
   if (problems.length) throw new Error(problems.join("\n"));
-}
-
-async function nmapPorts(address: string, args: string[]) {
-  const output = await hostCommand("nmap", [
-    ...(isIP(address) === 6 ? ["-6"] : []),
-    "-n",
-    "-Pn",
-    "--max-retries",
-    "1",
-    "-oG",
-    "-",
-    ...args,
-    address,
-  ]);
-  if (!output.includes("1 host up")) throw new Error(`Nmap could not scan ${address}.`);
-  return [...output.matchAll(/(\d+)\/(open\|filtered|open|closed|filtered)\/(tcp|udp)\//g)].map((match) => ({
-    port: Number(match[1]),
-    state: match[2]!,
-  }));
-}
-
-export async function auditExternal(config: HostPortConfig, address: string) {
-  if (!isIP(address) || address.includes("%")) throw new Error("Provide an IPv4 or IPv6 address literal.");
-  const { tcp, udp } = publicHostPorts(config);
-  const restricted = new Map(config.routes?.map(({ port, policy }) => [port, policy]));
-  const privatePorts = [22, 2019, 3000, 15432];
-  // Probe the inventory at normal timing before the full-range scan. In particular,
-  // a flood of unanswered SYNs can delay unrelated replies on an IPv6 scan.
-  const tcpCheck = await nmapPorts(address, ["-sS", "-p", [...tcp, ...privatePorts].join(",")]);
-  const udpResults = await nmapPorts(address, ["-sU", "-p", [...udp, ...privatePorts].join(",")]);
-  const tcpSweep = await nmapPorts(address, ["-sS", "-p-", "--open", "--min-rate", "2000"]);
-  const openTcp = new Set(
-    [...tcpCheck, ...tcpSweep].filter(({ state }) => state === "open").map(({ port }) => port),
-  );
-  const unexpected = [...openTcp].filter(
-    (port) => !tcp.includes(port) || restricted.get(port) === "deny-all",
-  );
-  const missing = tcp.filter(
-    (port) => (restricted.get(port) ?? "internet") === "internet" && !openTcp.has(port),
-  );
-  const missingUdp = udp.filter(
-    (port) =>
-      !udpResults.some((entry) => entry.port === port && ["open", "open|filtered"].includes(entry.state)),
-  );
-  const unexpectedUdp = udpResults.filter(({ port, state }) => state === "open" && !udp.includes(port));
-  if (unexpected.length || missing.length || missingUdp.length || unexpectedUdp.length) {
-    throw new Error(
-      `${address} failed the external scan. Unexpected TCP ${unexpected.join(",") || "none"}, missing TCP ${missing.join(",") || "none"}, unexpected UDP ${unexpectedUdp.map(({ port }) => port).join(",") || "none"}, missing UDP ${missingUdp.join(",") || "none"}. UDP probe: ${udpResults.map(({ port, state }) => `${port} ${state}`).join(", ")}.`,
-    );
-  }
-  const udpSummary = udpResults
-    .filter(({ port }) => udp.includes(port))
-    .map(({ port, state }) => `${port} ${state}`);
-  console.log(
-    `${address} TCP open: ${[...openTcp].toSorted((a, b) => a - b).join(", ")}. UDP: ${udpSummary.join(", ")}.`,
-  );
-}
-
-export async function readExternalInventory(file: string) {
-  const { config } = JSON.parse(await readFile(file, "utf8")) as { config: HostPortConfig };
-  publicHostPorts(config);
-  return config;
 }
 
 async function main(args: string[]) {

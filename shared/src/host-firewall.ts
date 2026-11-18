@@ -76,6 +76,7 @@ function hostFirewallTable(config: HostPortConfig) {
     iifname "lo" accept
     iifname "tailscale0" accept
     meta l4proto { icmp, ipv6-icmp } accept
+    ip6 daddr fe80::/10 udp sport 547 udp dport 546 accept
     tcp dport @public_tcp accept
     udp dport @public_udp accept
   }

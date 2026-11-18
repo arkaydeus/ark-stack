@@ -85,7 +85,7 @@ export function verifyMaintenanceRelease(
   ) {
     throw new Error("Maintenance release image list does not match the exact Compose manifest.");
   }
-  return validated;
+  return { ...validated, serviceNames: Object.keys(document.services ?? {}) };
 }
 
 export function maintenanceArgv(project: string, file: string) {

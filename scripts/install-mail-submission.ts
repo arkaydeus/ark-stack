@@ -13,11 +13,12 @@ type Listener = {
 };
 
 export async function ensureMailSubmission(
-  exec: string[],
+  container: string,
   { user, password }: Credential,
   restart: () => Promise<unknown>,
 ) {
   if (!user || !password) throw new Error("Stalwart needs the installer recovery administrator credential.");
+  const exec = ["exec", "-i", container];
   async function jmap<T>(name: string, args: Record<string, unknown>) {
     // Stalwart already has curl for its health check. Keep the credential off the command line.
     const config = [
@@ -47,6 +48,30 @@ export async function ensureMailSubmission(
   ) {
     throw new Error("Stalwart port 587 must be configured as SMTP submission with STARTTLS.");
   }
+  const networks = JSON.parse(
+    await hostCommand("docker", ["inspect", "--format", "{{json .NetworkSettings.Networks}}", container]),
+  ) as Record<string, { IPAddress: string; GlobalIPv6Address: string }>;
+  const addresses = Object.values(networks)
+    .flatMap(({ IPAddress, GlobalIPv6Address }) => [IPAddress, GlobalIPv6Address])
+    .filter(Boolean)
+    .map((address) => (address.includes(":") ? `[${address}]` : address));
+  if (!addresses.length) throw new Error("Stalwart has no Docker network address for the TCP 587 check.");
+  const binds = new Set(
+    submission.flatMap(({ bind }) => Object.keys(bind).filter((key) => bind[key] && key.endsWith(":587"))),
+  );
+  if (
+    submission.length &&
+    addresses.some(
+      (address) =>
+        !binds.has("[::]:587") &&
+        !binds.has(`${address}:587`) &&
+        !(address.startsWith("[") === false && binds.has("0.0.0.0:587")),
+    )
+  ) {
+    throw new Error(
+      "Stalwart port 587 must bind its Docker network addresses. A loopback-only bind cannot serve the publication.",
+    );
+  }
   if (!submission.length) {
     const { created } = await jmap<{ created?: { submission?: { id: string } } }>("x:NetworkListener/set", {
       create: {
@@ -64,18 +89,24 @@ export async function ensureMailSubmission(
   }
 
   const probe = () =>
-    hostCommand("docker", [
-      ...exec,
-      "curl",
-      "-fsS",
-      "--max-time",
-      "5",
-      "--ssl-reqd",
-      "--insecure",
-      "--request",
-      "NOOP",
-      "smtp://127.0.0.1:587",
-    ]);
+    Promise.all(
+      addresses.map((address) =>
+        hostCommand("docker", [
+          ...exec,
+          "curl",
+          "-fsS",
+          "--noproxy",
+          "*",
+          "--max-time",
+          "5",
+          "--ssl-reqd",
+          "--insecure",
+          "--request",
+          "NOOP",
+          `smtp://${address}:587`,
+        ]),
+      ),
+    );
   if (
     submission.length &&
     (await probe().then(
@@ -97,13 +128,15 @@ export async function ensureMailSubmission(
       return;
     await Bun.sleep(250);
   } while (Date.now() < deadline);
-  throw new Error("Stalwart did not answer SMTP STARTTLS on port 587 after startup.");
+  throw new Error("Stalwart did not answer SMTP STARTTLS on its Docker network addresses on port 587.");
 }
 
 export async function startLocalMail(root: string, credential: Credential) {
   const compose = ["compose", "-f", join(root, "infra", "mail", "docker-compose.yml")];
   await hostCommand("docker", [...compose, "up", "-d", "--wait", "--wait-timeout", "120"]);
-  await ensureMailSubmission([...compose, "exec", "-T", "stalwart"], credential, () =>
+  const container = (await hostCommand("docker", [...compose, "ps", "-q", "stalwart"])).trim();
+  if (!container) throw new Error("Stalwart container not found after Compose startup.");
+  await ensureMailSubmission(container, credential, () =>
     hostCommand("docker", [...compose, "restart", "stalwart"]),
   );
 }

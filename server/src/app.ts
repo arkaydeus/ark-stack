@@ -1271,6 +1271,7 @@ app.post("/api/wizard", async (c) => {
     });
   }
   const input = wizardInput.parse(await c.req.json());
+  if (input.includeMail) requireMailEnabled();
   const ownershipToken = `ark-own-${createToken(16)}`;
   const plan = buildDomainPlan({
     baseDomain: input.baseDomain,
@@ -1660,10 +1661,17 @@ app.post("/api/databases", async (c) => {
   return c.json({ id, operationId: operation.id });
 });
 
+function requireMailEnabled() {
+  if (!mailEnabled(process.env.ARK_MAIL_ENABLED)) {
+    throw new HTTPException(503, { message: "Mail is disabled on this installation." });
+  }
+}
+
 app.post("/api/mailboxes", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const input = mailboxInput.parse(await c.req.json());
   requireDomain(access, input.domainId, "manage");
   const id = createId("mbx");
@@ -1683,6 +1691,7 @@ app.post("/api/aliases", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const input = aliasInput.parse(await c.req.json());
   requireDomain(access, input.domainId, "manage");
   const existing = await db.select().from(aliases);
@@ -1725,6 +1734,7 @@ app.patch("/api/aliases/:id", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const body = z
     .object({
       description: z.string().max(200).optional(),
@@ -1772,6 +1782,7 @@ app.patch("/api/aliases/:id", async (c) => {
 app.delete("/api/aliases/:id", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMailEnabled();
   const [alias] = await db
     .select()
     .from(aliases)
@@ -2645,6 +2656,7 @@ app.post("/api/databases/:id/clients/:clientId/rollover/confirm", async (c) => {
 app.get("/api/mail/queue", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMailEnabled();
   // Queue entries carry sender and recipient addresses for every tenant. Scope reads to the
   // domains the caller may view, matching the domain scoping the mutation route already does.
   const domainRows = await db.select().from(domainClaims);
@@ -2665,6 +2677,7 @@ app.post("/api/mail/queue", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const input = queueActionInput.parse(await c.req.json());
   const native = (await listMailQueue()).find((item) => item.id === input.item.id);
   if (!native) throw new HTTPException(404, { message: "Queue item not found." });
@@ -2698,6 +2711,7 @@ app.post("/api/mailboxes/:id/devices", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const input = deviceInput.parse(await c.req.json());
   const [mailbox] = await db
     .select()
@@ -2760,6 +2774,7 @@ app.post("/api/devices/:id/revoke", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const [device] = await db
     .select()
     .from(mailboxDevices)
@@ -3255,6 +3270,7 @@ app.post("/api/mail/reconcile", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const body = z.object({ mailboxId: z.string() }).parse(await c.req.json());
   const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, body.mailboxId));
   if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
@@ -3271,6 +3287,7 @@ app.post("/api/ses/reconcile", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const body = z.object({ domainId: z.string() }).parse(await c.req.json());
   requireDomain(access, body.domainId, "manage");
   const operation = await enqueue({
@@ -3285,6 +3302,7 @@ app.post("/api/mailboxes/:id/lifecycle", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const body = z
     .object({ lifecycle: z.enum(["active", "suspended", "retained", "purged"]) })
     .parse(await c.req.json());

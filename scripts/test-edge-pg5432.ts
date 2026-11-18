@@ -36,6 +36,7 @@
 // `ARK_EDGE_PG5432_ONLY=<text>` runs only the named tests whose name contains <text> (setup always runs).
 import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -881,6 +882,30 @@ const brief = (result: Result) =>
     ? result.stdout
     : `exit ${result.status}: ${result.stderr.split("\n").at(-1)?.slice(0, 160)}`;
 
+async function freshPostgresListener(report: Report) {
+  const port = await stack.hostPort(5432);
+  const result = await new Promise<{ connected: boolean; bytes: number }>((finish, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const attempt = { connected: false, bytes: 0 };
+    socket.setTimeout(3000, () => socket.destroy(new Error("Initial 5432 frontend did not reject.")));
+    socket.on("connect", () => {
+      attempt.connected = true;
+      socket.write(Buffer.from("0000000804d2162f", "hex"));
+    });
+    socket.on("data", (chunk) => (attempt.bytes += chunk.length));
+    socket.on("error", (error: NodeJS.ErrnoException) => {
+      if (!attempt.connected || error.code !== "ECONNRESET") reject(error);
+    });
+    socket.on("close", () => finish(attempt));
+  });
+  expect(
+    report,
+    result.connected && result.bytes === 0,
+    "the fresh Compose frontend accepts TCP and rejects SSLRequest",
+    `TCP handshake ${result.connected ? "completed" : "failed"}, ${result.bytes} response bytes`,
+  );
+}
+
 /** Connect and send nothing: HAProxy's 5 s inspect delay must close the connection. */
 async function idleClose(source: string) {
   const name = `ark-edge-pg-idle-${suffix}`;
@@ -1532,6 +1557,7 @@ try {
   await run("static Compose topology", staticComposeTest);
   await prepareFiles();
   await startContainers();
+  await run("fresh install with no database endpoint", freshPostgresListener);
   sourceIp.A = `${clientPrefix}.10`;
   sourceIp.B = `${clientPrefix}.11`;
   sourceIp.C = `${clientPrefix}.12`;

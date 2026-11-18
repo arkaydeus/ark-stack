@@ -13,6 +13,7 @@ import {
 } from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
+import { lockHostDeployment } from "./host-deployment-lock.ts";
 import { configureEdgeAuthKey } from "./install-edge-auth.ts";
 import { chownEdgeL4, composeImages, seedEdgeL4, verifyImageIds } from "./install-edge-l4.ts";
 import { appliedHostConfig } from "./host-inventory.ts";
@@ -34,6 +35,8 @@ if (flags.length === 1 && flags[0] === "--enroll-vps") {
 if (flags.length && (flags.length !== 1 || flags[0] !== "--harden-vps")) {
   throw new Error("Usage: host:install [--enroll-vps | --harden-vps]");
 }
+const useDocker = process.env.ARK_INSTALL_SKIP_DOCKER !== "1";
+if (useDocker) await lockHostDeployment(root);
 const hardened =
   flags[0] === "--harden-vps" ||
   (process.platform === "linux" &&
@@ -66,18 +69,30 @@ const edgeAuthKey = await configureEdgeAuthKey(envPath);
 const sni = applyEdgeSniPorts(await Bun.file(envPath).text(), process.env.ARK_EDGE_SNI_PORTS);
 const values = parseEnvFile(sni.env);
 const enableMail = mailEnabled(process.env.ARK_MAIL_ENABLED ?? values.ARK_MAIL_ENABLED);
+const compose = ["compose", "-f", "infra/platform/docker-compose.yml"];
+async function stopDisabledMail() {
+  if (!useDocker || enableMail) return;
+  // Stop the old firewall writer before changing the baseline and remove its old container
+  // configuration so that Docker cannot restart it with mail enabled after an interrupted install.
+  if (hardened) await run("docker", [...compose, "rm", "--stop", "--force", "database-ingress"]);
+  await run("docker", ["compose", "-f", "infra/mail/docker-compose.yml", "stop", "stalwart"]);
+  // Until the API is recreated with the new setting it can still accept mail mutations.
+  await run("docker", [...compose, "stop", "mail-worker", "api"]);
+}
 values.ARK_MAIL_ENABLED = enableMail ? "1" : "0";
 values.ARK_HOST_HARDENING = hardened ? "1" : "0";
 values.ARK_HOST_METRICS_SOURCE = hardened ? hostMetricsPath : "../../tmp/host-metrics";
 if (hardened) {
-  const config = await appliedHostConfig(root, values).catch((error) => {
-    console.warn(
-      `Could not reuse the previous front policy. Dedicated ports stay closed until reconciliation. ${String(error)}`,
-    );
-    return { mailEnabled: enableMail, sniPorts: sni.ports };
+  await installHostHardening(async () => {
+    await stopDisabledMail();
+    return appliedHostConfig(root, values).catch((error) => {
+      console.warn(
+        `Could not reuse the previous front policy. Dedicated ports stay closed until reconciliation. ${String(error)}`,
+      );
+      return { mailEnabled: enableMail, sniPorts: sni.ports };
+    });
   });
-  await installHostHardening(config);
-}
+} else await stopDisabledMail();
 await Bun.write(
   envPath,
   Object.entries(values)
@@ -185,7 +200,7 @@ if (process.platform === "linux" && process.getuid?.() === 0) {
   await chownEdgeL4(join(root, "tmp", "edge-l4"), containerUid);
 }
 
-if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
+if (useDocker) {
   // Numeric IDs, not names: HAProxy must be uid 99 and GID 4400 must be free in the pinned images.
   await verifyImageIds(
     composeImages(
@@ -198,14 +213,13 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
       run("docker", ["network", "create", network]),
     );
   }
-  const compose = ["compose", "-f", "infra/platform/docker-compose.yml"];
   await run("docker", [
     ...compose,
     "build",
     "api",
     "migrate",
     "database-worker",
-    "mail-worker",
+    ...(enableMail ? ["mail-worker"] : []),
     "domain-worker",
     "edge-watchdog",
     "haproxy-validator",
@@ -214,15 +228,11 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "database-ingress",
   ]);
   await run("docker", [...compose, "up", "-d", "postgres", "app-postgres"]);
-  const mail = ["compose", "-f", "infra/mail/docker-compose.yml"];
   if (enableMail) {
     await startLocalMail(root, {
       user: process.env.STALWART_ADMIN_ADDRESS ?? parsed.STALWART_ADMIN_ADDRESS,
       password: process.env.STALWART_ADMIN_PASSWORD ?? parsed.STALWART_ADMIN_PASSWORD,
     });
-  } else {
-    await run("docker", [...mail, "stop", "stalwart"]);
-    await run("docker", [...compose, "stop", "mail-worker"]);
   }
   await run("docker", [
     ...compose,

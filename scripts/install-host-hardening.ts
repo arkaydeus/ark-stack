@@ -69,10 +69,7 @@ export async function enrollVps() {
     if (state.BackendState === "Running") {
       throw new Error(`The running Tailscale node must use the host TUN interface and only ${ARK_VPS_TAG}.`);
     }
-    const keyFile = process.env.TS_VPS_AUTHKEY_FILE;
-    if (!keyFile?.startsWith("/") || ((await stat(keyFile)).mode & 0o077) !== 0) {
-      throw new Error(`Set TS_VPS_AUTHKEY_FILE to a private absolute key file for ${ARK_VPS_TAG}.`);
-    }
+    const keyFile = await vpsAuthKeyFile(process.env.TS_VPS_AUTHKEY_FILE);
     await hostCommand("tailscale", [
       "up",
       `--auth-key=file:${keyFile}`,
@@ -86,6 +83,17 @@ export async function enrollVps() {
   console.log("Verify Tailscale SSH as the owner before running host:install --harden-vps.");
 }
 
+export async function vpsAuthKeyFile(path: string | undefined) {
+  if (path?.startsWith("/")) {
+    const info = await stat(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+      return null;
+    });
+    if (info?.isFile() && (info.mode & 0o077) === 0) return path;
+  }
+  throw new Error(`Set TS_VPS_AUTHKEY_FILE to a private absolute key file for ${ARK_VPS_TAG}.`);
+}
+
 async function installFile(path: string, content: string) {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${crypto.randomUUID()}.tmp`;
@@ -97,11 +105,44 @@ export function automaticUpdatesConfig(rebootTime: string) {
   if (!/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/.test(rebootTime)) {
     throw new Error("ARK_HOST_REBOOT_TIME must be a 24-hour HH:MM value in the host time zone.");
   }
-  return `APT::Periodic::Update-Package-Lists "1";
+  return `APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "${rebootTime}";
 `;
+}
+
+function aptEnabled(value: string | undefined) {
+  return /^(?:1|true|yes|on|enable)$/i.test(value ?? "");
+}
+
+export function assertAutomaticUpdates(config: string, rebootTime: string, codename: string) {
+  const entries = [...config.matchAll(/^([\w:-]+) "([^"]*)";$/gm)];
+  const settings = new Map(entries.map(([, key, value]) => [key!, value!]));
+  const problems = [];
+  if (settings.has("APT::Periodic::Enable") && !aptEnabled(settings.get("APT::Periodic::Enable"))) {
+    problems.push("APT::Periodic::Enable must enable periodic updates");
+  }
+  for (const key of ["APT::Periodic::Update-Package-Lists", "APT::Periodic::Unattended-Upgrade"]) {
+    if (settings.get(key) !== "1") problems.push(`${key} must be 1 (daily)`);
+  }
+  if (!aptEnabled(settings.get("Unattended-Upgrade::Automatic-Reboot"))) {
+    problems.push("Unattended-Upgrade::Automatic-Reboot must be enabled");
+  }
+  if (settings.get("Unattended-Upgrade::Automatic-Reboot-Time") !== rebootTime) {
+    problems.push(`Unattended-Upgrade::Automatic-Reboot-Time must be ${rebootTime}`);
+  }
+  const security = `${codename}-security`;
+  const origins = entries
+    .filter(([, key]) => key?.startsWith("Unattended-Upgrade::Allowed-Origins::"))
+    .map(([, , value]) =>
+      value?.replaceAll("${distro_id}", "Ubuntu").replaceAll("${distro_codename}", codename),
+    );
+  if (!origins.includes(`Ubuntu:${security}`)) {
+    problems.push(`Unattended-Upgrade::Allowed-Origins must include Ubuntu:${security}`);
+  }
+  if (problems.length) throw new Error(`Effective apt configuration: ${problems.join(", ")}.`);
 }
 
 export function rebootMetricCommands(directory: string) {
@@ -120,7 +161,7 @@ export function rebootMetricCommands(directory: string) {
   ];
 }
 
-export async function installHostHardening(config: HostPortConfig) {
+export async function installHostHardening(getConfig: () => Promise<HostPortConfig>) {
   requireLinuxRoot();
   if (
     !vpsNodeReady(await tailscaleState()) ||
@@ -128,9 +169,13 @@ export async function installHostHardening(config: HostPortConfig) {
   ) {
     throw new Error("Run host:install --enroll-vps and verify owner Tailscale SSH first.");
   }
-  const updates = automaticUpdatesConfig(process.env.ARK_HOST_REBOOT_TIME ?? "04:00");
+  const rebootTime = process.env.ARK_HOST_REBOOT_TIME ?? "04:00";
+  const updates = automaticUpdatesConfig(rebootTime);
   await aptInstall(["nftables", "iproute2", "unattended-upgrades"]);
   await installFile("/etc/apt/apt.conf.d/52ark-unattended-upgrades", updates);
+  const codename = /^VERSION_CODENAME="?([a-z]+)"?$/m.exec(await Bun.file("/etc/os-release").text())?.[1];
+  if (!codename) throw new Error("Could not determine the Ubuntu release codename from /etc/os-release.");
+  assertAutomaticUpdates(await hostCommand("apt-config", ["dump"]), rebootTime, codename);
   await hostCommand("unattended-upgrades", ["--dry-run"]);
   await hostCommand("systemctl", ["enable", "--now", "apt-daily.timer", "apt-daily-upgrade.timer"]);
 
@@ -185,6 +230,7 @@ After=${firewallService}
 `,
   );
   // Boot starts with dedicated routes closed. The reconciler restores them with verified ark_front.
+  const config = await getConfig();
   const baseline = renderHostFirewall({ ...config, routes: [] });
   await hostCommand("nft", ["-c", "-f", "-"], baseline);
   await installFile(hostFirewallPath, baseline);

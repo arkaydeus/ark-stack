@@ -658,6 +658,15 @@ function renderPostgresRoute(route: PostgresRoute) {
  * is rejected. Without a published database there is no PgBouncer rule, so classic clients are rejected.
  */
 function renderPg5432Frontend(pooler: Pooler | null, routes: PostgresRoute[]) {
+  if (!pooler && !routes.length) {
+    // Keep the published port probeable through Docker even on the initial and closed generations.
+    return [
+      "frontend fe_pg5432",
+      `    bind :${POSTGRES_ROUTER_PORT}`,
+      "    tcp-request content reject",
+      "",
+    ].join("\n");
+  }
   const poolerRules = pooler
     ? [
         "    # Ark databases via PgBouncer: classic negotiation, or direct TLS for the DB hostname / no SNI.",
@@ -756,9 +765,8 @@ function renderConfig(input: {
     ),
   );
   const backends = input.routes.map(renderTlsRoute);
-  const pg5432 = Boolean(input.pooler || input.postgresRoutes.length);
   const reject =
-    sharedPorts.length || pg5432
+    sharedPorts.length || input.pooler || input.postgresRoutes.length
       ? ["backend be_reject", "    tcp-request content reject", ""].join("\n")
       : "";
   // PgBouncer is the only backend addressed by name: Docker's DNS on the pgbouncer-ingress network.
@@ -770,13 +778,11 @@ resolvers docker
     hold valid 10s
 `
     : "";
-  const postgres = pg5432
-    ? [
-        renderPg5432Frontend(input.pooler, input.postgresRoutes),
-        ...(input.pooler ? [renderPoolerBackend(input.pooler)] : []),
-        ...input.postgresRoutes.map(renderPostgresRoute),
-      ]
-    : [];
+  const postgres = [
+    renderPg5432Frontend(input.pooler, input.postgresRoutes),
+    ...(input.pooler ? [renderPoolerBackend(input.pooler)] : []),
+    ...input.postgresRoutes.map(renderPostgresRoute),
+  ];
   return `# Ark edge-l4 generation, rendered by edge.l4_apply (docs/design/front-door.md §3.8.5).
 # Immutable: edge.l4_apply writes a new generation, has it validated and swaps \`current\`.
 global

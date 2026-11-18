@@ -13,4 +13,5 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends op
 
 FROM scanner AS vps
 RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-     nftables iproute2 unattended-upgrades docker.io
+     nftables iproute2 unattended-upgrades docker.io docker-compose-v2 systemd-sysv dbus dnsmasq-base openssl \
+  && systemctl mask docker.service docker.socket
