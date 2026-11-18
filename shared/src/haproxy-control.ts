@@ -205,8 +205,9 @@ export class HaproxyMaster {
    * as succeeded only when every current worker is new since the request and reports the `expect`ed
    * content version in `show info`. Without `expect` (an unmarked configuration) nothing can prove
    * which configuration a new worker read, so the request is only sent again. Either way an unconfirmed
-   * request is sent again, up to `reloadAttempts` times with doubling backoff. An answered `Success=0` (an invalid configuration: the old workers
-   * keep serving) is returned at once and never retried or confirmed into a success.
+   * request is sent again, up to `reloadAttempts` times with doubling backoff. An answered `Success=0`
+   * (an invalid configuration: the old workers keep serving) is returned at once and never retried or
+   * confirmed into a success.
    */
   async reload(options: { expect?: string | null; timeoutMs?: number } = {}): Promise<ReloadOutcome> {
     const release = this.options.lock

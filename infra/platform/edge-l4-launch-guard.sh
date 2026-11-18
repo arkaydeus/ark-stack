@@ -51,6 +51,8 @@ point() {
   ln -s "$1" "$link.next"
   mv -f "$link.next" "$link"
 }
+# The worker derives the same path from its master socket (haproxyReloadLockPath); the override is for
+# scripts/edge-l4-guard.test.ts, which runs this script on the host.
 reload_lock="${ARK_HAPROXY_RELOAD_LOCK:-${master%/*}/reload.lock}"
 # Prints the master's answer to `reload`, sent under the reload lock. With an argument, the launch link
 # is first pointed at it inside the same lock. Waits at most 60 s for the lock (another reloader holds
