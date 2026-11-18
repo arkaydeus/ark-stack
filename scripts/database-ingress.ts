@@ -21,6 +21,7 @@ import {
   parseNftCounters,
   parseSniPorts,
   preserveDbIngressGenerations,
+  hostPublicIpv6Addresses,
   renderHostFirewall,
   sha256Hex,
   type IngressCounterSnapshot,
@@ -327,6 +328,8 @@ async function exportCounters() {
   if (exporting) return;
   exporting = true;
   try {
+    const addresses = hostPublicIpv6Addresses();
+    await publish(join(metricsDir, "ipv6-host.json"), JSON.stringify({ at: Date.now(), addresses }));
     const [dbSample, frontSample] = await Promise.all([
       scrapeCounters(DB_INGRESS_TABLE),
       frontDir ? scrapeCounters(FRONT_TABLE) : undefined,

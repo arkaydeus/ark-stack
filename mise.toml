@@ -40,6 +40,14 @@ description = "Run the DB-backed server tests (or the bun test arguments given) 
 run = "bun --no-env-file scripts/test-db.ts"
 raw_args = true
 
+[tasks."test:ipv6-preflight"]
+description = "Run FD-27 on isolated IPv4-only and dual-stack Docker networks with a disposable VPS, PostgreSQL and Pebble"
+run = "mise run test:db scripts/ipv6-preflight-test/preflight.test.ts"
+
+[tasks."test:ipv6-preflight-live"]
+description = "Opt-in IPv6 preflight against a scratch VPS and HTTP-01 against Let's Encrypt staging"
+run = "bun --no-env-file scripts/test-ipv6-preflight-live.ts"
+
 [tasks."test:db:up"]
 description = "Start and migrate a throwaway test PostgreSQL container and print shell exports plus an isolated ark_test_db test helper"
 run = "bun --no-env-file scripts/test-db.ts up"

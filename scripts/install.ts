@@ -14,6 +14,16 @@ import {
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
 import { lockHostDeployment } from "./host-deployment-lock.ts";
+import {
+  configureDockerIpv6,
+  dockerIpv6EvidenceDir,
+  installIpv6Observer,
+  migratePublishedNetwork,
+  publicationPredatesDaemonConfig,
+  readDockerDaemonConfig,
+  verifyOtherIpv6Publications,
+  verifyPublishedNetwork,
+} from "./install-docker-ipv6.ts";
 import { configureEdgeAuthKey } from "./install-edge-auth.ts";
 import { chownEdgeL4, composeImages, seedEdgeL4, verifyImageIds } from "./install-edge-l4.ts";
 import { appliedHostConfig } from "./host-inventory.ts";
@@ -21,6 +31,7 @@ import {
   enrollVps,
   hostFirewallPath,
   hostMetricsPath,
+  hostCommand,
   installHostHardening,
 } from "./install-host-hardening.ts";
 import { startLocalMail } from "./install-mail-submission.ts";
@@ -70,6 +81,19 @@ const sni = applyEdgeSniPorts(await Bun.file(envPath).text(), process.env.ARK_ED
 const values = parseEnvFile(sni.env);
 const enableMail = mailEnabled(process.env.ARK_MAIL_ENABLED ?? values.ARK_MAIL_ENABLED);
 const compose = ["compose", "-f", "infra/platform/docker-compose.yml"];
+const edgeNetwork = {
+  project: "ark-platform",
+  network: "admin",
+  service: "edge-ts",
+  compose,
+  dependents: ["edge", "edge-l4"],
+};
+const mailNetwork = {
+  project: "ark-mail",
+  network: "mail-public",
+  service: "stalwart",
+  compose: ["compose", "-f", "infra/mail/docker-compose.yml"],
+};
 async function stopDisabledMail() {
   if (!useDocker || enableMail) return;
   // Stop the old firewall writer before changing the baseline and remove its old container
@@ -82,6 +106,7 @@ async function stopDisabledMail() {
 values.ARK_MAIL_ENABLED = enableMail ? "1" : "0";
 values.ARK_HOST_HARDENING = hardened ? "1" : "0";
 values.ARK_HOST_METRICS_SOURCE = hardened ? hostMetricsPath : "../../tmp/host-metrics";
+values.ARK_IPV6_DOCKER_SOURCE = hardened ? dockerIpv6EvidenceDir : "../../tmp/ipv6";
 if (hardened) {
   await installHostHardening(async () => {
     await stopDisabledMail();
@@ -104,6 +129,7 @@ for (const key of [
   "ARK_MAIL_ENABLED",
   "ARK_HOST_HARDENING",
   "ARK_HOST_METRICS_SOURCE",
+  "ARK_IPV6_DOCKER_SOURCE",
   "ARK_EDGE_SNI_PORTS",
   ...SHARED_SNI_PORTS.map((port) => `ARK_EDGE_SNI_PORT_${port}`),
 ]) {
@@ -122,6 +148,7 @@ for (const path of [
   "edge-l4",
   "mail-state",
   "host-metrics",
+  "ipv6",
 ]) {
   await mkdir(join(root, "tmp", path), { recursive: true });
 }
@@ -227,6 +254,38 @@ if (useDocker) {
     "agent",
     "database-ingress",
   ]);
+  // The optional admin profile shares the old network. Remember its live services across retries
+  // so replacing the bridge or restarting Docker cannot strand a tailnet admin installation.
+  const tailnetRestorePath = join(root, "tmp", "ipv6", "tailnet-restore");
+  const tailnetLabels = await hostCommand("docker", [
+    "ps",
+    "--filter",
+    "label=com.docker.compose.project=ark-platform",
+    "--format",
+    '{{.Label "com.docker.compose.service"}}',
+  ]);
+  const previousTailnet = existsSync(tailnetRestorePath) ? await Bun.file(tailnetRestorePath).text() : "";
+  const tailnetServices = [
+    ...new Set(
+      (tailnetLabels + "\n" + previousTailnet)
+        .split("\n")
+        .filter((service) => service === "tailscale" || service === "tailnet-gateway"),
+    ),
+  ];
+  const tailnetCompose = [...compose, "--profile", "tailnet"];
+  if (tailnetServices.length) await Bun.write(tailnetRestorePath, tailnetServices.join("\n"));
+  // Preserve IPv6-to-IPv4 proxying until the published containers have dual-stack endpoints.
+  if (hardened) await configureDockerIpv6(false);
+  await migratePublishedNetwork(
+    tailnetServices.length
+      ? {
+          ...edgeNetwork,
+          compose: tailnetCompose,
+          dependents: [...edgeNetwork.dependents, "tailnet-gateway", "tailscale"],
+        }
+      : edgeNetwork,
+  );
+  if (enableMail) await migratePublishedNetwork(mailNetwork);
   await run("docker", [...compose, "up", "-d", "postgres", "app-postgres"]);
   if (enableMail) {
     await startLocalMail(root, {
@@ -273,11 +332,60 @@ if (useDocker) {
     "pgbouncer-public",
     "database-ingress",
   ]);
+  if (tailnetServices.length) {
+    await run("docker", [
+      ...tailnetCompose,
+      "up",
+      "-d",
+      "--wait",
+      "--wait-timeout",
+      "120",
+      ...tailnetServices,
+    ]);
+    await rm(tailnetRestorePath, { force: true });
+  }
+  if (hardened) {
+    const edgeId = await verifyPublishedNetwork(edgeNetwork);
+    const mailId = enableMail ? await verifyPublishedNetwork(mailNetwork) : null;
+    if ((await readDockerDaemonConfig()).config["userland-proxy"] !== false)
+      await verifyOtherIpv6Publications();
+    await configureDockerIpv6(true);
+    // Live-restore can retain old publications. Recreate those made before the daemon transition.
+    if (await publicationPredatesDaemonConfig(edgeId)) {
+      await run("docker", [...compose, "rm", "--stop", "--force", "edge", "edge-l4", "edge-ts"]);
+      await run("docker", [
+        ...compose,
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "120",
+        "edge-ts",
+        "edge",
+        "edge-l4",
+      ]);
+    }
+    if (mailId && (await publicationPredatesDaemonConfig(mailId))) {
+      await run("docker", [
+        ...mailNetwork.compose,
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "120",
+        "--force-recreate",
+        "stalwart",
+      ]);
+    }
+    await verifyPublishedNetwork(edgeNetwork);
+    if (enableMail) await verifyPublishedNetwork(mailNetwork);
+  }
   // A re-run that restarted edge-ts in place would otherwise leave edge and edge-l4 in its old namespace.
   await rejoinNamespaceDependents({
     project: "ark-platform",
     composeArgs: ["-f", join(root, "infra/platform/docker-compose.yml"), "-p", "ark-platform"],
   });
+  if (hardened) await installIpv6Observer(root);
   await run("docker", [
     "compose",
     "-f",

@@ -605,7 +605,7 @@ function renderTcpRoute(route: TcpRoute) {
     `${L4_TAILNET_ROUTE_MARKER} ${route.id} ${route.target}`,
     `# ${route.id} ${route.hostname}:${route.listenPort} -> ${route.target} (StableID ${route.stableId}), plain`,
     `frontend ${route.frontend}`,
-    `    bind :${route.listenPort}`,
+    `    bind :::${route.listenPort} v4v6`,
     // One slot of headroom so admission refuses the excess connection instead of queueing it.
     `    maxconn ${route.limits.maxConn + 1}`,
     ...admissionRules(route),
@@ -628,7 +628,7 @@ function renderPostgresRoute(route: PostgresRoute) {
         `# ---- ${route.compat.listenPort}: compatibility port for ${route.id} (classic SSLRequest, raw TCP) ----`,
         "# Off by default. The target answers SSLRequest and terminates TLS itself; admission is the route's.",
         `frontend ${route.compat.frontend}`,
-        `    bind :${route.compat.listenPort}`,
+        `    bind :::${route.compat.listenPort} v4v6`,
         `    maxconn ${route.limits.maxConn + 1}`,
         ...admissionRules(route),
         `    default_backend ${route.compat.backend}`,
@@ -683,7 +683,7 @@ function renderPg5432Frontend(pooler: Pooler | null, routes: PostgresRoute[]) {
     // Keep the published port probeable through Docker even on the initial and closed generations.
     return [
       "frontend fe_pg5432",
-      `    bind :${POSTGRES_ROUTER_PORT}`,
+      `    bind :::${POSTGRES_ROUTER_PORT} v4v6`,
       "    tcp-request content reject",
       "",
     ].join("\n");
@@ -710,7 +710,7 @@ function renderPg5432Frontend(pooler: Pooler | null, routes: PostgresRoute[]) {
   return [
     `# ---- ${POSTGRES_ROUTER_PORT}: PostgreSQL router ----------------------------------------------`,
     "frontend fe_pg5432",
-    `    bind :${POSTGRES_ROUTER_PORT}`,
+    `    bind :::${POSTGRES_ROUTER_PORT} v4v6`,
     "    maxconn 2000",
     "    tcp-request inspect-delay 5s",
     "    acl pg_ssl_request req.payload(0,8) -m bin 0000000804d2162f",
@@ -744,7 +744,7 @@ function renderSniFrontend(port: number, routes: TlsRoute[]) {
   return [
     `# ---- ${port}: shared SNI port ${"-".repeat(56)}`,
     `frontend fe_tls${port}`,
-    `    bind :${port}`,
+    `    bind :::${port} v4v6`,
     "    maxconn 2000",
     "    tcp-request inspect-delay 5s",
     "    stick-table type ipv6 size 100k expire 10m store conn_cur,conn_rate(10s)",
@@ -846,7 +846,7 @@ defaults
 ${resolvers}
 # ---- 443: SNI router -------------------------------------------------------
 frontend fe_tls443
-    bind :443
+    bind :::443 v4v6
     maxconn 2000
     tcp-request inspect-delay 5s
     stick-table type ipv6 size 100k expire 10m store conn_cur,conn_rate(10s)

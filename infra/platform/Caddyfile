@@ -3,6 +3,9 @@
 }
 
 :80 {
+  log
+  @otherRequests not path /.well-known/ark-ipv6-preflight/*
+  log_skip @otherRequests
   @challenge path /.well-known/acme-challenge/*
   handle @challenge {
     root * /var/lib/ark/acme

@@ -1,7 +1,9 @@
-import { secureEqual } from "@ark-stack/shared";
+import { IPV6_PREFLIGHT_HTTP_PATH, secureEqual } from "@ark-stack/shared";
+import { join } from "node:path";
 import { runWorker } from "./runtime.ts";
 import {
   executeClaimedJob,
+  enqueue,
   scheduleDnsMaintenance,
   scheduleEdgeObserve,
 } from "../../server/src/coordinator.ts";
@@ -64,6 +66,16 @@ if (import.meta.main) {
   const observeSchedule = scheduleEdgeObserve();
   const dnsSchedule = scheduleDnsMaintenance();
   try {
+    const edgeDir = process.env.ARK_EDGE_DIR;
+    if (edgeDir && process.env.ARK_IPV6_HOST_SNAPSHOT) {
+      // An existing generation predates the HTTP source logging added alongside native IPv6.
+      const active = await Bun.file(join(edgeDir, "Caddyfile"))
+        .text()
+        .catch(() => "");
+      if (!active.includes(IPV6_PREFLIGHT_HTTP_PATH)) {
+        await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
+      }
+    }
     await runDomainJobs();
   } finally {
     if (observeSchedule) clearInterval(observeSchedule);

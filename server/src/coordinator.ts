@@ -49,6 +49,12 @@ import { and, desc, eq, isNotNull, isNull, like, or, sql as drizzleSql } from "d
 
 import { db, sql, type DbTransaction } from "./db.ts";
 import { withPgbouncerLock } from "./modules/pgbouncer-lock.ts";
+import {
+  ipv6PreflightDue,
+  ipv6PreflightKey,
+  ipv6PreflightKind,
+  runIpv6Preflight,
+} from "./modules/ipv6-preflight.ts";
 import { loadEnv } from "./env.ts";
 import { canonicalHost, currentLoginHost, isAdminHost, refreshLoginHost } from "./origin-hosts.ts";
 import { evaluateAlerts, raiseAlert, resolveAlert } from "./modules/alerts.ts";
@@ -604,6 +610,7 @@ export async function runOperation(
   await assertExecutionAuthorized(operation);
   if (kind === "integration.vercel_push") return runtime.vercelPush(operation);
   if (kind === "domain.verify") return verifyDomain(operation);
+  if (kind === ipv6PreflightKind) return runIpv6Preflight(operation);
   if (kind === "certificate.issue" || kind === "certificate.renew") return issueCertificate(operation);
   if (kind === "database.provision") return provisionDatabase(operation);
   if (kind === "database.query") return queryDatabase(operation);
@@ -1855,6 +1862,9 @@ export async function runDnsMaintenance() {
       payload: { routeEndpointsOnly, scheduledDns: true },
       idempotencyKey: "dns.maintenance:" + domainId,
     });
+  }
+  if (await ipv6PreflightDue()) {
+    await enqueue({ kind: ipv6PreflightKind, targetIds: ["platform"], idempotencyKey: ipv6PreflightKey });
   }
 }
 

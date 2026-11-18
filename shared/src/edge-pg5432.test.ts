@@ -55,7 +55,7 @@ describe("fe_pg5432 (§3.8.5)", () => {
   test("classic SSLRequest, GSSENC and Cancel go to PgBouncer; direct TLS by SNI; everything else rejected", () => {
     expect(section(config, "frontend fe_pg5432").split("\n")).toEqual([
       "frontend fe_pg5432",
-      "    bind :5432",
+      "    bind :::5432 v4v6",
       "    maxconn 2000",
       "    tcp-request inspect-delay 5s",
       "    acl pg_ssl_request req.payload(0,8) -m bin 0000000804d2162f",
@@ -122,7 +122,7 @@ describe("fe_pg5432 (§3.8.5)", () => {
     const empty = renderEdgeL4Generation({ httpHostnames: [] });
     for (const withoutBackend of [empty.files["haproxy.cfg"]!, routesOnly.files["haproxy.closed.cfg"]!]) {
       expect(section(withoutBackend, "frontend fe_pg5432").trimEnd()).toBe(
-        "frontend fe_pg5432\n    bind :5432\n    tcp-request content reject",
+        "frontend fe_pg5432\n    bind :::5432 v4v6\n    tcp-request content reject",
       );
     }
   });
@@ -201,7 +201,7 @@ describe("fe_pg5432 (§3.8.5)", () => {
       postgresRoutes: [{ ...pgHome, compatPort: 20007 }],
     });
     const frontend = section(compat.files["haproxy.cfg"]!, "frontend fe_rt_pg01_compat");
-    expect(frontend).toContain("    bind :20007");
+    expect(frontend).toContain("    bind :::20007 v4v6");
     expect(frontend).toContain("    tcp-request content reject if !{ src -f allow/rt_pg01.lst }");
     expect(frontend).toContain("    default_backend be_rt_pg01_compat");
     expect(section(compat.files["haproxy.cfg"]!, "backend be_rt_pg01_compat")).toContain(

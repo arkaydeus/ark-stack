@@ -34,6 +34,8 @@ Useful commands:
 | `mise run test:stalwart`             | disposable native Stalwart lifecycle test   |
 | `mise run test:edge`                 | Caddy, HAProxy, observer and harness tests  |
 | `mise run test:edge-tailnet`         | opt-in edge node checks on a real tailnet   |
+| `mise run test:ipv6-preflight`       | dual-stack Docker, AAAA and Pebble          |
+| `mise run test:ipv6-preflight-live`  | opt-in scratch VPS and ACME staging         |
 | `mise run edge:rejoin`               | put `edge` and `edge-l4` back in `edge-ts`  |
 | `mise run test:backups-tailnet`      | home-machine backups via backup-ts (Docker) |
 | `mise run test:backups-tailnet-live` | opt-in home backup on a real tailnet        |
