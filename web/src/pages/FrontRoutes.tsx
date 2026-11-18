@@ -2,14 +2,16 @@
 // route with its listener, TLS mode and who it admits, and explains which protocols can be routed by
 // name (TLS from the first byte, on 443 or a shared SNI port) and which need a dedicated raw port.
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import type { FrontListeners, FrontRouteSummary, PlatformState } from "@/lib/types";
 import { api } from "@/lib/utils";
 
 import { InlineError } from "./Auth";
+import { DnsReviewPanel } from "./DnsReview";
 
 const KIND_LABEL: Record<string, string> = {
   http: "HTTP route (443)",
@@ -26,10 +28,11 @@ function admitsBadge(route: FrontRouteSummary) {
 }
 
 /** Loads once per mount; App remounts it (by key) when the platform's operation list changes. */
-export function FrontRoutesView(_props: { state: PlatformState }) {
+export function FrontRoutesView({ state }: { state: PlatformState }) {
   const [routes, setRoutes] = useState<FrontRouteSummary[] | null>(null);
   const [listeners, setListeners] = useState<FrontListeners | null>(null);
   const [error, setError] = useState("");
+  const [openDns, setOpenDns] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -73,19 +76,39 @@ export function FrontRoutesView(_props: { state: PlatformState }) {
           </div>
           {routes?.length === 0 && <p className="empty-state">No routes yet.</p>}
           {routes?.map((route) => (
-            <div className="table-row grid-cols-[1.4fr_1fr_0.6fr_0.9fr_1fr_auto]" key={route.id}>
-              <strong className="truncate">{route.hostname}</strong>
-              <span>{KIND_LABEL[route.kind] ?? route.kind}</span>
-              <span className="mono">{route.listenPort}</span>
-              <span className="mono">{route.l4?.tlsMode ?? route.accessMode ?? "-"}</span>
-              <span>{admitsBadge(route) ?? <span className="text-muted-foreground">-</span>}</span>
-              <span className="flex gap-2">
-                <Badge variant={route.enabled ? "success" : "neutral"}>
-                  {route.enabled ? "enabled" : "disabled"}
-                </Badge>
-                <Badge variant={route.status === "ready" ? "success" : "warning"}>{route.status}</Badge>
-              </span>
-            </div>
+            <Fragment key={route.id}>
+              <div className="table-row grid-cols-[1.4fr_1fr_0.6fr_0.9fr_1fr_auto]">
+                <strong className="truncate">{route.hostname}</strong>
+                <span>{KIND_LABEL[route.kind] ?? route.kind}</span>
+                <span className="mono">{route.listenPort}</span>
+                <span className="mono">{route.l4?.tlsMode ?? route.accessMode ?? "-"}</span>
+                <span>{admitsBadge(route) ?? <span className="text-muted-foreground">-</span>}</span>
+                <span className="flex flex-wrap items-center gap-2">
+                  <Badge variant={route.enabled ? "success" : "neutral"}>
+                    {route.enabled ? "enabled" : "disabled"}
+                  </Badge>
+                  <Badge variant={route.status === "ready" ? "success" : "warning"}>{route.status}</Badge>
+                  {route.domain && state.user.role !== "viewer" && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-expanded={openDns === route.id}
+                      onClick={() => setOpenDns(openDns === route.id ? null : route.id)}
+                    >
+                      DNS
+                    </Button>
+                  )}
+                </span>
+              </div>
+              {openDns === route.id && (
+                <div className="border-t border-border p-4">
+                  <DnsReviewPanel
+                    reviewPath={"/api/front/routes/" + route.id + "/dns"}
+                    owner={state.user.role === "owner"}
+                  />
+                </div>
+              )}
+            </Fragment>
           ))}
         </CardContent>
       </Card>

@@ -54,9 +54,17 @@ export const wizardInput = z.object({
 
 export const domainInput = z.object({
   name: hostname,
+  dnsProvider: dnsProvider.default("manual"),
   mailFrom: hostname.optional(),
   dmarcPolicy: z.enum(["none", "quarantine", "reject"]).default("none"),
 });
+
+export const dnsPublishInput = z
+  .object({
+    planHash: z.string().regex(/^[a-f0-9]{64}$/),
+    authorizeAAAAWithdrawal: z.literal(true).optional(),
+  })
+  .strict();
 
 export const mailboxInput = z.object({
   domainId: z.string().min(1),

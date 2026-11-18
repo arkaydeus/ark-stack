@@ -89,7 +89,7 @@ export function Wizard({ onDone }: { onDone: () => Promise<void> }) {
               </label>
               <select id="dnsProvider" name="dnsProvider" className="select">
                 <option value="manual">Manual / other</option>
-                <option value="cloudflare">Cloudflare (optional automation later)</option>
+                <option value="cloudflare">Cloudflare (publish after review)</option>
               </select>
             </div>
           </CardContent>

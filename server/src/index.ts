@@ -22,7 +22,15 @@ if (process.env.ARK_SKIP_LISTEN !== "1") {
   }
   Bun.serve({
     port: env.listenPort,
-    fetch: app.fetch,
+    fetch(request, server) {
+      const path = new URL(request.url).pathname;
+      // The reviewed DNS response covers live provider reads and writes. Keep its HTTP
+      // connection open for the domain worker request's bounded timeout.
+      if (/^\/api\/(?:domains\/[^/]+\/(?:dns|publish)|front\/routes\/[^/]+\/dns)$/.test(path)) {
+        server.timeout(request, 60);
+      }
+      return app.fetch(request);
+    },
   });
   console.log(`Ark Stack API listening on ${env.listenPort}`);
 }

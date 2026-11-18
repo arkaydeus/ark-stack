@@ -9,6 +9,7 @@ import { act, api, formatDate } from "@/lib/utils";
 
 import { InlineError } from "./Auth";
 import { BackupTargetsPanel } from "./BackupTargets";
+import { DnsReviewPanel } from "./DnsReview";
 
 export function Overview({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
   return (
@@ -126,6 +127,7 @@ function Metric({ label, value, detail }: { label: string; value: number; detail
 }
 
 export function DomainsView({ state, reload }: { state: PlatformState; reload: () => Promise<void> }) {
+  const [openReview, setOpenReview] = useState<string | null>(null);
   return (
     <div className="space-y-5">
       {state.domains.map((domain) => (
@@ -134,45 +136,44 @@ export function DomainsView({ state, reload }: { state: PlatformState; reload: (
             <div>
               <CardTitle>{domain.name}</CardTitle>
               <CardDescription>
-                Ownership token is installation-bound. Copy records into the DNS provider.
+                Review the records for this domain and check public DNS before certificates are requested.
               </CardDescription>
             </div>
             <div className="flex items-center gap-2">
               <Badge variant={statusVariant(domain.status)}>{domain.status}</Badge>
-              <Button
-                size="sm"
-                onClick={() =>
-                  act(api(`/api/domains/${domain.id}/verify`, { method: "POST", body: "{}" }), reload)
-                }
-              >
-                Recheck DNS
-              </Button>
-              {state.providers?.cloudflare && (
+              {state.user.role !== "viewer" && (
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={() =>
-                    act(api(`/api/domains/${domain.id}/publish`, { method: "POST", body: "{}" }), reload)
-                  }
+                  aria-expanded={openReview === domain.id}
+                  onClick={() => setOpenReview(openReview === domain.id ? null : domain.id)}
                 >
-                  Publish reviewed DNS
+                  {openReview === domain.id ? "Close DNS review" : "Review DNS"}
                 </Button>
               )}
             </div>
           </CardHeader>
           <CardContent className="space-y-3">
-            {domain.records.map((record) => (
-              <div className="rounded-lg border border-border p-3 text-sm" key={record.id}>
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="mono">
-                    {record.type} {record.relativeName}
-                  </span>
-                  <Badge variant={statusVariant(record.status)}>{record.status}</Badge>
+            {openReview === domain.id ? (
+              <DnsReviewPanel
+                reviewPath={"/api/domains/" + domain.id + "/dns"}
+                owner={state.user.role === "owner"}
+                reload={reload}
+              />
+            ) : (
+              domain.records.map((record) => (
+                <div className="rounded-lg border border-border p-3 text-sm" key={record.id}>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="mono">
+                      {record.type} {record.relativeName}
+                    </span>
+                    <Badge variant={statusVariant(record.status)}>{record.status}</Badge>
+                  </div>
+                  <p className="mt-1 text-muted-foreground">{record.purpose}</p>
+                  <code className="mt-2 block break-all text-xs">{record.expectedValue}</code>
                 </div>
-                <p className="mt-1 text-muted-foreground">{record.purpose}</p>
-                <code className="mt-2 block break-all text-xs">{record.expectedValue}</code>
-              </div>
-            ))}
+              ))
+            )}
           </CardContent>
         </Card>
       ))}

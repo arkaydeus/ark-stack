@@ -2,7 +2,25 @@ import { describe, expect, test } from "bun:test";
 
 import { buildDomainPlan, dnsRecordVerified, mergeSpf } from "./dns-plan.ts";
 
+const aaaa = (plan: ReturnType<typeof buildDomainPlan>) =>
+  plan.records.filter((record) => record.type === "AAAA");
+
 describe("DNS plan", () => {
+  test("initial domain plans withhold IPv6 until preflight passes and the toggle is on", () => {
+    const input = {
+      baseDomain: "example.com",
+      publicIpv4: "203.0.113.10",
+      publicIpv6: "2001:db8::10",
+      adminMode: "public" as const,
+      ownershipToken: "ark-own-test",
+      includeDatabase: true,
+      includeMail: true,
+    };
+    expect(aaaa(buildDomainPlan(input))).toHaveLength(0);
+    expect(aaaa(buildDomainPlan({ ...input, ipv6Status: "passed", aaaaEnabled: false }))).toHaveLength(0);
+    expect(aaaa(buildDomainPlan({ ...input, ipv6Status: "passed" }))).toHaveLength(3);
+  });
+
   test("emits ownership, database, mail, and public admin records", () => {
     const plan = buildDomainPlan({
       baseDomain: "example.com",

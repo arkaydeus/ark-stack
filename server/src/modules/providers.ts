@@ -6,8 +6,6 @@ import { promisify } from "node:util";
 
 import {
   buildStalwartPlan,
-  chooseCloudflareMutation,
-  cloudflareRecordBody,
   compareInventory,
   digestFromHeaders,
   caddyState,
@@ -29,7 +27,6 @@ import {
   signAwsRequest,
   stalwartRef,
   type DbIngressLimits,
-  type DnsWrite,
   type EdgeAppRoute,
   type EdgeHttpRoute,
   type ExternalInventory,
@@ -99,46 +96,6 @@ export async function reconcileSes(domain: string, mailFrom: string) {
       mailFromStatus: identityBody.MailFromAttributes?.MailFromDomainStatus ?? "unknown",
     },
   };
-}
-
-export async function publishCloudflare(zone: string, records: DnsWrite[]) {
-  const token = process.env.DNS_API_TOKEN ?? process.env.CLOUDFLARE_API_TOKEN ?? "";
-  if (!token) return { published: false, reason: "manual" as const, records };
-  const zoneRes = await fetch(
-    `https://api.cloudflare.com/client/v4/zones?name=${encodeURIComponent(zone)}&status=active&per_page=1`,
-    { headers: { authorization: `Bearer ${token}` } },
-  );
-  const zoneBody = (await zoneRes.json()) as { result?: Array<{ id: string }> };
-  const zoneId = zoneBody.result?.[0]?.id;
-  if (!zoneId) throw new Error(`No unique active Cloudflare zone for ${zone}`);
-  const results = [];
-  for (const record of records) {
-    const existingRes = await fetch(
-      `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?type=${record.type}&name=${encodeURIComponent(record.name)}&per_page=100`,
-      { headers: { authorization: `Bearer ${token}` } },
-    );
-    const existingBody = (await existingRes.json()) as {
-      result?: Array<{ id: string; content: string; priority?: number }>;
-    };
-    const mutation = chooseCloudflareMutation(existingBody.result ?? [], record);
-    const body = cloudflareRecordBody(record);
-    if (mutation.action === "keep") {
-      results.push({ record, action: "keep" });
-      continue;
-    }
-    const url =
-      mutation.action === "update"
-        ? `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${mutation.id}`
-        : `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`;
-    const response = await fetch(url, {
-      method: mutation.action === "update" ? "PUT" : "POST",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(`Cloudflare ${mutation.action} failed: ${response.status}`);
-    results.push({ record, action: mutation.action });
-  }
-  return { published: true, reason: "cloudflare" as const, results };
 }
 
 type StalwartRecord = { id: string; name: string; domainId?: string };

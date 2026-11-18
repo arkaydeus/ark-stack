@@ -181,6 +181,7 @@ export type FrontRouteSummary = {
   enabled: boolean;
   status: string;
   lastError: string | null;
+  domain: { id: string; name: string; status: string; dnsProvider: string } | null;
   l4: {
     tlsMode: string | null;
     sourceCidrs: string[];

@@ -42,6 +42,7 @@ const publicIpv6 = "2001:db8::10";
 const zone = `fd08-${suffix}.com`;
 const flowZone = `fd08-flow-${suffix}.com`;
 const pendingZone = `fd08-pending-${suffix}.com`;
+const providerResult = (result: unknown) => Response.json({ success: true, result });
 const homeIp = "100.101.102.103";
 const self = { id: `nEDGE${suffix}`, name: "ark-edge", ips: ["100.64.0.1"], tags: ["tag:ark-edge"] };
 const home = { id: `nHOME${suffix}`, name: "home", ips: [homeIp] };
@@ -139,7 +140,7 @@ async function routeRow(id: string) {
 async function records(hostname: string): Promise<Json[]> {
   return [
     ...(await sql`
-    SELECT type, relative_name, expected_value, required FROM dns_records WHERE name = ${hostname} ORDER BY type
+    SELECT type, relative_name, expected_value, required FROM dns_records WHERE name = ${hostname} AND withdrawal_reason IS NULL ORDER BY type
   `),
   ];
 }
@@ -1019,6 +1020,7 @@ describe("certificate recovery and scoped observer DNS", () => {
     const { route } = await createRoute(`waiting.${flowZone}`);
     await sql`UPDATE front_routes SET status = 'awaiting_dns' WHERE id = ${route.id}`;
     const endpointId = (await routeRow(route.id))!.endpoint_id;
+    await sql`UPDATE dns_records SET published_at = now() WHERE name = ${route.hostname}`;
     resolvedA = [publicIpv4];
     for (let cycle = 0; cycle < 2; cycle++) {
       const queued: Array<{ kind: string; targetIds: string[]; payload?: Record<string, unknown> }> = [];
@@ -1058,7 +1060,8 @@ describe("certificate recovery and scoped observer DNS", () => {
     expect(await queuedCount("database.provision", databaseId)).toBe(0);
     expect(await queuedCount("mail.provision", mailboxId)).toBe(0);
     expect(await queuedCount("dns.publish", domainIds.flow)).toBe(0);
-    // Positive control: an explicit full-domain verification retains the existing service flow.
+    // Positive control: after publication, a full-domain verification retains the service flow.
+    await sql`UPDATE dns_records SET published_at = now() WHERE name IN ${sql([`unrelated.${flowZone}`, `mail.${flowZone}`])}`;
     const manual = await realEnqueue({
       kind: "domain.verify",
       targetIds: [domainIds.flow],
@@ -1068,7 +1071,7 @@ describe("certificate recovery and scoped observer DNS", () => {
     expect(await queuedCount("certificate.issue", unrelatedId)).toBe(1);
     expect(await queuedCount("database.provision", databaseId)).toBe(1);
     expect(await queuedCount("mail.provision", mailboxId)).toBe(1);
-    expect(await queuedCount("dns.publish", domainIds.flow)).toBe(1);
+    expect(await queuedCount("dns.publish", domainIds.flow)).toBe(0);
     await sql`UPDATE domain_claims SET dns_provider = 'manual' WHERE id = ${domainIds.flow}`;
   });
 });
@@ -1190,4 +1193,434 @@ describe("gate durable dispatch lifecycle", () => {
       await (await import("./origin-hosts.ts")).refreshLoginHost(true);
     }
   }, 30_000);
+});
+
+describe("FD-19 reviewed DNS", () => {
+  type ProviderRecord = {
+    id: string;
+    type: string;
+    name: string;
+    content: string;
+    ttl: number;
+    proxied: boolean;
+    comment?: string;
+    modified_on?: string;
+  };
+
+  async function dnsFixture(provider: "manual" | "cloudflare") {
+    const created = await call(actors.owner, "POST", "/api/domains", {
+      name: createId("fd19").replace("_", "-") + ".com",
+      dnsProvider: provider,
+    });
+    expect(created.status).toBe(200);
+    const domainId = String(created.body.id);
+    const proof = created.body.records[0] as ProviderRecord & { value: string };
+    const name = proof.name.replace(/^_ark-stack\./, "");
+    await sql`UPDATE domain_claims SET status = 'verified' WHERE id = ${domainId}`;
+    const path = "/api/domains/" + domainId;
+    const providerRecords = new Map<string, ProviderRecord>();
+    const writes: Array<{ method: string; id: string; body?: Partial<ProviderRecord> }> = [];
+    const hooks: { onRead?: (record: ProviderRecord) => void } = {};
+    const zoneId = createId("cfzone");
+    const publicDns = {
+      a: [publicIpv4],
+      aaaa: [] as string[],
+      caa: [] as Array<{ critical: number; issue: string }>,
+      aaaaError: false,
+      aaaaLookups: 0,
+    };
+    const originalFetch = globalThis.fetch;
+    const previousToken = process.env.DNS_API_TOKEN;
+    const [settings] = await sql`SELECT ipv6_status FROM platform_settings WHERE id = 'default'`;
+    process.env.DNS_API_TOKEN = "mock-fd19-zone-token";
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        if (url.hostname !== "api.cloudflare.com") return originalFetch(input, init);
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer mock-fd19-zone-token");
+        const method = init?.method ?? "GET";
+        if (url.pathname === "/client/v4/zones" && url.searchParams.get("name") === name)
+          return providerResult([{ id: zoneId, name }]);
+        const apiPath = "/client/v4/zones/" + zoneId + "/dns_records";
+        if (url.pathname === apiPath && method === "GET") {
+          return providerResult(
+            [...providerRecords.values()].filter(
+              (record) => record.name === url.searchParams.get("name.exact"),
+            ),
+          );
+        }
+        const id = url.pathname.slice(apiPath.length + 1);
+        const current = providerRecords.get(id);
+        if (url.pathname.startsWith(apiPath + "/") && method === "GET") {
+          if (current) hooks.onRead?.(current);
+          return current
+            ? providerResult(current)
+            : Response.json({ success: false, errors: [{ code: 81044 }] }, { status: 404 });
+        }
+        if (url.pathname.startsWith(apiPath + "/") && method === "DELETE" && current) {
+          writes.push({ method, id });
+          providerRecords.delete(id);
+          return providerResult({ id });
+        }
+        if ((url.pathname === apiPath && method === "POST") || (method === "PATCH" && current)) {
+          const body = JSON.parse(String(init?.body)) as ProviderRecord;
+          const changed = { ...current, ...body, id: current?.id ?? createId("rec") };
+          writes.push({ method, id: changed.id, body });
+          providerRecords.set(changed.id, changed);
+          return providerResult(changed);
+        }
+        throw new Error("Unexpected mocked Cloudflare request " + method + " " + url.pathname);
+      },
+      { preconnect: originalFetch.preconnect },
+    );
+    setDnsResolver({
+      txt: async (hostname) => (hostname === proof.name ? [[proof.value]] : []),
+      a: async () => publicDns.a,
+      aaaa: async () => {
+        publicDns.aaaaLookups++;
+        if (publicDns.aaaaError) throw Object.assign(new Error("DNS timeout"), { code: "ETIMEOUT" });
+        return publicDns.aaaa;
+      },
+      caa: async (hostname) => (hostname === name ? publicDns.caa : []),
+      mx: async () => [],
+      cname: async () => [],
+    });
+    return {
+      name,
+      path,
+      domainId,
+      proof,
+      providerRecords,
+      writes,
+      publicDns,
+      zoneId,
+      hooks,
+      async allowIpv6(status: "passed" | "failed") {
+        await sql`UPDATE platform_settings SET ipv6_status = ${status} WHERE id = 'default'`;
+      },
+      async verify(operationId?: string) {
+        const queued = operationId ?? (await call(actors.owner, "POST", path + "/verify")).body.operationId;
+        const [operation] = await db.select().from(operations).where(eq(operations.id, queued));
+        await runOperation("domain.verify", operation!);
+      },
+      async dispose() {
+        globalThis.fetch = originalFetch;
+        if (previousToken === undefined) delete process.env.DNS_API_TOKEN;
+        else process.env.DNS_API_TOKEN = previousToken;
+        const owned = await sql`SELECT id FROM endpoints WHERE domain_id = ${domainId}`;
+        const endpointIds = owned.map((row) => String(row.id));
+        if (endpointIds.length) {
+          await sql`DELETE FROM front_routes WHERE endpoint_id IN ${sql(endpointIds)}`;
+          await sql`DELETE FROM certificates WHERE endpoint_id IN ${sql(endpointIds)}`;
+          await sql`DELETE FROM endpoints WHERE id IN ${sql(endpointIds)}`;
+        }
+        await sql`DELETE FROM alerts WHERE dedup_key = ${"dns-aaaa-withdrawal:" + domainId}`;
+        await sql`DELETE FROM audit_events WHERE resource_id = ${domainId}`;
+        await sql`DELETE FROM domain_claims WHERE id = ${domainId}`;
+        await sql`UPDATE platform_settings SET ipv6_status = ${String(settings?.ipv6_status ?? "unchecked")} WHERE id = 'default'`;
+      },
+    };
+  }
+
+  async function certificateRequests(routeId: string) {
+    return sql`
+      SELECT operations.id FROM operations JOIN front_routes ON target_ids ? front_routes.endpoint_id
+      WHERE operations.kind = 'certificate.issue' AND front_routes.id = ${routeId}
+    `;
+  }
+
+  test("apex/www Cloudflare review is read-only, rejects a stale hash and publishes DNS-only before verification", async () => {
+    const fixture = await dnsFixture("cloudflare");
+    try {
+      const { name, path, providerRecords, proof, writes } = fixture;
+      const { route: apex } = await createRoute(name);
+      const { route: www } = await createRoute("www." + name);
+      providerRecords.set("ownership", {
+        ...proof,
+        content: proof.value,
+        id: "ownership",
+        type: "TXT",
+        ttl: 60,
+        proxied: false,
+      });
+      providerRecords.set("apex", {
+        id: "apex",
+        name,
+        type: "A",
+        content: publicIpv4,
+        ttl: 300,
+        proxied: true,
+      });
+      await sql`UPDATE front_routes SET status = 'awaiting_dns' WHERE id IN ${sql([apex.id, www.id])}`;
+      await fixture.verify();
+      expect(await certificateRequests(apex.id)).toHaveLength(0);
+      expect((await routeRow(apex.id))!.last_error).toMatch(/review and publish/i);
+
+      const url = "/api/front/routes/" + www.id + "/dns";
+      const review = await call(actors.owner, "GET", url);
+      expect(review.status).toBe(200);
+      const plan = review.body.cloudflare;
+      expect(
+        plan.actions.map((action: Json) => [action.action, action.after.name, action.after.proxied]),
+      ).toEqual([
+        ["keep", proof.name, false],
+        ["update", name, false],
+        ["create", "www." + name, false],
+      ]);
+      expect(
+        review.body.records
+          .filter((record: Json) => record.type === "A")
+          .map((record: Json) => record.relativeName),
+      ).toEqual(["@", "www"]);
+      expect(writes).toHaveLength(0);
+
+      providerRecords.get("apex")!.content = "203.0.113.99";
+      expect((await call(actors.owner, "POST", path + "/publish", { planHash: plan.planHash })).status).toBe(
+        409,
+      );
+      expect(writes).toHaveLength(0);
+      const fresh = await call(actors.owner, "GET", path + "/dns");
+      const applied = await call(actors.owner, "POST", path + "/publish", {
+        planHash: fresh.body.cloudflare.planHash,
+      });
+      expect(applied.status).toBe(200);
+      expect(writes.map((item) => [item.method, item.body?.proxied])).toEqual([
+        ["PATCH", false],
+        ["POST", false],
+      ]);
+      const saved =
+        await sql`SELECT name, provider_ownership FROM dns_records WHERE domain_id = ${fixture.domainId} AND type = 'A' ORDER BY name`;
+      expect(saved[0].provider_ownership).toBeNull(); // Updating an existing provider row does not establish ownership.
+      expect(saved[1].provider_ownership).toMatchObject({
+        zoneId: fixture.zoneId,
+        record: { id: writes[1].id, name: "www." + name, content: publicIpv4, proxied: false },
+      });
+      expect(await certificateRequests(apex.id)).toHaveLength(0);
+      await fixture.verify(applied.body.operationId);
+      expect(await certificateRequests(apex.id)).toHaveLength(1);
+      expect(await certificateRequests(www.id)).toHaveLength(1);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  for (const mode of ["preflight", "toggle"] as const) {
+    test(`${mode} withdrawal deletes only the Ark-owned AAAA and confirms public absence after TTL`, async () => {
+      const fixture = await dnsFixture("cloudflare");
+      try {
+        const { name, path, domainId, writes, providerRecords, publicDns } = fixture;
+        await fixture.allowIpv6("passed");
+        const { route } = await createRoute(name);
+        publicDns.aaaa = [publicIpv6];
+        const first = await call(actors.owner, "GET", path + "/dns");
+        const published = await call(actors.owner, "POST", path + "/publish", {
+          planHash: first.body.cloudflare.planHash,
+          ...(mode === "preflight" ? { authorizeAAAAWithdrawal: true } : {}),
+        });
+        expect(published.status).toBe(200);
+        const aaaa = [...providerRecords.values()].find((record) => record.type === "AAAA")!;
+        const unrelated = { ...aaaa, id: "unrelated", name: "other." + name };
+        providerRecords.set(unrelated.id, unrelated);
+        writes.length = 0;
+
+        if (mode === "preflight") {
+          await fixture.allowIpv6("failed");
+        } else {
+          const toggle = await call(actors.owner, "PUT", path + "/aaaa", { enabled: false });
+          expect(toggle.status).toBe(200);
+          await fixture.verify(toggle.body.operationId);
+          expect(writes).toHaveLength(0);
+        }
+        const pending = await call(actors.owner, "GET", path + "/dns");
+        expect(pending.status).toBe(200);
+        expect(pending.body.ipv6Status).toBe("withdrawal_pending");
+        expect(pending.body.records.find((record: Json) => record.type === "AAAA")).toMatchObject({
+          value: publicIpv6,
+          providerRemoval: mode === "preflight" ? "automatic" : "review",
+        });
+        expect(
+          pending.body.cloudflare.actions.find((action: Json) => action.action === "delete"),
+        ).toMatchObject({ after: null, before: { id: aaaa.id }, deletionScope: { record: { id: aaaa.id } } });
+
+        if (mode === "preflight") {
+          await fixture.verify();
+        } else {
+          aaaa.content = "2001:db8::bad";
+          const drifted = await call(actors.owner, "POST", path + "/publish", {
+            planHash: pending.body.cloudflare.planHash,
+          });
+          expect(drifted.status).toBe(409);
+          expect(writes).toHaveLength(0);
+          aaaa.content = publicIpv6;
+          let reads = 0;
+          fixture.hooks.onRead = (record) => {
+            if (record.id === aaaa.id && ++reads === 2) record.proxied = true;
+          };
+          const changedDuringPublish = await call(actors.owner, "POST", path + "/publish", {
+            planHash: pending.body.cloudflare.planHash,
+          });
+          expect(changedDuringPublish.status).toBe(409);
+          expect(writes).toHaveLength(0);
+          fixture.hooks.onRead = undefined;
+          aaaa.proxied = false;
+          const reviewed = await call(actors.owner, "POST", path + "/publish", {
+            planHash: pending.body.cloudflare.planHash,
+          });
+          expect(reviewed.status).toBe(200);
+          await fixture.verify(reviewed.body.operationId);
+        }
+
+        expect(writes).toEqual([{ method: "DELETE", id: aaaa.id }]);
+        expect(providerRecords.has(aaaa.id)).toBe(false);
+        expect(providerRecords.get(unrelated.id)).toEqual(unrelated);
+        expect(
+          providerRecords.has([...providerRecords.values()].find((record) => record.type === "A")!.id),
+        ).toBe(true);
+        expect(await certificateRequests(route.id)).toHaveLength(0);
+
+        publicDns.aaaa = [];
+        await fixture.verify();
+        expect((await call(actors.owner, "GET", path + "/dns")).body.ipv6Status).toBe("withdrawal_pending");
+        await sql`UPDATE dns_records SET provider_removed_at = now() - interval '301 seconds' WHERE domain_id = ${domainId} AND withdrawal_reason = 'ipv6'`;
+        publicDns.aaaa = [publicIpv6];
+        await fixture.verify();
+        expect((await call(actors.owner, "GET", path + "/dns")).body.ipv6Status).toBe("withdrawal_pending");
+        publicDns.aaaa = [];
+        const lookups = publicDns.aaaaLookups;
+        await fixture.verify();
+        expect(publicDns.aaaaLookups).toBeGreaterThan(lookups);
+        expect((await call(actors.owner, "GET", path + "/dns")).body.ipv6Status).toBe("a_only");
+        const [tombstone] =
+          await sql`SELECT status, provider_removed_at, withdrawal_confirmed_at, provider_ownership
+          FROM dns_records WHERE domain_id = ${domainId} AND withdrawal_reason = 'ipv6'`;
+        expect(tombstone).toMatchObject({
+          status: "withdrawn",
+          provider_ownership: { record: { id: aaaa.id } },
+        });
+        expect(tombstone.withdrawal_confirmed_at).not.toBeNull();
+      } finally {
+        await fixture.dispose();
+      }
+    });
+  }
+
+  test("manual guides show @ and www, and a failed lookup cannot confirm manual removal", async () => {
+    const fixture = await dnsFixture("manual");
+    try {
+      const { name, path, publicDns, writes } = fixture;
+      await fixture.allowIpv6("passed");
+      await createRoute(name);
+      const { route } = await createRoute("www." + name);
+      publicDns.aaaa = [publicIpv6];
+      const disabled = await call(actors.owner, "PUT", path + "/aaaa", { enabled: false });
+      expect(disabled.status).toBe(200);
+      await fixture.verify(disabled.body.operationId);
+      const url = "/api/front/routes/" + route.id + "/dns";
+      const review = await call(actors.owner, "GET", url);
+      expect(review.status).toBe(200);
+      expect(review.body.guides.map((guide: Json) => guide.title)).toEqual([
+        "Namecheap",
+        "Other DNS providers",
+      ]);
+      expect(review.body.ipv6Status).toBe("withdrawal_pending");
+      expect(
+        review.body.records
+          .filter((record: Json) => record.type === "AAAA")
+          .map((record: Json) => [record.relativeName, record.providerRemoval]),
+      ).toEqual([
+        ["@", "manual"],
+        ["www", "manual"],
+      ]);
+      publicDns.aaaa = [];
+      publicDns.aaaaError = true;
+      await fixture.verify();
+      expect((await call(actors.owner, "GET", url)).body.ipv6Status).toBe("withdrawal_pending");
+      publicDns.aaaaError = false;
+      await fixture.verify();
+      expect((await call(actors.owner, "GET", url)).body.ipv6Status).toBe("a_only");
+      publicDns.aaaa = ["2001:db8::123"];
+      await fixture.verify();
+      const unexpected = (await call(actors.owner, "GET", url)).body;
+      expect(unexpected.ipv6Status).toBe("withdrawal_pending");
+      expect(unexpected.records).toContainEqual(
+        expect.objectContaining({
+          type: "AAAA",
+          value: "2001:db8::123",
+          providerRemoval: "manual",
+        }),
+      );
+      expect((await call(actors.owner, "PUT", path + "/aaaa", { enabled: true })).status).toBe(403);
+      await stepUp(actors.owner, "exposure.public", { domainId: fixture.domainId, enabled: true });
+      expect((await call(actors.owner, "PUT", path + "/aaaa", { enabled: true })).status).toBe(200);
+      expect(writes).toHaveLength(0);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  test("revoking automatic withdrawal leaves provider changes for review", async () => {
+    const fixture = await dnsFixture("cloudflare");
+    try {
+      const { name, path, providerRecords, writes } = fixture;
+      await fixture.allowIpv6("passed");
+      await createRoute(name);
+      const { body: review } = await call(actors.owner, "GET", path + "/dns");
+      const applied = await call(actors.owner, "POST", path + "/publish", {
+        planHash: review.cloudflare.planHash,
+        authorizeAAAAWithdrawal: true,
+      });
+      expect(applied.status).toBe(200);
+      expect((await call(actors.owner, "GET", path + "/dns")).body.automaticWithdrawalAuthorized).toBe(true);
+      expect((await call(actors.owner, "DELETE", path + "/aaaa/authorization")).status).toBe(200);
+      await fixture.allowIpv6("failed");
+      writes.length = 0;
+      await fixture.verify();
+      const pending = (await call(actors.owner, "GET", path + "/dns")).body;
+      expect(pending.automaticWithdrawalAuthorized).toBe(false);
+      expect(pending.records.find((record: Json) => record.type === "AAAA")?.providerRemoval).toBe("review");
+      expect([...providerRecords.values()].some((record) => record.type === "AAAA")).toBe(true);
+      expect(writes).toHaveLength(0);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  test("Cloudflare proxy addresses and inherited CAA block certificate requests with actionable errors", async () => {
+    const fixture = await dnsFixture("manual");
+    try {
+      const { name, publicDns } = fixture;
+      const { route } = await createRoute("www." + name);
+      await sql`UPDATE front_routes SET status = 'awaiting_dns' WHERE id = ${route.id}`;
+      publicDns.a = [publicIpv4, "104.16.20.1"];
+      await fixture.verify();
+      expect((await routeRow(route.id))!.last_error).toMatch(/Cloudflare proxy.*DNS only/);
+      expect(await certificateRequests(route.id)).toHaveLength(0);
+      publicDns.a = [publicIpv4];
+      publicDns.caa = [{ critical: 0, issue: "other-ca.example" }];
+      await fixture.verify();
+      expect((await routeRow(route.id))!.last_error).toMatch(/CAA.*letsencrypt\.org/);
+      expect(await certificateRequests(route.id)).toHaveLength(0);
+      publicDns.caa = [{ critical: 0, issue: "letsencrypt.org;validationmethods=http-01" }];
+      await fixture.verify();
+      expect(await certificateRequests(route.id)).toHaveLength(1);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  test("route API rejects both ts.net and a configured custom tailnet suffix", async () => {
+    const [edge] = await sql`SELECT stable_id, dns_name FROM tailnet_nodes WHERE source = 'edge' AND is_self`;
+    expect(edge).toBeDefined();
+    const custom = "tailnet-" + suffix + ".com";
+    await sql`UPDATE tailnet_nodes SET dns_name = ${"edge." + custom} WHERE source = 'edge' AND stable_id = ${String(edge.stable_id)}`;
+    try {
+      for (const hostname of ["ts.net", "home.tail1234.ts.net", custom, "www." + custom]) {
+        const response = await call(actors.owner, "POST", "/api/front/routes", routeRequest(hostname));
+        expect(response.status).toBe(422);
+        expect(response.body.error).toMatch(/tailnet.*cannot be public/i);
+      }
+    } finally {
+      await sql`UPDATE tailnet_nodes SET dns_name = ${String(edge.dns_name)} WHERE source = 'edge' AND stable_id = ${String(edge.stable_id)}`;
+    }
+  });
 });

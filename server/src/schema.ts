@@ -1,3 +1,4 @@
+import type { CloudflareOwnership } from "@ark-stack/shared";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -209,6 +210,14 @@ export const dnsRecords = pgTable(
     relativeName: text("relative_name").notNull(),
     expectedValue: text("expected_value").notNull(),
     observedValue: text("observed_value"),
+    ttl: integer("ttl").notNull().default(300),
+    providerOwnership: jsonb("provider_ownership").$type<CloudflareOwnership>(),
+    automaticWithdrawal: boolean("automatic_withdrawal").notNull().default(false),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    withdrawalReason: text("withdrawal_reason").$type<"ipv6" | "endpoint_deleted">(),
+    withdrawalStartedAt: timestamp("withdrawal_started_at", { withTimezone: true }),
+    providerRemovedAt: timestamp("provider_removed_at", { withTimezone: true }),
+    withdrawalConfirmedAt: timestamp("withdrawal_confirmed_at", { withTimezone: true }),
     purpose: text("purpose").notNull(),
     required: boolean("required").notNull().default(true),
     status: text("status").notNull().default("pending"),
