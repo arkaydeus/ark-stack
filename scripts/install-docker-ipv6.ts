@@ -7,8 +7,8 @@ import { hostCommand } from "./install-host-hardening.ts";
 export const daemonConfigPath = "/etc/docker/daemon.json";
 export const dockerIpv6EvidenceDir = "/var/lib/ark/ipv6";
 
-export function dockerStartedAt() {
-  return hostCommand("env", [
+export function dockerStartedAt(command = hostCommand) {
+  return command("env", [
     "TZ=UTC",
     "systemctl",
     "show",
@@ -41,40 +41,43 @@ export function dockerIpv6DaemonConfig(config: Record<string, unknown>, disableP
   };
 }
 
-export async function configureDockerIpv6(disableProxy: boolean) {
-  const { raw, config } = await readDockerDaemonConfig();
+export async function configureDockerIpv6(
+  disableProxy: boolean,
+  { path = daemonConfigPath, command = hostCommand } = {},
+) {
+  const { raw, config } = await readDockerDaemonConfig(path);
   const desired = dockerIpv6DaemonConfig(config, disableProxy);
   const changed = JSON.stringify(desired) !== JSON.stringify(config);
-  const [current] = JSON.parse(await hostCommand("docker", ["network", "inspect", "bridge"]));
-  const liveRestore = (await hostCommand("docker", ["info", "--format", "{{.LiveRestoreEnabled}}"])).trim();
+  const [current] = JSON.parse(await command("docker", ["network", "inspect", "bridge"]));
+  const liveRestore = (await command("docker", ["info", "--format", "{{.LiveRestoreEnabled}}"])).trim();
   const loaded =
-    raw !== null && (await stat(daemonConfigPath)).mtimeMs < Date.parse(await dockerStartedAt()) + 1_000;
+    raw !== null && (await stat(path)).mtimeMs < Date.parse(await dockerStartedAt(command)) + 1_000;
   if (!changed && loaded && current?.EnableIPv6 && liveRestore === "true") return false;
 
-  await mkdir(dirname(daemonConfigPath), { recursive: true });
-  const next = `${daemonConfigPath}.${crypto.randomUUID()}.tmp`;
-  const mode = raw === null ? 0o644 : (await stat(daemonConfigPath)).mode & 0o777;
+  await mkdir(dirname(path), { recursive: true });
+  const next = `${path}.${crypto.randomUUID()}.tmp`;
+  const mode = raw === null ? 0o644 : (await stat(path)).mode & 0o777;
   try {
     await writeFile(next, JSON.stringify(desired, null, 2) + "\n", { flag: "wx", mode });
-    await hostCommand("dockerd", ["--validate", "--config-file", next]);
-    await rename(next, daemonConfigPath);
+    await command("dockerd", ["--validate", "--config-file", next]);
+    await rename(next, path);
     try {
-      await hostCommand("systemctl", ["restart", "docker.service"]);
-      await hostCommand("docker", ["info"]);
-      const [bridge] = JSON.parse(await hostCommand("docker", ["network", "inspect", "bridge"]));
+      await command("systemctl", ["restart", "docker.service"]);
+      await command("docker", ["info"]);
+      const [bridge] = JSON.parse(await command("docker", ["network", "inspect", "bridge"]));
       if (
         !bridge?.EnableIPv6 ||
-        (await hostCommand("docker", ["info", "--format", "{{.LiveRestoreEnabled}}"])).trim() !== "true"
+        (await command("docker", ["info", "--format", "{{.LiveRestoreEnabled}}"])).trim() !== "true"
       ) {
         throw new Error("Docker did not start with IPv6 and live-restore enabled.");
       }
     } catch (error) {
-      if (raw === null) await rm(daemonConfigPath);
+      if (raw === null) await rm(path);
       else {
         await writeFile(next, raw, { flag: "wx", mode });
-        await rename(next, daemonConfigPath);
+        await rename(next, path);
       }
-      await hostCommand("systemctl", ["restart", "docker.service"]);
+      await command("systemctl", ["restart", "docker.service"]);
       throw error;
     }
     return true;
@@ -98,16 +101,14 @@ type PublishedNetwork = {
   dependents?: string[];
 };
 
-export async function migratePublishedNetwork({
-  project,
-  network,
-  compose,
-  dependents = [],
-}: PublishedNetwork) {
+export async function migratePublishedNetwork(
+  { project, network, compose, dependents = [] }: PublishedNetwork,
+  command = hostCommand,
+) {
   const name = `${project}_${network}`;
-  const ids = await hostCommand("docker", ["network", "ls", "-q", "--filter", `name=^${name}$`]);
+  const ids = await command("docker", ["network", "ls", "-q", "--filter", `name=^${name}$`]);
   if (!ids.trim()) return;
-  const [existing] = JSON.parse(await hostCommand("docker", ["network", "inspect", name])) as DockerNetwork[];
+  const [existing] = JSON.parse(await command("docker", ["network", "inspect", name])) as DockerNetwork[];
   if (!existing) throw new Error(`Could not inspect ${name}.`);
   if (
     existing.Labels?.["com.docker.compose.project"] !== project ||
@@ -120,7 +121,7 @@ export async function migratePublishedNetwork({
   const services = new Set(dependents);
   for (const id of containers) {
     const labels = JSON.parse(
-      await hostCommand("docker", ["inspect", "--format", "{{json .Config.Labels}}", id]),
+      await command("docker", ["inspect", "--format", "{{json .Config.Labels}}", id]),
     );
     const service = labels?.["com.docker.compose.service"];
     if (labels?.["com.docker.compose.project"] !== project || !/^[a-z0-9][a-z0-9_-]*$/.test(service ?? "")) {
@@ -128,8 +129,8 @@ export async function migratePublishedNetwork({
     }
     services.add(service);
   }
-  if (services.size) await hostCommand("docker", [...compose, "rm", "--stop", "--force", ...services]);
-  await hostCommand("docker", ["network", "rm", existing.Id]);
+  if (services.size) await command("docker", [...compose, "rm", "--stop", "--force", ...services]);
+  await command("docker", ["network", "rm", existing.Id]);
 }
 
 export async function publishedNetworkState(project: string, network: string, service: string) {
@@ -176,10 +177,10 @@ export async function publicationPredatesDaemonConfig(id: string) {
 
 // Disabling the daemon-wide proxy would remove the IPv6 translation used by any
 // wildcard publication backed exclusively by an IPv4 endpoint.
-export async function verifyOtherIpv6Publications() {
-  const ids = (await hostCommand("docker", ["ps", "-q"])).trim().split("\n").filter(Boolean);
+export async function verifyOtherIpv6Publications(command = hostCommand) {
+  const ids = (await command("docker", ["ps", "-q"])).trim().split("\n").filter(Boolean);
   if (!ids.length) return;
-  const containers = JSON.parse(await hostCommand("docker", ["inspect", ...ids])) as {
+  const containers = JSON.parse(await command("docker", ["inspect", ...ids])) as {
     Name: string;
     HostConfig: { PortBindings?: Record<string, { HostIp: string }[] | null> };
     NetworkSettings: { Networks: Record<string, { GlobalIPv6Address: string }> };
@@ -200,14 +201,21 @@ export async function verifyOtherIpv6Publications() {
   }
 }
 
-export async function installIpv6Observer(root: string) {
-  await mkdir(dockerIpv6EvidenceDir, { recursive: true, mode: 0o755 });
-  const executable = "/usr/local/lib/ark/observe-docker-ipv6";
+export async function installIpv6Observer(
+  root: string,
+  {
+    directory = dockerIpv6EvidenceDir,
+    executable = "/usr/local/lib/ark/observe-docker-ipv6",
+    unit = "/etc/systemd/system/ark-docker-ipv6",
+    command = hostCommand,
+  } = {},
+) {
+  await mkdir(directory, { recursive: true, mode: 0o755 });
   await mkdir(dirname(executable), { recursive: true, mode: 0o755 });
   const candidate = executable + "." + crypto.randomUUID();
   try {
     // The persistent root service runs an installed executable, independently of checkout and Bun updates.
-    await hostCommand(process.execPath, [
+    await command(process.execPath, [
       "build",
       "--compile",
       join(root, "scripts", "observe-docker-ipv6.ts"),
@@ -218,7 +226,6 @@ export async function installIpv6Observer(root: string) {
   } finally {
     await rm(candidate, { force: true });
   }
-  const unit = "/etc/systemd/system/ark-docker-ipv6";
   await writeFile(
     `${unit}.service`,
     `[Unit]
@@ -226,7 +233,7 @@ Description=Observe Docker native IPv6 and edge connections
 After=docker.service
 [Service]
 Type=oneshot
-ExecStart=${executable} ${dockerIpv6EvidenceDir}
+ExecStart=${executable} ${directory}
 TimeoutStartSec=20s
 `,
     { mode: 0o644 },
@@ -244,7 +251,105 @@ WantedBy=timers.target
 `,
     { mode: 0o644 },
   );
-  await hostCommand("systemctl", ["daemon-reload"]);
-  await hostCommand("systemctl", ["enable", "--now", "ark-docker-ipv6.timer"]);
-  await hostCommand("systemctl", ["start", "ark-docker-ipv6.service"]);
+  await command("systemctl", ["daemon-reload"]);
+  await command("systemctl", ["enable", "--now", "ark-docker-ipv6.timer"]);
+  await command("systemctl", ["start", "ark-docker-ipv6.service"]);
+}
+
+/** Stage the daemon and networks while the Docker proxy can still serve IPv4-only endpoints. */
+export async function preparePublishedIpv6({
+  edge,
+  mail,
+  hardened,
+  tailnetRestorePath,
+}: {
+  edge: PublishedNetwork;
+  mail?: PublishedNetwork;
+  hardened: boolean;
+  tailnetRestorePath: string;
+}) {
+  // The optional admin profile shares the old network. Remember its live services across retries
+  // so replacing the bridge or restarting Docker cannot strand a tailnet admin installation.
+  const tailnetLabels = await hostCommand("docker", [
+    "ps",
+    "--filter",
+    `label=com.docker.compose.project=${edge.project}`,
+    "--format",
+    '{{.Label "com.docker.compose.service"}}',
+  ]);
+  const previousTailnet = (await Bun.file(tailnetRestorePath).exists())
+    ? await Bun.file(tailnetRestorePath).text()
+    : "";
+  const tailnetServices = [
+    ...new Set(
+      (tailnetLabels + "\n" + previousTailnet)
+        .split("\n")
+        .filter((service) => service === "tailscale" || service === "tailnet-gateway"),
+    ),
+  ];
+  const tailnetCompose = [...edge.compose, "--profile", "tailnet"];
+  if (tailnetServices.length) await Bun.write(tailnetRestorePath, tailnetServices.join("\n"));
+  // Preserve IPv6-to-IPv4 proxying until the published containers have dual-stack endpoints.
+  if (hardened) await configureDockerIpv6(false);
+  await migratePublishedNetwork(
+    tailnetServices.length
+      ? {
+          ...edge,
+          compose: tailnetCompose,
+          dependents: [...(edge.dependents ?? []), "tailnet-gateway", "tailscale"],
+        }
+      : edge,
+  );
+  if (mail) await migratePublishedNetwork(mail);
+  if (!tailnetServices.length) return;
+  return async () => {
+    await hostCommand("docker", [
+      ...tailnetCompose,
+      "up",
+      "-d",
+      "--wait",
+      "--wait-timeout",
+      "120",
+      ...tailnetServices,
+    ]);
+    await rm(tailnetRestorePath, { force: true });
+  };
+}
+
+/** Verify endpoints before turning off the Docker proxy and recreating pre-transition publications. */
+export async function finishPublishedIpv6(edge: PublishedNetwork, mail?: PublishedNetwork) {
+  const edgeId = await verifyPublishedNetwork(edge);
+  const mailId = mail ? await verifyPublishedNetwork(mail) : null;
+  if ((await readDockerDaemonConfig()).config["userland-proxy"] !== false) {
+    await verifyOtherIpv6Publications();
+  }
+  await configureDockerIpv6(true);
+  // Live-restore can retain publications created under the old daemon settings.
+  if (await publicationPredatesDaemonConfig(edgeId)) {
+    const services = [...(edge.dependents ?? []), edge.service];
+    await hostCommand("docker", [...edge.compose, "rm", "--stop", "--force", ...services]);
+    await hostCommand("docker", [
+      ...edge.compose,
+      "up",
+      "-d",
+      "--wait",
+      "--wait-timeout",
+      "120",
+      ...services.toReversed(),
+    ]);
+  }
+  if (mail && mailId && (await publicationPredatesDaemonConfig(mailId))) {
+    await hostCommand("docker", [
+      ...mail.compose,
+      "up",
+      "-d",
+      "--wait",
+      "--wait-timeout",
+      "120",
+      "--force-recreate",
+      mail.service,
+    ]);
+  }
+  await verifyPublishedNetwork(edge);
+  if (mail) await verifyPublishedNetwork(mail);
 }

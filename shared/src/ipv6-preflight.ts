@@ -6,6 +6,7 @@ import { z } from "zod";
 import { parseIpv6 } from "./cidr.ts";
 
 export const IPV6_PREFLIGHT_WEEK_MS = 7 * 24 * 60 * 60_000;
+export const IPV6_PREFLIGHT_RETRY_MS = 5 * 60_000;
 export const IPV6_PREFLIGHT_TICKET_MS = 15 * 60_000;
 export const IPV6_HOST_SAMPLE_MS = 45_000;
 export const IPV6_PREFLIGHT_HTTP_PATH = "/.well-known/ark-ipv6-preflight/";
@@ -137,6 +138,7 @@ export function evaluateIpv6Report(
   expected: Ipv6ExpectedCheck[],
   report: Ipv6ProbeReport,
   logs: Ipv6EdgeLog[],
+  origin: "managed" | "manual",
 ) {
   const reported = new Map(report.checks.map((result) => [result.id, result]));
   const unique = reported.size === report.checks.length && reported.size === expected.length;
@@ -149,6 +151,14 @@ export function evaluateIpv6Report(
     if (result.outcome !== "passed") {
       return { ...evidence, outcome: result.outcome, reason: `external probe: ${result.reason}` };
     }
+    // A manual signature authenticates the submission, but the signer can claim a query
+    // succeeded after opening a TCP connection. Only the configured runner can attest to SQL.
+    if (origin === "manual" && (protocol === "postgres-classic" || protocol === "postgres-direct"))
+      return {
+        ...evidence,
+        outcome: "unverified",
+        reason: "database authentication requires the managed runner",
+      };
     const source = publicIpv6(result.source);
     const matched =
       source &&

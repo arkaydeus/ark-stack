@@ -76,7 +76,7 @@ test("a configured SNI frontend is present with or without leased routes and rej
   const generation = renderEdgeL4Generation({ httpHostnames: [], sniPorts: [8883] });
   for (const file of ["haproxy.cfg", "haproxy.closed.cfg"]) {
     expect(generation.files[file]).toMatch(
-      /frontend fe_tls8883\n    bind :8883\n[\s\S]+default_backend be_reject/,
+      /frontend fe_tls8883\n    bind :::8883 v4v6\n[\s\S]+default_backend be_reject/,
     );
     expect(generation.files[file]).not.toContain("frontend fe_tls5671");
   }

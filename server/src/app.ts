@@ -142,6 +142,7 @@ import {
   ipv6PreflightChallenge,
   ipv6PreflightKey,
   ipv6PreflightKind,
+  ipv6PreflightTarget,
   ipv6PreflightResultPath,
   ipv6Settings,
   ipv6Summary,
@@ -612,7 +613,7 @@ app.all("/api/auth/*", async (c) => {
 const workerPrefixes: Record<string, string[]> = {
   database: ["database.", "pgbouncer."],
   // `integration.` (front door §3.4): the domain worker is the only worker with external egress.
-  domains: ["domain.", "dns.", "certificate.", "edge.", "admin.", "integration."],
+  domains: ["domain.", "dns.", "certificate.", "edge.", "admin.", "integration.", ipv6PreflightKind],
   mail: ["mail.", "mailbox.", "ses."],
   backup: [
     "backup.",
@@ -761,7 +762,13 @@ app.get("/api/internal/jobs", async (c) => {
   if (!requested.length || requested.some((item) => !allowed.has(item))) {
     throw new HTTPException(403, { message: "A valid worker job allowlist is required." });
   }
-  const claimed = await claimQueued({ limit: 1, kindPrefixes: requested });
+  const preflight = requested.includes(ipv6PreflightKind);
+  const claimed = await claimQueued({
+    limit: 1,
+    kindPrefixes: requested.filter((kind) => kind !== ipv6PreflightKind),
+    exactKinds: preflight ? [ipv6PreflightKind] : [],
+    excludeKinds: preflight ? [] : [ipv6PreflightKind],
+  });
   return c.json({ jobs: claimed.rows.map((row) => ({ ...row, claimToken: claimed.token })) });
 });
 
@@ -943,7 +950,7 @@ app.post(ipv6PreflightResultPath, async (c) => {
   }
   const operation = await enqueue({
     kind: ipv6PreflightKind,
-    targetIds: ["platform"],
+    targetIds: [ipv6PreflightTarget],
     payload: { report },
     idempotencyKey: `ipv6.preflight.result:${report.id}`,
   });
@@ -1405,7 +1412,11 @@ app.post("/api/wizard", async (c) => {
     .where(eq(platformSettings.id, "default"));
   await db.update(platformSetup).set({ wizardCompleted: true }).where(eq(platformSetup.id, "default"));
   if (input.publicIpv6) {
-    await enqueue({ kind: ipv6PreflightKind, targetIds: ["platform"], idempotencyKey: ipv6PreflightKey });
+    await enqueue({
+      kind: ipv6PreflightKind,
+      targetIds: [ipv6PreflightTarget],
+      idempotencyKey: ipv6PreflightKey,
+    });
   }
   await grantAccess(access.userId, { domainId });
   const verify =
@@ -3774,7 +3785,7 @@ app.post("/api/settings/ipv6/preflight", async (c) => {
   requireMfa(c.get("session"));
   const operation = await enqueue({
     kind: ipv6PreflightKind,
-    targetIds: ["platform"],
+    targetIds: [ipv6PreflightTarget],
     actorId: access.userId,
     idempotencyKey: ipv6PreflightKey,
   });

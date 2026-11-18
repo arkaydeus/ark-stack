@@ -9,6 +9,7 @@ import {
 } from "../../server/src/coordinator.ts";
 import { DnsReviewError } from "../../server/src/modules/cloudflare-dns.ts";
 import { domainDnsReview } from "../../server/src/modules/domain-dns.ts";
+import { ipv6PreflightKind } from "../../server/src/modules/ipv6-preflight.ts";
 
 export function dnsControlHandler(token: string) {
   return async (request: Request) => {
@@ -48,6 +49,7 @@ export function runDomainJobs(
   return Promise.all([
     runWorker("domains", ["domain.", "dns.", "certificate.", "edge.", "admin."], executor, options),
     runWorker("domains", ["integration."], executor, options),
+    runWorker("domains", [ipv6PreflightKind], executor, options),
   ]);
 }
 

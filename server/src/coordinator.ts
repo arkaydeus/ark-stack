@@ -53,6 +53,7 @@ import {
   ipv6PreflightDue,
   ipv6PreflightKey,
   ipv6PreflightKind,
+  ipv6PreflightTarget,
   runIpv6Preflight,
 } from "./modules/ipv6-preflight.ts";
 import { loadEnv } from "./env.ts";
@@ -385,6 +386,8 @@ export async function claimQueued(
     limit?: number;
     kindPrefix?: string;
     kindPrefixes?: string[];
+    exactKinds?: string[];
+    excludeKinds?: string[];
     excludePrefix?: string;
     agentOwned?: boolean;
     leaseMs?: number;
@@ -399,6 +402,8 @@ export async function claimQueued(
   );
   const prefixes = input.kindPrefixes ?? (input.kindPrefix ? [input.kindPrefix] : []);
   const patterns = prefixes.map((item) => `${item}%`);
+  const exact = input.exactKinds ?? [];
+  const excludedKinds = input.excludeKinds ?? [];
   const excluded = input.excludePrefix ? [`${input.excludePrefix}%`] : [];
   if (!mailEnabled(process.env.ARK_MAIL_ENABLED)) excluded.push("mail.%", "mailbox.%", "ses.%");
   const agentOwned = input.agentOwned ?? false;
@@ -422,13 +427,17 @@ export async function claimQueued(
       const batch = await tx`
         UPDATE operations
         SET status = 'running',
+            target_ids = CASE WHEN kind = ${ipv6PreflightKind}
+              THEN jsonb_build_array(${ipv6PreflightTarget}::text) ELSE target_ids END,
             claim_token = ${token},
             heartbeat_at = now(),
             updated_at = now()
         WHERE id IN (
           SELECT id FROM operations
           WHERE status = 'queued'
-            AND (${patterns.length === 0}::boolean OR kind LIKE ANY(${patterns}::text[]))
+            AND (${patterns.length + exact.length === 0}::boolean
+              OR kind LIKE ANY(${patterns}::text[]) OR kind = ANY(${exact}::text[]))
+            AND NOT (kind = ANY(${excludedKinds}::text[]))
             AND NOT (kind LIKE ANY(${excluded}::text[]))
             AND (
               ${agentOwned}::boolean IS NOT TRUE
@@ -442,7 +451,9 @@ export async function claimQueued(
               SELECT 1 FROM operations active
               WHERE active.status = 'running'
                 AND active.id <> operations.id
-                AND active.target_ids ?| ARRAY(SELECT jsonb_array_elements_text(operations.target_ids))
+                AND active.target_ids ?| CASE WHEN operations.kind = ${ipv6PreflightKind}
+                  THEN ARRAY[${ipv6PreflightTarget}::text]
+                  ELSE ARRAY(SELECT jsonb_array_elements_text(operations.target_ids)) END
             )
           ORDER BY created_at
           LIMIT 1
@@ -512,9 +523,17 @@ export async function processQueued(
   limit = 8,
   kindPrefix?: string,
   excludePrefix = !env.embeddedWorkers && !kindPrefix ? "service." : undefined,
+  excludeKinds?: string[],
 ) {
   for (let index = 0; index < limit; index++) {
-    const { token, rows } = await claimQueued({ limit: 1, kindPrefix, excludePrefix });
+    const preflight = kindPrefix === ipv6PreflightKind;
+    const { token, rows } = await claimQueued({
+      limit: 1,
+      kindPrefix: preflight ? undefined : kindPrefix,
+      exactKinds: preflight ? [ipv6PreflightKind] : undefined,
+      excludePrefix,
+      excludeKinds,
+    });
     if (!rows.length) break;
     const operation = rows[0]!;
     if (kindPrefix && !operation.kind.startsWith(kindPrefix)) continue;
@@ -550,7 +569,8 @@ export async function processQueued(
       clearInterval(heartbeat);
     }
   }
-  if (kindPrefix !== "integration.") await evaluateAlerts().catch(() => undefined);
+  if (kindPrefix !== "integration." && kindPrefix !== ipv6PreflightKind)
+    await evaluateAlerts().catch(() => undefined);
 }
 
 async function addStep(operationId: string, name: string, evidence: Record<string, unknown> = {}) {
@@ -610,7 +630,7 @@ export async function runOperation(
   await assertExecutionAuthorized(operation);
   if (kind === "integration.vercel_push") return runtime.vercelPush(operation);
   if (kind === "domain.verify") return verifyDomain(operation);
-  if (kind === ipv6PreflightKind) return runIpv6Preflight(operation);
+  if (kind === ipv6PreflightKind) return runIpv6Preflight(operation, withEdgeLock);
   if (kind === "certificate.issue" || kind === "certificate.renew") return issueCertificate(operation);
   if (kind === "database.provision") return provisionDatabase(operation);
   if (kind === "database.query") return queryDatabase(operation);
@@ -664,6 +684,7 @@ export async function assertExecutionAuthorized(operation: OperationRow) {
   };
   if (access.role === "viewer") throw new Error("Operation actor no longer has mutation permission.");
   if (access.role === "owner") return;
+  if (operation.kind === ipv6PreflightKind) throw new Error("Only owners may execute IPv6 preflight.");
   if (
     [
       "database.client_issue",
@@ -1864,7 +1885,11 @@ export async function runDnsMaintenance() {
     });
   }
   if (await ipv6PreflightDue()) {
-    await enqueue({ kind: ipv6PreflightKind, targetIds: ["platform"], idempotencyKey: ipv6PreflightKey });
+    await enqueue({
+      kind: ipv6PreflightKind,
+      targetIds: [ipv6PreflightTarget],
+      idempotencyKey: ipv6PreflightKey,
+    });
   }
 }
 
@@ -3269,10 +3294,11 @@ function reportCoordinatorError(error: unknown) {
 export function startCoordinator() {
   let coreInFlight = false;
   let integrationInFlight = false;
+  let preflightInFlight = false;
   const tick = () => {
     if (!coreInFlight) {
       coreInFlight = true;
-      void processQueued(8, undefined, "integration.")
+      void processQueued(8, undefined, "integration.", [ipv6PreflightKind])
         .catch(reportCoordinatorError)
         .finally(() => {
           coreInFlight = false;
@@ -3284,6 +3310,14 @@ export function startCoordinator() {
         .catch(reportCoordinatorError)
         .finally(() => {
           integrationInFlight = false;
+        });
+    }
+    if (!preflightInFlight) {
+      preflightInFlight = true;
+      void processQueued(1, ipv6PreflightKind)
+        .catch(reportCoordinatorError)
+        .finally(() => {
+          preflightInFlight = false;
         });
     }
   };

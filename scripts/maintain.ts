@@ -1,18 +1,22 @@
+import { existsSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
 import {
   bundleDigest,
+  dockerIpv6Ready,
   mailEnabled,
   maintenanceArgv,
   parseEnvFile,
   verifyMaintenanceRelease,
+  type Ipv6DockerState,
 } from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
 import { lockHostDeployment } from "./host-deployment-lock.ts";
-import { hostCommand } from "./install-host-hardening.ts";
+import { dockerIpv6EvidenceDir, publishedNetworkState } from "./install-docker-ipv6.ts";
+import { hostCommand, hostFirewallPath } from "./install-host-hardening.ts";
 
 const root = join(import.meta.dir, "..");
 const execute = process.env.ARK_MAINTENANCE_EXECUTE === "1";
@@ -37,10 +41,8 @@ const project = "ark-platform";
 const argv = maintenanceArgv(project, compose);
 const prefix = ["compose", "-f", compose, "-p", project];
 const envFile = Bun.file(join(root, ".env"));
-const installedMail = (await envFile.exists())
-  ? parseEnvFile(await envFile.text()).ARK_MAIL_ENABLED
-  : undefined;
-const enableMail = mailEnabled(installedMail ?? process.env.ARK_MAIL_ENABLED);
+const installed = (await envFile.exists()) ? parseEnvFile(await envFile.text()) : {};
+const enableMail = mailEnabled(installed.ARK_MAIL_ENABLED ?? process.env.ARK_MAIL_ENABLED);
 // The installed setting wins even if the maintenance process started before a mail-off install ended.
 process.env.ARK_MAIL_ENABLED = enableMail ? "1" : "0";
 const omitMail = !enableMail && validated.serviceNames.includes("mail-worker");
@@ -55,6 +57,45 @@ await appendFile(
 if (!execute) {
   console.log(JSON.stringify({ planned: argv, images: validated.images, executed: false }, null, 2));
   process.exit(0);
+}
+
+const manifest = Bun.YAML.parse(composeSource) as { networks?: { admin?: { enable_ipv6?: boolean } } };
+if (manifest.networks?.admin?.enable_ipv6 === true && validated.serviceNames.includes("edge-ts")) {
+  const hardened = installed.ARK_HOST_HARDENING === "1" || existsSync(hostFirewallPath);
+  const ready = await (async () => {
+    if (!hardened) {
+      const network = await hostCommand("docker", [
+        "network",
+        "ls",
+        "-q",
+        "--filter",
+        "name=^ark-platform_admin$",
+      ]);
+      if (!network.trim()) return true;
+      const [admin] = JSON.parse(await hostCommand("docker", ["network", "inspect", "ark-platform_admin"]));
+      return admin?.EnableIPv6 === true;
+    }
+    const directory = installed.ARK_IPV6_DOCKER_SOURCE;
+    if (directory !== dockerIpv6EvidenceDir) return false;
+    const { docker } = (await Bun.file(join(directory, "snapshot.json")).json()) as {
+      docker?: Ipv6DockerState;
+    };
+    if (!docker || !dockerIpv6Ready(docker)) return false;
+    const edge = await publishedNetworkState(project, "admin", "edge-ts");
+    if (!edge.networkIpv6 || edge.edge !== docker.edge || edge.edgeAddress !== docker.edgeAddress)
+      return false;
+    if (!enableMail) return true;
+    const mail = await publishedNetworkState("ark-mail", "mail-public", "stalwart");
+    return mail.networkIpv6 && Boolean(mail.edgeAddress);
+  })().catch(() => false);
+  if (!ready) {
+    throw new Error(
+      "Native Docker IPv6 must be ready before applying this signed release. " +
+        "Run the staged upgrade with mise run host:install on this installation, then retry signed maintenance " +
+        "after the Docker IPv6 observer has refreshed its evidence.",
+    );
+  }
+  if (hardened) process.env.ARK_IPV6_DOCKER_SOURCE = dockerIpv6EvidenceDir;
 }
 
 if (omitMail) await hostCommand("docker", [...prefix, "stop", "mail-worker"]);

@@ -3,12 +3,14 @@ import { join } from "node:path";
 
 import {
   IPV6_HOST_SAMPLE_MS,
+  IPV6_PREFLIGHT_RETRY_MS,
   IPV6_PREFLIGHT_TICKET_MS,
   IPV6_PREFLIGHT_WEEK_MS,
   createId,
   currentGeneration,
   dockerIpv6Ready,
   evaluateIpv6Report,
+  haproxyServerName,
   ipv6ProbeReport,
   ipv6ProbeRequest,
   planHash,
@@ -25,9 +27,17 @@ import {
 import { and, desc, eq, ne } from "drizzle-orm";
 
 import { db, type DbTransaction } from "../db.ts";
-import { domainClaims, frontRoutes, operations, operationSteps, platformSettings } from "../schema.ts";
+import {
+  domainClaims,
+  endpoints,
+  frontRoutes,
+  operations,
+  operationSteps,
+  platformSettings,
+} from "../schema.ts";
 import { reconcileDomainDns } from "./domain-dns.ts";
 import { edgeL4Settings } from "./edge-l4.ts";
+import { l4RoutePolicy, revokedSerials, storedL4Settings } from "./l4-routes.ts";
 import { poolerEdgeInput } from "./pooler-policy.ts";
 
 type Settings = typeof platformSettings.$inferSelect;
@@ -38,6 +48,7 @@ const settingsId = eq(platformSettings.id, "default");
 const challengeStep = "ipv6-preflight-challenge";
 const resultStep = "ipv6-preflight-result";
 export const ipv6PreflightKind = "domain.ipv6_preflight" as const;
+export const ipv6PreflightTarget = "ipv6-preflight";
 export const ipv6PreflightKey = "ipv6.preflight";
 export const ipv6PreflightResultPath = "/api/settings/ipv6/preflight/result";
 
@@ -77,16 +88,48 @@ async function installedGeneration() {
   return manifest?.version === 2 ? { generation, ...manifest } : null;
 }
 
+async function desiredListeners() {
+  // The route and certificate policies must come from the same revision.
+  return db.transaction(
+    async (tx) => {
+      const routes = await tx
+        .select({ route: frontRoutes, hostname: endpoints.hostname })
+        .from(frontRoutes)
+        .innerJoin(endpoints, eq(endpoints.id, frontRoutes.endpointId))
+        .where(and(eq(frontRoutes.enabled, true), ne(frontRoutes.kind, "http")))
+        .orderBy(frontRoutes.id);
+      const revoked = await revokedSerials(
+        routes.flatMap(({ route }) => (route.clientCaId ? [route.clientCaId] : [])),
+        tx,
+      );
+      return routes.map(({ route, hostname }) => {
+        const policy = route.status === "ready" ? storedL4Settings(route) : null;
+        return {
+          id: route.id,
+          port: route.listenPort,
+          server:
+            policy &&
+            haproxyServerName({
+              id: route.id,
+              hostname,
+              stableId: route.targetNodeStableId,
+              ip: route.targetIp,
+              port: route.targetPort,
+              policy: l4RoutePolicy(policy, revoked),
+            }),
+        };
+      });
+    },
+    { isolationLevel: "repeatable read" },
+  );
+}
+
 async function preflightPlan(settings: Settings) {
   const [host, snapshot, edge, routes, pooler] = await Promise.all([
     sample<Host>("ARK_IPV6_HOST_SNAPSHOT"),
     sample<Snapshot>("ARK_IPV6_DOCKER_SNAPSHOT"),
     installedGeneration(),
-    db
-      .select()
-      .from(frontRoutes)
-      .where(and(eq(frontRoutes.enabled, true), ne(frontRoutes.kind, "http")))
-      .orderBy(frontRoutes.id),
+    desiredListeners(),
     poolerEdgeInput(),
   ]);
   const address = publicIpv6(settings.publicIpv6);
@@ -109,7 +152,7 @@ async function preflightPlan(settings: Settings) {
     docker?.edge,
     docker?.edgeAddress,
     edge?.generation,
-    routes.map((route) => [route.id, route.listenPort, route.compatPort, route.updatedAt]),
+    routes,
     pooler.pooler,
   ]);
   const fail = (status: "failed" | "not_present", reason: string) => ({
@@ -130,6 +173,9 @@ async function preflightPlan(settings: Settings) {
       "Docker has not confirmed native IPv6, ip6tables, live-restore, proxy disabled and a dual-stack edge.",
     );
   if (!edge) return fail("failed", "The active HAProxy generation could not be read.");
+
+  if (edge.routes.length !== routes.length)
+    return fail("failed", "The active HAProxy route inventory differs from the enabled routes.");
 
   const checks: Ipv6ExpectedCheck[] = [];
   const tls443 = edge.routes.find((route) => route.kind === "tls" && route.listenPort === 443);
@@ -157,28 +203,24 @@ async function preflightPlan(settings: Settings) {
   }
   for (const stored of routes) {
     const route = edge.routes.find((candidate) => candidate.id === stored.id);
-    if (
-      !route ||
-      route.listenPort !== stored.listenPort ||
-      (route.compat?.listenPort ?? null) !== stored.compatPort
-    ) {
+    if (!route || !stored.server || route.server !== stored.server || route.listenPort !== stored.port) {
       return fail(
         "failed",
-        `Port ${stored.listenPort} route ${stored.id} is missing from active HAProxy configuration.`,
+        `Port ${stored.port} route ${stored.id} does not match the active HAProxy configuration.`,
       );
     }
     const base = {
       id: route.id,
       port: route.listenPort,
       hostname: route.hostname,
-      backend: route.loop?.backend ?? route.backend,
-      server: route.loop?.server ?? route.server,
+      backend: route.backend,
+      server: route.server,
     };
     if (route.kind === "postgres") {
       checks.push({
         ...base,
         protocol: "postgres-direct",
-        frontend: "fe_pg5432",
+        frontend: route.loop ? `fe_${route.id}_pg` : "fe_pg5432",
         clientCertificate: route.mode === "terminate_mtls",
       });
       if (route.compat)
@@ -197,7 +239,7 @@ async function preflightPlan(settings: Settings) {
       checks.push({
         ...base,
         protocol: "tls",
-        frontend: `fe_tls${route.listenPort}`,
+        frontend: route.loop ? `fe_${route.id}_tls` : `fe_tls${route.listenPort}`,
         clientCertificate: route.mode === "terminate_mtls",
       });
     }
@@ -212,10 +254,14 @@ export async function ipv6PreflightDue() {
   const settings = await ipv6Settings();
   if (!settings?.publicIpv4 && !settings?.publicIpv6) return false;
   const plan = await preflightPlan(settings);
+  const interval =
+    settings.ipv6Status === "failed" && process.env.ARK_OFFHOST_HEARTBEAT_URL
+      ? IPV6_PREFLIGHT_RETRY_MS
+      : IPV6_PREFLIGHT_WEEK_MS;
   return (
     settings.ipv6Evidence?.fingerprint !== plan.fingerprint ||
     !settings.ipv6CheckedAt ||
-    Date.now() - settings.ipv6CheckedAt.getTime() >= IPV6_PREFLIGHT_WEEK_MS
+    Date.now() - settings.ipv6CheckedAt.getTime() >= interval
   );
 }
 
@@ -323,7 +369,10 @@ async function offhostReport(request: Ipv6ProbeRequest) {
   return ipv6ProbeReport.parse(await response.json());
 }
 
+type WithEdgeLock = <T>(work: () => Promise<T>) => Promise<T>;
+
 async function completeProbe(
+  withEdgeLock: WithEdgeLock,
   operation: Operation,
   settings: Settings,
   plan: Extract<Plan, { status: "ready" }>,
@@ -331,7 +380,8 @@ async function completeProbe(
   report: Ipv6ProbeReport,
   challengeId?: string,
 ) {
-  let evidence = evaluateIpv6Report(request, plan.checks, report, []);
+  const origin = challengeId ? "manual" : "managed";
+  let evidence = evaluateIpv6Report(request, plan.checks, report, [], origin);
   // An ingress log is flushed when the connection closes and then picked up by the host timer.
   for (let attempt = 0; attempt < 9; attempt++) {
     const snapshot = await sample<Snapshot>("ARK_IPV6_DOCKER_SNAPSHOT");
@@ -346,6 +396,7 @@ async function completeProbe(
         plan.checks,
         report,
         Array.isArray(snapshot.logs) ? snapshot.logs : [],
+        origin,
       );
     }
     if (
@@ -363,25 +414,27 @@ async function completeProbe(
       unverified.map(({ port, protocol, hostname }) => `${port}/${protocol} (${hostname})`).join(", ")
     : undefined;
 
-  await db.transaction(async (tx) => {
-    const current = await latestSettings(tx, settings, plan);
-    if (challengeId && (request.expiresAt <= Date.now() || (await readStep(challengeId, resultStep, tx)))) {
-      throw new Error("The signed IPv6 preflight request expired or was already used.");
-    }
-    const metadata = {
-      fingerprint: plan.fingerprint,
-      addresses: plan.addresses,
-      docker: plan.docker,
-      checks: evidence,
-    };
-    await recordResult(tx, current, operation.id, reason ? "failed" : "passed", metadata, reason);
-    if (challengeId)
-      await step(tx, challengeId, resultStep, { submittedAs: operation.id, ...metadata }, reason);
-  });
+  await withEdgeLock(() =>
+    db.transaction(async (tx) => {
+      const current = await latestSettings(tx, settings, plan);
+      if (request.expiresAt <= Date.now() || (challengeId && (await readStep(challengeId, resultStep, tx)))) {
+        throw new Error("The signed IPv6 preflight request expired or was already used.");
+      }
+      const metadata = {
+        fingerprint: plan.fingerprint,
+        addresses: plan.addresses,
+        docker: plan.docker,
+        checks: evidence,
+      };
+      await recordResult(tx, current, operation.id, reason ? "failed" : "passed", metadata, reason);
+      if (challengeId)
+        await step(tx, challengeId, resultStep, { submittedAs: operation.id, ...metadata }, reason);
+    }),
+  );
   if (reason) throw new Error(reason);
 }
 
-export async function runIpv6Preflight(operation: Operation) {
+export async function runIpv6Preflight(operation: Operation, withEdgeLock: WithEdgeLock) {
   const previous = await readStep(operation.id, resultStep);
   if (previous?.error) throw new Error(previous.error);
   if (previous || (await readStep(operation.id, challengeStep))) return;
@@ -403,18 +456,20 @@ export async function runIpv6Preflight(operation: Operation) {
         "The signed IPv6 preflight request expired, was used, or names an older configuration.",
       );
     }
-    return completeProbe(operation, settings, plan, request, submitted, submitted.id);
+    return completeProbe(withEdgeLock, operation, settings, plan, request, submitted, submitted.id);
   }
   const metadata = { fingerprint: plan.fingerprint, addresses: plan.addresses, docker: plan.docker };
   if (plan.status !== "ready") {
-    await db.transaction(async (tx) =>
-      recordResult(
-        tx,
-        await latestSettings(tx, settings, plan),
-        operation.id,
-        plan.status,
-        metadata,
-        plan.reason,
+    await withEdgeLock(() =>
+      db.transaction(async (tx) =>
+        recordResult(
+          tx,
+          await latestSettings(tx, settings, plan),
+          operation.id,
+          plan.status,
+          metadata,
+          plan.reason,
+        ),
       ),
     );
     if (plan.status === "failed") throw new Error(plan.reason);
@@ -436,43 +491,52 @@ export async function runIpv6Preflight(operation: Operation) {
     } catch {
       // Transport failure is unverified for every port and is recorded through the same DNS flow.
     }
-    return completeProbe(operation, settings, plan, request, report ?? { id: request.id, checks: [] });
+    return completeProbe(
+      withEdgeLock,
+      operation,
+      settings,
+      plan,
+      request,
+      report ?? { id: request.id, checks: [] },
+    );
   }
 
-  await db.transaction(async (tx) => {
-    const current = await latestSettings(tx, settings, plan);
-    const fresh =
-      current.ipv6Status === "passed" &&
-      current.ipv6Evidence?.fingerprint === plan.fingerprint &&
-      current.ipv6CheckedAt &&
-      issuedAt - current.ipv6CheckedAt.getTime() < IPV6_PREFLIGHT_WEEK_MS;
-    if (!fresh) {
-      const reason = "Awaiting the signed off-host IPv6 preflight report.";
-      // The challenge stays open after the initial unverified status is committed.
-      const rows = await tx
-        .update(platformSettings)
-        .set({
-          ipv6Status: "failed",
-          ipv6CheckedAt: new Date(issuedAt),
-          ipv6Evidence: {
-            ...metadata,
-            operationId: operation.id,
-            reason,
-            checks: request.checks.map(({ id, port, protocol, hostname }) => ({
-              id,
-              port,
-              protocol,
-              hostname,
-              outcome: "unverified",
-            })),
-          },
-        })
-        .where(settingsId)
-        .returning();
-      await reconcileIpv6Dns(tx, current, rows[0]!, operation.id);
-    }
-    await step(tx, operation.id, challengeStep, { ...metadata, request });
-  });
+  await withEdgeLock(() =>
+    db.transaction(async (tx) => {
+      const current = await latestSettings(tx, settings, plan);
+      const fresh =
+        current.ipv6Status === "passed" &&
+        current.ipv6Evidence?.fingerprint === plan.fingerprint &&
+        current.ipv6CheckedAt &&
+        issuedAt - current.ipv6CheckedAt.getTime() < IPV6_PREFLIGHT_WEEK_MS;
+      if (!fresh) {
+        const reason = "Awaiting the signed off-host IPv6 preflight report.";
+        // The challenge stays open after the initial unverified status is committed.
+        const rows = await tx
+          .update(platformSettings)
+          .set({
+            ipv6Status: "failed",
+            ipv6CheckedAt: new Date(issuedAt),
+            ipv6Evidence: {
+              ...metadata,
+              operationId: operation.id,
+              reason,
+              checks: request.checks.map(({ id, port, protocol, hostname }) => ({
+                id,
+                port,
+                protocol,
+                hostname,
+                outcome: "unverified",
+              })),
+            },
+          })
+          .where(settingsId)
+          .returning();
+        await reconcileIpv6Dns(tx, current, rows[0]!, operation.id);
+      }
+      await step(tx, operation.id, challengeStep, { ...metadata, request });
+    }),
+  );
 }
 
 async function reconcileIpv6Dns(

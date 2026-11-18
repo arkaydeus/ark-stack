@@ -674,7 +674,7 @@ Extend `OperationKind` (`shared/src/operations.ts:51-82`). The names below are c
 - Certificate-retirement admission fence and role drain at each predecessor `not_after` (§3.10.4).
 - `database.client_rollover` daily.
 - CRL refresh for TLS-TCP route CAs weekly (`crl_next_update` minus 7 days).
-- `domain.ipv6_preflight` weekly, and on any change to the public IP.
+- `domain.ipv6_preflight` weekly, on listener or public IP changes, and after a five-minute retry interval for failed managed checks.
 - Append-only canary per backup target weekly.
 - Expiry alerts: client certificates (rollover pending at T−30 days, warning at T−14, critical at T−7) and Vercel tokens (30 days before `token_expires_at`). These extend `server/src/modules/alerts.ts`.
 
@@ -1287,7 +1287,7 @@ resolvers docker
 
 # ---- 443: SNI router -------------------------------------------------------
 frontend fe_tls443
-    bind :443
+    bind :::443 v4v6
     maxconn 2000
     tcp-request inspect-delay 5s
     stick-table type ipv6 size 100k expire 10m store conn_cur,conn_rate(10s)
@@ -1330,7 +1330,7 @@ backend be_rt_p7q2
 
 # ---- 5432: PostgreSQL router ----------------------------------------------
 frontend fe_pg5432
-    bind :5432
+    bind :::5432 v4v6
     maxconn 2000
     tcp-request inspect-delay 5s
     acl pg_ssl_request req.payload(0,8) -m bin 0000000804d2162f
@@ -1367,7 +1367,7 @@ backend be_reject
 # ---- 20001: raw TCP route (no TLS) ----------------------------------------
 # rt_t001 ssh-box.example.com:20001 -> box.tail1234.ts.net (100.77.9.3:22), plain
 frontend fe_rt_t001
-    bind :20001
+    bind :::20001 v4v6
     maxconn 20
     tcp-request connection reject unless { src -f /usr/local/etc/haproxy/allow/rt_t001.lst }
     stick-table type ipv6 size 10k expire 10m store conn_cur,conn_rate(10s)
@@ -2022,7 +2022,7 @@ When the preflight has not passed or the domain switch is off, the UI shows any 
 
 #### 3.13.4 IPv6 preflight (R9)
 
-`domain.ipv6_preflight` runs on demand (`POST /api/settings/ipv6/preflight`), weekly, and whenever the public address changes. It passes only if **all** of these hold:
+`domain.ipv6_preflight` runs on demand (`POST /api/settings/ipv6/preflight`), weekly, and whenever the public address or listener configuration changes. Failed managed checks are retried after five minutes. The worker runs the off-host request in a dedicated queue lane, then validates and commits it under the edge lock. The preflight passes only if **all** of these hold:
 
 1. **A public IPv6 address exists.** The host-netns reconciler (`database-ingress`) reports the host's global-scope IPv6 addresses. The setting `public_ipv6` must be one of them, and must not be ULA, link-local or a documentation prefix.
 2. **Docker native IPv6 is active, so client addresses survive** (§3.17):
@@ -2034,12 +2034,12 @@ When the preflight has not passed or the domain switch is off, the UI shows any 
 
 3. **Every public port answers over IPv6 from outside.** An external probe connects to `[public_ipv6]` on:
    - 80: expects the challenge edge's 404 or a known redirect;
-   - 443: expects a TLS handshake for a configured hostname;
+   - 443 and configured shared SNI ports: expect a TLS handshake for each TLS-TCP route and a configured HTTPS hostname on 443, when present;
    - 5432 when PgBouncer is enabled: classic `SSLRequest` must reply `S`, followed by the configured TLS/client authentication;
    - 5432 for each Postgres route: direct TLS with that route's SNI and ALPN `postgresql`, its configured certificate/auth policy and an allowed probe source. A route-only installation must reject classic SSLRequest; it can still pass this direct-TLS preflight;
    - every enabled raw-TCP and compat port: expects a TCP connect.
 
-   The probe also checks that the **source address and port logged by the edge match the probe's connection**. Caddy records the port 80 request and HAProxy records the admitted TCP connections. Probe identities and source addresses must already satisfy route CIDR and authentication policies. If an authorized external probe cannot be supplied, the check is unverified and AAAA is withheld. The off-host heartbeat runner (`ARK_OFFHOST_HEARTBEAT_URL` receiver) exposes a `/preflight` endpoint. When the receiver is unset, an owner downloads a one-time request and runs the Bun probe from an external IPv6-capable machine. The probe submits a signed report to the admin origin. See [Native IPv6 and AAAA publication](../operating.md#native-ipv6-and-aaaa-publication).
+   The probe also checks that the **source address and port logged by the edge match the probe's connection**. Caddy records the port 80 request and HAProxy records the admitted TCP connections. Probe identities and source addresses must already satisfy route CIDR and authentication policies. If an authorized external probe cannot be supplied, the check is unverified and AAAA is withheld. The off-host heartbeat runner (`ARK_OFFHOST_HEARTBEAT_URL` receiver) exposes a `/preflight` endpoint. When the receiver is unset, an owner downloads a one-time request and runs the Bun probe from an external IPv6-capable machine. The probe submits a signed report to the admin origin. The managed runner is required for PostgreSQL authentication evidence on port 5432. For terminated TLS, the edge log must identify a connection to the actual route target. See [Native IPv6 and AAAA publication](../operating.md#native-ipv6-and-aaaa-publication).
 
 4. **The result is recorded** in `platform_settings.ipv6_status` and `ipv6_evidence`, per port. `failed` lists the failing ports; `not_present` means no global IPv6 address.
 
@@ -2841,7 +2841,7 @@ Every ticket includes the repository's standard gates: `mise run format:check`, 
   - Probe configured 5432 protocols separately: classic SSLRequest only for enabled PgBouncer, direct TLS with route SNI and ALPN postgresql for Postgres routes, using approved source/auth credentials without bypasses.
   - Daemon settings (`ipv6`, `ip6tables`, `userland-proxy: false`, `live-restore`) via the installer, in the safe order of §3.17.
   - `enable_ipv6` on the published network.
-  - `domain.ipv6_preflight`: host global address, Docker IPv6 state, and an external probe (heartbeat runner or signed manual script) over 80, 443, 5432 and every enabled raw or compat port, including the source-address check.
+  - `domain.ipv6_preflight`: host global address, Docker IPv6 state, and an external probe over 80, 443, configured shared SNI ports, 5432 and every enabled raw or compat port, including the source-address check. PostgreSQL authentication evidence requires the managed HTTPS runner.
   - Extend FD-19's existing `PUT /api/domains/:id/aaaa` response with the current preflight status.
 - **Depends on:** FD-05, FD-25.
 - **Acceptance criteria:**

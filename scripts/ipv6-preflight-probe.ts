@@ -139,6 +139,10 @@ async function probe(
         } finally {
           await sql.end({ timeout: 1 });
         }
+      } else {
+        // Give a TLS terminator time to connect upstream. The independently collected
+        // backend log is what confirms the connection.
+        await Promise.race([Bun.sleep(250), once(tls, "close")]);
       }
     }
     return { id, outcome: "passed", source, sourcePort };

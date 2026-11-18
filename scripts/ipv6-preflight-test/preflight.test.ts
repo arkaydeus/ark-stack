@@ -9,6 +9,11 @@ import { join, resolve } from "node:path";
 import {
   CADDY_GLOBAL_BLOCK,
   EDGE_L4_GENERATION_ENV,
+  IPV6_PREFLIGHT_RETRY_MS,
+  dockerIpv6Ready,
+  ipv6ProbeRequest,
+  l4Limits,
+  l4PolicyFingerprint,
   normalizeHostname,
   publicIpv6,
   renderEdgeL4Generation,
@@ -16,16 +21,39 @@ import {
   type EdgeL4Input,
   type Ipv6ProbeReport,
   type Ipv6ProbeRequest,
+  type OperationKind,
 } from "@ark-stack/shared";
 
 import { app } from "../../server/src/app.ts";
-import { enqueue, runOperation, setDnsResolver } from "../../server/src/coordinator.ts";
+import {
+  enqueue,
+  revealSecret,
+  runDnsMaintenance,
+  runOperation,
+  setDnsResolver,
+} from "../../server/src/coordinator.ts";
 import { db, sql } from "../../server/src/db.ts";
 import { loadEnv } from "../../server/src/env.ts";
-import { ipv6PreflightChallenge, ipv6Settings } from "../../server/src/modules/ipv6-preflight.ts";
-import { createCaMaterial, signClientCertificate } from "../../server/src/modules/pki.ts";
+import { MockLocalApi } from "../../server/src/mock-localapi.ts";
+import { observeEdgeTailnet } from "../../server/src/modules/edge-observe.ts";
+import { edgeLocalApi } from "../../server/src/modules/tailnet-localapi.ts";
+import {
+  ipv6PreflightChallenge,
+  ipv6PreflightDue,
+  ipv6PreflightKind,
+  ipv6PreflightTarget,
+  ipv6Settings,
+} from "../../server/src/modules/ipv6-preflight.ts";
+import {
+  createCaMaterial,
+  createPrivateCa,
+  generateCaCrl,
+  issueClientCertificate,
+  signClientCertificate,
+} from "../../server/src/modules/pki.ts";
 import { planPgbouncer, renderPgbouncerFiles } from "../../server/src/modules/pgbouncer.ts";
 import { EdgeTestRuntime } from "../edge-test/runtime.ts";
+import type { Subprocess } from "bun";
 import type { ProbeCredential } from "../ipv6-preflight-probe.ts";
 
 const root = resolve(import.meta.dir, "../..");
@@ -47,6 +75,8 @@ const dbHost = "db.fd27.example.com";
 const pgHost = "pg.fd27.example.com";
 const domainId = "dom_fd27";
 const targetIp = "100.76.27.17";
+const tlsHost = "tls.fd27.example.com";
+const mtlsHost = "mtls.fd27.example.com";
 const role = "ipv6_probe";
 const password = crypto.randomUUID();
 const database = "probe_db";
@@ -63,17 +93,33 @@ async function retry<T>(attempt: () => Promise<T>, timeoutMs = 30_000) {
   }
 }
 
+async function executeFixtureOperation(operation: Awaited<ReturnType<typeof enqueue>>) {
+  try {
+    await runOperation(operation.kind as OperationKind, operation);
+    await sql`UPDATE operations SET status='succeeded' WHERE id=${operation.id}`;
+  } catch (error) {
+    await sql`UPDATE operations SET status='failed' WHERE id=${operation.id}`;
+    throw error;
+  }
+}
+
 async function preflight() {
   const operation = await enqueue({
-    kind: "domain.ipv6_preflight",
-    targetIds: ["platform"],
+    kind: ipv6PreflightKind,
+    targetIds: [ipv6PreflightTarget],
     idempotencyKey: crypto.randomUUID(),
   });
-  await runOperation("domain.ipv6_preflight", operation);
+  await executeFixtureOperation(operation);
   return operation;
 }
 
-async function submit(request: Ipv6ProbeRequest, token: string, report: Ipv6ProbeReport, pattern?: RegExp) {
+async function submit(
+  request: Ipv6ProbeRequest,
+  token: string,
+  report: Ipv6ProbeReport,
+  pattern?: RegExp,
+  consumed = true,
+) {
   const signature = signIpv6Report(report, token);
   const call = (mac: string) =>
     app.request("http://127.0.0.1:3000/api/settings/ipv6/preflight/result", {
@@ -91,11 +137,41 @@ async function submit(request: Ipv6ProbeRequest, token: string, report: Ipv6Prob
     where: (operations, { eq }) => eq(operations.id, operationId),
   });
   assert.ok(queued);
-  const completion = runOperation("domain.ipv6_preflight", queued);
+  const completion = executeFixtureOperation(queued);
   if (pattern) await assert.rejects(completion, pattern);
   else await completion;
-  assert.equal((await call(signature)).status, 403);
+  if (consumed) assert.equal((await call(signature)).status, 403);
   return queued.id;
+}
+
+async function enqueueManaged() {
+  return enqueue({
+    kind: ipv6PreflightKind,
+    targetIds: [ipv6PreflightTarget],
+    idempotencyKey: crypto.randomUUID(),
+  });
+}
+
+async function scheduleManaged() {
+  await runDnsMaintenance();
+  const row = await db.query.operations.findFirst({
+    where: (operations, { eq, like, or }) =>
+      or(
+        eq(operations.idempotencyKey, "ipv6.preflight"),
+        like(operations.idempotencyKey, "ipv6.preflight:%"),
+      ),
+    orderBy: (operations, { desc }) => desc(operations.createdAt),
+  });
+  assert.ok(row);
+  return row;
+}
+async function observe() {
+  const operation = await enqueue({
+    kind: "edge.observe",
+    targetIds: ["tailnet:edge"],
+    idempotencyKey: crypto.randomUUID(),
+  });
+  await executeFixtureOperation(operation);
 }
 
 test("native IPv6, separate PostgreSQL probes, AAAA withdrawal and Pebble HTTP-01", async () => {
@@ -134,9 +210,11 @@ test("native IPv6, separate PostgreSQL probes, AAAA withdrawal and Pebble HTTP-0
     edge: join(dir, "l4"),
   };
   const savedEnv = {
+    ARK_OFFHOST_HEARTBEAT_URL: process.env.ARK_OFFHOST_HEARTBEAT_URL,
     ARK_IPV6_HOST_SNAPSHOT: process.env.ARK_IPV6_HOST_SNAPSHOT,
     ARK_IPV6_DOCKER_SNAPSHOT: process.env.ARK_IPV6_DOCKER_SNAPSHOT,
     ARK_EDGE_L4_DIR: process.env.ARK_EDGE_L4_DIR,
+    ARK_EDGE_TS_SOCKET: process.env.ARK_EDGE_TS_SOCKET,
   };
   Object.assign(process.env, {
     ARK_IPV6_HOST_SNAPSHOT: files.host,
@@ -160,6 +238,101 @@ test("native IPv6, separate PostgreSQL probes, AAAA withdrawal and Pebble HTTP-0
   }
 
   const credentials: Record<string, ProbeCredential> = {};
+  let worker: Subprocess | undefined;
+  let localApi: MockLocalApi | undefined;
+  let releaseRunner: (() => void) | undefined;
+  let tlsReceiver: ReturnType<typeof Bun.serve> | undefined;
+  let api: ReturnType<typeof Bun.serve> | undefined;
+  let respond: (request: Ipv6ProbeRequest) => Promise<Response>;
+  async function stopWorker() {
+    if (!worker) return;
+    worker.kill();
+    await worker.exited;
+    worker = undefined;
+    delete process.env.ARK_OFFHOST_HEARTBEAT_URL;
+  }
+  async function startWorker() {
+    if (!tlsReceiver) {
+      const crt = join(dir, "receiver.crt");
+      const key = join(dir, "receiver.key");
+      const openssl = Bun.spawn(
+        [
+          "openssl",
+          "req",
+          "-x509",
+          "-newkey",
+          "ec",
+          "-pkeyopt",
+          "ec_paramgen_curve:P-256",
+          "-nodes",
+          "-days",
+          "2",
+          "-subj",
+          "/CN=127.0.0.1",
+          "-addext",
+          "subjectAltName=IP:127.0.0.1",
+          "-keyout",
+          key,
+          "-out",
+          crt,
+        ],
+        { stdout: "ignore", stderr: "ignore" },
+      );
+      assert.equal(await openssl.exited, 0);
+      tlsReceiver = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        tls: { cert: Bun.file(crt), key: Bun.file(key) },
+        async fetch(request) {
+          assert.equal(new URL(request.url).pathname, "/preflight");
+          assert.equal(
+            request.headers.get("authorization"),
+            `Bearer ${process.env.ARK_OFFHOST_HEARTBEAT_TOKEN}`,
+          );
+          return respond(ipv6ProbeRequest.parse(await request.json()));
+        },
+      });
+      api = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+    }
+    process.env.ARK_OFFHOST_HEARTBEAT_URL = tlsReceiver.url.toString();
+    worker = Bun.spawn(
+      [
+        process.execPath,
+        "--no-env-file",
+        "-e",
+        `
+      import { runDomainJobs } from "./workers/src/domains.ts";
+      import { executeClaimedJob } from "./server/src/coordinator.ts";
+      // The fixture controls public DNS explicitly after the withdrawal check.
+      await runDomainJobs((job) => job.kind === "domain.verify" ? Promise.resolve() : executeClaimedJob(job), { pollMs: 50 });
+    `,
+      ],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          ARK_API_URL: api!.url.toString().replace(/\/$/, ""),
+          ARK_EDGE_DIR: join(dir, "caddy"),
+          ARK_WORKER_TOKEN: process.env.ARK_DOMAIN_WORKER_TOKEN,
+          NODE_EXTRA_CA_CERTS: join(dir, "receiver.crt"),
+        },
+        stdout: "ignore",
+        stderr: "inherit",
+      },
+    );
+  }
+
+  async function completed(id: string, status: "succeeded" | "failed") {
+    return retry(async () => {
+      const row = await db.query.operations.findFirst({
+        where: (operations, { eq }) => eq(operations.id, id),
+      });
+      assert.ok(row);
+      assert.equal(row.status, status, row.error ?? `${row.kind} is ${row.status}`);
+      return row;
+    }, 35_000);
+  }
+
   async function probe(request: Ipv6ProbeRequest, client = runner, auth = credentials) {
     return JSON.parse(
       await docker(
@@ -280,13 +453,15 @@ test("native IPv6, separate PostgreSQL probes, AAAA withdrawal and Pebble HTTP-0
       "/sbin/init",
     );
     await host("mkdir", "-p", "/work/run", "/work/acme", "/etc/docker");
-    const built = await Bun.build({
-      entrypoints: [join(import.meta.dir, "inside.ts")],
-      target: "bun",
-      outdir: dir,
-    });
-    assert.ok(built.success, built.logs.join("\n"));
+    const builds = await Promise.all(
+      [join(import.meta.dir, "inside.ts"), join(root, "scripts/observe-docker-ipv6.ts")].map((entrypoint) =>
+        Bun.build({ entrypoints: [entrypoint], target: "bun", outdir: dir }),
+      ),
+    );
+    for (const build of builds) assert.ok(build.success, build.logs.join("\n"));
     await docker("cp", join(dir, "inside.js"), `${vps}:/work/inside.js`);
+    await host("mkdir", "-p", "/work/scripts");
+    await docker("cp", join(dir, "observe-docker-ipv6.js"), `${vps}:/work/scripts/observe-docker-ipv6.ts`);
     await snapshot(false);
     await preflight();
     assert.equal((await ipv6Settings())?.ipv6Status, "not_present");
@@ -354,8 +529,24 @@ services:
     pull_policy: never
     command: [sleep, infinity]
     stop_grace_period: 1s
-    ports: ["80:80", "443:443", "5432:5432", "20007:20007", "20008:20008"]
+    ports: ["80:80", "443:443", "5432:5432", "8883:8883", "20007:20007", "20008:20008"]
     networks: [admin, pgbouncer-ingress]
+  tailscale:
+    container_name: tailscale
+    image: ${bun}
+    pull_policy: never
+    command: [sleep, infinity]
+    stop_grace_period: 1s
+    profiles: [tailnet]
+    networks: [admin]
+  tailnet-gateway:
+    container_name: tailnet-gateway
+    image: ${bun}
+    pull_policy: never
+    command: [sleep, infinity]
+    stop_grace_period: 1s
+    profiles: [tailnet]
+    network_mode: "service:tailscale"
 networks:
   admin:
     enable_ipv6: ${ipv6}
@@ -364,16 +555,37 @@ networks:
   pgbouncer-ingress: { internal: true }
 `,
       );
+      await put(
+        "mail.yml",
+        `name: ark-mail
+services:
+  stalwart:
+    container_name: stalwart
+    image: ${bun}
+    pull_policy: never
+    command: [sleep, infinity]
+    stop_grace_period: 1s
+    ports: ["25:25"]
+    networks: [mail-public]
+networks:
+  mail-public: { enable_ipv6: ${ipv6} }
+`,
+      );
     }
     await composeFile(false);
-    await compose("up", "-d");
+    await compose("--profile", "tailnet", "up", "-d");
+    await nested("compose", "-f", "/work/mail.yml", "up", "-d");
     await staged("prepare");
-    await compose("up", "-d");
+    await compose("--profile", "tailnet", "up", "-d");
+    await nested("compose", "-f", "/work/mail.yml", "up", "-d");
     await assert.rejects(staged("proxy-off"), /before disabling Docker's proxy/);
     assert.equal(platform.networks.admin.enable_ipv6, true);
     await composeFile(true);
-    await staged("network");
-    await compose("up", "-d");
+    await staged("upgrade-networks");
+    const tailnet = await nested("ps", "--format", "{{.Names}}");
+    assert.match(tailnet, /tailscale/);
+    assert.match(tailnet, /tailnet-gateway/);
+    const mailBefore = await nested("inspect", "--format", "{{.Id}}", "stalwart");
     const current = await nested("inspect", "--format", "{{.Id}}", "edge-ts");
     const baseline = (await Bun.file(join(root, "infra/platform/Caddyfile")).text())
       .split(":80 {")[1]!
@@ -445,12 +657,20 @@ ${appHost} {
     await generation({ httpHostnames: [appHost] });
     await snapshot();
     await assert.rejects(preflight(), /proxy disabled/);
-    await staged("proxy-off");
     await nested("rm", "-f", "edge", "edge-l4");
-    await compose("up", "-d", "--force-recreate", "edge-ts");
+    await staged("proxy-off");
+    assert.notEqual(await nested("inspect", "--format", "{{.Id}}", "stalwart"), mailBefore);
     assert.notEqual(await nested("inspect", "--format", "{{.Id}}", "edge-ts"), current);
     await startCaddy();
     await generation({ httpHostnames: [appHost] });
+    await staged("install-observer");
+    assert.equal(await host("systemctl", "is-enabled", "ark-docker-ipv6.timer"), "enabled");
+    assert.ok(dockerIpv6Ready(JSON.parse(await host("cat", "/var/lib/ark/ipv6/snapshot.json")).docker));
+    const manual = await challenge();
+    const manualReport = await probe(manual.request);
+    await snapshot();
+    await submit(manual.request, manual.token, manualReport);
+    assert.equal((await ipv6Settings())?.ipv6Status, "passed");
 
     await nested(
       "run",
@@ -586,6 +806,21 @@ exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c
     await nested("network", "connect", "database-management", "pgbouncer-public");
 
     const cidrs = [source + "/128"];
+    const policy = (
+      kind: "postgres" | "tcp" | "tls",
+      listenPort: number,
+      tlsMode: "passthrough" | "plain" | "terminate" | "terminate_mtls",
+      options: { compatPort?: number; clientCaId?: string } = {},
+    ) =>
+      l4PolicyFingerprint({
+        kind,
+        listenPort,
+        tlsMode,
+        sourceCidrs: cidrs,
+        allowInternet: false,
+        limits: l4Limits(kind),
+        ...options,
+      });
     const pgRoute = {
       id: "rt_fd27pg",
       hostname: pgHost,
@@ -594,8 +829,15 @@ exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c
       port: 5432,
       sourceCidrs: cidrs,
       compatPort: 20007,
+      policy: policy("postgres", 5432, "passthrough", { compatPort: 20007 }),
     };
-    const rawRoute = { ...pgRoute, id: "rt_fd27raw", hostname: "tcp.fd27.example.com", listenPort: 20008 };
+    const rawRoute = {
+      ...pgRoute,
+      id: "rt_fd27raw",
+      hostname: "tcp.fd27.example.com",
+      listenPort: 20008,
+      policy: policy("tcp", 20008, "plain"),
+    };
     const pooler = { hostname: dbHost, sourceCidrs: cidrs };
     await sql`INSERT INTO endpoints (id,domain_id,kind,hostname,exposure,status) VALUES
       ('ep_fd27pg',${domainId},'route',${pgHost},'public','awaiting_dns'),
@@ -618,55 +860,275 @@ exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c
         tcpRoutes: mode === "pooler" ? [] : [rawRoute],
         pooler: mode === "route" ? null : pooler,
       });
-      const { request, token } = await challenge();
-      assert.equal(
-        request.checks.some(({ protocol }) => protocol === "postgres-classic"),
-        mode !== "route",
-      );
-      assert.equal(
-        request.checks.some(({ protocol }) => protocol === "postgres-direct"),
-        mode !== "pooler",
-      );
+      await snapshot();
       if (mode === "route") {
+        const obsolete = await challenge();
+        const report = await probe(obsolete.request);
+        await snapshot();
+        await sql`UPDATE front_routes SET source_cidrs='["2001:db9::99/128"]', updated_at=now() WHERE id=${pgRoute.id}`;
+        await submit(obsolete.request, obsolete.token, report, /older configuration/, false);
+        await assert.rejects(preflight(), /does not match the active HAProxy configuration/);
+        await sql`UPDATE front_routes SET source_cidrs=${JSON.stringify(cidrs)}::jsonb WHERE id=${pgRoute.id}`;
+
+        const delegated = await challenge();
         const classic = await probe({
-          ...request,
+          ...delegated.request,
           checks: [
             { id: "pgbouncer", protocol: "postgres-classic", port: 5432, hostname: dbHost },
-            request.checks[0]!,
+            delegated.request.checks[0]!,
           ],
         });
         assert.equal(classic.checks[0]?.outcome, "failed");
+        // An admitted TCP connection to the real PostgreSQL backend corroborates the address and
+        // source port, but a signer without database credentials cannot attest to a query.
+        const claimed = {
+          id: pgRoute.id,
+          ...JSON.parse(
+            await docker(
+              "exec",
+              runner,
+              "bun",
+              "/tmp/inside.js",
+              "postgres-handshake",
+              JSON.stringify({
+                address,
+                hostname: pgHost,
+                ca: credentials[pgRoute.id]!.ca,
+              }),
+            ),
+          ),
+        };
+        const genuine = await probe(delegated.request);
+        await snapshot();
+        const { logs } = await Bun.file(files.docker).json();
+        assert.ok(
+          logs.some(
+            (log: { source: string; sourcePort: number; frontend?: string; connected?: boolean }) =>
+              log.source === claimed.source &&
+              log.sourcePort === claimed.sourcePort &&
+              log.frontend === "fe_pg5432" &&
+              log.connected,
+          ),
+          "The handshake without SQL login must have independent HAProxy backend-connect evidence.",
+        );
+        await submit(
+          delegated.request,
+          delegated.token,
+          {
+            ...genuine,
+            checks: genuine.checks.map((check) => (check.id === pgRoute.id ? claimed : check)),
+          },
+          /5432\/postgres-direct/,
+        );
+        const checks = (await ipv6Settings())?.ipv6Evidence?.checks as {
+          id: string;
+          outcome: string;
+          reason?: string;
+        }[];
+        assert.deepEqual(checks.find(({ id }) => id === pgRoute.id)?.outcome, "unverified");
+        assert.match(checks.find(({ id }) => id === pgRoute.id)?.reason ?? "", /requires the managed runner/);
+
+        const started = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        releaseRunner = () => release.resolve();
+        respond = async () => {
+          const body = new ReadableStream<Uint8Array>({
+            async start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"checks":'));
+              started.resolve();
+              await release.promise;
+              controller.error(new Error("The fixture runner disconnected mid-report."));
+            },
+          });
+          return new Response(body, { headers: { "content-type": "application/json" } });
+        };
+        await startWorker();
+        await sql`UPDATE platform_settings SET ipv6_checked_at=${new Date(Date.now() - IPV6_PREFLIGHT_RETRY_MS - 1).toISOString()}::timestamptz`;
+        const outage = await scheduleManaged();
+        await Promise.race([
+          started.promise,
+          Bun.sleep(10_000).then(() => {
+            throw new Error("The HTTPS runner did not receive the scheduled check.");
+          }),
+        ]);
+        // The edge job must complete while the preflight is still awaiting the HTTPS response.
+        const drain = await enqueue({
+          kind: "edge.drain",
+          targetIds: ["platform"],
+          payload: { reason: "fixture" },
+        });
+        await completed(drain.id, "succeeded");
+        releaseRunner();
+        releaseRunner = undefined;
+        await completed(outage.id, "failed");
+        const failed = await ipv6Settings();
+        assert.equal(failed?.ipv6Status, "failed");
+        assert.equal(await ipv6PreflightDue(), false);
+        await sql`UPDATE platform_settings SET ipv6_checked_at=${new Date(Date.now() - IPV6_PREFLIGHT_RETRY_MS - 1).toISOString()}::timestamptz`;
+        assert.equal(await ipv6PreflightDue(), true);
+        respond = async (request) => {
+          const result = await probe(request);
+          await snapshot();
+          return Response.json(result);
+        };
+        const retried = await scheduleManaged();
+        assert.notEqual(retried.id, outage.id);
+        await completed(retried.id, "succeeded");
+        assert.equal((await ipv6Settings())?.ipv6Evidence?.fingerprint, failed?.ipv6Evidence?.fingerprint);
+      } else {
+        if (mode === "both") {
+          respond = async (request) => {
+            const forbidden = await probe(request, denied);
+            assert.ok(
+              forbidden.checks
+                .filter(({ id }) => ["pgbouncer", pgRoute.id].includes(id))
+                .every(({ outcome }) => outcome !== "passed"),
+            );
+            const bad = await probe(request, runner, {
+              ...credentials,
+              pgbouncer: { ...credentials.pgbouncer, cert: undefined, key: undefined },
+              [pgRoute.id]: { ...credentials[pgRoute.id], password: "wrong-password" },
+            });
+            assert.equal(bad.checks.find(({ id }) => id === "pgbouncer")?.outcome, "unverified");
+            assert.equal(bad.checks.find(({ id }) => id === pgRoute.id)?.outcome, "failed");
+            const result = await probe(request);
+            await snapshot();
+            return Response.json(result);
+          };
+        }
+        await completed((await enqueueManaged()).id, "succeeded");
       }
-      const report = await probe(request);
-      await snapshot();
-      assert.deepEqual(
-        report.checks.filter(({ outcome }) => outcome !== "passed"),
-        [],
-      );
-      await submit(request, token, report);
+
       const settings = await ipv6Settings();
       assert.equal(settings?.ipv6Status, "passed");
-      const checks = settings?.ipv6Evidence?.checks as { source: string }[] | undefined;
-      assert.equal(checks?.length, request.checks.length);
-      for (const evidence of checks ?? []) assert.equal(evidence.source, source);
+      const checks = settings?.ipv6Evidence?.checks as { source: string; protocol: string }[];
+      assert.equal(
+        checks.some(({ protocol }) => protocol === "postgres-classic"),
+        mode !== "route",
+      );
+      assert.equal(
+        checks.some(({ protocol }) => protocol === "postgres-direct"),
+        mode !== "pooler",
+      );
+      for (const evidence of checks) assert.equal(evidence.source, source);
       console.log(`${mode} passed with ${source} confirmed by the edge logs.`);
-
-      if (mode === "both") {
-        const forbidden = await probe(request, denied);
-        assert.ok(
-          forbidden.checks
-            .filter(({ id }) => ["pgbouncer", pgRoute.id].includes(id))
-            .every(({ outcome }) => outcome !== "passed"),
-        );
-        const bad = await probe(request, runner, {
-          ...credentials,
-          pgbouncer: { ...credentials.pgbouncer, cert: undefined, key: undefined },
-          [pgRoute.id]: { ...credentials[pgRoute.id], password: "wrong-password" },
-        });
-        assert.equal(bad.checks.find(({ id }) => id === "pgbouncer")?.outcome, "unverified");
-        assert.equal(bad.checks.find(({ id }) => id === pgRoute.id)?.outcome, "failed");
-      }
     }
+
+    await stopWorker();
+    const observationSocket = join(dir, "edge.sock");
+    localApi = new MockLocalApi({
+      backendState: "Running",
+      suffix: ".tail27.ts.net",
+      self: { id: "nEdge27", name: "ark-edge", ips: ["100.76.27.1"], tags: ["tag:ark-edge"] },
+      peers: [{ id: pgRoute.stableId, name: "target", ips: [targetIp] }],
+      reachable: new Set([`${targetIp}:5432`]),
+    });
+    process.env.ARK_EDGE_TS_SOCKET = await localApi.listen(observationSocket);
+    await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at) VALUES
+      ('crt_fd27pg', 'ep_fd27pg', ${JSON.stringify([pgHost])}::jsonb, 'issued', now()),
+      ('crt_fd27raw', 'ep_fd27raw', ${JSON.stringify([rawRoute.hostname])}::jsonb, 'issued', now())`;
+    await observeEdgeTailnet({
+      api: edgeLocalApi(observationSocket),
+      enqueue: async () => undefined,
+    });
+    const policyFingerprint = (await ipv6Settings())?.ipv6Evidence?.fingerprint;
+    const [before] = await sql`SELECT updated_at FROM front_routes WHERE id=${pgRoute.id}`;
+    await Bun.sleep(5);
+    await observe();
+    const [after] = await sql`SELECT updated_at FROM front_routes WHERE id=${pgRoute.id}`;
+    assert.notDeepEqual(before?.updated_at, after?.updated_at);
+    await snapshot();
+    assert.equal(await ipv6PreflightDue(), false);
+    assert.equal((await ipv6Settings())?.ipv6Evidence?.fingerprint, policyFingerprint);
+
+    const deadTls = {
+      ...pgRoute,
+      id: "rt_fd27tls",
+      hostname: tlsHost,
+      listenPort: 8883,
+      port: 6543,
+      tlsMode: "terminate" as const,
+      policy: policy("tls", 8883, "terminate"),
+      certificatePem: (await cert(tlsHost)) + "\n" + (await host("cat", `/work/tls/${tlsHost}/key.pem`)),
+    };
+    credentials[deadTls.id] = { ca: await host("cat", `/work/tls/${tlsHost}/cert.pem`) };
+    const mtlsCa = await createPrivateCa({ purpose: "tcp-client", name: "FD-27 mTLS" });
+    const mtlsClient = await issueClientCertificate({
+      caId: mtlsCa.id,
+      subjectCn: "fd27-mtls",
+      keyOwner: { resourceType: "platform", resourceId: "platform" },
+    });
+    const mtlsKey = await db.query.secrets.findFirst({
+      where: (secrets, { eq }) => eq(secrets.id, mtlsClient.certificate.keySecretId!),
+    });
+    assert.ok(mtlsKey);
+    assert.ok(mtlsClient.certificate.certPem);
+    const mtls = {
+      ...deadTls,
+      id: "rt_fd27mtls",
+      hostname: mtlsHost,
+      port: 5432,
+      tlsMode: "terminate_mtls" as const,
+      policy: policy("tls", 8883, "terminate_mtls", { clientCaId: mtlsCa.id }),
+      certificatePem: (await cert(mtlsHost)) + "\n" + (await host("cat", `/work/tls/${mtlsHost}/key.pem`)),
+      clientCaPem: mtlsClient.caCertPem,
+      clientCrlPem: (await generateCaCrl({ caId: mtlsCa.id })).crlPem,
+    };
+    credentials[mtls.id] = {
+      ca: await host("cat", `/work/tls/${mtlsHost}/cert.pem`),
+      cert: mtlsClient.certificate.certPem,
+      key: revealSecret(mtlsKey),
+    };
+    await sql`INSERT INTO endpoints (id,domain_id,kind,hostname,exposure,status) VALUES
+      ('ep_fd27tls',${domainId},'route',${tlsHost},'public','awaiting_dns'),
+      ('ep_fd27mtls',${domainId},'route',${mtlsHost},'public','awaiting_dns')`;
+    await sql`INSERT INTO front_routes (id,kind,endpoint_id,listen_port,target_input,target_node_stable_id,
+      target_ip,target_port,access_mode,tls_mode,enabled,status,source_cidrs,client_ca_id) VALUES
+      (${deadTls.id},'tls','ep_fd27tls',8883,${targetIp},'nFd27',${targetIp},6543,'public','terminate',true,'ready',${JSON.stringify(cidrs)}::jsonb,null),
+      (${mtls.id},'tls','ep_fd27mtls',8883,${targetIp},'nFd27',${targetIp},5432,'public','terminate_mtls',true,'ready',${JSON.stringify(cidrs)}::jsonb,${mtlsCa.id})`;
+    const dataRoutes = { httpHostnames: [appHost], postgresRoutes: [pgRoute], tcpRoutes: [rawRoute], pooler };
+    await generation({ ...dataRoutes, tlsRoutes: [deadTls, mtls], sniPorts: [8883] });
+    await snapshot();
+    const invalidClient = {
+      ...credentials,
+      [mtls.id]: { ca: credentials[mtls.id]!.ca, cert: clientCert.certPem, key: credentials.pgbouncer!.key },
+    };
+    respond = async (request) => {
+      const report = await probe(request, runner, invalidClient);
+      assert.equal(
+        report.checks.find(({ id }) => id === deadTls.id)?.outcome,
+        "passed",
+        "Public TLS completed even though the backend is offline.",
+      );
+      await snapshot();
+      return Response.json(report);
+    };
+    await startWorker();
+    const failedTls = await completed((await enqueueManaged()).id, "failed");
+    assert.match(
+      failedTls.error ?? "",
+      /8883\/tls/,
+      "The managed operation must record the listener failures.",
+    );
+    const tlsEvidence = (await ipv6Settings())?.ipv6Evidence?.checks as {
+      id: string;
+      outcome: string;
+      reason?: string;
+    }[];
+    assert.match(tlsEvidence.find(({ id }) => id === deadTls.id)?.reason ?? "", /edge did not log/);
+    assert.notEqual(tlsEvidence.find(({ id }) => id === mtls.id)?.outcome, "passed");
+
+    await sql`UPDATE front_routes SET enabled=false WHERE id=${deadTls.id}`;
+    await generation({ ...dataRoutes, tlsRoutes: [mtls], sniPorts: [8883] });
+    await snapshot();
+    respond = async (request) => {
+      const result = await probe(request);
+      await snapshot();
+      return Response.json(result);
+    };
+    await completed((await enqueueManaged()).id, "succeeded");
+    const mtlsEvidence = (await ipv6Settings())?.ipv6Evidence?.checks as { id: string; outcome: string }[];
+    assert.equal(mtlsEvidence.find(({ id }) => id === mtls.id)?.outcome, "passed");
 
     const [planned] = await sql`SELECT expected_value FROM dns_records WHERE domain_id=${domainId}
       AND name=${appHost} AND type='AAAA' AND withdrawal_reason IS NULL`;
@@ -840,11 +1302,11 @@ exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c
       "443",
       "drop",
     );
-    const closed = await challenge();
-    const closedReport = await probe(closed.request);
-    assert.equal(closedReport.checks.find(({ id }) => id === "https")?.outcome, "failed");
     await snapshot();
-    const failedOperation = await submit(closed.request, closed.token, closedReport, /443\/tls/);
+    const closed = await enqueueManaged();
+    await completed(closed.id, "failed");
+    const failedOperation = closed.id;
+    await stopWorker();
     assert.equal((await ipv6Settings())?.ipv6Status, "failed");
     const [old] = await sql`SELECT withdrawal_reason, withdrawal_confirmed_at FROM dns_records
       WHERE domain_id=${domainId} AND name=${appHost} AND type='AAAA'`;
@@ -881,6 +1343,11 @@ exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c
     await runtime.dumpLogs();
     throw error;
   } finally {
+    releaseRunner?.();
+    await stopWorker();
+    await api?.stop(true);
+    await tlsReceiver?.stop(true);
+    localApi?.stop();
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

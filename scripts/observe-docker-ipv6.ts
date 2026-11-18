@@ -35,7 +35,7 @@ export function parseIpv6EdgeLogs(lines: string, service: "edge" | "edge-l4") {
           at,
           source,
           sourcePort: Number(match[2]),
-          frontend: match[3]!,
+          frontend: match[3]!.replace(/~$/, ""),
           backend: match[4]!,
           server: match[5]!,
           connected: Number(match[6]) >= 0 && match[5] !== "<NOSRV>",
