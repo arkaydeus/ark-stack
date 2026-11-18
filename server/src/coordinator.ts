@@ -1,4 +1,4 @@
-import { resolve4, resolve6, resolveCname, resolveMx, resolveTxt } from "node:dns/promises";
+import { Resolver, type resolveCaa } from "node:dns/promises";
 import { join, resolve } from "node:path";
 
 import {
@@ -15,6 +15,7 @@ import {
   canViewProject,
   classifySql,
   createId,
+  dnsPublishInput,
   decryptSecret,
   deriveSesSmtpPassword,
   dnsRecordVerified,
@@ -35,20 +36,19 @@ import {
   redactLogLine,
   validateMaintenanceBundle,
   type BackupStatus,
-  type DnsWrite,
   type ExternalInventory,
   type EdgeWithdrawalAdapter,
   type MaintenanceBundle,
   type OperationKind,
   type OperationState,
 } from "@ark-stack/shared";
-import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, like, or, sql as drizzleSql } from "drizzle-orm";
 
-import { db, sql } from "./db.ts";
+import { db, sql, type DbTransaction } from "./db.ts";
 import { withPgbouncerLock } from "./modules/pgbouncer-lock.ts";
 import { loadEnv } from "./env.ts";
 import { canonicalHost, currentLoginHost, isAdminHost, refreshLoginHost } from "./origin-hosts.ts";
-import { evaluateAlerts, raiseAlert } from "./modules/alerts.ts";
+import { evaluateAlerts, raiseAlert, resolveAlert } from "./modules/alerts.ts";
 import { runBackup, runRestoreTest } from "./modules/backups.ts";
 import {
   evaluateBackupAlerts,
@@ -57,7 +57,7 @@ import {
   verifyTarget,
   type TargetEvidence,
 } from "./modules/offsite-backups.ts";
-import { issueCertificateFiles } from "./modules/certificates.ts";
+import { acmeAccountUri, issueCertificateFiles } from "./modules/certificates.ts";
 import { applyFrontIngress } from "./modules/front-ingress.ts";
 import {
   edgeL4Configured,
@@ -83,7 +83,6 @@ import {
 import {
   routesAfterCertificate,
   routesAfterDnsCheck,
-  reconcileRouteRecords,
   routesCertificateFailed,
 } from "./modules/front-routes.ts";
 import { edgeLocalApi, edgeSocketPath } from "./modules/tailnet-localapi.ts";
@@ -145,13 +144,27 @@ import {
   type DueRetirement,
   type IssueSuccessorResult,
 } from "./modules/db-client-rollover.ts";
+import {
+  commitDnsSnapshot,
+  confirmWithdrawals,
+  desiredDns,
+  domainsDueForDns,
+  observedWithdrawals,
+  pendingWithdrawal,
+  publishReviewedDns,
+  readDnsSnapshot,
+  saveProjection,
+  rememberUnexpectedAaaa,
+  withdrawAuthorizedAaaa,
+  type StoredDnsRecord,
+} from "./modules/domain-dns.ts";
+import { dnsBlockingError, emptyIfNoDnsData, isCloudflareProxyAddress } from "./modules/dns-verification.ts";
 import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
 import { poolerEdgeInput } from "./modules/pooler-policy.ts";
 import {
   applyDatabaseAllowlist,
   applyStalwartDevice,
-  publishCloudflare,
   reconcileSes,
   resolveImageDigest,
   scanImport,
@@ -204,16 +217,22 @@ export type DnsResolver = {
   txt(name: string): Promise<string[][]>;
   a(name: string): Promise<string[]>;
   aaaa(name: string): Promise<string[]>;
+  caa?: typeof resolveCaa;
   mx(name: string): Promise<Array<{ priority: number; exchange: string }>>;
   cname(name: string): Promise<string[]>;
 };
 
+// Public answers are the evidence for ACME and withdrawal. They must not come from local or
+// split-horizon tailnet DNS.
+const publicResolver = new Resolver({ timeout: 2_000, tries: 2 });
+publicResolver.setServers(["1.1.1.1", "8.8.8.8"]);
 const nodeResolver: DnsResolver = {
-  txt: (name) => resolveTxt(name),
-  a: (name) => resolve4(name),
-  aaaa: (name) => resolve6(name),
-  mx: (name) => resolveMx(name),
-  cname: (name) => resolveCname(name),
+  txt: (name) => publicResolver.resolveTxt(name),
+  a: (name) => publicResolver.resolve4(name),
+  aaaa: (name) => publicResolver.resolve6(name),
+  caa: (name) => publicResolver.resolveCaa(name),
+  mx: (name) => publicResolver.resolveMx(name),
+  cname: (name) => publicResolver.resolveCname(name),
 };
 
 let dnsResolver: DnsResolver = nodeResolver;
@@ -298,89 +317,51 @@ export function operationIdempotencyKey(
   return `${kind}:${targetIds.join(",")}:${planHash(payload ?? {})}`;
 }
 
-function isUniqueViolation(error: unknown) {
-  let current: unknown = error;
-  for (let index = 0; index < 5 && current; index++) {
-    if (current && typeof current === "object" && "code" in current && current.code === "23505") {
-      return true;
-    }
-    current = current && typeof current === "object" && "cause" in current ? current.cause : undefined;
-  }
-  return false;
-}
-
-export async function enqueue(input: {
+type EnqueueInput = {
   kind: OperationKind;
   actorId?: string;
   targetIds: string[];
   payload?: Record<string, unknown>;
   idempotencyKey?: string;
-}) {
-  const base = input.idempotencyKey ?? operationIdempotencyKey(input.kind, input.targetIds, input.payload);
-  // Serialise enqueues for one idempotency base. The unique index only protects the very first
-  // enqueue: once a prior terminal operation exists every caller mints a distinct suffixed key,
-  // so concurrent callers would both insert and leave two queued duplicates.
-  const connection = await sql.reserve();
-  try {
-    await connection`SELECT pg_advisory_lock(hashtext(${`ark:enqueue:${base}`}))`;
-    try {
-      return await insertEnqueued(input, base);
-    } finally {
-      await connection`SELECT pg_advisory_unlock(hashtext(${`ark:enqueue:${base}`}))`;
-    }
-  } finally {
-    connection.release();
-  }
+};
+
+export function enqueue(input: EnqueueInput) {
+  return db.transaction((tx) => enqueueInTransaction(tx, input));
 }
 
-async function insertEnqueued(
-  input: {
-    kind: OperationKind;
-    actorId?: string;
-    targetIds: string[];
-    payload?: Record<string, unknown>;
-    idempotencyKey?: string;
-  },
-  base: string,
-) {
-  const related = await sql`
-    SELECT * FROM operations
-    WHERE idempotency_key = ${base} OR idempotency_key LIKE ${`${base}:%`}
-    ORDER BY created_at DESC
-  `;
+async function enqueueInTransaction(tx: DbTransaction, input: EnqueueInput) {
+  const base = input.idempotencyKey ?? operationIdempotencyKey(input.kind, input.targetIds, input.payload);
+  // A unique index protects the first enqueue; the lock also serializes retries after a terminal order.
+  await tx.execute(drizzleSql`SELECT pg_advisory_xact_lock(hashtext(${`ark:enqueue:${base}`}))`);
+  const related = await tx
+    .select()
+    .from(operations)
+    .where(or(eq(operations.idempotencyKey, base), like(operations.idempotencyKey, `${base}:%`)))
+    .orderBy(desc(operations.createdAt));
   // A running edge apply may already have captured an older desired state. Reuse only queued
   // successors: every mutation during a running apply must leave durable work behind it.
-  const inflight = related
-    .map(mapOperation)
-    .find((row) => (input.kind === "edge.l4_apply" ? row.status === "queued" : isInFlight(row.status)));
+  const inflight = related.find((row) =>
+    input.kind === "edge.l4_apply" ? row.status === "queued" : isInFlight(row.status),
+  );
   if (inflight) return inflight;
   const idempotencyKey = related.length ? `${base}:${createId("idem")}` : base;
-  try {
-    const [row] = await db
-      .insert(operations)
-      .values({
-        id: createId("op"),
-        kind: input.kind,
-        actorId: input.actorId,
-        idempotencyKey,
-        planHash: planHash(input.payload ?? {}),
-        targetIds: input.targetIds,
-        payload: input.payload ?? {},
-        status: "queued",
-      })
-      .returning();
-    return row;
-  } catch (error) {
-    if (!isUniqueViolation(error)) throw error;
-    const [existing] = await db
-      .select()
-      .from(operations)
-      .where(eq(operations.idempotencyKey, idempotencyKey));
-    if (existing) return existing;
-    const [retry] = related.map(mapOperation);
-    if (retry) return retry;
-    throw error;
-  }
+  const [row] = await tx
+    .insert(operations)
+    .values({
+      id: createId("op"),
+      kind: input.kind,
+      actorId: input.actorId,
+      idempotencyKey,
+      planHash: planHash(input.payload ?? {}),
+      targetIds: input.targetIds,
+      payload: input.payload ?? {},
+      status: "queued",
+    })
+    .onConflictDoNothing({ target: operations.idempotencyKey })
+    .returning();
+  if (row) return row;
+  const [existing] = await tx.select().from(operations).where(eq(operations.idempotencyKey, idempotencyKey));
+  return existing!;
 }
 
 export async function claimQueued(
@@ -751,10 +732,13 @@ export async function finalizeAgentCompletion(
     .where(eq(deploymentRevisions.desiredRevision, service.desiredRevision));
 }
 
-async function observeDns(type: string, name: string) {
+function publicAddresses(type: string, name: string) {
+  return emptyIfNoDnsData(type === "A" ? dnsResolver.a(name) : dnsResolver.aaaa(name));
+}
+
+async function observeDns(type: string, name: string, addresses: typeof publicAddresses) {
   if (type === "TXT") return observedDnsValue("TXT", (await dnsResolver.txt(name)).flat());
-  if (type === "A") return observedDnsValue("A", await dnsResolver.a(name));
-  if (type === "AAAA") return observedDnsValue("AAAA", await dnsResolver.aaaa(name));
+  if (type === "A" || type === "AAAA") return observedDnsValue(type, await addresses(type, name));
   if (type === "MX") {
     const records = await dnsResolver.mx(name);
     return observedDnsValue(
@@ -768,20 +752,34 @@ async function observeDns(type: string, name: string) {
 
 async function verifyDomain(operation: OperationRow) {
   const domainId = operation.targetIds[0];
-  const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, domainId));
-  if (!domain) throw new Error("Domain not found.");
-  const routeEndpointsOnly = operation.payload?.routeEndpointsOnly === true;
-  await reconcileRouteRecords(domainId);
-  const endpointRows = (await db.select().from(endpoints).where(eq(endpoints.domainId, domainId))).filter(
-    (endpoint) => !routeEndpointsOnly || endpoint.kind === "route",
-  );
-  const routeHostnames = new Set(endpointRows.map((endpoint) => endpoint.hostname));
-  const records = (await db.select().from(dnsRecords).where(eq(dnsRecords.domainId, domainId))).filter(
+  const routeEndpointsOnly = operation.payload.routeEndpointsOnly === true;
+  const scheduled = operation.payload.scheduledDns === true;
+  const stub = process.env.ARK_DNS_STUB === "1";
+  const autoErrors = await withdrawAuthorizedAaaa(domainId);
+  const snapshot = await readDnsSnapshot(domainId);
+  const { domain, records, endpointRows: allEndpoints } = snapshot;
+  const lookups = new Map<string, Promise<string[]>>();
+  const addresses: typeof publicAddresses = (type, name) => {
+    const key = `${type}:${name}`;
+    let result = lookups.get(key);
+    if (!result) {
+      result = publicAddresses(type, name);
+      lookups.set(key, result);
+    }
+    return result;
+  };
+  const now = new Date();
+  // Test stubs cover desired records only. A withdrawal needs a real or explicitly injected lookup.
+  const confirmed = stub ? [] : await observedWithdrawals(records, addresses, now);
+  const withdrawals = records.filter((record) => pendingWithdrawal(record) && !confirmed.includes(record.id));
+  const endpointRows = allEndpoints.filter((endpoint) => !routeEndpointsOnly || endpoint.kind === "route");
+  const endpointNames = new Set(endpointRows.map((endpoint) => endpoint.hostname));
+  const active = records.filter(
     (record) =>
-      !routeEndpointsOnly || record.name === `_ark-stack.${domain.name}` || routeHostnames.has(record.name),
+      desiredDns(record) &&
+      (!routeEndpointsOnly || record.name === `_ark-stack.${domain.name}` || endpointNames.has(record.name)),
   );
-  if (!records.length) throw new Error("Domain has no stored DNS ownership challenge.");
-  const ownership = records.find(
+  const ownership = active.find(
     (record) =>
       record.type === "TXT" &&
       record.required &&
@@ -789,74 +787,234 @@ async function verifyDomain(operation: OperationRow) {
       record.expectedValue === domain.ownershipToken &&
       record.purpose.toLowerCase().includes("ownership"),
   );
-  if (!ownership)
-    throw new Error("Domain ownership challenge is missing or does not match this installation.");
-  const verifiedRecordIds = new Set<string>();
-  const observedById = new Map<string, string>();
-  for (const record of records) {
-    const stub = process.env.ARK_DNS_STUB === "1";
-    let observed = stub ? record.expectedValue : "";
+  const observations = new Map<string, { observed: string; ok: boolean }>();
+  for (const record of ownership ? active : []) {
+    let observed = record.expectedValue;
+    let ok = stub;
     if (!stub) {
       try {
-        observed = await observeDns(record.type, record.name);
+        observed = await observeDns(record.type, record.name, addresses);
+        ok = dnsRecordVerified(record.type, record.expectedValue, observed);
       } catch (error) {
         observed = error instanceof Error ? error.message : "lookup failed";
       }
     }
-    const ok = stub
-      ? observed.includes(record.expectedValue)
-      : dnsRecordVerified(record.type, record.expectedValue, observed);
-    await db
-      .update(dnsRecords)
-      .set({ observedValue: observed, status: ok ? "verified" : "error" })
-      .where(eq(dnsRecords.id, record.id));
-    observedById.set(record.id, observed);
-    if (ok) verifiedRecordIds.add(record.id);
+    observations.set(record.id, { observed, ok });
   }
-  if (!verifiedRecordIds.has(ownership.id)) {
-    throw new Error(`DNS ownership proof ${ownership.name} is not yet published correctly.`);
-  }
-  await db
-    .update(domainClaims)
-    .set({ status: "verified", lastError: null, updatedAt: new Date() })
-    .where(eq(domainClaims.id, domainId));
-  const verifiedEndpointIds = new Set<string>();
-  for (const endpoint of endpointRows) {
-    const endpointRecords = records.filter((record) => record.name === endpoint.hostname && record.required);
-    const verified =
-      endpoint.exposure !== "public" ||
-      (endpointRecords.length > 0 && endpointRecords.every((record) => verifiedRecordIds.has(record.id)));
-    await db
-      .update(endpoints)
-      .set({ status: verified ? "verified" : "awaiting_dns", lastVerifiedAt: verified ? new Date() : null })
-      .where(eq(endpoints.id, endpoint.id));
-    if (verified) verifiedEndpointIds.add(endpoint.id);
-    // Front-door routes (FD-08): a certificate is requested only once the route has passed its
-    // edge probe and every required address record resolves to this server (§3.13.1, §3.14).
-    if (endpoint.kind === "route") {
-      const { issueCertificate: requested } = await routesAfterDnsCheck({
-        endpointId: endpoint.id,
-        verified,
-        pending: endpointRecords
-          .filter((record) => !verifiedRecordIds.has(record.id))
-          .map((record) => ({
-            type: record.type,
-            name: record.name,
-            expected: record.expectedValue,
-            observed: observedById.get(record.id) ?? "",
-          })),
-        operationId: operation.id,
-        routeEndpointsOnly,
+  const ownershipError = !ownership
+    ? "Domain ownership challenge is missing or does not match this installation."
+    : !observations.get(ownership.id)?.ok
+      ? `DNS ownership proof ${ownership.name} is not yet published correctly.`
+      : null;
+
+  const checkedProxyHosts = new Set<string>();
+  const proxyAaaaHosts = new Set<string>();
+  const endpointChecks: Array<{
+    endpoint: (typeof endpointRows)[number];
+    required: StoredDnsRecord[];
+    pending: Array<{ type: string; name: string; expected: string; observed: string }>;
+    blockingError: string | null;
+    unexpectedAaaa: string[];
+  }> = [];
+  const caa = dnsResolver.caa ?? (async () => []);
+  for (const endpoint of ownershipError ? [] : endpointRows) {
+    const required = active.filter((record) => record.name === endpoint.hostname && record.required);
+    const hasAddresses = required.some((record) => record.type === "A" || record.type === "AAAA");
+    let blockingError: string | null = null;
+    let unexpectedAaaa: string[] = [];
+    if (endpoint.exposure === "public" && hasAddresses && !stub) {
+      blockingError = await dnsBlockingError({
+        hostname: endpoint.hostname,
+        records: required,
+        addresses,
+        caa,
+        accountUri: () => acmeAccountUri(endpoint.hostname),
       });
-      if (!verified || !requested) continue;
-    } else if (!verified) continue;
-    await enqueue({
-      kind: "certificate.issue",
-      actorId: operation.actorId ?? undefined,
-      targetIds: [endpoint.id],
-    });
+      if (required.some((record) => record.type === "AAAA")) {
+        checkedProxyHosts.add(endpoint.hostname);
+      } else {
+        const found = await addresses("AAAA", endpoint.hostname).catch(() => null);
+        if (found) {
+          checkedProxyHosts.add(endpoint.hostname);
+          if (found.some(isCloudflareProxyAddress)) proxyAaaaHosts.add(endpoint.hostname);
+          unexpectedAaaa = found.filter((ip) => !isCloudflareProxyAddress(ip));
+        }
+      }
+    }
+    const pending = required
+      .filter((record) => !observations.get(record.id)?.ok)
+      .map((record) => ({
+        type: record.type,
+        name: record.name,
+        expected: record.expectedValue,
+        observed: observations.get(record.id)?.observed ?? "",
+      }));
+    endpointChecks.push({ endpoint, required, pending, blockingError, unexpectedAaaa });
   }
-  await addStep(operation.id, "dns-verified", { records: records.length });
+
+  const verifiedEndpointIds = new Set<string>();
+  let remainingProxyHosts: string[] = [];
+  const blocked = await commitDnsSnapshot(snapshot, async (tx, locked) => {
+    await saveProjection(tx, locked.stored, locked.records);
+    await confirmWithdrawals(tx, confirmed, now);
+    for (const [id, { observed, ok }] of observations) {
+      await tx
+        .update(dnsRecords)
+        .set({ observedValue: observed, status: ok ? "verified" : "error" })
+        .where(eq(dnsRecords.id, id));
+    }
+    const errors: Array<{ hostname: string; error: string }> = [];
+    for (const {
+      endpoint,
+      required,
+      pending,
+      unexpectedAaaa,
+      blockingError: policyError,
+    } of endpointChecks) {
+      let blockingError = policyError;
+      if (endpoint.exposure === "public") {
+        if (unexpectedAaaa.length) {
+          withdrawals.push(
+            ...(await rememberUnexpectedAaaa(tx, domain, records, endpoint.hostname, unexpectedAaaa)),
+          );
+        }
+        if (
+          !blockingError &&
+          withdrawals.some((record) => record.name === endpoint.hostname && record.type === "AAAA")
+        ) {
+          blockingError = `IPv6 withdrawal is pending for ${endpoint.hostname}. Remove the prior AAAA and wait for DNS to confirm its absence.`;
+        }
+        if (
+          !blockingError &&
+          domain.dnsProvider === "cloudflare" &&
+          required.some((record) => !record.publishedAt)
+        ) {
+          blockingError = `Review and publish the Cloudflare DNS plan for ${endpoint.hostname}, then recheck DNS.`;
+        }
+      }
+      if (blockingError) errors.push({ hostname: endpoint.hostname, error: blockingError });
+      if (
+        !blockingError &&
+        endpoint.kind === "mail" &&
+        domain.dnsProvider === "cloudflare" &&
+        active.some(
+          (record) =>
+            record.type === "MX" &&
+            record.required &&
+            (!record.publishedAt || !observations.get(record.id)?.ok),
+        )
+      ) {
+        blockingError = "The incoming mail MX record needs review and public DNS verification.";
+        errors.push({ hostname: endpoint.hostname, error: blockingError });
+      }
+      const verified =
+        !blockingError && (endpoint.exposure !== "public" || (required.length > 0 && !pending.length));
+      await tx
+        .update(endpoints)
+        .set({
+          status: verified ? "verified" : "awaiting_dns",
+          lastVerifiedAt: verified ? now : null,
+        })
+        .where(eq(endpoints.id, endpoint.id));
+      if (verified) verifiedEndpointIds.add(endpoint.id);
+      if (endpoint.kind === "route") {
+        const { issueCertificate: shouldIssue } = await routesAfterDnsCheck(
+          {
+            endpointId: endpoint.id,
+            verified,
+            pending,
+            blockingError: blockingError ?? undefined,
+            operationId: operation.id,
+            allowCertificateRetry: !routeEndpointsOnly && !scheduled,
+          },
+          tx,
+        );
+        if (!shouldIssue) continue;
+      } else if (!verified) {
+        continue;
+      } else if (scheduled) {
+        const [prior] = await tx
+          .select({ id: operations.id })
+          .from(operations)
+          .where(
+            and(
+              eq(operations.kind, "certificate.issue"),
+              drizzleSql`${operations.targetIds} ? ${endpoint.id}`,
+            ),
+          )
+          .limit(1);
+        const [certificate] = await tx
+          .select({ id: certificates.id })
+          .from(certificates)
+          .where(eq(certificates.endpointId, endpoint.id))
+          .limit(1);
+        if (prior || certificate || !["awaiting_dns", "draft", "verified"].includes(endpoint.status))
+          continue;
+      }
+
+      // A recovery may overlap the original job's completion. Give it a distinct queue key;
+      // the operation target fence keeps it from executing while the old order is running.
+      const [rejectedOrder] =
+        endpoint.kind === "route"
+          ? await tx
+              .select({ id: operations.id })
+              .from(operations)
+              .where(
+                and(
+                  eq(operations.kind, "certificate.issue"),
+                  drizzleSql`${operations.targetIds} ? ${endpoint.id}`,
+                  drizzleSql`${operations.payload} @> '{"dnsRecheckRejected": true}'::jsonb`,
+                ),
+              )
+              .orderBy(desc(operations.createdAt), desc(operations.id))
+              .limit(1)
+          : [];
+      // Readiness, route lifecycle, and their certificate handoff commit together.
+      await enqueueInTransaction(tx, {
+        kind: "certificate.issue",
+        actorId: operation.actorId ?? undefined,
+        targetIds: [endpoint.id],
+        payload: { verifiedDns: true },
+        idempotencyKey: rejectedOrder && "certificate.issue:dns-recovery:" + rejectedOrder.id,
+      });
+    }
+    const retainedProxyHosts = locked.domain.proxyAaaaHosts.filter(
+      (name) =>
+        !checkedProxyHosts.has(name) &&
+        locked.endpointRows.some((endpoint) => endpoint.exposure === "public" && endpoint.hostname === name),
+    );
+    remainingProxyHosts = [...retainedProxyHosts, ...proxyAaaaHosts].toSorted();
+    await tx
+      .update(domainClaims)
+      .set({
+        status: ownershipError ? locked.domain.status : "verified",
+        lastError: ownershipError ?? autoErrors[0] ?? errors[0]?.error ?? null,
+        proxyAaaaHosts: remainingProxyHosts,
+        updatedAt: now,
+      })
+      .where(eq(domainClaims.id, domainId));
+    return errors;
+  });
+
+  const pendingName = withdrawals.find((record) => record.type === "AAAA")?.name ?? remainingProxyHosts[0];
+  const dedupKey = `dns-aaaa-withdrawal:${domainId}`;
+  if (pendingName) {
+    await raiseAlert({
+      dedupKey,
+      severity: "warning",
+      title: autoErrors[0] ?? `IPv6 DNS removal pending for ${pendingName}`,
+    });
+  } else {
+    await resolveAlert(dedupKey);
+  }
+  if (ownershipError) {
+    if (scheduled) return;
+    throw new Error(ownershipError);
+  }
+  await addStep(operation.id, "dns-verified", {
+    records: active.length,
+    blocked,
+  });
   if (routeEndpointsOnly) return;
   const clusters = await db.select().from(databaseClusters);
   for (const database of await db.select().from(managedDatabases)) {
@@ -883,25 +1041,80 @@ async function verifyDomain(operation: OperationRow) {
       }
     }
   }
-  if (domain?.dnsProvider === "cloudflare") {
-    await enqueue({
-      kind: "dns.publish",
-      actorId: operation.actorId ?? undefined,
-      targetIds: [domainId],
-    });
-  }
 }
 
 async function issueCertificate(operation: OperationRow) {
+  if (operation.payload.dnsRecheckRejected === true)
+    throw new Error(
+      "The previous DNS check blocked this certificate order. DNS verification will queue a new order.",
+    );
   const endpointId = operation.targetIds[0];
   const [endpoint] = await db.select().from(endpoints).where(eq(endpoints.id, endpointId));
   if (!endpoint) throw new Error("Endpoint not found.");
   const action = operation.kind === "certificate.renew" ? "renew" : "run";
   let issued: Awaited<ReturnType<typeof issueCertificateFiles>>;
+  let attemptedOrder = false;
   try {
+    // The DNS check and certificate order are separate jobs. Recheck policy and address
+    // eligibility in case a toggle, preflight result or resolver answer changed in between.
+    if (
+      operation.payload.verifiedDns &&
+      endpoint.exposure === "public" &&
+      endpoint.domainId &&
+      process.env.ARK_DNS_STUB !== "1"
+    ) {
+      const snapshot = await readDnsSnapshot(endpoint.domainId);
+      const live = snapshot.endpointRows.find((row) => row.id === endpoint.id);
+      if (!live || live.hostname !== endpoint.hostname || live.exposure !== endpoint.exposure) {
+        throw new Error("Endpoint changed before certificate issuance. Recheck DNS.");
+      }
+      const matching = snapshot.records.filter((record) => record.name === endpoint.hostname);
+      const required = matching.filter((record) => desiredDns(record) && record.required);
+      const error = await dnsBlockingError({
+        hostname: endpoint.hostname,
+        records: required,
+        addresses: publicAddresses,
+        caa: dnsResolver.caa ?? (async () => []),
+        accountUri: () => acmeAccountUri(endpoint.hostname),
+      });
+      if (error) throw new Error(error);
+      if (
+        matching.some((record) => record.type === "AAAA" && pendingWithdrawal(record)) ||
+        (snapshot.domain.dnsProvider === "cloudflare" && required.some((record) => !record.publishedAt))
+      ) {
+        throw new Error(
+          `DNS publishing or withdrawal is pending for ${endpoint.hostname}. Review and recheck DNS.`,
+        );
+      }
+      if (
+        !required.length ||
+        !(
+          await Promise.all(
+            required.map(async (record) =>
+              dnsRecordVerified(
+                record.type,
+                record.expectedValue,
+                await observeDns(record.type, record.name, publicAddresses),
+              ),
+            ),
+          )
+        ).every(Boolean)
+      ) {
+        throw new Error(
+          `Public DNS for ${endpoint.hostname} changed. Recheck it before requesting a certificate.`,
+        );
+      }
+      await commitDnsSnapshot(snapshot, async () => {});
+    }
+    attemptedOrder = true;
     issued = await issueCertificateFiles(endpoint.hostname, action);
   } catch (error) {
-    if (endpoint.kind === "route") await routesCertificateFailed(endpoint.id, (error as Error).message);
+    if (endpoint.kind === "route")
+      await routesCertificateFailed(
+        endpoint.id,
+        (error as Error).message,
+        !attemptedOrder && action === "run" ? operation.id : undefined,
+      );
     throw error;
   }
   if (!issued.fingerprint || !issued.expiresAt) {
@@ -1594,21 +1807,45 @@ async function changeMode(operation: OperationRow) {
 }
 
 async function publishDns(operation: OperationRow) {
-  const domainId = operation.targetIds[0];
-  const [domain] = await db.select().from(domainClaims).where(eq(domainClaims.id, domainId));
-  if (!domain) throw new Error("Domain not found.");
-  const records = await db.select().from(dnsRecords).where(eq(dnsRecords.domainId, domainId));
-  const writes: DnsWrite[] = records
-    .filter((record) => !record.expectedValue.includes("review existing"))
-    .map((record) => ({
-      type: record.type,
-      name: record.name,
-      content: record.expectedValue,
-      ttl: 300,
-      priority: record.type === "MX" ? 10 : undefined,
-    }));
-  const result = await publishCloudflare(domain.name, writes);
-  await addStep(operation.id, "dns-publish", result);
+  const input = dnsPublishInput.parse(operation.payload.reviewed ?? { planHash: operation.payload.planHash });
+  const [actor] = await db
+    .select()
+    .from(platformAccess)
+    .where(eq(platformAccess.userId, operation.actorId ?? ""));
+  if (
+    (actor?.role !== "owner" && actor?.role !== "operator") ||
+    (operation.payload.role && actor.role !== operation.payload.role)
+  )
+    throw new Error("DNS publisher is no longer authorized.");
+  await publishReviewedDns(operation, input, { userId: actor.userId, role: actor.role });
+}
+
+export async function runDnsMaintenance() {
+  for (const { domainId, routeEndpointsOnly } of await domainsDueForDns()) {
+    await enqueue({
+      kind: "domain.verify",
+      targetIds: [domainId],
+      payload: { routeEndpointsOnly, scheduledDns: true },
+      idempotencyKey: "dns.maintenance:" + domainId,
+    });
+  }
+}
+
+export function scheduleDnsMaintenance(intervalMs = 120_000) {
+  let running = false;
+  async function tick() {
+    if (running) return;
+    running = true;
+    try {
+      await runDnsMaintenance();
+    } catch (error) {
+      console.error("DNS maintenance failed:", error instanceof Error ? error.message : error);
+    } finally {
+      running = false;
+    }
+  }
+  void tick();
+  return setInterval(() => void tick(), intervalMs).unref();
 }
 
 async function reconcileSesOp(operation: OperationRow) {
@@ -2929,6 +3166,7 @@ export function startCoordinator() {
   // Embedded workers include the database worker's duties, so they run the rollover scheduler.
   startRolloverScheduler();
   scheduleEdgeObserve();
+  scheduleDnsMaintenance();
   // ...and the backup worker's (FD-21), when backups execute, and its backup-ts observation (FD-30).
   scheduleBackups();
   scheduleBackupObserve();

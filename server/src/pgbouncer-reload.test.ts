@@ -98,6 +98,42 @@ beforeAll(async () => {
   await db
     .insert(endpoints)
     .values({ id: endpointId, kind: "database", hostname, exposure: "public", status: "verified" });
+
+  const ca = await pki.createPrivateCa({ purpose: "db-client", name: `reload-${clientId}` });
+  caId = ca.id;
+  // The inventory summary never exposes the key secret ID, so read it from the row for cleanup.
+  const [caRow] = await db.select().from(privateCas).where(eq(privateCas.id, ca.id));
+  caKeyId = caRow?.keySecretId ?? "";
+  const issued = await pki.issueClientCertificate({
+    caId,
+    subjectCn: "recovery_shop_production",
+    keyOwner: { resourceType: "platform", resourceId: "platform" },
+  });
+  clientKeyId = issued.certificate.keySecretId;
+  await db.insert(databaseClusters).values({ id: clusterId, name: clusterId, endpointId });
+  await db
+    .insert(managedDatabases)
+    .values({ id: databaseId, clusterId, name: "recoverydb", exposure: "public" });
+  await db.insert(secrets).values({
+    id: secretId,
+    kind: "database_password",
+    resourceType: "database",
+    resourceId: databaseId,
+    ...encryptSecret(process.env.ARK_ROOT_KEY!, "runtime-password", "k1"),
+  });
+  await db
+    .insert(databaseRoles)
+    .values({ id: roleId, databaseId, name: "recovery_shop_production", kind: "runtime", secretId });
+  await db.insert(databaseClients).values({
+    id: clientId,
+    databaseId,
+    name: "shop",
+    environment: "production",
+    roleKind: "runtime",
+    roleId,
+    caId,
+    status: "revoked",
+  });
 });
 
 afterAll(async () => {
@@ -237,40 +273,7 @@ describe("payload-less renewal recovery", () => {
     const pending = (
       await db.select().from(certificates).where(eq(certificates.endpointId, endpointId))
     ).find((row) => row.status === "awaiting_reload")!;
-    const ca = await pki.createPrivateCa({ purpose: "db-client", name: `reload-${clientId}` });
-    caId = ca.id;
-    // The inventory summary never exposes the key secret ID, so read it from the row for cleanup.
-    const [caRow] = await db.select().from(privateCas).where(eq(privateCas.id, ca.id));
-    caKeyId = caRow?.keySecretId ?? "";
-    const issued = await pki.issueClientCertificate({
-      caId,
-      subjectCn: "recovery_shop_production",
-      keyOwner: { resourceType: "platform", resourceId: "platform" },
-    });
-    clientKeyId = issued.certificate.keySecretId;
-    await db.insert(databaseClusters).values({ id: clusterId, name: clusterId, endpointId });
-    await db
-      .insert(managedDatabases)
-      .values({ id: databaseId, clusterId, name: "recoverydb", exposure: "public" });
-    await db.insert(secrets).values({
-      id: secretId,
-      kind: "database_password",
-      resourceType: "database",
-      resourceId: databaseId,
-      ...encryptSecret(process.env.ARK_ROOT_KEY!, "runtime-password", "k1"),
-    });
-    await db
-      .insert(databaseRoles)
-      .values({ id: roleId, databaseId, name: "recovery_shop_production", kind: "runtime", secretId });
-    await db.insert(databaseClients).values({
-      id: clientId,
-      databaseId,
-      name: "shop",
-      environment: "production",
-      roleKind: "runtime",
-      roleId,
-      caId,
-    });
+    await db.update(databaseClients).set({ status: "active" }).where(eq(databaseClients.id, clientId));
     const reload = await enqueue({
       kind: "pgbouncer.reload",
       targetIds: [endpointId],
@@ -345,6 +348,7 @@ describe("payload-less renewal recovery", () => {
 });
 
 test("revoking the last client fences public admission at the edge before a failed admin reload", async () => {
+  await db.update(databaseClients).set({ status: "active" }).where(eq(databaseClients.id, clientId));
   // PgBouncer keeps its old admission configuration when RELOAD fails; the edge must stop routing to it.
   expect((await poolerEdgeInput()).pooler).not.toBeNull();
   await db.update(databaseClients).set({ status: "revoked" }).where(eq(databaseClients.id, clientId));
@@ -412,6 +416,7 @@ test("revoking the last client fences public admission at the edge before a fail
 }, 15_000);
 
 test("startup installs ingress limits without reopening a revoked client or rewriting pooler files", async () => {
+  await db.update(databaseClients).set({ status: "revoked" }).where(eq(databaseClients.id, clientId));
   const previousDir = process.env.ARK_PGBOUNCER_DIR;
   const dir = join(work, "startup-revoked");
   await mkdir(dir);

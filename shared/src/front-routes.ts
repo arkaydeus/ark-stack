@@ -153,10 +153,14 @@ export function checkGateRouteSettings(input: { bypassPaths?: unknown; allowedOr
 }
 
 /** Normalises a public route hostname; tailnet names can never be public hostnames. */
-export function normalizeRouteHostname(value: string) {
+export function normalizeRouteHostname(value: string, tailnetSuffix?: string) {
   const hostname = normalizeHostname(value);
-  if (hostname === "ts.net" || hostname.endsWith(".ts.net")) {
-    throw new ValidationError("Tailnet (ts.net) names cannot be public route hostnames.");
+  const suffix = tailnetSuffix?.toLowerCase().replace(/^\.|\.$/g, "");
+  const reserved = ["ts.net", suffix].find(
+    (zone) => zone && (hostname === zone || hostname.endsWith("." + zone)),
+  );
+  if (reserved) {
+    throw new ValidationError("Tailnet names under " + reserved + " cannot be public route hostnames.");
   }
   return hostname;
 }

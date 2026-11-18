@@ -4,7 +4,7 @@
 // by name (TLS from the first byte, on 443, a shared SNI port or the 5432 router) and which need a
 // dedicated raw port.
 
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import { type FormEvent, Fragment, useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ import type { FrontListeners, FrontRouteSummary, PlatformState } from "@/lib/typ
 import { api, parseCidrList } from "@/lib/utils";
 
 import { InlineError } from "./Auth";
+import { DnsReviewPanel } from "./DnsReview";
 
 const KIND_LABEL: Record<string, string> = {
   http: "HTTP route (443)",
@@ -29,30 +30,38 @@ function admitsBadge(route: FrontRouteSummary) {
   return <Badge variant="info">{route.l4.sourceCidrs.length} CIDR(s)</Badge>;
 }
 
-/** Loads on mount and after each change; App remounts it (by key) when the operation list changes. */
 export function FrontRoutesView({ state }: { state: PlatformState }) {
   const isOwner = state.user.role === "owner";
+  const canReviewDns = state.user.role !== "viewer";
   const [routes, setRoutes] = useState<FrontRouteSummary[] | null>(null);
   const [listeners, setListeners] = useState<FrontListeners | null>(null);
   const [error, setError] = useState("");
-  const load = useCallback(async () => {
-    try {
-      const [list, ports] = await Promise.all([
-        api<{ routes: FrontRouteSummary[] }>("/api/front/routes"),
-        api<FrontListeners>("/api/front/listeners"),
-      ]);
-      setRoutes(list.routes);
-      setListeners(ports);
-      setError("");
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not load routes.");
-    }
-  }, []);
-  const refresh = () => void load();
+  const [openDns, setOpenDns] = useState<string | null>(null);
+  const [refreshRevision, setRefreshRevision] = useState(0);
+  const refresh = () => setRefreshRevision((revision) => revision + 1);
+  const routeRevision = JSON.stringify(state.operations.map(({ id, status }) => [id, status]));
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    let cancelled = false;
+    Promise.all([
+      api<{ routes: FrontRouteSummary[] }>("/api/front/routes"),
+      api<FrontListeners>("/api/front/listeners"),
+    ])
+      .then(([list, ports]) => {
+        if (cancelled) return;
+        setRoutes(list.routes);
+        setListeners(ports);
+        setError("");
+      })
+      .catch(
+        (cause) => !cancelled && setError(cause instanceof Error ? cause.message : "Could not load routes."),
+      );
+    return () => {
+      cancelled = true;
+    };
+    // Refresh the route list after operations and direct edits without remounting the DNS review.
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
+  }, [routeRevision, refreshRevision]);
 
   const columns = isOwner
     ? "grid-cols-[1.4fr_1fr_0.7fr_0.9fr_1fr_auto_auto]"
@@ -82,28 +91,45 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
           </div>
           {routes?.length === 0 && <p className="empty-state">No routes yet.</p>}
           {routes?.map((route) => (
-            <div className={`table-row ${columns}`} key={route.id}>
-              <strong className="truncate">{route.hostname}</strong>
-              <span>{KIND_LABEL[route.kind] ?? route.kind}</span>
-              <span>
-                <span className="mono">{route.listenPort}</span>
-                {route.l4?.compatPort != null && (
-                  <span className="block text-xs text-muted-foreground">
-                    compat <span className="mono">{route.l4.compatPort}</span>
-                  </span>
-                )}
-              </span>
-              <span className="mono">{route.l4?.tlsMode ?? route.accessMode ?? "-"}</span>
-              <span>{admitsBadge(route) ?? <span className="text-muted-foreground">-</span>}</span>
-              <span className="flex gap-2">
-                <Badge variant={route.enabled ? "success" : "neutral"}>
-                  {route.enabled ? "enabled" : "disabled"}
-                </Badge>
-                <Badge variant={route.status === "ready" ? "success" : "warning"}>{route.status}</Badge>
-              </span>
-              {isOwner && <RouteActions route={route} onChanged={refresh} />}
-              {route.lastError && <p className="col-span-full text-xs text-red-200">{route.lastError}</p>}
-            </div>
+            <Fragment key={route.id}>
+              <div className={`table-row ${columns}`}>
+                <strong className="truncate">{route.hostname}</strong>
+                <span>{KIND_LABEL[route.kind] ?? route.kind}</span>
+                <span>
+                  <span className="mono">{route.listenPort}</span>
+                  {route.l4?.compatPort != null && (
+                    <span className="block text-xs text-muted-foreground">
+                      compat <span className="mono">{route.l4.compatPort}</span>
+                    </span>
+                  )}
+                </span>
+                <span className="mono">{route.l4?.tlsMode ?? route.accessMode ?? "-"}</span>
+                <span>{admitsBadge(route) ?? <span className="text-muted-foreground">-</span>}</span>
+                <span className="flex flex-wrap items-center gap-2">
+                  <Badge variant={route.enabled ? "success" : "neutral"}>
+                    {route.enabled ? "enabled" : "disabled"}
+                  </Badge>
+                  <Badge variant={route.status === "ready" ? "success" : "warning"}>{route.status}</Badge>
+                  {route.domain && canReviewDns && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-expanded={openDns === route.id}
+                      onClick={() => setOpenDns((open) => (open === route.id ? null : route.id))}
+                    >
+                      DNS
+                    </Button>
+                  )}
+                </span>
+                {isOwner && <RouteActions route={route} onChanged={refresh} />}
+                {route.lastError && <p className="col-span-full text-xs text-red-200">{route.lastError}</p>}
+              </div>
+              {openDns === route.id && route.domain && canReviewDns && (
+                <div className="border-t border-border p-4">
+                  <DnsReviewPanel reviewPath={`/api/front/routes/${route.id}/dns`} owner={isOwner} />
+                </div>
+              )}
+            </Fragment>
           ))}
         </CardContent>
       </Card>

@@ -4,7 +4,7 @@
 // two-destination health. restic is a stand-in script; the runtime proof against real tailscaled,
 // rest-server and restic is `mise run test:backups-tailnet`.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Socket } from "node:net";
@@ -111,7 +111,7 @@ for arg in "$@"; do last="$arg"; done
 case "$*" in
   *"cat config"*) exit 0 ;;
 esac
-if [ -f "${work}/block" ] && echo "$*" | grep -q " backup "; then
+if [ -f "${work}/block" ] && [ -n "$RESTIC_REST_USERNAME" ] && echo "$*" | grep -q " backup "; then
   echo $$ > "${work}/pid"
   while [ -f "${work}/block" ]; do sleep 0.05; done
 fi
@@ -470,41 +470,46 @@ describe("transfers: proxy scoping, refusal and the watchdog", () => {
         .where(eq(backupTargets.name, `home-${suffix}`));
       view = state([home]);
       await observe(change === "expired" ? 3_000 : undefined);
-      await writeFile(join(work, "block"), "");
-      await rm(join(work, "pid"), { force: true });
+      const block = join(work, "block");
+      const pidPath = join(work, "pid");
+      await rm(pidPath, { force: true });
+      await writeFile(block, "");
       const running = offsite.exportFiles(`volume:fd30-guard-${suffix}`, work, []);
-      const deadline = Date.now() + 5_000;
-      while (!(await Bun.file(join(work, "pid")).exists()) && Date.now() < deadline) await Bun.sleep(20);
-      const pid = Number(await Bun.file(join(work, "pid")).text());
-      let changedAt = Date.now();
-      if (change === "replaced") {
-        view = state([impostor]);
-        await observe();
-        changedAt = Date.now();
-      } else if (change === "removed") {
-        view = state([]);
-        await observe();
-        changedAt = Date.now();
-      } else {
-        const [row] = await sql`SELECT valid_until FROM tailnet_snapshots WHERE source = 'backup'`;
-        changedAt = new Date(row!.valid_until).getTime();
-      }
-      const results = await running;
-      const stoppedAt = Date.now();
-      const mine = results.find((item) => item.targetId === target!.id)!;
-      expect(mine.error).toMatch(/stopped by the transfer watchdog|Transfer stopped/);
-      expect(stoppedAt - changedAt).toBeLessThan(TRANSFER_STOP_BOUND_MS);
-      let alive = true;
+      // A setup error must still release the fake upload and wait for it before the next case.
+      const settled = running.catch(() => undefined);
       try {
-        process.kill(pid, 0);
-      } catch {
-        alive = false;
+        const deadline = Date.now() + 5_000;
+        let pid = 0;
+        while (Date.now() < deadline) {
+          pid = Number(await readFile(pidPath, "utf8").catch(() => ""));
+          if (Number.isInteger(pid) && pid > 0) break;
+          await Bun.sleep(20);
+        }
+        if (!Number.isInteger(pid) || pid <= 0) throw new Error("The REST upload did not start.");
+        expect(process.kill(pid, 0)).toBe(true);
+        let changedAt: number;
+        if (change === "expired") {
+          const [row] = await sql`SELECT valid_until FROM tailnet_snapshots WHERE source = 'backup'`;
+          changedAt = new Date(row!.valid_until).getTime();
+        } else {
+          view = state(change === "replaced" ? [impostor] : []);
+          await observe();
+          changedAt = Date.now();
+        }
+        const results = await running;
+        const stoppedAt = Date.now();
+        const mine = results.find((item) => item.targetId === target!.id)!;
+        expect(mine.error).toMatch(/stopped by the transfer watchdog|Transfer stopped/);
+        expect(stoppedAt - changedAt).toBeLessThan(TRANSFER_STOP_BOUND_MS);
+        expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      } finally {
+        await rm(block, { force: true });
+        await settled;
+        await rm(pidPath, { force: true });
+        view = state([home]);
+        await observe();
       }
-      expect(alive).toBe(false);
-      await rm(join(work, "block"), { force: true });
-      view = state([home]);
-      await observe();
-    });
+    }, 15_000);
   }
 });
 

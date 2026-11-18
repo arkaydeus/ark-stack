@@ -56,12 +56,11 @@ import {
   routeDomainFor,
   tailnetSuffixOf,
   validateRouteTarget,
-  type DnsRecordPlan,
   type FrontRouteCreateInput,
   type FrontRouteUpdateInput,
   type OperationKind,
 } from "@ark-stack/shared";
-import { and, desc, eq, like, sql as statement } from "drizzle-orm";
+import { and, desc, eq, sql as statement } from "drizzle-orm";
 
 import { db, type DbTransaction } from "../db.ts";
 import {
@@ -76,6 +75,14 @@ import {
   operations,
 } from "../schema.ts";
 import { currentRoute, routeVersion } from "./front-route-state.ts";
+import {
+  endpointDnsScope,
+  desiredDns,
+  ensureEndpointDnsRecords,
+  lockedDnsDomain,
+  pendingWithdrawal,
+  retireDnsRecord,
+} from "./domain-dns.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, loadEdgeSnapshot } from "./edge-observe.ts";
 import { enabledSniPorts, isL4Kind, storedL4Settings } from "./l4-routes.ts";
 import * as pki from "./pki.ts";
@@ -323,7 +330,12 @@ function summarize(
       endpointStatus: endpoint.status,
       lastVerifiedAt: endpoint.lastVerifiedAt?.toISOString() ?? null,
       records: records
-        .filter((record) => record.name === endpoint.hostname && ["A", "AAAA"].includes(record.type))
+        .filter(
+          (record) =>
+            record.name === endpoint.hostname &&
+            ["A", "AAAA"].includes(record.type) &&
+            (desiredDns(record) || pendingWithdrawal(record)),
+        )
         .map((record) => ({
           type: record.type,
           name: record.name,
@@ -419,7 +431,7 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
     kind === "http"
       ? gateSettings(accessMode, input, { bypassPaths: [], allowedOrigins: [] })
       : { bypassPaths: [], allowedOrigins: [] };
-  const hostname = normalizeRouteHostname(input.hostname);
+  const hostname = await publicRouteHostname(input.hostname);
   const domain = routeDomainFor(hostname, await db.select().from(domainClaims));
   if (!domain) {
     throw new FrontRouteError(
@@ -496,76 +508,10 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
   };
 }
 
-async function writeRecords(tx: DbTransaction, domainId: string, hostname: string, records: DnsRecordPlan[]) {
-  const existing = await tx
-    .select()
-    .from(dnsRecords)
-    .where(and(eq(dnsRecords.domainId, domainId), eq(dnsRecords.name, hostname)));
-  for (const current of existing) {
-    if (
-      current.purpose.startsWith(ROUTE_RECORD_PURPOSE) &&
-      !records.some((record) => record.type === current.type && record.name === current.name)
-    ) {
-      await tx.delete(dnsRecords).where(eq(dnsRecords.id, current.id));
-    }
-  }
-  for (const record of records) {
-    const current = existing.find((item) => item.type === record.type && item.name === record.name);
-    if (!current) {
-      await tx.insert(dnsRecords).values({
-        id: createId("dns"),
-        domainId,
-        type: record.type,
-        name: record.name,
-        relativeName: record.relativeName,
-        expectedValue: record.value,
-        purpose: record.purpose,
-        required: record.required,
-      });
-    } else if (
-      current.purpose.startsWith(ROUTE_RECORD_PURPOSE) &&
-      (current.expectedValue !== record.value || current.required !== record.required)
-    ) {
-      await tx
-        .update(dnsRecords)
-        .set({
-          expectedValue: record.value,
-          required: record.required,
-          status: "pending",
-          observedValue: null,
-        })
-        .where(eq(dnsRecords.id, current.id));
-    }
-  }
-}
-
-/** Re-plan owned address records before DNS checks, including removal after IPv6 is disabled. */
-export async function reconcileRouteRecords(domainId: string) {
-  await db.transaction(async (tx) => {
-    // Serialise record reconciliation for this domain (including concurrent manual/observer checks).
-    const [domain] = await tx.select().from(domainClaims).where(eq(domainClaims.id, domainId)).for("update");
-    const [platform] = await tx.select().from(platformSettings).where(eq(platformSettings.id, "default"));
-    if (!domain || !platform?.publicIpv4) return;
-    for (const endpoint of await tx
-      .select()
-      .from(endpoints)
-      .where(and(eq(endpoints.domainId, domainId), eq(endpoints.kind, "route")))) {
-      await writeRecords(
-        tx,
-        domainId,
-        endpoint.hostname,
-        routeAddressRecords({
-          hostname: endpoint.hostname,
-          zone: domain.name,
-          publicIpv4: platform.publicIpv4,
-          publicIpv6: platform.publicIpv6,
-          ipv6Status: platform.ipv6Status,
-          aaaaEnabled: domain.aaaaEnabled,
-          purpose: ROUTE_RECORD_PURPOSE,
-        }),
-      );
-    }
-  });
+async function publicRouteHostname(value: string) {
+  const hostname = normalizeRouteHostname(value);
+  const { self } = await loadEdgeSnapshot();
+  return normalizeRouteHostname(hostname, self ? tailnetSuffixOf(self) : undefined);
 }
 
 /**
@@ -581,8 +527,22 @@ export async function commitRouteCreate(
 ) {
   const routeId = createId("rt");
   const now = new Date();
+  let records = plan.records;
   try {
     await db.transaction(async (tx) => {
+      const { domain, settings: platform } = await lockedDnsDomain(tx, plan.domain.id);
+      if (domain.status !== "verified" || !platform?.publicIpv4) {
+        throw new FrontRouteError(409, "The domain or server address changed. Review the route again.");
+      }
+      records = routeAddressRecords({
+        hostname: plan.hostname,
+        zone: domain.name,
+        publicIpv4: platform.publicIpv4,
+        publicIpv6: platform.publicIpv6,
+        ipv6Status: platform.ipv6Status,
+        aaaaEnabled: domain.aaaaEnabled,
+        purpose: ROUTE_RECORD_PURPOSE,
+      });
       await authorize?.(tx);
       if (plan.kind === "tcp" || plan.l4?.compatPort != null) {
         await lockRawPorts(tx);
@@ -649,7 +609,7 @@ export async function commitRouteCreate(
         createdAt: now,
         updatedAt: now,
       });
-      await writeRecords(tx, plan.domain.id, plan.hostname, plan.records);
+      await ensureEndpointDnsRecords(tx, plan.domain.id, plan.hostname, records);
       await auditRoute(
         actor,
         "front_route.create",
@@ -670,7 +630,7 @@ export async function commitRouteCreate(
                 redirectTo: plan.redirectTo,
               }
             : { l4: plan.l4, clientCaId: clientCa?.id ?? null }),
-          records: plan.records,
+          records,
           status: "draft",
         },
         undefined,
@@ -702,7 +662,7 @@ export async function commitRouteCreate(
   }
   // The committed awaiting_acl row is also picked up by the periodic observer after a crash here.
   const observe = await enqueue({ kind: "edge.observe", targetIds: [EDGE_OBSERVE_TARGET] });
-  return { routeId, observeOperationId: idOf(observe) ?? null };
+  return { routeId, records, observeOperationId: idOf(observe) ?? null };
 }
 
 // ---- Update -----------------------------------------------------------------------------------
@@ -948,6 +908,7 @@ export async function commitRouteUpdate(
 export async function prepareRouteEnable(routeId: string) {
   const { route, endpoint, version } = await loadRoute(routeId);
   requireManaged(route);
+  await publicRouteHostname(endpoint.hostname);
   if (route.enabled) throw new FrontRouteError(409, "The route is already enabled.");
   if (route.kind === "http") assertSupportedAccessMode(route.accessMode, "enable");
   else {
@@ -1024,9 +985,8 @@ export async function prepareRouteDelete(routeId: string) {
 }
 
 /**
- * Removes the route and drains it. The endpoint, its certificates and its route address records go
- * too unless another route still uses the endpoint. Provider-side DNS records are not deleted here;
- * exact, reviewed provider deletes arrive with FD-19.
+ * Drains and removes the route. Its last endpoint retires the address records into a DNS review
+ * so the exact provider records can be withdrawn and checked independently of the route.
  */
 export async function commitRouteDelete(
   plan: Awaited<ReturnType<typeof prepareRouteDelete>>,
@@ -1036,7 +996,8 @@ export async function commitRouteDelete(
 ) {
   const { route, endpoint } = plan;
   const removedEndpoint = await db.transaction(async (tx) => {
-    // Shared endpoint first, before any route row, including concurrent creates.
+    if (endpoint.domainId) await lockedDnsDomain(tx, endpoint.domainId);
+    // Lock the shared endpoint before any route row, including concurrent creates.
     await tx.select().from(endpoints).where(eq(endpoints.id, endpoint.id)).for("update");
     await authorize?.(tx);
     const removed = await tx
@@ -1060,15 +1021,20 @@ export async function commitRouteDelete(
       .where(eq(frontRoutes.endpointId, endpoint.id));
     if (others.length || endpoint.kind !== "route") return false;
     if (endpoint.domainId) {
-      await tx
-        .delete(dnsRecords)
-        .where(
-          and(
-            eq(dnsRecords.domainId, endpoint.domainId),
-            eq(dnsRecords.name, endpoint.hostname),
-            like(dnsRecords.purpose, `${ROUTE_RECORD_PURPOSE}%`),
-          ),
-        );
+      const records = await tx
+        .select()
+        .from(dnsRecords)
+        .where(endpointDnsScope(endpoint.domainId, endpoint.hostname));
+      for (const record of records.filter(
+        (item) =>
+          (desiredDns(item) || (pendingWithdrawal(item) && item.withdrawalReason === "ipv6")) &&
+          item.purpose.startsWith(ROUTE_RECORD_PURPOSE),
+      )) {
+        await tx
+          .update(dnsRecords)
+          .set(retireDnsRecord(record, "endpoint_deleted", new Date()))
+          .where(eq(dnsRecords.id, record.id));
+      }
     }
     await tx.delete(certificates).where(eq(certificates.endpointId, endpoint.id));
     await tx.delete(endpoints).where(eq(endpoints.id, endpoint.id));
@@ -1076,6 +1042,13 @@ export async function commitRouteDelete(
   });
   const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   await routeDrain(enqueue, route, "route_deleted");
+  if (removedEndpoint && endpoint.domainId) {
+    await enqueue({
+      kind: "domain.verify",
+      targetIds: [endpoint.domainId],
+      payload: { routeEndpointsOnly: true },
+    });
+  }
   await auditRoute(
     actor,
     "front_route.delete",
@@ -1095,8 +1068,8 @@ export async function commitRouteDelete(
 
 // ---- Lifecycle hooks for domain.verify and certificate.issue ----------------------------------
 
-async function routesOn(endpointId: string) {
-  const rows = await db
+async function routesOn(endpointId: string, executor: Pick<typeof db, "select"> = db) {
+  const rows = await executor
     .select({ route: frontRoutes, version: routeVersion })
     .from(frontRoutes)
     .where(eq(frontRoutes.endpointId, endpointId));
@@ -1108,15 +1081,19 @@ async function routesOn(endpointId: string) {
  * to this server, routes in `awaiting_dns` move to `issuing_certificate` and the caller requests a
  * certificate; before that, nothing is requested and the route records what DNS still shows.
  */
-export async function routesAfterDnsCheck(input: {
-  endpointId: string;
-  verified: boolean;
-  pending: Array<{ type: string; name: string; expected: string; observed: string }>;
-  operationId?: string;
-  routeEndpointsOnly?: boolean;
-}) {
-  const routes = await routesOn(input.endpointId);
-  const [certificate] = await db
+export async function routesAfterDnsCheck(
+  input: {
+    endpointId: string;
+    verified: boolean;
+    pending: Array<{ type: string; name: string; expected: string; observed: string }>;
+    blockingError?: string;
+    operationId?: string;
+    allowCertificateRetry: boolean;
+  },
+  tx: DbTransaction,
+) {
+  const routes = await routesOn(input.endpointId, tx);
+  const [certificate] = await tx
     .select()
     .from(certificates)
     .where(eq(certificates.endpointId, input.endpointId))
@@ -1130,16 +1107,22 @@ export async function routesAfterDnsCheck(input: {
   for (const route of routes) {
     // An observer check only starts issuance on the transition; explicit verification may retry it.
     if (route.status === "issuing_certificate") {
-      if (input.verified && !input.routeEndpointsOnly) issue = true;
+      if (input.verified && input.allowCertificateRetry) issue = true;
+      else if (input.blockingError && input.blockingError !== route.lastError) {
+        await tx
+          .update(frontRoutes)
+          .set({ lastError: input.blockingError, updatedAt: new Date() })
+          .where(currentRoute(route.id, route.version));
+      }
       continue;
     }
     if (
       route.status !== "awaiting_dns" &&
-      !(route.status === "ready" && needsCertificate && !input.routeEndpointsOnly)
+      !(route.status === "ready" && needsCertificate && input.allowCertificateRetry)
     )
       continue;
     if (input.verified) {
-      const changed = await db
+      const changed = await tx
         .update(frontRoutes)
         .set({ status: "issuing_certificate", lastError: null, updatedAt: new Date() })
         .where(currentRoute(route.id, route.version))
@@ -1151,16 +1134,19 @@ export async function routesAfterDnsCheck(input: {
         route.id,
         { from: route.status, to: "issuing_certificate", reason: "dns_resolves" },
         input.operationId,
+        tx,
       );
       issue = true;
       continue;
     }
     const first = input.pending[0];
-    const lastError = first
-      ? `Waiting for DNS: ${first.type} ${first.name} must resolve to ${first.expected} (observed: ${first.observed || "nothing"}).`
-      : "Waiting for DNS: the route hostname has no address record to check.";
-    if (route.status === "awaiting_dns" && lastError !== route.lastError) {
-      await db
+    const lastError =
+      input.blockingError ??
+      (first
+        ? `Waiting for DNS: ${first.type} ${first.name} must resolve to ${first.expected} (observed: ${first.observed || "nothing"}).`
+        : "Waiting for DNS: the route hostname has no address record to check.");
+    if (lastError !== route.lastError) {
+      await tx
         .update(frontRoutes)
         .set({ lastError, updatedAt: new Date() })
         .where(currentRoute(route.id, route.version));
@@ -1202,18 +1188,35 @@ export async function routesAfterCertificate(input: {
   return { observe: input.status === "issued" };
 }
 
-/** Records a failed issuance on the waiting routes; `POST /api/domains/:id/verify` retries it. */
-export async function routesCertificateFailed(endpointId: string, message: string) {
-  const routes = (await routesOn(endpointId)).filter((route) => route.status === "issuing_certificate");
-  for (const route of routes) {
-    await db
-      .update(frontRoutes)
-      .set({
-        lastError: `Certificate issuance failed: ${message.slice(0, 500)}. Verify the domain again to retry.`,
-        updatedAt: new Date(),
-      })
-      .where(currentRoute(route.id, route.version));
-  }
+/** Return pre-order DNS failures to the observer. Failed ACME orders use the explicit retry. */
+export async function routesCertificateFailed(endpointId: string, message: string, rejectedOrderId?: string) {
+  await db.transaction(async (tx) => {
+    const routes = (await routesOn(endpointId, tx)).filter((route) => route.status === "issuing_certificate");
+    if (rejectedOrderId && routes.length) {
+      await tx
+        .update(operations)
+        .set({
+          payload: statement`${operations.payload} || '{"dnsRecheckRejected": true}'::jsonb`,
+        })
+        .where(eq(operations.id, rejectedOrderId));
+      await tx
+        .update(endpoints)
+        .set({ status: "awaiting_dns", lastVerifiedAt: null })
+        .where(eq(endpoints.id, endpointId));
+    }
+    for (const route of routes) {
+      await tx
+        .update(frontRoutes)
+        .set({
+          ...(rejectedOrderId ? { status: "awaiting_dns" as const } : {}),
+          lastError: rejectedOrderId
+            ? message.slice(0, 500)
+            : `Certificate issuance failed: ${message.slice(0, 500)}. Verify the domain again to retry.`,
+          updatedAt: new Date(),
+        })
+        .where(and(currentRoute(route.id, route.version), eq(frontRoutes.status, "issuing_certificate")));
+    }
+  });
 }
 
 // ---- Route client certificates (terminate_mtls, §3.8.4, FD-14) ---------------------------------------

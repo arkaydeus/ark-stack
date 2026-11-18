@@ -1,4 +1,4 @@
-import { access, chmod, copyFile, mkdir, rename } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -58,8 +58,34 @@ async function firstExisting(paths: string[]) {
   return null;
 }
 
+const certificateRoot = (hostname: string) =>
+  join(process.env.ARK_CERT_DIR ?? join(process.cwd(), "tmp", "certs"), hostname);
+
+export async function acmeAccountUri(hostname: string) {
+  const email = process.env.ARK_ACME_EMAIL;
+  if (!process.env.ARK_LEGO_BIN || !email) return null;
+  const staging = process.env.ARK_ACME_STAGING !== "0";
+  try {
+    const host = staging
+      ? "acme-staging-v02.api.letsencrypt.org"
+      : new URL(process.env.LEGO_SERVER || "https://acme-v02.api.letsencrypt.org/directory").host;
+    const account = join(certificateRoot(hostname), "lego", "accounts", host.replaceAll(":", "_"), email);
+    // lego v4 keeps one account per storage path, ACME server and email.
+    await access(join(account, "keys", email + ".key"));
+    const saved = JSON.parse(await readFile(join(account, "account.json"), "utf8")) as {
+      registration?: { uri?: string; body?: { status?: string } };
+    };
+    const uri = saved.registration?.uri;
+    return saved.registration?.body?.status === "valid" && uri && new URL(uri).protocol === "https:"
+      ? uri
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function issueCertificateFiles(hostname: string, action: "run" | "renew" = "run") {
-  const root = join(process.env.ARK_CERT_DIR ?? join(process.cwd(), "tmp", "certs"), hostname);
+  const root = certificateRoot(hostname);
   await mkdir(root, { recursive: true });
   const keyPath = join(root, "privkey.pem");
   const certPath = join(root, "fullchain.pem");

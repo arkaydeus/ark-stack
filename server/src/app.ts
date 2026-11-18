@@ -44,6 +44,7 @@ import {
   validateComposeSource,
   wizardInput,
   domainInput,
+  dnsPublishInput,
   mailboxInput,
   aliasInput,
   databaseInput,
@@ -135,6 +136,18 @@ import { db, sql } from "./db.ts";
 import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
+import { DnsReviewError } from "./modules/cloudflare-dns.ts";
+import {
+  changeAaaaSetting,
+  desiredDns,
+  dnsRecordValues,
+  domainDnsReview,
+  pendingWithdrawal,
+  queueDnsPublish,
+  dnsPublishStatus,
+  revokeAaaaWithdrawal,
+  watchManualDns,
+} from "./modules/domain-dns.ts";
 import { frontAclSnippet } from "./modules/front-acl.ts";
 import {
   FrontRouteError,
@@ -217,6 +230,7 @@ import {
   dnsRecords,
   domainClaims,
   endpoints,
+  frontRoutes,
   mailDomains,
   mailboxes,
   mailboxDevices,
@@ -275,6 +289,7 @@ app.onError((error, c) => {
   if (error instanceof ValidationError) return c.json({ error: error.message }, 422);
   if (error instanceof DatabaseClientError) return c.json({ error: error.message }, error.status);
   if (error instanceof FrontRouteError) return c.json({ error: error.message }, error.status);
+  if (error instanceof DnsReviewError) return c.json({ error: error.message }, error.status);
   if (error instanceof GateSettingsError) return c.json({ error: error.message }, error.status);
   if (error instanceof RouteAccessError) return c.json({ error: error.message }, error.status);
   // CSR and CA policy refusals (CsrError included) describe the submitted input; no key material.
@@ -1129,7 +1144,9 @@ app.get("/api/state", async (c) => {
     poolerPolicy: await poolerPolicyView(access),
     domains: visibleDomains.map((domain) => ({
       ...redactDomain(domain, access),
-      records: records.filter((record) => record.domainId === domain.id),
+      records: records.filter(
+        (record) => record.domainId === domain.id && (desiredDns(record) || pendingWithdrawal(record)),
+      ),
     })),
     endpoints: visibleEndpoints,
     certificates: certs
@@ -1246,7 +1263,6 @@ app.post("/api/wizard", async (c) => {
   const plan = buildDomainPlan({
     baseDomain: input.baseDomain,
     publicIpv4: input.publicIpv4,
-    publicIpv6: input.publicIpv6,
     adminMode: input.adminMode,
     adminHostname: input.adminHostname,
     databaseHostname: input.databaseHostname,
@@ -1265,16 +1281,7 @@ app.post("/api/wizard", async (c) => {
     mailFrom: `bounce.${plan.zone}`,
   });
   for (const record of plan.records) {
-    await db.insert(dnsRecords).values({
-      id: createId("dns"),
-      domainId,
-      type: record.type,
-      name: record.name,
-      relativeName: record.relativeName,
-      expectedValue: record.value,
-      purpose: record.purpose,
-      required: record.required,
-    });
+    await db.insert(dnsRecords).values(dnsRecordValues(domainId, record));
   }
   const createdEndpoints: string[] = [];
   const addEndpoint = async (kind: string, hostname: string, exposure: string) => {
@@ -1333,6 +1340,10 @@ app.post("/api/wizard", async (c) => {
       adminHostname:
         input.adminMode === "public" ? normalizeHostname(input.adminHostname ?? `admin.${plan.zone}`) : null,
       publicIpv4: input.publicIpv4,
+      publicIpv6: input.publicIpv6 ?? null,
+      ipv6Status: "unchecked",
+      ipv6CheckedAt: null,
+      ipv6Evidence: null,
       dnsProvider: input.dnsProvider,
       authOrigin: env.authUrl,
       updatedAt: new Date(),
@@ -1340,17 +1351,20 @@ app.post("/api/wizard", async (c) => {
     .where(eq(platformSettings.id, "default"));
   await db.update(platformSetup).set({ wizardCompleted: true }).where(eq(platformSetup.id, "default"));
   await grantAccess(access.userId, { domainId });
-  const verify = await enqueue({ kind: "domain.verify", actorId: access.userId, targetIds: [domainId] });
+  const verify =
+    input.dnsProvider === "cloudflare"
+      ? null
+      : await enqueue({ kind: "domain.verify", actorId: access.userId, targetIds: [domainId] });
   await audit(
     access.userId,
     "wizard.complete",
     "domain",
     domainId,
     { adminMode: input.adminMode },
-    verify.id,
+    verify?.id,
     access.role,
   );
-  return c.json({ domainId, records: plan.records, operationId: verify.id });
+  return c.json({ domainId, records: plan.records, operationId: verify?.id ?? null });
 });
 
 app.post("/api/step-up", async (c) => {
@@ -1416,6 +1430,7 @@ app.post("/api/domains", async (c) => {
   requireOperator(access);
   requireMfa(c.get("session"));
   const input = domainInput.parse(await c.req.json());
+  if (input.dnsProvider === "cloudflare") requireOwner(access);
   const name = normalizeHostname(input.name);
   const id = createId("dom");
   const ownershipToken = `ark-own-${createToken(16)}`;
@@ -1424,6 +1439,7 @@ app.post("/api/domains", async (c) => {
     name,
     ownershipToken,
     status: "awaiting_dns",
+    dnsProvider: input.dnsProvider,
     mailFrom: input.mailFrom ? normalizeHostname(input.mailFrom) : `bounce.${name}`,
     dmarcPolicy: input.dmarcPolicy,
   });
@@ -1434,6 +1450,7 @@ app.post("/api/domains", async (c) => {
     name: `_ark-stack.${name}`,
     relativeName: "_ark-stack",
     expectedValue: ownershipToken,
+    ttl: 60,
     purpose: "Installation-bound domain ownership proof",
     required: true,
   });
@@ -1450,6 +1467,7 @@ app.post("/api/domains/:id/verify", async (c) => {
   requireOperator(access);
   requireMfa(c.get("session"));
   requireDomain(access, c.req.param("id"), "manage");
+  await watchManualDns(c.req.param("id"));
   const operation = await enqueue({
     kind: "domain.verify",
     actorId: access.userId,
@@ -1458,18 +1476,130 @@ app.post("/api/domains/:id/verify", async (c) => {
   return c.json({ operationId: operation.id });
 });
 
+app.post("/api/domains/:id/dns/watch", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  requireMfa(c.get("session"));
+  const domainId = c.req.param("id");
+  requireDomain(access, domainId, "manage");
+  await watchManualDns(domainId);
+  return c.body(null, 204);
+});
+
+async function dnsWorkerReview<T>(domainId: string, local: () => Promise<T>) {
+  const url = process.env.ARK_DOMAIN_WORKER_URL;
+  if (!url) {
+    if (process.env.NODE_ENV === "production")
+      throw new DnsReviewError(503, "The domain worker is unavailable.");
+    return local();
+  }
+  let response: Response;
+  try {
+    response = await fetch(new URL("/dns/review", url), {
+      method: "POST",
+      headers: { authorization: "Bearer " + env.workerTokens.domains, "content-type": "application/json" },
+      body: JSON.stringify({ domainId }),
+      signal: AbortSignal.timeout(55_000),
+    });
+  } catch {
+    throw new DnsReviewError(
+      503,
+      "The domain worker did not respond. Reload the DNS review before retrying.",
+    );
+  }
+  const result = (await response.json().catch(() => null)) as (T & { error?: string }) | null;
+  if (!response.ok) {
+    const status = response.status;
+    throw new DnsReviewError(
+      status === 403 || status === 404 || status === 409 || status === 422 || status === 503 ? status : 502,
+      result?.error ?? "The domain worker could not complete the DNS request.",
+    );
+  }
+  if (!result) throw new DnsReviewError(502, "The domain worker returned an invalid DNS response.");
+  return result;
+}
+
+async function getDnsReview(domainId: string, localOnly: boolean) {
+  if (localOnly) return domainDnsReview(domainId, false);
+  const [domain] = await db
+    .select({ provider: domainClaims.dnsProvider })
+    .from(domainClaims)
+    .where(eq(domainClaims.id, domainId));
+  if (!domain) throw new DnsReviewError(404, "Domain not found.");
+  if (domain.provider !== "cloudflare") return domainDnsReview(domainId);
+  return dnsWorkerReview(domainId, () => domainDnsReview(domainId));
+}
+
+app.get("/api/domains/:id/dns", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  requireDomain(access, c.req.param("id"));
+  c.header("cache-control", "no-store");
+  return c.json(await getDnsReview(c.req.param("id"), c.req.query("local") === "1"));
+});
+
 app.post("/api/domains/:id/publish", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
-  requireDomain(access, c.req.param("id"), "manage");
+  const domainId = c.req.param("id");
+  requireDomain(access, domainId, "manage");
+  const input = dnsPublishInput.parse(await c.req.json());
+  if (input.authorizeAAAAWithdrawal !== undefined) requireOwner(access);
+  const actor = {
+    userId: access.userId,
+    role: access.role === "owner" ? ("owner" as const) : ("operator" as const),
+  };
+  const accepted = await queueDnsPublish(domainId, input, actor);
+  c.header("location", `/api/domains/${domainId}/publish/${accepted.operationId}`);
+  c.header("cache-control", "no-store");
+  return c.json(accepted, 202);
+});
+
+app.get("/api/domains/:id/publish/:operationId", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  const domainId = c.req.param("id");
+  requireDomain(access, domainId, "manage");
+  c.header("cache-control", "no-store");
+  const result = await dnsPublishStatus(domainId, c.req.param("operationId"));
+  return c.json(result, result.status === "failed" && result.errorStatus === 409 ? 409 : 200);
+});
+
+app.put("/api/domains/:id/aaaa", async (c) => {
+  const access = c.get("access");
+  const session = c.get("session");
+  requireOwner(access);
+  requireMfa(session);
+  const domainId = c.req.param("id");
+  const input = z
+    .object({ enabled: z.boolean() })
+    .strict()
+    .parse(await c.req.json());
+  await changeAaaaSetting(domainId, input.enabled, (tx) =>
+    requirePrivileged(
+      access,
+      session,
+      "exposure.public",
+      privilegedRequestHash("exposure.public", { domainId, ...input }),
+      tx,
+    ),
+  );
   const operation = await enqueue({
-    kind: "dns.publish",
-    actorId: access.userId,
-    targetIds: [c.req.param("id")],
+    kind: "domain.verify",
+    targetIds: [domainId],
+    payload: { routeEndpointsOnly: true },
   });
-  await audit(access.userId, "dns.publish", "domain", c.req.param("id"), {}, operation.id, access.role);
+  await audit(access.userId, "dns.aaaa", "domain", domainId, input, operation.id, access.role);
   return c.json({ operationId: operation.id });
+});
+
+app.delete("/api/domains/:id/aaaa/authorization", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  await revokeAaaaWithdrawal(c.req.param("id"), access.userId);
+  return c.json({ revoked: true });
 });
 
 app.post("/api/projects", async (c) => {
@@ -3520,6 +3650,20 @@ app.get("/api/front/routes/:id", async (c) => {
   return c.json({ route });
 });
 
+app.get("/api/front/routes/:id/dns", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  const [row] = await db
+    .select({ domainId: endpoints.domainId })
+    .from(frontRoutes)
+    .innerJoin(endpoints, eq(endpoints.id, frontRoutes.endpointId))
+    .where(eq(frontRoutes.id, c.req.param("id")));
+  if (!row?.domainId) throw new DnsReviewError(404, "No DNS claim for this route.");
+  requireDomain(access, row.domainId);
+  c.header("cache-control", "no-store");
+  return c.json(await getDnsReview(row.domainId, c.req.query("local") === "1"));
+});
+
 app.post("/api/front/routes", async (c) => {
   const access = c.get("access");
   requireOwner(access);
@@ -3535,12 +3679,12 @@ app.post("/api/front/routes", async (c) => {
       tx,
     );
   const actor = { userId: access.userId, role: access.role };
-  const { routeId, observeOperationId } = await commitRouteCreate(plan, actor, enqueue, authorize);
+  const { routeId, records, observeOperationId } = await commitRouteCreate(plan, actor, enqueue, authorize);
   const [route] = await listFrontRoutes(routeId);
   return c.json(
     {
       route,
-      records: plan.records.map((record) => ({
+      records: records.map((record) => ({
         type: record.type,
         name: record.name,
         relativeName: record.relativeName,

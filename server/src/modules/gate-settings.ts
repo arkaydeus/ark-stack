@@ -6,7 +6,7 @@
 // endpoint and its address records and durable jobs in one transaction: `domain.verify` (DNS, then the
 // certificate through the normal endpoint flow) and `edge.apply`. The edge renders the login site only
 // once its certificate is issued. Disabling tightens and needs no step-up: it removes the endpoint and
-// its records, revokes every `gate` session (they belong to an origin that no longer exists) and
+// retires its address records, revokes every `gate` session (they belong to an origin that no longer exists) and
 // re-applies the edge.
 
 import {
@@ -18,10 +18,18 @@ import {
   type GateSettingsInput,
   type OperationKind,
 } from "@ark-stack/shared";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 
 import { db, type DbTransaction } from "../db.ts";
 import { loadEnv } from "../env.ts";
+import {
+  endpointDnsScope,
+  desiredDns,
+  pendingWithdrawal,
+  ensureEndpointDnsRecords,
+  reconcileDomainDns,
+  retireDnsRecord,
+} from "./domain-dns.ts";
 import { isAdminHost, refreshLoginHost } from "../origin-hosts.ts";
 import {
   auditEvents,
@@ -138,15 +146,20 @@ async function removeGateEndpoints(tx: DbTransaction, keepHostname: string | nul
   for (const endpoint of await tx.select().from(endpoints).where(eq(endpoints.kind, GATE_ENDPOINT_KIND))) {
     if (endpoint.hostname === keepHostname) continue;
     if (endpoint.domainId) {
-      await tx
-        .delete(dnsRecords)
-        .where(
-          and(
-            eq(dnsRecords.domainId, endpoint.domainId),
-            eq(dnsRecords.name, endpoint.hostname),
-            eq(dnsRecords.purpose, GATE_RECORD_PURPOSE),
-          ),
-        );
+      const records = await tx
+        .select()
+        .from(dnsRecords)
+        .where(endpointDnsScope(endpoint.domainId, endpoint.hostname));
+      for (const record of records.filter(
+        (item) =>
+          (desiredDns(item) || (pendingWithdrawal(item) && item.withdrawalReason === "ipv6")) &&
+          item.purpose.startsWith(GATE_RECORD_PURPOSE),
+      )) {
+        await tx
+          .update(dnsRecords)
+          .set(retireDnsRecord(record, "endpoint_deleted", new Date()))
+          .where(eq(dnsRecords.id, record.id));
+      }
     }
     // Certificates cascade with the endpoint.
     await tx.delete(endpoints).where(eq(endpoints.id, endpoint.id));
@@ -167,13 +180,14 @@ export async function commitGateSettings(
   const result = await db.transaction(async (tx) => {
     await authorize?.(tx);
     const [previous] = await tx
-      .select({ mode: platformSettings.gateLoginMode, hostname: platformSettings.gateLoginHostname })
+      .select()
       .from(platformSettings)
       .where(eq(platformSettings.id, "default"))
       .for("update");
     await removeGateEndpoints(tx, plan.hostname);
+    let records = plan.records;
     let revokedSessions = 0;
-    if (plan.mode === "disabled" || previous?.hostname !== plan.hostname) {
+    if (plan.mode === "disabled" || previous?.gateLoginHostname !== plan.hostname) {
       // Sessions minted on a login origin that no longer exists (or moved) are revoked.
       revokedSessions = (
         await tx.delete(session).where(eq(session.origin, "gate")).returning({ id: session.id })
@@ -207,34 +221,28 @@ export async function commitGateSettings(
           throw new GateSettingsError(409, `${plan.hostname} was reserved by another endpoint.`);
         }
       }
-      const existing = await tx
+      const [domain] = await tx
         .select()
-        .from(dnsRecords)
-        .where(and(eq(dnsRecords.domainId, plan.domain.id), eq(dnsRecords.name, plan.hostname)));
-      for (const current of existing) {
-        if (
-          current.purpose === GATE_RECORD_PURPOSE &&
-          !plan.records.some((record) => record.type === current.type)
-        ) {
-          await tx.delete(dnsRecords).where(eq(dnsRecords.id, current.id));
-        }
+        .from(domainClaims)
+        .where(eq(domainClaims.id, plan.domain.id))
+        .for("update");
+      if (domain?.status !== "verified" || !previous?.publicIpv4) {
+        throw new GateSettingsError(
+          409,
+          "The domain or server address changed. Review the login hostname again.",
+        );
       }
-      for (const record of plan.records) {
-        const current = existing.find((item) => item.type === record.type);
-        if (current && current.purpose === GATE_RECORD_PURPOSE && current.expectedValue === record.value)
-          continue;
-        if (current) await tx.delete(dnsRecords).where(eq(dnsRecords.id, current.id));
-        await tx.insert(dnsRecords).values({
-          id: createId("dns"),
-          domainId: plan.domain.id,
-          type: record.type,
-          name: record.name,
-          relativeName: record.relativeName,
-          expectedValue: record.value,
-          purpose: record.purpose,
-          required: record.required,
-        });
-      }
+      records = routeAddressRecords({
+        hostname: plan.hostname,
+        zone: domain.name,
+        publicIpv4: previous.publicIpv4,
+        publicIpv6: previous.publicIpv6,
+        ipv6Status: previous.ipv6Status,
+        aaaaEnabled: domain.aaaaEnabled,
+        purpose: GATE_RECORD_PURPOSE,
+      });
+      await ensureEndpointDnsRecords(tx, domain.id, plan.hostname, records);
+      await reconcileDomainDns(tx, domain, previous);
     }
     await tx
       .insert(platformSettings)
@@ -253,8 +261,8 @@ export async function commitGateSettings(
       detail: {
         mode: plan.mode,
         hostname: plan.hostname,
-        records: plan.records,
-        previous: previous ?? null,
+        records,
+        previous: previous ? { mode: previous.gateLoginMode, hostname: previous.gateLoginHostname } : null,
         revokedSessions,
       },
     });

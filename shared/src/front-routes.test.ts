@@ -239,6 +239,7 @@ describe("admin path allowlists (§3.3)", () => {
     "/api/front/routes/rt_0123abcd/enable",
     "/api/front/routes/rt_0123abcd/disable",
     "/api/front/routes/rt_0123abcd/acl",
+    "/api/front/routes/rt_0123abcd/dns",
   ];
   const publicAdmin = renderCaddyfile({
     adminMode: "public",

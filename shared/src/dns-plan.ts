@@ -1,3 +1,4 @@
+import type { DomainDnsReview } from "./dns-review.ts";
 import { normalizeHostname } from "./hostnames.ts";
 
 export type DnsProvider = "manual" | "cloudflare" | "other";
@@ -18,6 +19,8 @@ export type DomainPlanInput = {
   baseDomain: string;
   publicIpv4: string;
   publicIpv6?: string;
+  ipv6Status?: Ipv6Status;
+  aaaaEnabled?: boolean;
   adminMode: AdminMode;
   adminHostname?: string;
   databaseHostname?: string;
@@ -37,6 +40,13 @@ export function relativeDnsName(name: string, zone: string) {
 
 export function buildDomainPlan(input: DomainPlanInput) {
   const zone = normalizeHostname(input.baseDomain);
+  const ipv6 = aaaaAllowed({
+    publicIpv6: input.publicIpv6,
+    ipv6Status: input.ipv6Status ?? "unchecked",
+    aaaaEnabled: input.aaaaEnabled ?? true,
+  })
+    ? input.publicIpv6
+    : undefined;
   const records: DnsRecordPlan[] = [
     {
       type: "TXT",
@@ -51,20 +61,12 @@ export function buildDomainPlan(input: DomainPlanInput) {
 
   if (input.includeDatabase) {
     const hostname = normalizeHostname(input.databaseHostname ?? `db.${zone}`);
-    records.push(
-      ...addressRecords(hostname, zone, input.publicIpv4, input.publicIpv6, "Public database endpoint"),
-    );
+    records.push(...addressRecords(hostname, zone, input.publicIpv4, ipv6, "Public database endpoint"));
   }
   if (input.includeMail) {
     const hostname = normalizeHostname(input.mailHostname ?? `mail.${zone}`);
     records.push(
-      ...addressRecords(
-        hostname,
-        zone,
-        input.publicIpv4,
-        input.publicIpv6,
-        "Incoming and client mail endpoint",
-      ),
+      ...addressRecords(hostname, zone, input.publicIpv4, ipv6, "Incoming and client mail endpoint"),
     );
     if (input.existingMx?.length) {
       records.push({
@@ -110,9 +112,7 @@ export function buildDomainPlan(input: DomainPlanInput) {
   }
   if (input.adminMode === "public") {
     const hostname = normalizeHostname(input.adminHostname ?? `admin.${zone}`);
-    records.push(
-      ...addressRecords(hostname, zone, input.publicIpv4, input.publicIpv6, "Public administration hostname"),
-    );
+    records.push(...addressRecords(hostname, zone, input.publicIpv4, ipv6, "Public administration hostname"));
   }
 
   return { zone, records };
@@ -243,6 +243,13 @@ function stripDnsQuotes(value: string) {
 
 function normalizeDnsToken(type: string, value: string) {
   const trimmed = stripDnsQuotes(value).replace(/\.$/, "").trim();
+  if (type === "AAAA" && trimmed.includes(":")) {
+    try {
+      return new URL("http://[" + trimmed + "]/").hostname.slice(1, -1);
+    } catch {
+      return trimmed.toLowerCase();
+    }
+  }
   if (type === "TXT") {
     if (/^v=spf1\b/i.test(trimmed)) {
       const mechanisms = trimmed
@@ -288,4 +295,35 @@ export function dnsRecordVerified(type: string, expected: string, observed: stri
     .filter(Boolean)
     .toSorted();
   return got.includes(want) || got.join(",") === want;
+}
+
+export function manualDnsGuides(
+  zone: string,
+  names: string[],
+  includeAaaa: boolean,
+): DomainDnsReview["guides"] {
+  return [
+    {
+      title: "Namecheap",
+      url: "https://www.namecheap.com/support/knowledgebase/article.aspx/434/2237/how-do-i-set-up-host-records-for-a-domain/",
+      steps: [
+        "Open Domain List → Manage → Advanced DNS → Host Records. Use this panel for BasicDNS, PremiumDNS or FreeDNS.",
+        "Choose Add New Record and select A Record for IPv4 or AAAA Record for IPv6. Enter @ for the apex or www for the www hostname, and copy the value shown below.",
+        "Use Automatic TTL. For a removal, delete the row that matches the listed type, host and prior value.",
+      ],
+    },
+    {
+      title: "Other DNS providers",
+      steps: [
+        `Find the authoritative DNS provider with dig NS ${zone} +short and open its DNS editor.`,
+        "Enter the type, relative host, value and TTL shown below. If the provider asks for a full hostname, use the full name shown.",
+        "Resolve conflicting records and turn off any DNS proxy or forwarding. Where CAA restricts issuance, allow letsencrypt.org.",
+        "Remove the exact rows marked for removal, wait for the TTL, then recheck DNS.",
+        ...names.flatMap((name) => [
+          `Check IPv4 with dig A ${name} @1.1.1.1 +short.`,
+          ...(includeAaaa ? [`Check IPv6 with dig AAAA ${name} @1.1.1.1 +short.`] : []),
+        ]),
+      ],
+    },
+  ];
 }

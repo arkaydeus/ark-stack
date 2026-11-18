@@ -1,3 +1,4 @@
+import type { CloudflareOwnership, DnsWrite } from "@ark-stack/shared";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -210,6 +211,8 @@ export const domainClaims = pgTable("domain_claims", {
   lastError: text("last_error"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  dnsWatchUntil: timestamp("dns_watch_until", { withTimezone: true }),
+  proxyAaaaHosts: jsonb("proxy_aaaa_hosts").$type<string[]>().notNull().default([]),
   // Per-domain AAAA switch (R9). Effective AAAA = aaaaEnabled AND ipv6Status = 'passed'.
   aaaaEnabled: boolean("aaaa_enabled").notNull().default(true),
 });
@@ -226,6 +229,20 @@ export const dnsRecords = pgTable(
     relativeName: text("relative_name").notNull(),
     expectedValue: text("expected_value").notNull(),
     observedValue: text("observed_value"),
+    ttl: integer("ttl").notNull().default(300),
+    providerOwnership: jsonb("provider_ownership").$type<CloudflareOwnership>(),
+    providerUpdateIntent: jsonb("provider_update_intent").$type<{
+      zoneId: string;
+      providerId: string | null;
+      marker: string;
+      after: DnsWrite;
+    }>(),
+    automaticWithdrawal: boolean("automatic_withdrawal").notNull().default(false),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    withdrawalReason: text("withdrawal_reason").$type<"ipv6" | "endpoint_deleted" | "address_changed">(),
+    withdrawalStartedAt: timestamp("withdrawal_started_at", { withTimezone: true }),
+    providerRemovedAt: timestamp("provider_removed_at", { withTimezone: true }),
+    withdrawalConfirmedAt: timestamp("withdrawal_confirmed_at", { withTimezone: true }),
     purpose: text("purpose").notNull(),
     required: boolean("required").notNull().default(true),
     status: text("status").notNull().default("pending"),

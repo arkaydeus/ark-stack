@@ -5,7 +5,7 @@ export type DnsWrite = {
   ttl: number;
   priority?: number;
 };
-
+import { expectedDnsValue } from "./dns-plan.ts";
 export function cloudflareRecordBody(record: DnsWrite) {
   const body: Record<string, unknown> = {
     type: record.type,
@@ -39,8 +39,9 @@ export function chooseCloudflareMutation(
   existing: Array<{ id: string; content: string; priority?: number }>,
   record: DnsWrite,
 ) {
-  const normalize = normalizeContent;
   const type = record.type.toUpperCase();
+  const normalize = (value: string) =>
+    type === "AAAA" ? expectedDnsValue(type, value) : normalizeContent(value);
   const content = normalize(record.content);
   const exact = existing.find(
     (item) => normalize(item.content) === content && item.priority === record.priority,

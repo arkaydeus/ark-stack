@@ -1007,13 +1007,17 @@ describe("PUT /api/settings/gate", () => {
     expect(audit?.detail.hostname).toBe(movedLoginHost);
   });
 
-  test("disabling needs no step-up, removes the endpoint and records and revokes gate sessions", async () => {
+  test("disabling needs no step-up, removes the endpoint, retires its DNS and revokes gate sessions", async () => {
     const gateUser = await createUser("disabled");
     await sessionCookie(gateUser.id, "gate");
     const response = await put({ mode: "disabled" });
     expect(response.status).toBe(200);
     expect((await sql`SELECT id FROM endpoints WHERE kind = 'gate'`).length).toBe(0);
-    expect((await sql`SELECT id FROM dns_records WHERE name = ${movedLoginHost}`).length).toBe(0);
+    const records =
+      await sql`SELECT type, status, withdrawal_reason FROM dns_records WHERE name = ${movedLoginHost}`;
+    expect([...records]).toEqual([
+      { type: "A", status: "withdrawal_pending", withdrawal_reason: "endpoint_deleted" },
+    ]);
     expect((await sql`SELECT id FROM session WHERE origin = 'gate'`).length).toBe(0);
     expect((await call({ host: movedLoginHost, path: "/api/auth/get-session" })).status).toBe(421);
     // Restore the login origin for the mode-change checks.

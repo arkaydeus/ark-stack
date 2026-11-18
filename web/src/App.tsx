@@ -227,7 +227,7 @@ function ViewBody({
   if (view === "activity") return <ActivityView state={state} />;
   if (view === "backups") return <BackupsView state={state} reload={reload} />;
   if (view === "updates") return <UpdatesView state={state} reload={reload} />;
-  if (view === "front-routes") return <FrontRoutesView key={state.operations.length} state={state} />;
+  if (view === "front-routes") return <FrontRoutesView state={state} />;
   if (view === "front-acl") return <FrontAclView state={state} />;
   if (view === "gate-users") return <GateUsersView state={state} />;
   if (view === "settings") return <SettingsView state={state} reload={reload} />;

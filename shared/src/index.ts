@@ -10,6 +10,7 @@ export * from "./crypto.ts";
 export * from "./db-clients.ts";
 export * from "./db-ingress.ts";
 export * from "./dns-plan.ts";
+export * from "./dns-review.ts";
 export * from "./edge.ts";
 export * from "./edge-http.ts";
 export * from "./errors.ts";
