@@ -3,24 +3,30 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
-  nftAllowlist,
-  renderFrontRawPorts,
+  FRONT_SHARED_LIMIT_DEFAULTS,
+  renderDbIngress,
+  renderFrontIngress,
   sha256Hex,
   type DbIngressLimits,
   type EdgeL4Input,
 } from "@ark-stack/shared";
 
-export function frontIngressRules(input: EdgeL4Input, limits: DbIngressLimits, previous = "") {
+export function frontIngressRules(
+  input: EdgeL4Input,
+  limits: DbIngressLimits,
+  previous = "",
+  sharedLimits = FRONT_SHARED_LIMIT_DEFAULTS,
+) {
   const raw = [
     ...(input.tcpRoutes ?? []),
     ...(input.postgresRoutes ?? []).flatMap((route) =>
       route.compatPort == null ? [] : [{ ...route, listenPort: route.compatPort }],
     ),
   ];
+  // The database section comes first, followed by the front policy's own shebang.
+  const previousDatabase = previous.split("\n#!", 1)[0];
   return (
-    nftAllowlist([], 5432, limits, previous.split("table inet ark_front_raw")[0]) +
-    "\n" +
-    renderFrontRawPorts(raw)
+    renderDbIngress(limits, previousDatabase) + "\n" + renderFrontIngress(raw, input.sniPorts, sharedLimits)
   );
 }
 
@@ -35,7 +41,12 @@ export async function applyFrontIngress(
     if (error.code === "ENOENT") return "";
     throw error;
   });
-  const rules = frontIngressRules(input, limits, previous);
+  const defaults = FRONT_SHARED_LIMIT_DEFAULTS;
+  const rules = frontIngressRules(input, limits, previous, {
+    maxConnectionsPerSource: Number(env.ARK_FRONT_MAX_CONNECTIONS ?? defaults.maxConnectionsPerSource),
+    newConnectionsPerSecond: Number(env.ARK_FRONT_RATE_PER_SECOND ?? defaults.newConnectionsPerSecond),
+    newConnectionBurst: Number(env.ARK_FRONT_RATE_BURST ?? defaults.newConnectionBurst),
+  });
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const temporary = `${file}.${crypto.randomUUID()}.tmp`;
   await writeFile(temporary, rules, { mode: 0o600 });

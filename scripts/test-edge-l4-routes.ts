@@ -41,7 +41,7 @@ import {
   haproxyServerName,
   l4PolicyFingerprint,
   routeIdentityKey,
-  renderFrontRawPorts,
+  renderFrontIngress,
   type EdgeL4Input,
   type EdgeL4TcpRoute,
   type EdgeL4TlsRoute,
@@ -63,8 +63,9 @@ const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
 const bunImage =
   "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
-const nftImage = "ark-db-ingress-test:local";
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
+const nftImage = `ark-db-ingress-test:${suffix}`;
+let nftImageBuilt = false;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-l4-routes-${suffix}-`));
 const network = `ark-edge-l4r-${suffix}`;
 const runtime = new EdgeTestRuntime(directory, network, bunImage);
@@ -1178,13 +1179,13 @@ async function nftTest(report: Report) {
   await mkdir(rules);
   const client = "10.99.0.2";
   const files = {
-    "raw.nft": renderFrontRawPorts([
+    "raw.nft": renderFrontIngress([
       { id: "rt_t001", listenPort: 20001, sourceCidrs: [`${client}/32`] },
       { id: "rt_t002", listenPort: 20002, sourceCidrs: [] },
       { id: "rt_t004", listenPort: 20004, sourceCidrs: [], allowInternet: true },
       { id: "rt_t005", listenPort: 20005, sourceCidrs: ["10.99.1.0/24"] },
     ]),
-    "empty.nft": renderFrontRawPorts([]),
+    "empty.nft": renderFrontIngress([]),
   };
   for (const [name, text] of Object.entries(files)) await writeFile(join(rules, name), text);
   await chmod(rules, 0o755);
@@ -1197,6 +1198,7 @@ async function nftTest(report: Report) {
   });
   if ((await child.exited) !== 0)
     throw new Error(`building ${nftImage} failed: ${await new Response(child.stderr).text()}`);
+  nftImageBuilt = true;
   const script = `set -e
 for f in /rules/*.nft; do nft -c -f "$f"; echo "nft -c ok: $(basename "$f")"; done
 ip netns add srv; ip netns add cli
@@ -1325,5 +1327,6 @@ try {
   await runtime.cleanup();
   for (const name of extraNetworks)
     await Bun.spawn(["docker", "network", "rm", name], { stdout: "ignore", stderr: "ignore" }).exited;
+  if (nftImageBuilt) await docker("image", "rm", nftImage).catch(() => undefined);
 }
 process.exit(failed ? 1 : 0);

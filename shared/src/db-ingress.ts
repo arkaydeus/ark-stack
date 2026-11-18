@@ -1,23 +1,14 @@
 // The public database port's nftables policy (docs/design/front-door.md §3.11, FD-18).
 //
-// `inet ark_db_ingress` matches TCP 5432 on both the `input` hook (a host-namespace listener,
-// today's `database-ingress` proxy) and the `forward` hook (Docker DNAT to a published port, the
-// FD-26 Postgres router), so the same rules hold before and after that change. It carries:
-//
-// - the per-database CIDR allowlist, until FD-26 moves it into HAProxy's `be_pgbouncer`;
-// - per-source limits: a concurrent-connection cap (`ct count`) and a new-connection rate
-//   (`limit rate`). IPv4 sources are keyed per address and IPv6 sources per /64, so a client
-//   cannot dodge the limits by rotating through its own /64.
+// `inet ark_db_ingress` limits public TCP 5432 on the input hook (host listeners) and the
+// forward hook (DNAT to the FD-26 router). IPv4 sources are keyed per address and IPv6 sources
+// per /64. The pooler and each PostgreSQL route enforce their CIDRs in HAProxy.
 //
 // Every drop has a named counter. The host-namespace reconciler reads them back and the API
 // exports them on `/api/metrics/prometheus` as `ark_nft_drop_packets_total`.
 import { z } from "zod";
 
-import { parseCidr } from "./cidr.ts";
-
-export const DB_INGRESS_TABLE = "ark_db_ingress";
-export const DB_INGRESS_LIMITS_CHAIN = "ark_db_limits";
-export const DB_INGRESS_ALLOW_CHAIN = "ark_db_allow";
+import { DB_INGRESS_COUNTERS, DB_INGRESS_LIMITS_CHAIN, DB_INGRESS_TABLE } from "./ingress-counters.ts";
 
 /**
  * §3.11 defaults. Vercel egress comes from shared AWS addresses, so many function instances can
@@ -116,34 +107,41 @@ export function dbIngressLimitsSummary(settings: Parameters<typeof platformDbIng
   };
 }
 
-/**
- * Named counters in the table, one per drop rule. `reason` and `family` become metric labels.
- * The allowlist counter exists only while an allowlist is rendered.
- */
-export const DB_INGRESS_COUNTERS = {
-  drop_conn4: { chain: DB_INGRESS_LIMITS_CHAIN, reason: "concurrent", family: "ipv4" },
-  drop_conn6: { chain: DB_INGRESS_LIMITS_CHAIN, reason: "concurrent", family: "ipv6" },
-  drop_rate4: { chain: DB_INGRESS_LIMITS_CHAIN, reason: "rate", family: "ipv4" },
-  drop_rate6: { chain: DB_INGRESS_LIMITS_CHAIN, reason: "rate", family: "ipv6" },
-  drop_allowlist: { chain: DB_INGRESS_ALLOW_CHAIN, reason: "allowlist", family: "any" },
-} as const;
-
-export type DbIngressCounterName = keyof typeof DB_INGRESS_COUNTERS;
-
-/** Marks whether the rendered file enforces a CIDR allowlist; the reconcilers report it. */
-export const DB_INGRESS_ENFORCED_MARKER = "# ark-db-ingress: allowlist=enforced";
-const OPEN_MARKER = "# ark-db-ingress: allowlist=open";
-
 /** IPv6 sources are grouped by /64 for both limits (§3.11). */
 const V6_PREFIX_MASK = "ffff:ffff:ffff:ffff::";
 
-export function nftAllowlist(
-  cidrs: string[],
-  port = 5432,
-  limits: DbIngressLimits = DB_INGRESS_LIMIT_DEFAULTS,
-  previousRules = "",
-) {
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error(`Invalid database port ${port}.`);
+function connectionSets(rules: string) {
+  return new Set([...rules.matchAll(/^[\t ]+set (conn[46](?:_[0-9]+)?) \{/gm)].map((match) => match[1]!));
+}
+
+function declareConnectionSet(name: string) {
+  const type = name.startsWith("conn4") ? "ipv4_addr" : "ipv6_addr";
+  return [name, name.replace("conn", "active")].map(
+    (set) => `  set ${set} { type ${type}; size 65535; flags dynamic; }`,
+  );
+}
+
+function drainConnectionSet(name: string) {
+  const active = name.replace("conn", "active");
+  return name.startsWith("conn4")
+    ? `    ct state new ip saddr @${active} counter name "drop_conn4" drop`
+    : `    ct state new ip6 saddr and ${V6_PREFIX_MASK} @${active} counter name "drop_conn6" drop`;
+}
+
+/** Retain generations installed by the other publisher, even across a reconciler restart. */
+export function preserveDbIngressGenerations(rules: string, installed: string) {
+  const desired = connectionSets(rules);
+  const live = [...connectionSets(installed)].filter((name) => !desired.has(name));
+  if (!desired.size || !live.length) return rules;
+  return rules
+    .replace(/^  set conn[46].*$/m, (line) => [...live.flatMap(declareConnectionSet), line].join("\n"))
+    .replace(
+      `  chain ${DB_INGRESS_LIMITS_CHAIN} {\n`,
+      (line) => line + live.map(drainConnectionSet).join("\n") + "\n",
+    );
+}
+
+export function renderDbIngress(limits: DbIngressLimits = DB_INGRESS_LIMIT_DEFAULTS, previousRules = "") {
   const parsed = dbIngressLimitsInput.safeParse(limits);
   if (!parsed.success) {
     throw new Error(
@@ -160,71 +158,40 @@ export function nftAllowlist(
   // generation per configured value. Retain older conncount sets and deny their sources
   // until they drain (the kernel garbage-collects empty conncount elements). This keeps
   // idle established connections accounted for without terminating them on a cap change.
-  const connectionSets = new Set(
-    [...previousRules.matchAll(/^  set (conn[46](?:_[0-9]+)?) \{/gm)].map((match) => match[1]!),
-  );
+  const generations = connectionSets(previousRules);
   const conn4 = `conn4_${conn}`;
   const conn6 = `conn6_${conn}`;
-  connectionSets.add(conn4);
-  connectionSets.add(conn6);
-  const setDeclarations = [...connectionSets]
-    .flatMap((name) => {
-      const type = name.startsWith("conn4") ? "ipv4_addr" : "ipv6_addr";
-      return [name, name.replace("conn", "active")].map(
-        (set) => `  set ${set} { type ${type}; size 65535; flags dynamic; }`,
-      );
-    })
-    .join("\n");
-  const drainingRules = [...connectionSets]
+  generations.add(conn4);
+  generations.add(conn6);
+  const setDeclarations = [...generations].flatMap(declareConnectionSet).join("\n");
+  const drainingRules = [...generations]
     .filter((name) => name !== conn4 && name !== conn6)
-    .map((name) =>
-      name.startsWith("conn4")
-        ? `    ct state new ip saddr @${name.replace("conn", "active")} counter name "drop_conn4" drop`
-        : `    ct state new ip6 saddr and ${V6_PREFIX_MASK} @${name.replace("conn", "active")} counter name "drop_conn6" drop`,
-    )
+    .map(drainConnectionSet)
     .join("\n");
   const rate4 = `rate4_${rate}_${burst}`;
   const rate6 = `rate6_${rate}_${burst}`;
-  const valid = cidrs.map((item) => parseCidr(item)).filter((item) => item.ok);
-  const v4 = valid.filter((item) => item.version === 4).map((item) => `    ip saddr ${item.cidr} return`);
-  const v6 = valid.filter((item) => item.version === 6).map((item) => `    ip6 saddr ${item.cidr} return`);
-  const enforced = valid.length > 0;
-  // The allowlist runs first, so sources it drops never take a slot in the per-source sets.
-  // An empty allowlist still emits a real table: the reconcilers read it back and treat a
-  // missing table as a failed apply.
-  const jumps = (match: string) =>
-    [
-      ...(enforced ? [`    ${match} jump ${DB_INGRESS_ALLOW_CHAIN}`] : []),
-      `    ${match} jump ${DB_INGRESS_LIMITS_CHAIN}`,
-    ].join("\n");
-  const allowChain = enforced
-    ? `  chain ${DB_INGRESS_ALLOW_CHAIN} {
-${[...v4, ...v6].join("\n")}
-    counter name "drop_allowlist" drop
-  }
-`
-    : "";
-  const counters = (Object.keys(DB_INGRESS_COUNTERS) as DbIngressCounterName[])
-    .filter((name) => enforced || name !== "drop_allowlist")
+  const counters = Object.keys(DB_INGRESS_COUNTERS)
     .map((name) => `  counter ${name} {}`)
     .join("\n");
   return `#!/usr/sbin/nft -f
-# Generated public database source policy (docs/design/front-door.md §3.11).
-${enforced ? DB_INGRESS_ENFORCED_MARKER : OPEN_MARKER}
-# ${enforced ? `CIDR allowlist enforced on tcp/${port}; other sources are dropped.` : `Empty allowlist: any authenticated client may reach tcp/${port}.`}
-# Per-source limits on tcp/${port}: ${conn} concurrent, ${rate}/second (burst ${burst}) new connections. IPv6 sources are grouped by /64.
+# Generated public database limits (docs/design/front-door.md §3.11).
+# Per-source limits on tcp/5432: ${conn} concurrent, ${rate}/second (burst ${burst}) new connections. IPv6 sources are grouped by /64.
 # input covers a host-namespace listener; forward covers Docker DNAT to a published port.
 table inet ${DB_INGRESS_TABLE}
 # Declare objects without deleting live conncount state or named counters. Flushing only
 # chains removes old jumps/rules (including a legacy allowlist) in this same transaction.
 add chain inet ${DB_INGRESS_TABLE} input { type filter hook input priority -1; policy accept; }
 add chain inet ${DB_INGRESS_TABLE} forward { type filter hook forward priority -1; policy accept; }
-add chain inet ${DB_INGRESS_TABLE} ${DB_INGRESS_ALLOW_CHAIN}
 add chain inet ${DB_INGRESS_TABLE} ${DB_INGRESS_LIMITS_CHAIN}
 flush chain inet ${DB_INGRESS_TABLE} input
 flush chain inet ${DB_INGRESS_TABLE} forward
-flush chain inet ${DB_INGRESS_TABLE} ${DB_INGRESS_ALLOW_CHAIN}
 flush chain inet ${DB_INGRESS_TABLE} ${DB_INGRESS_LIMITS_CHAIN}
+# Retire the old allowlist objects, including on upgrades from a pre-FD-26 policy.
+add chain inet ${DB_INGRESS_TABLE} ark_db_allow
+flush chain inet ${DB_INGRESS_TABLE} ark_db_allow
+delete chain inet ${DB_INGRESS_TABLE} ark_db_allow
+add counter inet ${DB_INGRESS_TABLE} drop_allowlist
+delete counter inet ${DB_INGRESS_TABLE} drop_allowlist
 table inet ${DB_INGRESS_TABLE} {
 ${counters}
 ${setDeclarations}
@@ -232,13 +199,13 @@ ${setDeclarations}
   set ${rate6} { type ipv6_addr; size 65535; flags dynamic; timeout 2m; }
   chain input {
     type filter hook input priority -1; policy accept;
-${jumps(`tcp dport ${port}`)}
+    tcp dport 5432 jump ${DB_INGRESS_LIMITS_CHAIN}
   }
   chain forward {
     type filter hook forward priority -1; policy accept;
-${jumps(`ct status dnat tcp dport ${port}`)}
+    ct direction original ct status dnat tcp dport 5432 jump ${DB_INGRESS_LIMITS_CHAIN}
   }
-${allowChain}  chain ${DB_INGRESS_LIMITS_CHAIN} {
+  chain ${DB_INGRESS_LIMITS_CHAIN} {
 ${drainingRules ? `${drainingRules}\n` : ""}    # Presence trackers use count over 0: a set lookup evaluates its element expression,
     # so looking up the capped conn sets would only match sources already over the OLD cap.
     ct state new add @active4_${conn} { ip saddr ct count over 0 }
@@ -250,82 +217,4 @@ ${drainingRules ? `${drainingRules}\n` : ""}    # Presence trackers use count ov
   }
 }
 `;
-}
-
-/** True when a rendered policy file enforces a CIDR allowlist (rather than only the limits). */
-export function dbIngressAllowlistEnforced(rules: string) {
-  return rules.split("\n").some((line) => line.trim() === DB_INGRESS_ENFORCED_MARKER);
-}
-
-export type DbIngressCounterSample = { name: DbIngressCounterName; packets: number; bytes: number };
-
-export type DbIngressCounterSnapshot = {
-  table: typeof DB_INGRESS_TABLE;
-  observedAt: string;
-  counters: DbIngressCounterSample[];
-};
-
-function isCounterName(value: unknown): value is DbIngressCounterName {
-  return typeof value === "string" && Object.hasOwn(DB_INGRESS_COUNTERS, value);
-}
-
-function isCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
-/**
- * Reads `nft -j list counters table inet ark_db_ingress` output. Only the known named counters
- * of this table are kept; anything else is ignored.
- */
-export function parseNftCounters(json: string, observedAt = new Date()): DbIngressCounterSnapshot {
-  const parsed = JSON.parse(json) as { nftables?: Array<Record<string, unknown>> };
-  const counters: DbIngressCounterSample[] = [];
-  for (const item of parsed.nftables ?? []) {
-    const counter = item.counter as Record<string, unknown> | undefined;
-    if (!counter || counter.table !== DB_INGRESS_TABLE || counter.family !== "inet") continue;
-    if (!isCounterName(counter.name) || !isCount(counter.packets) || !isCount(counter.bytes)) continue;
-    counters.push({ name: counter.name, packets: counter.packets, bytes: counter.bytes });
-  }
-  return { table: DB_INGRESS_TABLE, observedAt: observedAt.toISOString(), counters };
-}
-
-/** Counter snapshots older than this are reported stale (the reconciler writes every 15 s). */
-export const DB_INGRESS_COUNTERS_STALE_SECONDS = 120;
-
-/**
- * Prometheus lines for a counter snapshot written by the host-namespace reconciler. `snapshot`
- * is untrusted file content: unknown names and malformed values are dropped, and labels come
- * only from `DB_INGRESS_COUNTERS`. A missing snapshot reports `ark_nft_counters_present 0`.
- */
-export function dbIngressCounterMetrics(snapshot: unknown, now = new Date()) {
-  const table = DB_INGRESS_TABLE;
-  const lines = [
-    "# HELP ark_nft_counters_present Whether the host nftables counter snapshot was readable.",
-    "# TYPE ark_nft_counters_present gauge",
-  ];
-  const value = snapshot as Partial<DbIngressCounterSnapshot> | null | undefined;
-  const observedAt = typeof value?.observedAt === "string" ? Date.parse(value.observedAt) : Number.NaN;
-  if (!value || value.table !== table || !Array.isArray(value.counters) || Number.isNaN(observedAt)) {
-    lines.push(`ark_nft_counters_present{table="${table}"} 0`);
-    return lines;
-  }
-  lines.push(`ark_nft_counters_present{table="${table}"} 1`);
-  lines.push(
-    "# HELP ark_nft_counters_age_seconds Age of the host nftables counter snapshot.",
-    "# TYPE ark_nft_counters_age_seconds gauge",
-    `ark_nft_counters_age_seconds{table="${table}"} ${Math.max(0, Math.round((now.getTime() - observedAt) / 1000))}`,
-    "# HELP ark_nft_drop_packets_total Packets dropped by Ark's nftables rules, by table, chain and reason.",
-    "# TYPE ark_nft_drop_packets_total counter",
-  );
-  const seen = new Set<string>();
-  for (const sample of value.counters as unknown[]) {
-    const item = sample as Partial<DbIngressCounterSample> | null;
-    if (!item || !isCounterName(item.name) || !isCount(item.packets) || seen.has(item.name)) continue;
-    seen.add(item.name);
-    const labels = DB_INGRESS_COUNTERS[item.name];
-    lines.push(
-      `ark_nft_drop_packets_total{table="${table}",chain="${labels.chain}",reason="${labels.reason}",family="${labels.family}"} ${item.packets}`,
-    );
-  }
-  return lines;
 }

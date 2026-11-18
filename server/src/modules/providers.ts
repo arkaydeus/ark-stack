@@ -16,8 +16,7 @@ import {
   edgeCertificatePaths,
   funnelDisabled,
   jmapCall,
-  nftAllowlist,
-  dbIngressAllowlistEnforced,
+  renderDbIngress,
   sha256Hex,
   parseBearerChallenge,
   registryManifestUrl,
@@ -403,18 +402,13 @@ export function dbIngressCountersFile() {
  * reconciler no longer relays 5432 (HAProxy's `fe_pg5432` owns it), so there is no exposure toggle
  * here: whether PgBouncer is reachable is decided by rendering `be_pgbouncer` at the edge.
  */
-export async function applyDatabaseAllowlist(
-  dir: string,
-  cidrs: string[],
-  port = 5432,
-  options: { limits?: DbIngressLimits } = {},
-) {
+export async function applyDatabaseIngress(dir: string, limits?: DbIngressLimits) {
   const file = join(dir, "allowlist.nft");
   const previousRules = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return "";
     throw error;
   });
-  const rules = nftAllowlist(cidrs, port, options.limits, previousRules);
+  const rules = renderDbIngress(limits, previousRules);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   // Publish complete policies atomically: the host watcher must never load a partial write.
   const temporary = `${file}.${crypto.randomUUID()}.tmp`;
@@ -425,10 +419,8 @@ export async function applyDatabaseAllowlist(
   try {
     if (helper) {
       await exec(helper, [file], { timeout: 20_000 });
-      return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules) };
+      return { file, applied: true, enforced: false };
     }
-    // An empty allowlist installs per-source limits without CIDR allowlist jumps. The
-    // reconcilers read the table back and treat a missing table as a failed apply.
     if (process.env.ARK_APPLY_NFT === "0") {
       if (requireApply) throw new Error("Database ingress policy cannot be applied because ARK_APPLY_NFT=0.");
       return { file, applied: false, enforced: false, reason: "disabled" };
@@ -442,7 +434,7 @@ export async function applyDatabaseAllowlist(
         const status = await readFile(join(dir, "allowlist.status"), "utf8").catch(() => "");
         if (status.includes(`policy_hash=${expectedHash}\n`)) {
           if (status.includes("applied=true\n")) {
-            return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules) };
+            return { file, applied: true, enforced: false };
           }
           lastStatus = status.split("error=")[1]?.trim() || "Requested policy is not ready.";
         }
@@ -452,7 +444,7 @@ export async function applyDatabaseAllowlist(
     }
     await exec("nft", ["-f", file], { timeout: 10_000 });
     await exec("nft", ["list", "table", "inet", "ark_db_ingress"], { timeout: 10_000 });
-    return { file, applied: true, enforced: dbIngressAllowlistEnforced(rules) };
+    return { file, applied: true, enforced: false };
   } catch (error) {
     const message = error instanceof Error ? error.message : "nft apply failed";
     if (requireApply)
