@@ -18,7 +18,7 @@ const loginRequest = new Request("https://login.example.test/api/auth/sign-in/em
 const otherRequest = new Request("https://www.example.test/api/auth/sign-in/email");
 // Positive match only, as origin-hosts.ts does: any other host has no origin.
 const byHost = (request: Request): SessionOrigin | null =>
-  (({ "admin.example.test": "admin", "login.example.test": "gate" })[new URL(request.url).host] as
+  ({ "admin.example.test": "admin", "login.example.test": "gate" }[new URL(request.url).host] as
     | SessionOrigin
     | undefined) ?? null;
 

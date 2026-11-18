@@ -12,11 +12,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - run: bun scripts/check-image-plan.ts
       - name: Verify GHCR publishing with a disposable package
         run: bun scripts/test-ghcr-publish.ts

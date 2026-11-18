@@ -11,6 +11,7 @@
     "import/no-unassigned-import": "off",
     "react/react-in-jsx-scope": "off",
     "react/set-state-in-effect": "off",
-    "eslint/no-await-in-loop": "off"
+    "eslint/no-await-in-loop": "off",
+    "unicorn/consistent-function-scoping": "off"
   }
 }

@@ -641,8 +641,9 @@ export function tailnetBackupTarget(
     addresses: [
       ...new Set(
         nodes
-          .filter((item) => item.stableId === node?.stableId)
-          .flatMap((item) => [tailnetIp(item.ipv4), tailnetIp(item.ipv6)])
+          .flatMap((item) =>
+            item.stableId === node?.stableId ? [tailnetIp(item.ipv4), tailnetIp(item.ipv6)] : [],
+          )
           .filter((address): address is string => address !== null),
       ),
     ],
