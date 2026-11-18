@@ -377,7 +377,7 @@ export function databaseClientRolloverGuide(input: {
     branch
       ? `# Redeploy Preview branch ${JSON.stringify(branch)} using its deploy hook or the Vercel dashboard.`
       : `vercel deploy${target === "production" ? " --prod" : ""}        # or redeploy from the dashboard`,
-    '# Check database access, then press "Confirm rollover" in Ark.',
+    "# Check database access, then confirm in Ark: POST the reveal's confirm.path with its confirm.body (MFA).",
   ].join("\n");
   return {
     target,
@@ -386,7 +386,7 @@ export function databaseClientRolloverGuide(input: {
     notes: [
       "The old certificate admits new connections until its expiry, and its role's sessions are closed by expiry + 5 s; redeploy any time before then.",
       "Clients must reconnect and refresh their pools after the redeploy. Check the --force and --sensitive flag spellings against your Vercel CLI version.",
-      ...(branch ? ["Branch-specific commands require Vercel CLI 64.6.0 or later."] : []),
+      ...(branch ? ["Branch-specific commands require Vercel CLI 64.7.0 or later."] : []),
     ],
   };
 }

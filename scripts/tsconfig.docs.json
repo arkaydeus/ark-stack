@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "types": ["bun"] },
+  "include": ["check-docs.ts", "check-docs.test.ts"]
+}

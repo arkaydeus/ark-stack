@@ -233,7 +233,7 @@ describe("automatic rollover (§3.10.4, FD-28)", () => {
         "base64 -i client-next.crt | tr -d '\\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive --force",
         "base64 -i client-next.key | tr -d '\\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive --force",
         "vercel deploy --prod        # or redeploy from the dashboard",
-        '# Check database access, then press "Confirm rollover" in Ark.',
+        "# Check database access, then confirm in Ark: POST the reveal's confirm.path with its confirm.body (MFA).",
         "",
       ].join("\n"),
     );
