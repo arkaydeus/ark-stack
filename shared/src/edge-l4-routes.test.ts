@@ -273,15 +273,13 @@ describe("policy fingerprints in server names (§3.8.6 revocation)", () => {
     const old = { ...mqtt, policy: "1111111111111111" };
     const next = { ...mqtt, policy: "2222222222222222" };
     const index = allowedServerIndex(new Set([routeIdentityKey(next)]));
-    const targetOld = { server: haproxyServerName(old), key: "100.88.1.20:1883" };
-    const loopOld = { server: haproxyLoopServerName(old), key: null };
+    const targetOld = { backend: "be_mqtt_inner", server: haproxyServerName(old), key: "100.88.1.20:1883" };
+    const loopOld = { backend: "be_mqtt", server: haproxyLoopServerName(old), key: null };
     expect(haproxyServerDenied(targetOld, index)).toBe(true);
     expect(haproxyServerDenied(loopOld, index)).toBe(true);
-    expect(haproxyServerDenied({ server: haproxyServerName(next), key: "100.88.1.20:1883" }, index)).toBe(
-      false,
-    );
-    expect(haproxyServerDenied({ server: haproxyLoopServerName(next), key: null }, index)).toBe(false);
-    expect(haproxyServerDenied({ server: "caddy", key: null }, index)).toBe(false);
+    expect(haproxyServerDenied({ ...targetOld, server: haproxyServerName(next) }, index)).toBe(false);
+    expect(haproxyServerDenied({ ...loopOld, server: haproxyLoopServerName(next) }, index)).toBe(false);
+    expect(haproxyServerDenied({ backend: "be_caddy", server: "caddy", key: null }, index)).toBe(false);
     // HTTP identities are unchanged by the optional fifth element.
     const http = { id: "rt_web1", hostname: "www.example.com", stableId: "n1", ip: "100.88.1.21", port: 80 };
     expect(JSON.parse(decodeURIComponent(routeIdentityKey(http)))).toHaveLength(4);

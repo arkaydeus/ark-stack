@@ -1100,22 +1100,28 @@ export function haproxyServerDenied(
 }
 
 /**
- * The HAProxy launch guard's decision for the full configuration: `open` when it has no tailnet
- * server, or when every one is authorised by a currently valid lease. Otherwise the guard starts from
- * `haproxy.closed.cfg`.
+ * The full configuration opens only when the lease authorises every protected server.
+ * For the closed variant, Caddy independently enforces HTTP admission while the watchdog
+ * fences denied HTTP servers.
  */
 export function haproxyLaunchDecision(config: string, allowed: ReadonlySet<string>) {
   const index = allowedServerIndex(allowed);
-  const tailnet = haproxyConfigServers(config).filter((server) => server.key !== null);
-  const denied = tailnet.filter((server) => !haproxyServerAllowed(server, index));
+  const protectedServers = haproxyConfigServers(config).filter(haproxyServerProtected);
+  const denied = protectedServers.filter((server) => haproxyServerDenied(server, index));
+  const names = (servers: HaproxyServer[]) =>
+    [
+      ...new Set(
+        servers.map((server) => server.key ?? haproxyHttpHostname(server)).filter((key) => key !== null),
+      ),
+    ].toSorted();
   const marked = config
     .split("\n")
     .some((line) => line.startsWith(`${L4_TAILNET_ROUTE_MARKER} `) || line.startsWith("# ark-http-route "));
   return {
     open: denied.length === 0,
-    guarded: marked || tailnet.length > 0,
-    backends: [...new Set(tailnet.map((server) => server.key!))].toSorted(),
-    denied: [...new Set(denied.map((server) => server.key!))].toSorted(),
+    guarded: marked || protectedServers.length > 0,
+    backends: names(protectedServers),
+    denied: names(denied),
   };
 }
 

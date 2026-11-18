@@ -432,8 +432,8 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
       try {
         scoped = (await this.options.scopedHttp?.()) ?? false;
       } catch {
-        // With a partial policy, a failed master is handled by HAProxy's own supervisor.
-        scoped = allowed.size > 0;
+        // A legacy HTTP-only router may never have armed its supervisor.
+        // An unreadable master cannot confirm that Caddy's old streams are covered.
       }
       if (!scoped) {
         try {

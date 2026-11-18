@@ -180,6 +180,13 @@ function sessionName(session: SessionInfo) {
   return `${session.backend}/${session.server}`;
 }
 
+function workerSet(workers: HaproxyProcess[]) {
+  return workers
+    .map((worker) => `${worker.pid}/${worker.section}`)
+    .toSorted()
+    .join(",");
+}
+
 export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
   readonly proxy = "haproxy";
   readonly master: HaproxyMaster;
@@ -216,33 +223,29 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
 
   /** The first scoped generation retires sockets accepted by the old shared HTTP backend. */
   async retireLegacyHttp() {
-    return this.enforceServers(legacyCaddyServer);
+    return this.enforceServers(legacyCaddyServer, { retireLegacy: true });
   }
 
-  /** Confirms scoped control or fences the shared backend during the initial rollout. */
+  /** The watchdog leaves legacy admission intact and lets Caddy stop and recover under its lease. */
   async ensureHttpControl() {
-    if (await this.hasLegacyHttp()) {
-      const retired = await this.retireLegacyHttp();
-      if (retired.error) throw new Error(retired.error);
-    }
-    return true;
+    return !(await this.hasLegacyHttp());
   }
 
   /** A legacy backend can hold connections whose route cannot be determined at layer 4. */
   async hasLegacyHttp() {
     const workers = await this.master.workers();
     const hasCurrent = workers.some((worker) => worker.section === "current");
+    if (!hasCurrent) return true;
     const legacy = await Promise.all(
       workers.map(async (worker) => {
         try {
           if (!(await this.master.servers(worker.pid)).some(legacyCaddyServer)) return false;
           return (
-            !hasCurrent ||
             worker.section === "current" ||
             (await this.master.sessions(worker.pid)).some((session) => session.backend === "be_caddy")
           );
         } catch (error) {
-          if (error instanceof WorkerGoneError) return false;
+          if (error instanceof WorkerGoneError && worker.section === "old") return false;
           throw error;
         }
       }),
@@ -250,7 +253,10 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     return legacy.some(Boolean);
   }
 
-  private async enforceServers(denies: (server: ServerState) => boolean): Promise<WithdrawalResult> {
+  private async enforceServers(
+    denies: (server: ServerState) => boolean,
+    { retireLegacy = false } = {},
+  ): Promise<WithdrawalResult> {
     const active = new Set<string>();
     const withdrawn = new Set<string>();
     let workers: HaproxyProcess[];
@@ -270,21 +276,47 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     for (let pass = 0; pass < ENFORCE_PASSES; pass++) {
       problem = "";
       let clean = true;
+      if (retireLegacy) {
+        const current = workers.filter((worker) => worker.section === "current");
+        try {
+          const servers = await Promise.all(current.map((worker) => this.master.servers(worker.pid)));
+          if (
+            !servers.length ||
+            servers.some(
+              (entries) =>
+                entries.some(legacyCaddyServer) ||
+                !entries.some(
+                  (server) => server.backend === "be_caddy" && server.server === "caddy_platform",
+                ),
+            )
+          )
+            throw new Error("no confirmed scoped accepting worker");
+        } catch (error) {
+          return {
+            proxy: this.proxy,
+            active: [...active].toSorted(),
+            withdrawn: [...withdrawn].toSorted(),
+            error: `Legacy HTTP retirement requires an accepting scoped generation: ${(error as Error).message}`,
+          };
+        }
+      }
       await Promise.all(
-        workers.map(async (worker) => {
-          this.inspected.add(worker.pid);
-          try {
-            const outcome = await this.enforceWorker(worker.pid, denies, active, withdrawn);
-            if (!outcome.clean) {
+        workers
+          .filter((worker) => !retireLegacy || worker.section === "old")
+          .map(async (worker) => {
+            this.inspected.add(worker.pid);
+            try {
+              const outcome = await this.enforceWorker(worker.pid, denies, active, withdrawn);
+              if (!outcome.clean) {
+                clean = false;
+                problem = outcome.problem;
+              }
+            } catch (error) {
+              if (error instanceof WorkerGoneError) return;
               clean = false;
-              problem = outcome.problem;
+              problem = `worker ${worker.pid}: ${(error as Error).message}`;
             }
-          } catch (error) {
-            if (error instanceof WorkerGoneError) return;
-            clean = false;
-            problem = `worker ${worker.pid}: ${(error as Error).message}`;
-          }
-        }),
+          }),
       );
       // Re-enumerate: a worker started or left while we were working must be covered too.
       let after: HaproxyProcess[];
@@ -295,8 +327,7 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
         await new Promise((resolve) => setTimeout(resolve, 50));
         continue;
       }
-      const stable =
-        after.map((worker) => worker.pid).join(",") === workers.map((worker) => worker.pid).join(",");
+      const stable = workerSet(after) === workerSet(workers);
       workers = after;
       if (clean && stable) {
         return { proxy: this.proxy, active: [...active].toSorted(), withdrawn: [...withdrawn].toSorted() };

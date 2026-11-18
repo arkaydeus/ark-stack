@@ -250,6 +250,22 @@ describe("withdrawal with stream_close_delay (FD-09)", () => {
     expect(caddy.calls).toEqual(["GET /config/", "POST /stop"]);
   });
 
+  test("an unreachable HAProxy master cannot protect a partial withdrawal on legacy HTTP", async () => {
+    const caddy = fakeCaddy({ initial: delayedConfig() });
+    let stopRecorded = false;
+    const adapter = new CaddyWithdrawalAdapter("http://edge-admin:2019", caddy.fetcher, 3_000, {
+      scopedHttp: async () => {
+        throw new Error("master unavailable");
+      },
+      recordStop: async () => {
+        stopRecorded = true;
+      },
+    });
+    expect((await adapter.enforce(allowed(1))).stopped).toEqual(["100.101.102.103:3000"]);
+    expect(stopRecorded).toBe(true);
+    expect(caddy.calls).toEqual(["GET /config/", "POST /stop"]);
+  });
+
   test("after a deliberate stop, an unreachable Caddy is restarting, not a failure, for a bounded time", async () => {
     let clock = 0;
     const caddy = fakeCaddy({

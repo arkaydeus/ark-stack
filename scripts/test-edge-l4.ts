@@ -1,6 +1,6 @@
 // `mise run test:edge` (FD-25): the HAProxy SNI router (`edge-l4`) on 443 in front of Caddy, from
 // docs/design/front-door.md §3.5, §3.8.5, §3.8.6 and §3.2, in disposable containers. No tailnet login,
-// database or Python is needed.
+// pre-existing database or Python is needed.
 //
 // The shipped edge-ts, edge (Caddy behind its launch guard), edge-l4 (HAProxy 3.2.26 behind its launch
 // guard) and haproxy-validator (built from the Dockerfile target) Compose services run in a disposable
@@ -50,6 +50,7 @@ import {
   locationPolicy,
   planEdge,
   routeIdentityKey,
+  sha256Hex,
   servedHttpHostnames,
   servedHttpRoutes,
   type EdgeHttpRoute,
@@ -57,10 +58,11 @@ import {
   type EdgePolicyRoute,
   type WatchdogEvent,
 } from "@ark-stack/shared";
+import postgres from "postgres";
 
 import { composeImages, verifyImageIds } from "./install-edge-l4.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
-import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
+import { type EdgeStack, httpRouterArgs, startEdgeStack } from "./edge-test/stack.ts";
 
 const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
@@ -179,6 +181,10 @@ const scopedHttp = {
 };
 
 type Report = { name: string; lines: string[] };
+
+// Keep the HTTP continuity assertion strict while collecting the independent withdrawal cases.
+// The official Caddy image can close a fresh HTTP/1.1 connection during config handoff (#8233).
+class HttpContinuityFailure extends Error {}
 
 function expect(report: Report, condition: boolean, claim: string, observed: string) {
   if (!condition) throw new Error(`[${report.name}] FAILED: ${claim} (observed: ${observed})`);
@@ -514,6 +520,18 @@ async function edgeTsAddress(networkName: string) {
 
 /** `edge.apply` as the domain worker runs it: the production planner, renderer and writeEdge on edge-control. */
 async function edgeApply(plan = fixturePlan()) {
+  return edgeWorker<{ applied: boolean; httpRoutes: string[] }>(
+    ["write", JSON.stringify(plan)],
+    [
+      "--env",
+      "ARK_HAPROXY_MASTER_SOCKET=/var/run/haproxy/master.sock",
+      "--volume",
+      `${stack.volumes.haproxyRun}:/var/run/haproxy`,
+    ],
+  );
+}
+
+async function edgeWorker<T>(args: string[], settings: string[]) {
   const output = await docker(
     "run",
     "--rm",
@@ -531,10 +549,7 @@ async function edgeApply(plan = fixturePlan()) {
     "ARK_EDGE_RELOAD_URL=http://edge-admin:2019",
     "--env",
     "ARK_ACME_WEBROOT=/var/lib/ark/acme",
-    "--env",
-    "ARK_HAPROXY_MASTER_SOCKET=/var/run/haproxy/master.sock",
-    "--volume",
-    `${stack.volumes.haproxyRun}:/var/run/haproxy`,
+    ...settings,
     "--volume",
     `${bundles.writeEdge}:/harness:ro`,
     "--volume",
@@ -544,10 +559,9 @@ async function edgeApply(plan = fixturePlan()) {
     bunImage,
     "bun",
     "/harness/write-edge.js",
-    "write",
-    JSON.stringify(plan),
+    ...args,
   );
-  return JSON.parse(output) as { applied: boolean; httpRoutes: string[] };
+  return JSON.parse(output.split("\n").at(-1)!) as T;
 }
 
 async function caddyAdmin(path: string, init: { method?: string; body?: string; contentType?: string } = {}) {
@@ -618,7 +632,17 @@ function secureGet(servername: string, hostHeader = servername, path = "/") {
         const index = line.indexOf(":");
         if (index > 0) headers[line.slice(0, index).toLowerCase()] = line.slice(index + 1).trim();
       }
-      resolveReply({ status: Number(statusLine.split(" ")[1] ?? 0), headers, body: rest.join("\r\n\r\n") });
+      if (!statusLine) {
+        reject(
+          new Error(
+            socket.authorized || socket.alpnProtocol === "http/1.1"
+              ? "TLS completed but the peer closed before responding"
+              : "the peer closed before responding",
+          ),
+        );
+        return;
+      }
+      resolveReply({ status: Number(statusLine.split(" ")[1]), headers, body: rest.join("\r\n\r\n") });
     });
   });
 }
@@ -855,6 +879,7 @@ async function permissionsTest(report: Report) {
     users.map((text) => text.replace(/\n/g, " ")).join(" | "),
   );
 
+  const legacy = await websocket(wwwHost);
   const applied = await probe<{
     applied: boolean;
     reloaded: boolean;
@@ -868,6 +893,13 @@ async function permissionsTest(report: Report) {
     "the worker writes a generation, the validator accepts it, `current` is swapped and the master reloads",
     applied.error ??
       `generation ${applied.generation?.slice(0, 12)}, reload ${applied.reloadLog?.split("\n").find((line) => /Loading success|Initializing new worker/.test(line)) ?? "ok"}`,
+  );
+  await waitFor("legacy socket retirement", async () => legacy.closed() || undefined, 5_000, 25);
+  expect(
+    report,
+    (await secureGet(adminHost)).status === 200 && (await secureGet(wwwHost)).status === 200,
+    "installing the scoped generation retires legacy sessions and preserves admission",
+    "legacy socket closed, admin and route return 200",
   );
   const stat = await probe<Array<{ pxname: string; svname: string; status: string }>>(["stat"]);
   expect(
@@ -1251,16 +1283,17 @@ ${wsHost} {
     "the same WebSocket survives Caddy /load reloads behind HAProxy",
     `/load ${loads.join(", ")}; echo ${afterCaddy}`,
   );
-  expect(
-    report,
-    loadTraffic.requests > 0 && loadTraffic.failures.length === 0,
-    "requests through 443 during Caddy /load reloads all succeed",
-    loadTraffic.failures.join(", ") || `${loadTraffic.requests} requests, all 200`,
-  );
   ws.end();
   // Back to the production configuration for the remaining tests.
   const restored = await edgeApply();
   if (!restored.applied) throw new Error("writeEdge did not re-apply the production configuration");
+  if (!loadTraffic.requests || loadTraffic.failures.length)
+    throw new HttpContinuityFailure(
+      `requests through 443 during Caddy /load: ${loadTraffic.failures.join(", ") || "no requests"}`,
+    );
+  report.lines.push(
+    `  ok  requests through 443 during Caddy /load reloads all succeed [${loadTraffic.requests} requests, all 200]`,
+  );
 }
 
 /** A TLS handshake through 443 that is expected to fail: how it ended and after how long. */
@@ -1293,13 +1326,13 @@ function failedHandshake(servername: string) {
 async function caddyConnectFailures() {
   // %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq
   const pattern =
-    /be_caddy\/caddy(?:_platform)? (-?\d+)\/(-?\d+)\/\+?(\d+) \d+ SC \d+\/\d+\/\d+\/\d+\/\+?(\d+)/;
+    /(?:be_caddy\/caddy(?:_platform)?|be_http_\S+\/h_[a-f0-9]+) (-?\d+)\/(-?\d+)\/\+?(\d+) \d+ SC \d+\/\d+\/\d+\/\d+\/\+?(\d+)/;
   return (await logsOf(stack.edgeL4))
     .split("\n")
     .map((line) => ({ line, match: pattern.exec(line) }))
     .filter((entry) => entry.match)
     .map(({ line, match }) => ({
-      line: line.slice(line.indexOf("be_caddy")).trim(),
+      line: line.slice(match!.index).trim(),
       connect: Number(match![2]),
       total: Number(match![3]),
       retries: Number(match![4]),
@@ -1352,8 +1385,8 @@ async function measureListenerDown(report: Report) {
   );
   const before = (await caddyConnectFailures()).length;
   const attempts: Array<{ host: string; ms: number; outcome: string }> = [];
-  // HTTP route SNI (the explicit ACL), the admin site and unknown SNI (default_backend).
-  for (const host of [adminHost, tailnetHost, wwwHost, "unknown.example.net", adminHost, appHost]) {
+  // Only admitted hostnames reach Caddy. Unknown SNI is already covered by sniHostTest.
+  for (const host of [adminHost, tailnetHost, wwwHost, adminHost, appHost]) {
     attempts.push({ host, ...(await failedHandshake(host)) });
   }
   const slowest = Math.max(...attempts.map((attempt) => attempt.ms));
@@ -2040,7 +2073,9 @@ async function fd09RedirectTest(report: Report) {
 const websocketIdleMs = 630_000;
 
 async function fd09WebsocketTest(report: Report) {
+  await allowAllTailnetRoutes();
   await installScopedHttp();
+  await edgeApply();
   const ws = await websocket(wwwHost);
   const opened = await ws.echo("hello");
   const started = Date.now();
@@ -2076,6 +2111,295 @@ async function caddyPid() {
   return pid;
 }
 
+async function coordinatorFixture() {
+  const started = Bun.spawn(["bun", "--no-env-file", "scripts/test-db.ts", "up"], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "inherit",
+  });
+  const [code, output] = await Promise.all([started.exited, new Response(started.stdout).text()]);
+  const container = /^# Started and migrated (ark-test-db-[a-f0-9]{12})\./m.exec(output)?.[1];
+  if (container) runtime.containers.push(container);
+  const env = Object.fromEntries(
+    [...output.matchAll(/^export ([A-Z_]+)='([^']*)'$/gm)].map(([, key, value]) => [key!, value!]),
+  );
+  const url = env.DATABASE_URL;
+  if (code !== 0 || !container || !url)
+    throw new Error("Could not start the disposable coordinator database");
+  await docker("network", "connect", stack.networks.edgeControl, container);
+  const workerUrl = new URL(url);
+  workerUrl.hostname = container;
+  workerUrl.port = "5432";
+  env.DATABASE_URL = workerUrl.toString();
+  delete env.DATABASE_APP_URL;
+  const sql = postgres(url, { max: 1 });
+  const ingress = join(edgeDir, "fixture-ingress");
+  try {
+    await sql`INSERT INTO platform_settings (id, admin_mode, admin_hostname, gate_login_mode, gate_login_hostname)
+      VALUES ('default', 'public', ${adminHost}, 'public', ${loginHost}) ON CONFLICT (id) DO UPDATE SET
+      admin_mode = 'public', admin_hostname = ${adminHost}, gate_login_mode = 'public', gate_login_hostname = ${loginHost}`;
+    const plan = fixturePlan();
+    for (const cert of plan.certificates) {
+      const endpoint = `end_${cert.hostname}`;
+      const kind =
+        cert.hostname === adminHost
+          ? "admin"
+          : cert.hostname === loginHost
+            ? "gate"
+            : cert.hostname === appHost
+              ? "http"
+              : "route";
+      await sql`INSERT INTO endpoints (id, kind, hostname) VALUES (${endpoint}, ${kind}, ${cert.hostname})`;
+      await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
+        VALUES (${`crt_${cert.hostname}`}, ${endpoint}, ${JSON.stringify([cert.hostname])}::jsonb, 'issued', now())`;
+    }
+    await sql`INSERT INTO tailnet_snapshots (source, generation, completed_at, valid_until)
+      VALUES ('edge', 'fixture', now(), now() + interval '6 minutes')`;
+    await sql`INSERT INTO tailnet_nodes (source, generation, stable_id, dns_name, host_name, ipv4, is_self, online, observed_at)
+      VALUES ('edge', 'fixture', 'nEDGE', 'edge.tail1234.ts.net', 'edge', '100.64.0.1', true, true, now()),
+             ('edge', 'fixture', ${webRoute.stableId}, ${peerName}, 'peer-http', ${peerHttpIp}, false, true, now())`;
+    for (const route of fd09Routes.filter(({ access }) => access === "public")) {
+      await sql`INSERT INTO front_routes (id, kind, endpoint_id, listen_port, target_input,
+          target_node_stable_id, target_ip, target_port, access_mode, http_options, status, enabled)
+        VALUES (${route.id}, 'http', ${`end_${route.hostname}`}, 443, ${peerName}, ${route.stableId},
+          ${route.ip}, ${route.port}, 'public', ${JSON.stringify({ redirectTo: route.redirectTo })}::jsonb, 'ready', true)`;
+    }
+    // The real coordinator publishes firewall rules. Acknowledge the exact request in this
+    // isolated fixture, which publishes only HTTP and has no host firewall reconciler.
+    return {
+      sql,
+      async run(kind: "edge.drain" | "edge.l4_apply", { enqueue = true, failCensus = false } = {}) {
+        let acknowledged = "";
+        const timer = setInterval(async () => {
+          try {
+            const { id, hash } = await Bun.file(join(ingress, "policy.request")).json();
+            if (
+              id !== acknowledged &&
+              hash === sha256Hex(await Bun.file(join(ingress, "policy.nft")).text())
+            ) {
+              await Bun.write(
+                join(ingress, "policy.status"),
+                `request_id=${id}\npolicy_hash=${hash}\napplied=true\n`,
+              );
+              acknowledged = id;
+            }
+          } catch {
+            // The request may not have been published yet.
+          }
+        }, 75);
+        try {
+          return await edgeWorker<{ id: string; status: string; error: string | null; evidence: unknown }>(
+            ["coordinator", JSON.stringify({ kind, enqueue, failCensus })],
+            [
+              ...Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
+              "--env",
+              "ARK_FRONT_INGRESS_DIR=/edge/fixture-ingress",
+              ...httpRouterArgs(stack, true),
+            ],
+          );
+        } finally {
+          clearInterval(timer);
+        }
+      },
+    };
+  } catch (error) {
+    await sql.end();
+    throw error;
+  }
+}
+
+async function coordinatorHttpPublicationTest(report: Report) {
+  await allowAllTailnetRoutes();
+  await installScopedHttp();
+  await edgeApply();
+  const fixture = await coordinatorFixture();
+  try {
+    const before = await probe<{ reloads: number }>(["proc"]);
+    const failed = await fixture.run("edge.l4_apply", { failCensus: true });
+    const after = await probe<{ reloads: number }>(["proc"]);
+    expect(
+      report,
+      failed.status === "failed" &&
+        /503/.test(failed.error ?? "") &&
+        failed.evidence === null &&
+        after.reloads === before.reloads &&
+        (await secureGet(wwwHost)).status === 200 &&
+        (await secureGet(tailnetHost)).status === 200,
+      "a failed Caddy census leaves both HTTP routes published",
+      `${failed.error}; reload count ${after.reloads}`,
+    );
+    const applied = await fixture.run("edge.l4_apply");
+    expect(
+      report,
+      applied.status === "succeeded" && (await secureGet(apexHost)).status === 308,
+      "a verified census admits the redirect and its valid target",
+      applied.error ?? applied.status,
+    );
+    await fixture.sql`UPDATE front_routes SET http_options = ${JSON.stringify({ redirectTo: wwwHost })}::jsonb
+      WHERE id = ${webRoute.id}`;
+    const redirect = await fixture.run("edge.l4_apply");
+    expect(
+      report,
+      redirect.status === "succeeded" &&
+        (await secureGet(wwwHost)).status === 200 &&
+        (await failedHandshake(tailnetHost)).outcome !== "handshake completed",
+      "publication waits for Caddy to stop proxying a hostname before admitting its redirect",
+      redirect.error ?? redirect.status,
+    );
+    await fixture.sql`UPDATE front_routes SET http_options = '{}'::jsonb WHERE id = ${webRoute.id}`;
+    await fixture.sql`SELECT ark_gate_revoke(${webRoute.id}, 'pending publication fixture')`;
+    const pending = await fixture.run("edge.l4_apply");
+    expect(
+      report,
+      pending.status === "succeeded" &&
+        (await secureGet(wwwHost)).status === 200 &&
+        (await failedHandshake(tailnetHost)).outcome !== "handshake completed",
+      "publication excludes a route with a pending gate revocation",
+      pending.error ?? pending.status,
+    );
+    await fixture.sql`DELETE FROM gate_revocations WHERE route_id = ${webRoute.id}`;
+    await fixture.sql`UPDATE front_routes SET target_port = 3999 WHERE id = ${wwwRoute.id}`;
+    const mismatched = await fixture.run("edge.l4_apply");
+    expect(
+      report,
+      mismatched.status === "succeeded" &&
+        (await secureGet(tailnetHost)).status === 200 &&
+        (await failedHandshake(wwwHost)).outcome !== "handshake completed",
+      "publication excludes a hostname whose Caddy identity does not match policy",
+      mismatched.error ?? mismatched.status,
+    );
+  } finally {
+    await fixture.sql.end();
+    await installScopedHttp();
+    await edgeApply();
+  }
+}
+
+async function journaledHttpWithdrawalTest(report: Report) {
+  await allowAllTailnetRoutes();
+  await installScopedHttp();
+  await edgeApply();
+  const fixture = await coordinatorFixture();
+  const pid = await caddyPid();
+  const leaving = await websocket(wwwHost);
+  const sibling = await websocket(tailnetHost);
+  const reload = await probe<{ reload: { success: boolean } }>(["reload"]);
+  const current = await websocket(wwwHost);
+  try {
+    expect(
+      report,
+      reload.reload.success &&
+        (await leaving.echo("leaving")) === "leaving" &&
+        (await current.echo("current")) === "current",
+      "both worker generations have an active session",
+      wwwHost,
+    );
+    const start = Date.now();
+    await fixture.sql`SELECT ark_gate_revoke(${wwwRoute.id}, 'runtime withdrawal fixture')`;
+    const drain = await fixture.run("edge.drain", { enqueue: false });
+    const [journal] = await fixture.sql`
+      SELECT applied_by, (extract(epoch FROM applied_at) * 1000)::float8 AS applied_ms
+      FROM gate_revocations WHERE route_id = ${wwwRoute.id}
+    `;
+    const times = [leaving.closedAt(), current.closedAt()];
+    expect(
+      report,
+      drain.status === "succeeded" &&
+        journal?.applied_by === drain.id &&
+        times.every((time) => time !== null && time <= Number(journal.applied_ms) && time - start <= 5_000),
+      "the real drain closes both sessions within five seconds before acknowledging the journal",
+      drain.error ??
+        `closed ${times.map((time) => time && time - start).join(", ")} ms, acknowledged ${Number(journal?.applied_ms) - start} ms`,
+    );
+    expect(
+      report,
+      (await failedHandshake(wwwHost)).outcome !== "handshake completed",
+      "the drained route stays fenced until the queued publication",
+      wwwHost,
+    );
+    const apply = await fixture.run("edge.l4_apply", { enqueue: false });
+    expect(
+      report,
+      apply.status === "succeeded" &&
+        (await secureGet(wwwHost)).status === 200 &&
+        (await sibling.echo("still connected")) === "still connected" &&
+        (await caddyPid()) === pid,
+      "queued publication restores admission with the sibling session and Caddy PID intact",
+      apply.error ?? apply.status,
+    );
+  } finally {
+    leaving.end();
+    current.end();
+    sibling.end();
+    await fixture.sql.end();
+    await installScopedHttp();
+    await edgeApply();
+  }
+}
+
+async function legacyHttpWithdrawalTest(report: Report) {
+  for (const fault of [false, true]) {
+    const target = await websocket(wwwHost);
+    const sibling = await websocket(tailnetHost);
+    const before = await probe<{ workers: Array<{ pid: number }> }>(["proc"]);
+    if (fault) {
+      await docker("exec", "--user", "99", stack.edgeL4, "chmod", "600", "/var/run/haproxy/master.sock");
+    }
+    try {
+      const started = Date.now();
+      lease.routes = lease.routes.filter((route) => route.id !== wwwRoute.id);
+      const closedAt = await waitFor(
+        "legacy target socket to close",
+        async () => target.closedAt() ?? undefined,
+        5_000,
+        25,
+      );
+      expect(
+        report,
+        closedAt - started <= 5_000,
+        "legacy withdrawal closes the target within five seconds",
+        `${closedAt - started} ms with master ${fault ? "inaccessible" : "available"}`,
+      );
+      await waitFor(
+        "admin, login and the allowed route after Caddy restarts",
+        async () => {
+          const replies = await Promise.all([
+            secureGet(adminHost),
+            secureGet(loginHost, loginHost, "/gate/"),
+            secureGet(tailnetHost),
+            secureGet(wwwHost),
+          ]);
+          return replies.slice(0, 3).every(({ status }) => status === 200) && replies[3]?.status !== 200
+            ? true
+            : undefined;
+        },
+        20_000,
+      );
+      expect(
+        report,
+        sibling.closed(),
+        "legacy admission recovers without a domain apply",
+        "allowed hosts serve and the target stays denied",
+      );
+    } finally {
+      if (fault) {
+        await docker("exec", "--user", "99", stack.edgeL4, "chmod", "660", "/var/run/haproxy/master.sock");
+      }
+      target.end();
+      sibling.end();
+    }
+    const after = await probe<{ workers: Array<{ pid: number }> }>(["proc"]);
+    expect(
+      report,
+      after.workers[0]?.pid === before.workers[0]?.pid,
+      "the legacy HAProxy worker keeps accepting after withdrawal",
+      String(after.workers[0]?.pid),
+    );
+    await allowAllTailnetRoutes();
+    await edgeApply();
+  }
+}
+
 async function targetedHttpWithdrawalTest(
   report: Report,
   trigger: "identity" | "expiry" | "apply" | "drain",
@@ -2083,6 +2407,7 @@ async function targetedHttpWithdrawalTest(
   await allowAllTailnetRoutes();
   await installScopedHttp();
   await edgeApply();
+  const fixture = trigger === "drain" ? await coordinatorFixture() : null;
   const initialPid = await caddyPid();
   const target = await websocket(wwwHost);
   const sibling = await websocket(tailnetHost);
@@ -2120,15 +2445,13 @@ async function targetedHttpWithdrawalTest(
       lease.routes = [...remaining, { ...wwwRoute, kind: "http", stableId: "nREPLACED" }];
     else if (trigger === "apply")
       await edgeApply(fixturePlan(fd09Routes.filter((route) => route.id !== wwwRoute.id)));
-    else {
-      const result = await probe<{ withdrawn: string[]; error?: string }>([
-        "withdraw",
-        JSON.stringify(remaining.map(routeIdentityKey)),
-      ]);
+    else if (fixture) {
+      await fixture.sql`UPDATE front_routes SET enabled = false WHERE id = ${wwwRoute.id}`;
+      const result = await fixture.run("edge.drain");
       expect(
         report,
-        !result.error && result.withdrawn.includes(wwwHost),
-        "edge.drain targets the route",
+        result.status === "succeeded" && JSON.stringify(result.evidence).includes(wwwHost),
+        "the coordinator reads the lease and drains the route",
         JSON.stringify(result),
       );
     }
@@ -2168,13 +2491,8 @@ async function targetedHttpWithdrawalTest(
     target.end();
     current.end();
     sibling.end();
+    await fixture?.sql.end();
   }
-  expect(
-    report,
-    traffic.requests >= 2 && !traffic.errors.length,
-    "unrelated HTTP requests succeed throughout",
-    `${traffic.requests} requests; ${traffic.errors.join(", ") || "zero errors"}`,
-  );
   await allowAllTailnetRoutes();
   await installScopedHttp();
   await edgeApply();
@@ -2182,6 +2500,13 @@ async function targetedHttpWithdrawalTest(
     "the HTTP route to serve again",
     async () => ((await secureGet(wwwHost)).status === 200 ? true : undefined),
     15_000,
+  );
+  if (traffic.requests < 2 || traffic.errors.length)
+    throw new HttpContinuityFailure(
+      `unrelated HTTP during withdrawal: ${traffic.requests} requests; ${traffic.errors.join(", ")}`,
+    );
+  report.lines.push(
+    `  ok  unrelated HTTP requests succeed throughout [${traffic.requests} requests; zero errors]`,
   );
 }
 
@@ -2327,7 +2652,13 @@ async function run(name: string, test: (report: Report) => Promise<unknown>) {
   }
   const report: Report = { name, lines: [] };
   const started = Date.now();
-  await test(report);
+  try {
+    await test(report);
+  } catch (error) {
+    if (!(error instanceof HttpContinuityFailure)) throw error;
+    failed = true;
+    report.lines.push(`  FAILED  ${error.message}`);
+  }
   console.log(`${name} (${((Date.now() - started) / 1000).toFixed(1)} s)\n${report.lines.join("\n")}`);
 }
 
@@ -2350,6 +2681,7 @@ try {
     async () => ((await secureGet(adminHost)).status === 200 ? true : undefined),
     30_000,
   );
+  await run("HTTP legacy withdrawal", legacyHttpWithdrawalTest);
   await run("worker sockets, validation and reload (§3.8.6)", permissionsTest);
   await run("Caddy global block on the running edge (§3.5)", caddyBlockTest);
   await run("PROXY v2 trust", proxyTrustTest);
@@ -2364,11 +2696,12 @@ try {
   await run("FD-09: Location and Set-Cookie through 443", fd09LocationTest);
   await run("FD-09: static 502 through 443", fd09ErrorTest);
   await run("FD-09: apex redirect and the :80 list", fd09RedirectTest);
-  await run("FD-09: WebSocket idle over 10 minutes, then one edge.apply", fd09WebsocketTest);
+  await run("HTTP coordinator census and publication", coordinatorHttpPublicationTest);
   for (const trigger of ["identity", "expiry", "apply", "drain"] as const)
     await run(`HTTP targeted withdrawal: ${trigger}`, (report) =>
       targetedHttpWithdrawalTest(report, trigger),
     );
+  await run("HTTP coordinator journaled gate withdrawal", journaledHttpWithdrawalTest);
   await run(
     "FD-10: login-origin path allowlist, edge token and client address through 443",
     fd10AllowlistTest,
@@ -2376,8 +2709,11 @@ try {
   await run("watchdog: identity failure across HAProxy workers", identityWithdrawalTest);
   await run("domain worker drain (edge.drain) across HAProxy workers", workerDrainTest);
   await run("watchdog: lease expiry across HAProxy workers", leaseExpiryTest);
+  await run("FD-09: WebSocket idle over 10 minutes, then one edge.apply", fd09WebsocketTest);
   await run("HAProxy launch guard", launchGuardTest);
-  console.log("\nAll edge-l4 tests passed.");
+  console.log(
+    failed ? "\nEdge-l4 tests completed with HTTP continuity failures." : "\nAll edge-l4 tests passed.",
+  );
 } catch (error) {
   failed = true;
   console.error(`\n${(error as Error).stack ?? error}`);

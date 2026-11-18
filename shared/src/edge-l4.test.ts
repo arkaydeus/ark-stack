@@ -183,6 +183,26 @@ describe("edge-l4 rendering (§3.8.5 fe_tls443)", () => {
 });
 
 describe("HAProxy launch decision", () => {
+  test("an HTTP pin must match the lease to open the full configuration", () => {
+    const http = { ...route, id: "rt_web1", hostname: "www.example.com", port: 3000 };
+    const full = renderEdgeL4Generation({ httpHostnames: [http.hostname], httpRoutes: [http] }).files[
+      "haproxy.cfg"
+    ]!;
+    expect(haproxyLaunchDecision(full, new Set([routeIdentityKey(http)]))).toMatchObject({
+      open: true,
+      guarded: true,
+      backends: [http.hostname],
+      denied: [],
+    });
+    for (const allowed of [new Set<string>(), new Set([routeIdentityKey({ ...http, stableId: "nNEW" })])]) {
+      expect(haproxyLaunchDecision(full, allowed)).toMatchObject({
+        open: false,
+        guarded: true,
+        denied: [http.hostname],
+      });
+    }
+  });
+
   const full = renderEdgeL4Generation({ httpHostnames: [], tlsRoutes: [route] }).files["haproxy.cfg"]!;
   const identity = routeIdentityKey(route);
 
@@ -345,6 +365,44 @@ function fakeMaster(workers: FakeWorker[], log: string[] = []): HaproxyCli {
 }
 
 describe("HaproxyWithdrawalAdapter", () => {
+  test("legacy admission is left alone until an accepting scoped worker is verified", async () => {
+    const legacy = { backend: "be_caddy", server: "caddy", addr: "127.0.0.1", port: 8443, admin: 0 };
+    const old: FakeWorker = {
+      pid: 10,
+      section: "current",
+      stopped: false,
+      servers: [legacy],
+      sessions: [{ id: "0x10", backend: legacy.backend, server: legacy.server }],
+    };
+    const workers = [old];
+    const log: string[] = [];
+    const adapter = new HaproxyWithdrawalAdapter("/fake", fakeMaster(workers, log));
+    expect(await adapter.hasLegacyHttp()).toBe(true);
+    expect(await adapter.ensureHttpControl()).toBe(false);
+    expect((await adapter.retireLegacyHttp()).error).toMatch(/accepting scoped generation/);
+
+    old.section = "old";
+    expect((await adapter.retireLegacyHttp()).error).toMatch(/accepting scoped generation/);
+    expect(await adapter.ensureHttpControl()).toBe(false);
+    expect(log.every((command) => !/disable server|shutdown session/.test(command))).toBe(true);
+
+    old.stopped = true;
+    workers.push({
+      pid: 11,
+      section: "current",
+      stopped: false,
+      servers: [{ ...legacy, server: "caddy_platform" }],
+      sessions: [{ id: "0x11", backend: legacy.backend, server: "caddy_platform" }],
+    });
+    expect(await adapter.ensureHttpControl()).toBe(false);
+    expect((await adapter.retireLegacyHttp()).error).toBeUndefined();
+    expect(log).toContain("@!10 shutdown session 0x10");
+    expect(old.sessions).toEqual([]);
+    expect(workers[1]!.sessions).toHaveLength(1);
+    expect(await adapter.hasLegacyHttp()).toBe(false);
+    expect(await adapter.ensureHttpControl()).toBe(true);
+  });
+
   const allowedRoute = { ...route, id: "rt_keep", hostname: "keep.example.com", ip: "100.88.1.30" };
   const keepServer = haproxyServerName(allowedRoute);
   const dropServer = haproxyServerName(route);

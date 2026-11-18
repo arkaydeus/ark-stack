@@ -2861,15 +2861,13 @@ async function applyEdgeL4Locked(operation: OperationRow) {
   const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
   if (adminUrl && input.httpRoutes?.length) {
     // HAProxy must never admit a new identity while Caddy still serves that hostname's old pin.
-    const identities = await new CaddyWithdrawalAdapter(adminUrl).activeRoutes().catch(() => null);
+    const identities = await new CaddyWithdrawalAdapter(adminUrl).activeRoutes();
     const active = new Set(identities);
-    const proxyHosts = new Set(identities?.map(routeIdentityHostname));
+    const proxyHosts = new Set(identities.map(routeIdentityHostname));
     const inactive = new Set(
       servedHttpRoutes(plan)
-        .filter(
-          (route) =>
-            !identities ||
-            (route.redirectTo ? proxyHosts.has(route.hostname) : !active.has(routeIdentityKey(route))),
+        .filter((route) =>
+          route.redirectTo ? proxyHosts.has(route.hostname) : !active.has(routeIdentityKey(route)),
         )
         .map((route) => route.hostname),
     );
@@ -2999,15 +2997,21 @@ async function drainEdgeLocked(operation: OperationRow) {
   const backends = Array.isArray(operation.payload.backends) ? operation.payload.backends : [];
   const allowed = allowedBackends(await edgeLeaseDocument());
   const control = haproxyAdapter();
-  const haproxy = await drainHaproxyLocked(allowed, control, raiseAlert);
+  // Even if HAProxy cannot be verified, Caddy may need to stop to close streams
+  // accepted through a legacy shared worker.
+  const haproxy = await drainHaproxyLocked(allowed, control, raiseAlert).then(
+    (result) => ({ result }),
+    (error: unknown) => ({ error }),
+  );
   if (!adminUrl) {
     if (process.env.NODE_ENV === "production") {
       throw new Error("ARK_EDGE_RELOAD_URL is required to drain edge routes in production.");
     }
+    if ("error" in haproxy) throw haproxy.error;
     await addStep(operation.id, "edge-drain", {
       backends,
       caddy: "not configured",
-      haproxy,
+      haproxy: haproxy.result,
     });
     return;
   }
@@ -3030,12 +3034,13 @@ async function drainEdgeLocked(operation: OperationRow) {
     });
     throw new Error(`Caddy withdrawal failed; ${outcome}: ${result.error}`);
   }
+  if ("error" in haproxy) throw haproxy.error;
   await addStep(operation.id, "edge-drain", {
     reason: operation.payload.reason ?? null,
     routeIds: operation.payload.routeIds ?? [],
     backends,
     caddy: { active: result.active, withdrawn: result.withdrawn, restarting: !!result.unreachable },
-    haproxy,
+    haproxy: haproxy.result,
   });
 }
 

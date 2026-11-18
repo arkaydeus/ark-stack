@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { routeIdentityKey } from "@ark-stack/shared";
+import { haproxyHttpBackendName, haproxyHttpServerName, routeIdentityKey } from "@ark-stack/shared";
 
 import { writeEdge } from "./providers.ts";
 
@@ -12,10 +13,16 @@ const saved = {
   ARK_EDGE_DIR: process.env.ARK_EDGE_DIR,
   ARK_EDGE_RELOAD_URL: process.env.ARK_EDGE_RELOAD_URL,
   ARK_ACME_WEBROOT: process.env.ARK_ACME_WEBROOT,
+  ARK_HAPROXY_MASTER_SOCKET: process.env.ARK_HAPROXY_MASTER_SOCKET,
 };
 const temporaryDirectories: string[] = [];
+let master: Server | undefined;
 
 afterEach(async () => {
+  if (master) {
+    await new Promise<void>((resolve) => master!.close(() => resolve()));
+    master = undefined;
+  }
   globalThis.fetch = originalFetch;
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[key];
@@ -137,6 +144,73 @@ describe("writeEdge", () => {
       },
     },
   };
+
+  async function masterFor(legacy: boolean, timeline: string[]) {
+    const dir = await mkdtemp(join(tmpdir(), "ark-edge-cli-"));
+    temporaryDirectories.push(dir);
+    const socket = join(dir, "m");
+    const backend = legacy ? "be_caddy" : haproxyHttpBackendName(removed.hostname);
+    const name = legacy ? "caddy" : haproxyHttpServerName(removed);
+    let adminState = 0;
+    let sessions = 1;
+    master = createServer({ allowHalfOpen: true }, (connection) => {
+      let input = "";
+      connection.on("data", (chunk) => (input += chunk.toString()));
+      connection.on("end", () => {
+        const command = input.trim();
+        timeline.push(command);
+        if (command === "show proc") return connection.end("#<PID> <type>\n# workers\n10 worker 0\n");
+        if (command === "@!10 show servers state")
+          return connection.end(
+            `1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_port\n1 ${backend} 1 ${name} 127.0.0.1 2 ${adminState} 8443\n`,
+          );
+        if (command === "@!10 show sess") {
+          const rows = ["0xff: fe=GLOBAL be=<NONE> srv=<none>"];
+          if (sessions) rows.push(`0x10: fe=fe_tls443 be=${backend} srv=${name}`);
+          return connection.end(`${rows.join("\n")}\n`);
+        }
+        if (command === `@!10 disable server ${backend}/${name}`) adminState = 1;
+        if (command === `@!10 shutdown sessions server ${backend}/${name}`) sessions = 0;
+        return connection.end("\n");
+      });
+    });
+    await new Promise<void>((resolve, reject) => master!.once("error", reject).listen(socket, resolve));
+    process.env.ARK_HAPROXY_MASTER_SOCKET = socket;
+    return {
+      lateSession: () => {
+        sessions = 1;
+      },
+      target: `${backend}/${name}`,
+    };
+  }
+
+  test("a scoped withdrawal drains before load and verifies sessions again afterwards", async () => {
+    await prepare(200, 200, { config: runningConfig });
+    const timeline: string[] = [];
+    const cli = await masterFor(false, timeline);
+    const fetcher = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      timeline.push(path);
+      if (path === "/load") cli.lateSession();
+      return fetcher(input, init);
+    }) as typeof fetch;
+    expect((await writeEdge({ adminMode: "tailnet" })).applied).toBe(true);
+    expect(timeline.filter((item) => item.includes("shutdown sessions") || item === "/load")).toEqual([
+      `@!10 shutdown sessions server ${cli.target}`,
+      "/load",
+      `@!10 shutdown sessions server ${cli.target}`,
+    ]);
+  });
+
+  test("a removal on a legacy worker aborts without fencing shared admission or loading Caddy", async () => {
+    const { requests } = await prepare(200, 200, { config: runningConfig });
+    const timeline: string[] = [];
+    await masterFor(true, timeline);
+    await expect(writeEdge({ adminMode: "tailnet" })).rejects.toThrow("requires a scoped HAProxy generation");
+    expect(requests.map(({ url }) => new URL(url).pathname)).toEqual(["/config/"]);
+    expect(timeline).toEqual(["show proc", "@!10 show servers state"]);
+  });
 
   test("loads a removal without issuing a stop to Caddy", async () => {
     const { directory, requests } = await prepare(200, 200, { config: runningConfig });

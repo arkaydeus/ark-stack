@@ -7,6 +7,7 @@
 //
 //   bun write-edge.js write '<writeEdge input JSON>'
 //   bun write-edge.js write-routed '<writeEdge input JSON>' (also apply the HTTP SNI generation)
+//   bun write-edge.js coordinator '{"kind":"edge.drain","enqueue":true}' (disposable database)
 //   bun write-edge.js load-without-revalidate   (control: /adapt + /load without Cache-Control)
 import { servedHttpHostnames, servedHttpRoutes } from "@ark-stack/shared";
 import { writeEdgeL4 } from "../../server/src/modules/edge-l4.ts";
@@ -14,7 +15,30 @@ import { writeEdge } from "../../server/src/modules/providers.ts";
 
 const [mode, input] = process.argv.slice(2);
 
-if (mode === "write" || mode === "write-routed") {
+if (mode === "coordinator") {
+  const { kind, enqueue: create, failCensus } = JSON.parse(input ?? "{}");
+  if (kind !== "edge.drain" && kind !== "edge.l4_apply") throw new Error("Unexpected edge operation");
+  const { enqueue, processQueued } = await import("../../server/src/coordinator.ts");
+  const { sql } = await import("../../server/src/db.ts");
+  const fault = failCensus
+    ? Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null, { status: 503 }) })
+    : null;
+  if (fault) process.env.ARK_EDGE_RELOAD_URL = fault.url.origin;
+  try {
+    if (create) await enqueue({ kind, targetIds: ["platform"] });
+    const [queued] = await sql`
+      SELECT id FROM operations WHERE kind = ${kind} AND status = 'queued' ORDER BY created_at LIMIT 1
+    `;
+    if (!queued) throw new Error(`No queued ${kind}`);
+    await processQueued(1, kind);
+    const [finished] = await sql`SELECT id, status, error FROM operations WHERE id = ${queued.id}`;
+    const steps = await sql`SELECT evidence FROM operation_steps WHERE operation_id = ${queued.id}`;
+    console.log(JSON.stringify({ ...finished, evidence: steps[0]?.evidence ?? null }));
+  } finally {
+    await fault?.stop(true);
+    await sql.end();
+  }
+} else if (mode === "write" || mode === "write-routed") {
   const plan = JSON.parse(input ?? "{}");
   const written = await writeEdge(plan);
   if (mode === "write-routed") {

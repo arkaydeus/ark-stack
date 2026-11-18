@@ -8,12 +8,13 @@
 # generation symlink the domain worker swaps, so a master-CLI `reload` always reads the newest
 # generation in the mode this guard chose:
 #
-# - A configuration without any tailnet server needs no lease: the full variant; supervision stays latched after any protected generation.
-# - Otherwise the edge watchdog must answer `open` (every tailnet server authorised by a valid lease)
+# - A configuration without protected routes needs no lease. Supervision stays latched after any
+#   generation with an HTTP or L4 tailnet route.
+# - Otherwise the edge watchdog must answer `open` (every protected server authorised by a valid lease)
 #   for the full variant; else (or when the watchdog cannot be reached) the closed variant, which
 #   omits L4 tailnet targets. Caddy independently checks its HTTP lease and selects its closed
 #   configuration when needed.
-# - Once a tailnet route has existed, the watchdog must keep reporting verified HAProxy enforcement every
+# - Once a protected route has existed, the watchdog must keep reporting verified HAProxy enforcement every
 #   250 ms. After two consecutive misses, every HAProxy process is killed (listeners and established
 #   sessions), the container exits, and the next start is decided again.
 # - Started closed, the guard re-asks the watchdog and switches to the full variant (link + reload)
@@ -51,7 +52,7 @@ mode=full
 latched=0
 if guarded; then latched=1; fi
 if ! guarded; then
-  reason="the configuration has no tailnet route"
+  reason="the configuration has no protected route"
 else
   decision=""
   attempt=0
@@ -65,7 +66,7 @@ else
     reason="the watchdog confirmed a valid lease"
   elif [ -r "$closed" ]; then
     mode=closed
-    reason="no valid lease (watchdog: ${decision:-unreachable}); tailnet routes are not served"
+    reason="protected routes not authorised (watchdog: ${decision:-unreachable})"
   else
     echo "ark edge-l4 launch guard: no valid lease and no closed config; refusing to start" >&2
     exit 1
@@ -131,7 +132,7 @@ reopen() {
       elif [ "$mode" = full ] && [ "$decision" = "closed" ]; then
         point "$closed"
         mode=closed
-        echo "ark edge-l4 launch guard: lease no longer allows every tailnet route; later reloads use the closed configuration" >&2
+        echo "ark edge-l4 launch guard: lease no longer allows every protected route; later reloads use the closed configuration" >&2
       fi
     fi
     sleep 1
