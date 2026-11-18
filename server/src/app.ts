@@ -135,6 +135,7 @@ import {
   pendingWithdrawal,
   publishReviewedDns,
   revokeAaaaWithdrawal,
+  watchManualDns,
 } from "./modules/domain-dns.ts";
 import { frontAclSnippet } from "./modules/front-acl.ts";
 import {
@@ -1452,12 +1453,23 @@ app.post("/api/domains/:id/verify", async (c) => {
   requireOperator(access);
   requireMfa(c.get("session"));
   requireDomain(access, c.req.param("id"), "manage");
+  await watchManualDns(c.req.param("id"));
   const operation = await enqueue({
     kind: "domain.verify",
     actorId: access.userId,
     targetIds: [c.req.param("id")],
   });
   return c.json({ operationId: operation.id });
+});
+
+app.post("/api/domains/:id/dns/watch", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  requireMfa(c.get("session"));
+  const domainId = c.req.param("id");
+  requireDomain(access, domainId, "manage");
+  await watchManualDns(domainId);
+  return c.body(null, 204);
 });
 
 async function dnsWorkerRequest<T>(path: "review" | "publish", body: object, local: () => Promise<T>) {
@@ -1485,7 +1497,7 @@ async function dnsWorkerRequest<T>(path: "review" | "publish", body: object, loc
   if (!response.ok) {
     const status = response.status;
     throw new DnsReviewError(
-      status === 403 || status === 404 || status === 409 || status === 422 ? status : 502,
+      status === 403 || status === 404 || status === 409 || status === 422 || status === 503 ? status : 502,
       result?.error ?? "The domain worker could not complete the DNS request.",
     );
   }

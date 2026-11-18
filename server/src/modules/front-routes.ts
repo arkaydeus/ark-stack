@@ -975,7 +975,9 @@ export async function commitRouteDelete(
         .from(dnsRecords)
         .where(endpointDnsScope(endpoint.domainId, endpoint.hostname));
       for (const record of records.filter(
-        (item) => desiredDns(item) && item.purpose.startsWith(ROUTE_RECORD_PURPOSE),
+        (item) =>
+          (desiredDns(item) || (pendingWithdrawal(item) && item.withdrawalReason === "ipv6")) &&
+          item.purpose.startsWith(ROUTE_RECORD_PURPOSE),
       )) {
         await tx
           .update(dnsRecords)
@@ -1015,8 +1017,8 @@ export async function commitRouteDelete(
 
 // ---- Lifecycle hooks for domain.verify and certificate.issue ----------------------------------
 
-async function routesOn(endpointId: string) {
-  const rows = await db
+async function routesOn(endpointId: string, executor: Pick<typeof db, "select"> = db) {
+  const rows = await executor
     .select({ route: frontRoutes, version: routeVersion })
     .from(frontRoutes)
     .where(eq(frontRoutes.endpointId, endpointId));
@@ -1028,16 +1030,19 @@ async function routesOn(endpointId: string) {
  * to this server, routes in `awaiting_dns` move to `issuing_certificate` and the caller requests a
  * certificate; before that, nothing is requested and the route records what DNS still shows.
  */
-export async function routesAfterDnsCheck(input: {
-  endpointId: string;
-  verified: boolean;
-  pending: Array<{ type: string; name: string; expected: string; observed: string }>;
-  blockingError?: string;
-  operationId?: string;
-  routeEndpointsOnly?: boolean;
-}) {
-  const routes = await routesOn(input.endpointId);
-  const [certificate] = await db
+export async function routesAfterDnsCheck(
+  input: {
+    endpointId: string;
+    verified: boolean;
+    pending: Array<{ type: string; name: string; expected: string; observed: string }>;
+    blockingError?: string;
+    operationId?: string;
+    allowCertificateRetry: boolean;
+  },
+  tx: DbTransaction,
+) {
+  const routes = await routesOn(input.endpointId, tx);
+  const [certificate] = await tx
     .select()
     .from(certificates)
     .where(eq(certificates.endpointId, input.endpointId))
@@ -1051,9 +1056,9 @@ export async function routesAfterDnsCheck(input: {
   for (const route of routes) {
     // An observer check only starts issuance on the transition; explicit verification may retry it.
     if (route.status === "issuing_certificate") {
-      if (input.verified && !input.routeEndpointsOnly) issue = true;
+      if (input.verified && input.allowCertificateRetry) issue = true;
       else if (input.blockingError && input.blockingError !== route.lastError) {
-        await db
+        await tx
           .update(frontRoutes)
           .set({ lastError: input.blockingError, updatedAt: new Date() })
           .where(currentRoute(route.id, route.version));
@@ -1062,11 +1067,11 @@ export async function routesAfterDnsCheck(input: {
     }
     if (
       route.status !== "awaiting_dns" &&
-      !(route.status === "ready" && needsCertificate && !input.routeEndpointsOnly)
+      !(route.status === "ready" && needsCertificate && input.allowCertificateRetry)
     )
       continue;
     if (input.verified) {
-      const changed = await db
+      const changed = await tx
         .update(frontRoutes)
         .set({ status: "issuing_certificate", lastError: null, updatedAt: new Date() })
         .where(currentRoute(route.id, route.version))
@@ -1078,6 +1083,7 @@ export async function routesAfterDnsCheck(input: {
         route.id,
         { from: route.status, to: "issuing_certificate", reason: "dns_resolves" },
         input.operationId,
+        tx,
       );
       issue = true;
       continue;
@@ -1089,7 +1095,7 @@ export async function routesAfterDnsCheck(input: {
         ? `Waiting for DNS: ${first.type} ${first.name} must resolve to ${first.expected} (observed: ${first.observed || "nothing"}).`
         : "Waiting for DNS: the route hostname has no address record to check.");
     if (lastError !== route.lastError) {
-      await db
+      await tx
         .update(frontRoutes)
         .set({ lastError, updatedAt: new Date() })
         .where(currentRoute(route.id, route.version));

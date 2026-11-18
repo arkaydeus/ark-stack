@@ -11,14 +11,16 @@ import {
   type DnsReviewAction,
   type DomainDnsReview,
 } from "@ark-stack/shared";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, ne } from "drizzle-orm";
 
 import { db, type DbTransaction } from "../db.ts";
 import {
   auditEvents,
+  certificates,
   dnsRecords,
   domainClaims,
   endpoints,
+  frontRoutes,
   operations,
   platformAccess,
   platformSettings,
@@ -27,6 +29,7 @@ import {
   CloudflareDns,
   DnsReviewError,
   drift,
+  matchesWrite,
   ownershipMarker,
   planCloudflare,
   sameRecord,
@@ -71,7 +74,7 @@ export function retireDnsRecord(record: StoredDnsRecord, reason: "ipv6" | "endpo
     ...record,
     status: "withdrawal_pending",
     withdrawalReason: reason,
-    withdrawalStartedAt: now,
+    withdrawalStartedAt: record.withdrawalStartedAt ?? now,
     // Route removal always requires its own review even if IPv6 withdrawal was authorized.
     automaticWithdrawal: reason === "ipv6" && record.automaticWithdrawal,
   };
@@ -127,22 +130,40 @@ function projectDns(
     const publicNames = new Set(
       endpointRows.filter((endpoint) => endpoint.exposure === "public").map((endpoint) => endpoint.hostname),
     );
+    for (const record of next.filter(
+      (item) => desiredDns(item) && item.type === "AAAA" && publicNames.has(item.name) && !item.required,
+    )) {
+      next[next.indexOf(record)] = { ...record, required: true };
+    }
     for (const address of next.filter(
       (record) => desiredDns(record) && record.type === "A" && publicNames.has(record.name),
     )) {
       const history = next.filter((record) => record.type === "AAAA" && record.name === address.name);
-      if (history.some(desiredDns)) continue;
+      if (history.some(desiredDns)) {
+        for (const record of history) {
+          if (
+            pendingWithdrawal(record) &&
+            record.withdrawalReason === "ipv6" &&
+            !record.providerOwnership &&
+            !record.providerUpdateIntent &&
+            dnsRecordVerified("AAAA", ipv6, record.expectedValue)
+          ) {
+            next[next.indexOf(record)] = { ...record, status: "superseded", withdrawalConfirmedAt: now };
+          }
+        }
+        continue;
+      }
       const restore = history.find(
         (record) =>
           pendingWithdrawal(record) &&
           record.withdrawalReason === "ipv6" &&
-          record.required &&
           !record.providerRemovedAt &&
           dnsRecordVerified("AAAA", ipv6, record.expectedValue),
       );
       if (restore) {
         next[next.indexOf(restore)] = {
           ...restore,
+          required: true,
           status: "pending",
           withdrawalReason: null,
           withdrawalStartedAt: null,
@@ -159,6 +180,7 @@ function projectDns(
         purpose: `${address.purpose} (IPv6)`,
         observedValue: null,
         providerOwnership: null,
+        providerUpdateIntent: null,
         automaticWithdrawal: false,
         publishedAt: null,
         status: "pending",
@@ -178,7 +200,55 @@ async function dnsSnapshot(tx: DbTransaction, domain: Domain, settings?: Setting
   return { stored, endpointRows, records: projectDns(domain, settings, stored, endpointRows, new Date()) };
 }
 
-async function saveProjection(tx: DbTransaction, stored: StoredDnsRecord[], records: StoredDnsRecord[]) {
+// Use a consistent MVCC snapshot without holding row locks during network work.
+export function readDnsSnapshot(domainId: string) {
+  return db.transaction(
+    async (tx) => {
+      const [domain] = await tx.select().from(domainClaims).where(eq(domainClaims.id, domainId));
+      if (!domain) throw new DnsReviewError(404, "Domain not found.");
+      const [settings] = await tx.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+      return { domain, settings, ...(await dnsSnapshot(tx, domain, settings)) };
+    },
+    { isolationLevel: "repeatable read", accessMode: "read only" },
+  );
+}
+
+type DnsSnapshot = Awaited<ReturnType<typeof readDnsSnapshot>>;
+
+function snapshotKey({ domain, settings, stored, endpointRows }: DnsSnapshot) {
+  return planHash(
+    JSON.parse(
+      JSON.stringify([
+        domain,
+        [settings?.publicIpv4, settings?.publicIpv6, settings?.ipv6Status],
+        stored.toSorted((a, b) => a.id.localeCompare(b.id)),
+        endpointRows.toSorted((a, b) => a.id.localeCompare(b.id)),
+      ]),
+    ),
+  );
+}
+
+async function lockSnapshot(tx: DbTransaction, expected: DnsSnapshot) {
+  const { domain, settings } = await lockedDnsDomain(tx, expected.domain.id);
+  const current = { domain, settings, ...(await dnsSnapshot(tx, domain, settings)) };
+  if (snapshotKey(current) !== snapshotKey(expected)) {
+    throw new DnsReviewError(409, "The local DNS state changed. Reload the DNS review or recheck DNS.");
+  }
+  return current;
+}
+
+export async function commitDnsSnapshot<T>(
+  expected: DnsSnapshot,
+  commit: (tx: DbTransaction, snapshot: DnsSnapshot) => Promise<T>,
+) {
+  return db.transaction(async (tx) => commit(tx, await lockSnapshot(tx, expected)));
+}
+
+export async function saveProjection(
+  tx: DbTransaction,
+  stored: StoredDnsRecord[],
+  records: StoredDnsRecord[],
+) {
   const byId = new Map(stored.map((record) => [record.id, record]));
   for (const record of records) {
     const previous = byId.get(record.id);
@@ -262,7 +332,35 @@ export async function rememberUnexpectedAaaa(
   return additions;
 }
 
+async function recoverOwnership(client: CloudflareDns, zoneId: string, record: StoredDnsRecord) {
+  const intent = record.providerUpdateIntent;
+  if (!intent || intent.zoneId !== zoneId) return record;
+  const candidates = intent.providerId
+    ? [await client.record(zoneId, intent.providerId)]
+    : await client.records(zoneId, intent.after.name);
+  const matches = candidates.filter(
+    (item) => item && item.comment === intent.marker && matchesWrite(item, intent.after),
+  );
+  if (matches.length !== 1 || !matches[0]) return record;
+  return {
+    ...record,
+    providerOwnership: { zoneId, record: matches[0] },
+    providerUpdateIntent: null,
+    automaticWithdrawal: false,
+  };
+}
+
 async function cloudflareReview(client: CloudflareDns, domain: Domain, records: StoredDnsRecord[]) {
+  const zoneId = await client.zoneId(domain.name);
+  const recovered = [];
+  for (const record of records) {
+    recovered.push(
+      desiredDns(record) || pendingWithdrawal(record)
+        ? await recoverOwnership(client, zoneId, record)
+        : record,
+    );
+  }
+  records = recovered;
   for (const current of records.filter(desiredDns)) {
     if (
       records.some(
@@ -283,7 +381,7 @@ async function cloudflareReview(client: CloudflareDns, domain: Domain, records: 
   }
   const planned = await planCloudflare(
     client,
-    domain.name,
+    zoneId,
     records
       .filter((record) => desiredDns(record) && !record.expectedValue.includes("review existing"))
       .map((record) => ({
@@ -301,72 +399,82 @@ async function cloudflareReview(client: CloudflareDns, domain: Domain, records: 
         : [],
     ),
   );
-  return { ...planned, planHash: planHash([domain.id, planned]) };
+  return { ...planned, records, planHash: planHash([domain.id, planned]) };
 }
 
-export function domainDnsReview(domainId: string, includeCloudflare = true): Promise<DomainDnsReview> {
-  return db.transaction(async (tx) => {
-    const { domain, settings } = await lockedDnsDomain(tx, domainId);
-    const { records } = await dnsSnapshot(tx, domain, settings);
-    const cloudflare =
-      includeCloudflare && domain.dnsProvider === "cloudflare"
-        ? await cloudflareReview(new CloudflareDns(), domain, records)
-        : null;
-    const visible = records.filter((record) => desiredDns(record) || pendingWithdrawal(record));
-    const names = [
-      ...new Set(
-        visible.filter((record) => ["A", "AAAA"].includes(record.type)).map((record) => record.name),
-      ),
-    ];
-    const providerOnly: DnsReviewRecord[] =
-      cloudflare?.snapshots.flatMap(([name, snapshot]) =>
-        names.includes(name)
-          ? snapshot.flatMap((record) =>
-              record.type === "AAAA" && untrackedAaaa(records, name, record.content)
-                ? [
-                    {
-                      id: "provider:" + record.id,
-                      type: record.type,
-                      name,
-                      relativeName: relativeDnsName(name, domain.name),
-                      value: record.content,
-                      observed: null,
-                      ttl: cacheTtl(record.ttl),
-                      purpose: "Unexpected Cloudflare IPv6 address",
-                      status: "withdrawal_pending",
-                      providerRemoval: "manual" as const,
-                    },
-                  ]
-                : [],
-            )
-          : [],
-      ) ?? [];
-    return {
-      domainId,
-      zone: domain.name,
-      provider: domain.dnsProvider,
-      aaaaEnabled: domain.aaaaEnabled,
-      automaticWithdrawalAuthorized: visible.some((record) => record.automaticWithdrawal),
-      ipv6Status:
-        providerOnly.length ||
-        visible.some((record) => record.type === "AAAA" && pendingWithdrawal(record)) ||
-        domain.lastError?.startsWith("Unexpected AAAA")
-          ? "withdrawal_pending"
-          : effectiveAaaa(domain, settings)
-            ? "eligible"
-            : "a_only",
-      lastError: domain.lastError,
-      records: [...visible.map(reviewRecord), ...providerOnly],
-      guides: cloudflare
-        ? []
-        : manualDnsGuides(
-            domain.name,
-            names,
-            visible.some((record) => record.type === "AAAA"),
-          ),
-      cloudflare: cloudflare ? { planHash: cloudflare.planHash, actions: cloudflare.actions } : null,
-    };
-  });
+let activeReviews = 0;
+
+async function limitedCloudflareReview(client: CloudflareDns, domain: Domain, records: StoredDnsRecord[]) {
+  if (activeReviews >= 4) throw new DnsReviewError(503, "Cloudflare DNS is busy. Reload the review shortly.");
+  activeReviews++;
+  try {
+    return await cloudflareReview(client, domain, records);
+  } finally {
+    activeReviews--;
+  }
+}
+
+export async function domainDnsReview(domainId: string, includeCloudflare = true): Promise<DomainDnsReview> {
+  const { domain, settings, records } = await readDnsSnapshot(domainId);
+  const cloudflare =
+    includeCloudflare && domain.dnsProvider === "cloudflare"
+      ? await limitedCloudflareReview(new CloudflareDns(), domain, records)
+      : null;
+  const visible = (cloudflare?.records ?? records).filter(
+    (record) => desiredDns(record) || pendingWithdrawal(record),
+  );
+  const names = [
+    ...new Set(visible.filter((record) => ["A", "AAAA"].includes(record.type)).map((record) => record.name)),
+  ];
+  const activeNames = new Set(visible.filter(desiredDns).map((record) => record.name));
+  const providerOnly: DnsReviewRecord[] =
+    cloudflare?.snapshots.flatMap(([name, snapshot]) =>
+      activeNames.has(name)
+        ? snapshot.flatMap((record) =>
+            record.type === "AAAA" && untrackedAaaa(records, name, record.content)
+              ? [
+                  {
+                    id: "provider:" + record.id,
+                    type: record.type,
+                    name,
+                    relativeName: relativeDnsName(name, domain.name),
+                    value: record.content,
+                    observed: null,
+                    ttl: cacheTtl(record.ttl),
+                    purpose: "Unexpected Cloudflare IPv6 address",
+                    status: "withdrawal_pending",
+                    providerRemoval: "manual" as const,
+                  },
+                ]
+              : [],
+          )
+        : [],
+    ) ?? [];
+  return {
+    domainId,
+    zone: domain.name,
+    provider: domain.dnsProvider,
+    aaaaEnabled: domain.aaaaEnabled,
+    automaticWithdrawalAuthorized: visible.some((record) => record.automaticWithdrawal),
+    ipv6Status:
+      providerOnly.length ||
+      visible.some((record) => record.type === "AAAA" && pendingWithdrawal(record)) ||
+      domain.proxyAaaaHosts.length
+        ? "withdrawal_pending"
+        : effectiveAaaa(domain, settings)
+          ? "eligible"
+          : "a_only",
+    lastError: domain.lastError,
+    records: [...visible.map(reviewRecord), ...providerOnly],
+    guides: cloudflare
+      ? []
+      : manualDnsGuides(
+          domain.name,
+          names,
+          visible.some((record) => record.type === "AAAA"),
+        ),
+    cloudflare: cloudflare ? { planHash: cloudflare.planHash, actions: cloudflare.actions } : null,
+  };
 }
 
 export type DnsPublishRequest = {
@@ -376,106 +484,126 @@ export type DnsPublishRequest = {
 
 export type DnsPublisher = { userId: string; role: "owner" | "operator" };
 
+async function requireDnsPublisher(
+  tx: DbTransaction,
+  domainId: string,
+  actor: DnsPublisher,
+  input: DnsPublishRequest,
+) {
+  const [access] = await tx
+    .select()
+    .from(platformAccess)
+    .where(eq(platformAccess.userId, actor.userId))
+    .for("share");
+  if (
+    !access ||
+    access.role !== actor.role ||
+    !canViewDomain({ ...access, role: actor.role }, domainId) ||
+    (input.authorizeAAAAWithdrawal && actor.role !== "owner")
+  ) {
+    throw new DnsReviewError(
+      403,
+      "The actor is no longer authorized to publish or approve withdrawal for this domain.",
+    );
+  }
+}
+
 async function applyDnsAction(
   tx: DbTransaction,
   client: CloudflareDns,
   zoneId: string,
   record: StoredDnsRecord,
   action: DnsReviewAction,
+  intent: StoredDnsRecord["providerUpdateIntent"],
   authorize?: true,
 ) {
   if (action.action === "delete") {
     await client.delete(action.deletionScope!, action.before);
-    await tx.update(dnsRecords).set({ providerRemovedAt: new Date() }).where(eq(dnsRecords.id, record.id));
-    return;
+    await tx
+      .update(dnsRecords)
+      .set({
+        providerRemovedAt: new Date(),
+        automaticWithdrawal: false,
+        providerOwnership: action.deletionScope,
+        providerUpdateIntent: null,
+      })
+      .where(eq(dnsRecords.id, record.id));
+    return null;
   }
 
-  const current = action.action === "keep" ? action.before! : await client.write(zoneId, action);
+  const current =
+    action.action === "keep" ? action.before! : await client.write(zoneId, action, intent?.marker);
   const previous = record.providerOwnership;
   const previouslyOwned = Boolean(
     previous && action.before && previous.zoneId === zoneId && sameRecord(previous.record, action.before),
   );
-  // A unique marker on Ark's POST also lets a retry recover a successful create whose response
-  // or database commit was interrupted. Matching third-party records are never adopted.
-  const created =
+  const owned =
+    previouslyOwned ||
     action.action === "create" ||
     (!previous && action.action === "keep" && current.comment === ownershipMarker(record.id));
-  const owned = previouslyOwned || created;
   await tx
     .update(dnsRecords)
     .set({
       publishedAt: new Date(),
       providerOwnership: owned ? { zoneId, record: current } : previous,
+      providerUpdateIntent: owned ? null : record.providerUpdateIntent,
       automaticWithdrawal:
         owned &&
         record.type === "AAAA" &&
         (authorize === true || (previouslyOwned && record.automaticWithdrawal && action.action === "keep")),
     })
     .where(eq(dnsRecords.id, record.id));
+  return current;
 }
 
+const publishingDomains = new Set<string>();
+
 export async function publishReviewedDns(domainId: string, input: DnsPublishRequest, actor: DnsPublisher) {
-  const result = await db.transaction(async (tx) => {
-    const { domain, settings } = await lockedDnsDomain(tx, domainId);
-    if (domain.dnsProvider !== "cloudflare") throw new DnsReviewError(422, "This domain uses manual DNS.");
-    const [access] = await tx
-      .select()
-      .from(platformAccess)
-      .where(eq(platformAccess.userId, actor.userId))
-      .for("share");
-    if (
-      !access ||
-      access.role !== actor.role ||
-      !canViewDomain({ ...access, role: actor.role }, domainId) ||
-      (input.authorizeAAAAWithdrawal && actor.role !== "owner")
-    ) {
-      throw new DnsReviewError(
-        403,
-        "The actor is no longer authorized to publish or approve withdrawal for this domain.",
-      );
-    }
-    const { stored, records } = await dnsSnapshot(tx, domain, settings);
-    const client = new CloudflareDns();
-    const reviewed = await cloudflareReview(client, domain, records);
-    if (input.planHash !== reviewed.planHash) {
-      throw new DnsReviewError(
-        409,
-        "The Cloudflare DNS plan changed. Review the latest diff before publishing.",
-      );
-    }
-    await saveProjection(tx, stored, records);
-    const byId = new Map(records.map((record) => [record.id, record]));
-    const applied: DnsReviewAction[] = [];
-    let failure: unknown;
-    try {
-      for (const action of reviewed.actions) {
-        await applyDnsAction(
-          tx,
-          client,
-          reviewed.zoneId,
-          byId.get(action.recordId)!,
-          action,
-          input.authorizeAAAAWithdrawal,
-        );
-        applied.push(action);
-      }
-    } catch (error) {
-      // Persist evidence for successful mutations if a later provider request fails.
-      failure = error;
-    }
-    const operationId = failure ? null : createId("op");
-    if (operationId) {
-      // Publish and queue verification in the same commit. A worker cannot verify partial writes.
-      await tx.insert(operations).values({
-        id: operationId,
-        kind: "domain.verify",
-        actorId: actor.userId,
-        targetIds: [domainId],
-        idempotencyKey: "dns.publish:" + operationId,
-        planHash: planHash({}),
-      });
-    }
-    await tx.insert(auditEvents).values({
+  if (publishingDomains.size >= 3 && !publishingDomains.has(domainId)) {
+    throw new DnsReviewError(503, "Cloudflare DNS is busy. Retry the reviewed publish shortly.");
+  }
+  if (publishingDomains.has(domainId)) throw new DnsReviewError(409, "A DNS publish is already in progress.");
+  publishingDomains.add(domainId);
+  try {
+    return await publishDnsPlan(domainId, input, actor);
+  } finally {
+    publishingDomains.delete(domainId);
+  }
+}
+
+async function publishDnsPlan(domainId: string, input: DnsPublishRequest, actor: DnsPublisher) {
+  let snapshot = await readDnsSnapshot(domainId);
+  if (snapshot.domain.dnsProvider !== "cloudflare")
+    throw new DnsReviewError(422, "This domain uses manual DNS.");
+  await db.transaction((tx) => requireDnsPublisher(tx, domainId, actor, input));
+  const client = new CloudflareDns();
+  const reviewed = await limitedCloudflareReview(client, snapshot.domain, snapshot.records);
+  const { zoneId } = reviewed;
+  if (input.planHash !== reviewed.planHash) {
+    throw new DnsReviewError(
+      409,
+      "The Cloudflare DNS plan changed. Review the latest diff before publishing.",
+    );
+  }
+
+  // Compare the local snapshot again after every network read. Each write holds the domain lock
+  // only through that single mutation and its evidence update.
+  async function commitStep<T>(step: (tx: DbTransaction) => Promise<T>) {
+    const [value, next] = await commitDnsSnapshot(snapshot, async (tx, current) => {
+      await requireDnsPublisher(tx, domainId, actor, input);
+      const result = await step(tx);
+      return [result, { ...current, ...(await dnsSnapshot(tx, current.domain, current.settings)) }] as const;
+    });
+    snapshot = next;
+    return value;
+  }
+
+  await commitStep((tx) => saveProjection(tx, snapshot.stored, reviewed.records));
+  const byId = new Map(reviewed.records.map((record) => [record.id, record]));
+  const rrsets = new Map(reviewed.snapshots);
+  const applied: DnsReviewAction[] = [];
+  const audit = (tx: DbTransaction, operationId: string | null) =>
+    tx.insert(auditEvents).values({
       id: createId("audit"),
       actorId: actor.userId,
       role: actor.role,
@@ -488,22 +616,100 @@ export async function publishReviewedDns(domainId: string, input: DnsPublishRequ
         actions: reviewed.actions,
         applied,
         authorizeAAAAWithdrawal: input.authorizeAAAAWithdrawal,
-        incomplete: Boolean(failure),
+        incomplete: operationId === null,
       },
     });
-    return { applied, failure, operationId };
-  });
-  if (result.failure) throw result.failure;
-  return { actions: result.applied, operationId: result.operationId! };
+
+  try {
+    for (const action of reviewed.actions) {
+      const record = byId.get(action.recordId)!;
+      const name = action.deletionScope?.record.name ?? action.after!.name;
+      const type = action.deletionScope?.record.type ?? action.after!.type;
+      const rrset = rrsets.get(name)!;
+      const previous = record.providerOwnership;
+      const ownUpdate =
+        action.action === "update" &&
+        previous?.zoneId === zoneId &&
+        action.before &&
+        sameRecord(previous.record, action.before);
+      const intent =
+        action.action === "create" || ownUpdate
+          ? {
+              zoneId,
+              providerId: action.before?.id ?? null,
+              marker: ownershipMarker(createId("write")),
+              after: action.after!,
+            }
+          : null;
+      if (action.action === "create" && previous) {
+        if (previous.zoneId !== zoneId) throw drift(type, name);
+        await client.checkRecord(zoneId, null, previous.record.id, type, name);
+      }
+      if (intent) {
+        // Commit intent before the network write, so a lost response or rolled-back
+        // evidence update can only be recovered from this exact provider result.
+        await commitStep(async (tx) => {
+          await tx
+            .update(dnsRecords)
+            .set({ providerUpdateIntent: intent })
+            .where(eq(dnsRecords.id, record.id));
+        });
+      }
+      if (action.action === "delete") await client.checkDeletion(action.deletionScope!, action.before);
+      if (action.action === "update")
+        await client.checkRecord(zoneId, action.before, action.before!.id, type, name);
+      if (action.action !== "keep") await client.checkRrset(zoneId, name, rrset, type);
+      const written = await commitStep((tx) =>
+        applyDnsAction(tx, client, zoneId, record, action, intent, input.authorizeAAAAWithdrawal),
+      );
+      if (action.action !== "keep") {
+        const updated = rrset.filter((item) => item.id !== action.before?.id);
+        if (written) updated.push(written);
+        rrsets.set(
+          name,
+          updated.toSorted((a, b) => a.id.localeCompare(b.id)),
+        );
+      }
+      applied.push(action);
+    }
+
+    const operationId = createId("op");
+    await commitStep(async (tx) => {
+      await tx.insert(operations).values({
+        id: operationId,
+        kind: "domain.verify",
+        actorId: actor.userId,
+        targetIds: [domainId],
+        idempotencyKey: "dns.publish:" + operationId,
+        planHash: planHash({}),
+      });
+      await audit(tx, operationId);
+    });
+    return { actions: applied, operationId };
+  } catch (error) {
+    await db.transaction(async (tx) => {
+      await audit(tx, null);
+    });
+    throw error;
+  }
 }
 
-export async function withdrawAuthorizedAaaa(tx: DbTransaction, domain: Domain, records: StoredDnsRecord[]) {
-  const candidates = records.filter(
+export async function withdrawAuthorizedAaaa(domainId: string) {
+  let snapshot = await readDnsSnapshot(domainId);
+  const { domain } = snapshot;
+  const liveNames = new Set(
+    snapshot.endpointRows
+      .filter((endpoint) => endpoint.exposure === "public")
+      .map((endpoint) => endpoint.hostname),
+  );
+  const candidates = snapshot.records.filter(
     (record) =>
       pendingWithdrawal(record) &&
       record.type === "AAAA" &&
       record.withdrawalReason === "ipv6" &&
+      liveNames.has(record.name) &&
       !record.providerRemovedAt &&
+      !record.providerUpdateIntent &&
       record.automaticWithdrawal &&
       record.providerOwnership,
   );
@@ -516,6 +722,7 @@ export async function withdrawAuthorizedAaaa(tx: DbTransaction, domain: Domain, 
       const zoneId = await client.zoneId(domain.name);
       if (zoneId !== ownership.zoneId) throw drift(ownership.record.type, ownership.record.name);
       const current = await client.record(zoneId, ownership.record.id);
+      if (current && !sameRecord(current, ownership.record)) throw drift(record.type, record.name);
       const action: DnsReviewAction = {
         recordId: record.id,
         action: "delete",
@@ -523,16 +730,18 @@ export async function withdrawAuthorizedAaaa(tx: DbTransaction, domain: Domain, 
         after: null,
         deletionScope: ownership,
       };
-      await applyDnsAction(tx, client, zoneId, record, action);
-      // The verification in this transaction must wait the full TTL of the freshly removed record.
-      record.providerRemovedAt = new Date();
-      await tx.insert(auditEvents).values({
-        id: createId("audit"),
-        role: "system",
-        action: "dns.withdraw_aaaa",
-        resourceType: "domain",
-        resourceId: domain.id,
-        detail: { planHash: planHash([domain.id, action]), action, authorization: "preauthorized" },
+      snapshot = await commitDnsSnapshot(snapshot, async (tx, locked) => {
+        await saveProjection(tx, locked.stored, locked.records);
+        await applyDnsAction(tx, client, zoneId, record, action, null);
+        await tx.insert(auditEvents).values({
+          id: createId("audit"),
+          role: "system",
+          action: "dns.withdraw_aaaa",
+          resourceType: "domain",
+          resourceId: domain.id,
+          detail: { planHash: planHash([domain.id, action]), action, authorization: "preauthorized" },
+        });
+        return { ...locked, ...(await dnsSnapshot(tx, locked.domain, locked.settings)) };
       });
     } catch (error) {
       if (!(error instanceof DnsReviewError)) throw error;
@@ -542,8 +751,7 @@ export async function withdrawAuthorizedAaaa(tx: DbTransaction, domain: Domain, 
   return failures;
 }
 
-export async function confirmWithdrawals(
-  tx: DbTransaction,
+export async function observedWithdrawals(
   records: StoredDnsRecord[],
   addresses: (type: string, name: string) => Promise<string[]>,
   now = new Date(),
@@ -564,19 +772,18 @@ export async function confirmWithdrawals(
       continue;
     }
     const prior = owned?.record.content ?? record.expectedValue;
-    const current = records.find(
-      (item) => desiredDns(item) && item.name === record.name && item.type === record.type,
-    );
     const absent = !observed.some((value) => dnsRecordVerified(record.type, prior, value));
-    if (absent && (record.type !== "AAAA" || current || observed.length === 0)) confirmed.push(record.id);
+    if (absent) confirmed.push(record.id);
   }
-  if (confirmed.length) {
-    await tx
-      .update(dnsRecords)
-      .set({ status: "withdrawn", withdrawalConfirmedAt: now })
-      .where(inArray(dnsRecords.id, confirmed));
-  }
-  return records.filter((record) => pendingWithdrawal(record) && !confirmed.includes(record.id));
+  return confirmed;
+}
+
+export async function confirmWithdrawals(tx: DbTransaction, confirmed: string[], now: Date) {
+  if (!confirmed.length) return;
+  await tx
+    .update(dnsRecords)
+    .set({ status: "withdrawn", withdrawalConfirmedAt: now })
+    .where(inArray(dnsRecords.id, confirmed));
 }
 
 export async function changeAaaaSetting(
@@ -610,41 +817,77 @@ export async function revokeAaaaWithdrawal(domainId: string, userId: string) {
   });
 }
 
+/** Open or renew a bounded verification window from an explicit operator action. */
+export async function watchManualDns(domainId: string) {
+  await db
+    .update(domainClaims)
+    .set({ dnsWatchUntil: new Date(Date.now() + 30 * 60_000) })
+    .where(and(eq(domainClaims.id, domainId), ne(domainClaims.dnsProvider, "cloudflare")));
+}
+
 /** FD-27 supplies the IPv6 status. The domain worker reacts to persisted changes and retries withdrawals. */
 export async function domainsDueForDns() {
-  const [domains, records, endpointRows, [settings]] = await Promise.all([
+  const [domains, records, endpointRows, [settings], waitingRoutes, orders, issued] = await Promise.all([
     db.select().from(domainClaims),
     db.select().from(dnsRecords),
     db.select().from(endpoints),
     db.select().from(platformSettings).where(eq(platformSettings.id, "default")),
+    db
+      .select({ endpointId: frontRoutes.endpointId })
+      .from(frontRoutes)
+      .where(eq(frontRoutes.status, "awaiting_dns")),
+    db
+      .select({ targetIds: operations.targetIds })
+      .from(operations)
+      .where(eq(operations.kind, "certificate.issue")),
+    db.select({ endpointId: certificates.endpointId }).from(certificates),
   ]);
   const now = new Date();
+  const waitingRouteIds = new Set(waitingRoutes.map(({ endpointId }) => endpointId));
+  const issuedOrOrdered = new Set([
+    ...orders.flatMap(({ targetIds }) => targetIds),
+    ...issued.map(({ endpointId }) => endpointId),
+  ]);
   return domains.flatMap((domain) => {
+    if (publishingDomains.has(domain.id)) return [];
     const stored = records.filter((record) => record.domainId === domain.id);
     const domainEndpoints = endpointRows.filter((row) => row.domainId === domain.id);
     const projected = projectDns(domain, settings, stored, domainEndpoints, now);
     const recent = (at: Date) => now.getTime() - at.getTime() < 30 * 60_000;
+    const watching = (domain.dnsWatchUntil?.getTime() ?? 0) > now.getTime();
     const waiting = domainEndpoints.filter(
       (endpoint) =>
         endpoint.exposure === "public" &&
-        endpoint.status === "awaiting_dns" &&
+        (endpoint.status === "awaiting_dns" ||
+          (endpoint.status === "verified" &&
+            (endpoint.kind === "route"
+              ? waitingRouteIds.has(endpoint.id)
+              : !issuedOrOrdered.has(endpoint.id)))) &&
         projected.some(
           (record) =>
             desiredDns(record) &&
             record.name === endpoint.hostname &&
             (domain.dnsProvider === "cloudflare"
               ? record.publishedAt && recent(record.publishedAt)
-              : recent(endpoint.createdAt)),
+              : watching || recent(endpoint.createdAt)),
         ),
     );
     const awaitingOwnership =
-      domain.dnsProvider !== "cloudflare" && domain.status !== "verified" && recent(domain.createdAt);
+      domain.dnsProvider !== "cloudflare" &&
+      domain.status !== "verified" &&
+      (watching || recent(domain.createdAt));
     const needsReconcile = projected.some((record) => !stored.includes(record) || pendingWithdrawal(record));
-    return needsReconcile || awaitingOwnership || waiting.length
+    return needsReconcile || awaitingOwnership || waiting.length || domain.proxyAaaaHosts.length
       ? [
           {
             domainId: domain.id,
-            routeEndpointsOnly: !awaitingOwnership && waiting.every((endpoint) => endpoint.kind === "route"),
+            routeEndpointsOnly:
+              !awaitingOwnership &&
+              domainEndpoints.every(
+                (endpoint) =>
+                  endpoint.kind === "route" ||
+                  (!waiting.includes(endpoint) && !domain.proxyAaaaHosts.includes(endpoint.hostname)),
+              ),
           },
         ]
       : [];

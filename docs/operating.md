@@ -195,6 +195,8 @@ A route then moves through `draft → awaiting_acl → awaiting_dns → issuing_
 
 `enable` is refused (409) before `ready`. Changing the target re-pins it and returns the route to `awaiting_acl` (an enabled route stays enabled, is drained at once, and serves the new target only once it is `ready` again); DNS and certificate work is not repeated once the hostname has an issued certificate. Deleting a route drains it. If it is the endpoint's final route, Ark removes the endpoint and certificates and retains its address records as pending removals in the domain's DNS review. Every action and lifecycle transition writes a `front_route.*` audit event.
 
+For manual DNS, opening the provider guide or selecting **Recheck DNS** starts a 30-minute window. The domain worker checks public DNS every two minutes during that window.
+
 ### How the edge serves a route (FD-09)
 
 `edge.apply` reads `front_routes` and renders only enabled `ready` routes whose pinned identity the edge lease still allows; `edge.l4_apply` then adds exactly those hostnames to the HAProxy 443 map. Routes in `awaiting_acl`, `identity_mismatch`, `observation_expired` or `disabled` are in neither config. An `sso` route is served behind the login gate (below); it is never served as public. A route whose stored `http_options`, bypass paths or SSO stream-close delay (at most 5 minutes) fail validation is omitted and listed under `omitted` in the `edge-apply` step, instead of failing every apply.

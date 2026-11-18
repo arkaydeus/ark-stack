@@ -28,7 +28,7 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
 const { app } = await import("./app.ts");
 const { auth } = await import("./auth.ts");
 const { db, sql } = await import("./db.ts");
-const { runOperation, setDnsResolver } = await import("./coordinator.ts");
+const { runDnsMaintenance, runOperation, setDnsResolver } = await import("./coordinator.ts");
 const { operations } = await import("./schema.ts");
 const { MockLocalApi } = await import("./mock-localapi.ts");
 const { eq } = await import("drizzle-orm");
@@ -1101,7 +1101,7 @@ describe("gate durable dispatch lifecycle", () => {
         const { db, sql } = await import("./src/db.ts");
         const { operations } = await import("./src/schema.ts");
         const { eq } = await import("drizzle-orm");
-        const { runOperation, setDnsResolver } = await import("./src/coordinator.ts");
+        const { runDnsMaintenance, runOperation, setDnsResolver } = await import("./src/coordinator.ts");
         setDnsResolver({ txt: async () => [[${JSON.stringify(tokens.verified)}]],
           a: async () => [${JSON.stringify(publicIpv4)}], aaaa: async () => [],
           mx: async () => [], cname: async () => [] });
@@ -1220,7 +1220,11 @@ describe("FD-19 reviewed DNS", () => {
     const path = "/api/domains/" + domainId;
     const providerRecords = new Map<string, ProviderRecord>();
     const writes: Array<{ method: string; id: string; body?: Partial<ProviderRecord> }> = [];
-    const hooks: { onRead?: (record: ProviderRecord) => void } = {};
+    const hooks: {
+      onRead?: (record: ProviderRecord) => void;
+      onWrite?: (method: string, record: ProviderRecord) => void;
+      onZone?: () => Promise<void>;
+    } = {};
     const zoneId = createId("cfzone");
     const publicDns = {
       a: [publicIpv4],
@@ -1239,8 +1243,10 @@ describe("FD-19 reviewed DNS", () => {
         if (url.hostname !== "api.cloudflare.com") return originalFetch(input, init);
         expect(new Headers(init?.headers).get("authorization")).toBe("Bearer mock-fd19-zone-token");
         const method = init?.method ?? "GET";
-        if (url.pathname === "/client/v4/zones" && url.searchParams.get("name") === name)
+        if (url.pathname === "/client/v4/zones" && url.searchParams.get("name") === name) {
+          await hooks.onZone?.();
           return providerResult([{ id: zoneId, name }]);
+        }
         const apiPath = "/client/v4/zones/" + zoneId + "/dns_records";
         if (url.pathname === apiPath && method === "GET") {
           return providerResult(
@@ -1267,24 +1273,27 @@ describe("FD-19 reviewed DNS", () => {
           const changed = { ...current, ...body, id: current?.id ?? createId("rec") };
           writes.push({ method, id: changed.id, body });
           providerRecords.set(changed.id, changed);
+          hooks.onWrite?.(method, changed);
           return providerResult(changed);
         }
         throw new Error("Unexpected mocked Cloudflare request " + method + " " + url.pathname);
       },
       { preconnect: originalFetch.preconnect },
     );
-    setDnsResolver({
-      txt: async (hostname) => (hostname === proof.name ? [[proof.value]] : []),
-      a: async () => publicDns.a,
-      aaaa: async () => {
-        publicDns.aaaaLookups++;
-        if (publicDns.aaaaError) throw Object.assign(new Error("DNS timeout"), { code: "ETIMEOUT" });
-        return publicDns.aaaa;
-      },
-      caa: async (hostname) => (hostname === name ? publicDns.caa : []),
-      mx: async () => [],
-      cname: async () => [],
-    });
+    const installResolver = () =>
+      setDnsResolver({
+        txt: async (hostname) => (hostname === proof.name ? [[proof.value]] : []),
+        a: async () => publicDns.a,
+        aaaa: async () => {
+          publicDns.aaaaLookups++;
+          if (publicDns.aaaaError) throw Object.assign(new Error("DNS timeout"), { code: "ETIMEOUT" });
+          return publicDns.aaaa;
+        },
+        caa: async (hostname) => (hostname === name ? publicDns.caa : []),
+        mx: async () => [],
+        cname: async () => [],
+      });
+    installResolver();
     return {
       name,
       path,
@@ -1295,8 +1304,17 @@ describe("FD-19 reviewed DNS", () => {
       publicDns,
       zoneId,
       hooks,
+      installResolver,
       async allowIpv6(status: "passed" | "failed") {
         await sql`UPDATE platform_settings SET ipv6_status = ${status} WHERE id = 'default'`;
+      },
+      async publish(authorizeAAAAWithdrawal?: true) {
+        const review = await call(actors.owner, "GET", path + "/dns");
+        expect(review.status).toBe(200);
+        return call(actors.owner, "POST", path + "/publish", {
+          planHash: review.body.cloudflare.planHash,
+          authorizeAAAAWithdrawal,
+        });
       },
       async verify(operationId?: string) {
         const queued = operationId ?? (await call(actors.owner, "POST", path + "/verify")).body.operationId;
@@ -1607,6 +1625,340 @@ describe("FD-19 reviewed DNS", () => {
       await fixture.dispose();
     }
   });
+
+  async function deleteDnsRoute(routeId: string) {
+    await stepUp(actors.owner, "resource.delete", { routeId });
+    expect((await call(actors.owner, "DELETE", "/api/front/routes/" + routeId)).status).toBe(200);
+  }
+
+  test("recovers an owned PATCH after a lost reply and retires the updated A by exact ID", async () => {
+    const fixture = await dnsFixture("cloudflare");
+    try {
+      const { route } = await createRoute(fixture.name);
+      expect((await fixture.publish()).status).toBe(200);
+      const owned = [...fixture.providerRecords.values()].find((item) => item.type === "A")!;
+      const updatedIp = "203.0.113.55";
+      await sql`UPDATE platform_settings SET public_ipv4 = ${updatedIp} WHERE id = 'default'`;
+      fixture.hooks.onWrite = (method) => {
+        if (method === "PATCH") throw new Error("reply lost after the provider committed");
+      };
+      expect((await fixture.publish()).status).toBe(502);
+      expect(fixture.providerRecords.get(owned.id)?.content).toBe(updatedIp);
+      const [uncertain] = await sql`SELECT provider_update_intent, provider_ownership FROM dns_records
+        WHERE domain_id = ${fixture.domainId} AND type = 'A'`;
+      expect(uncertain?.provider_update_intent).toMatchObject({ providerId: owned.id });
+      expect(uncertain?.provider_ownership).toMatchObject({ record: { content: publicIpv4 } });
+      fixture.hooks.onWrite = undefined;
+      expect((await fixture.publish()).status).toBe(200);
+      const [recovered] = await sql`SELECT provider_update_intent, provider_ownership FROM dns_records
+        WHERE domain_id = ${fixture.domainId} AND type = 'A'`;
+      expect(recovered?.provider_update_intent).toBeNull();
+      expect(recovered?.provider_ownership).toMatchObject({ record: { id: owned.id, content: updatedIp } });
+      await deleteDnsRoute(route.id);
+      const review = (await call(actors.owner, "GET", fixture.path + "/dns")).body;
+      expect(review.cloudflare.actions).toContainEqual(
+        expect.objectContaining({
+          action: "delete",
+          before: expect.objectContaining({ id: owned.id, content: updatedIp }),
+        }),
+      );
+      const unrelated = { ...owned, id: "sibling", content: "203.0.113.56" };
+      fixture.providerRecords.set(unrelated.id, unrelated);
+      expect((await fixture.publish()).status).toBe(200);
+      expect(fixture.providerRecords.has(owned.id)).toBe(false);
+      expect(fixture.providerRecords.get(unrelated.id)).toEqual(unrelated);
+    } finally {
+      await sql`UPDATE platform_settings SET public_ipv4 = ${publicIpv4} WHERE id = 'default'`;
+      await fixture.dispose();
+    }
+  }, 20_000);
+
+  test("refuses an address sibling introduced after an earlier action in the same publish", async () => {
+    const fixture = await dnsFixture("cloudflare");
+    try {
+      const later = "www." + fixture.name;
+      await createRoute(fixture.name);
+      await createRoute(later);
+      fixture.hooks.onWrite = (_method, record) => {
+        if (record.type === "A" && record.name === fixture.name) {
+          fixture.providerRecords.set("sibling", {
+            ...record,
+            id: "sibling",
+            name: later,
+            content: "203.0.113.60",
+          });
+        }
+      };
+      const published = await fixture.publish();
+      expect(published.status).toBe(409);
+      expect(fixture.writes.some((write) => write.body?.name === later)).toBe(false);
+      expect(fixture.providerRecords.get("sibling")?.content).toBe("203.0.113.60");
+      const [saved] = await sql`SELECT provider_ownership FROM dns_records
+        WHERE domain_id = ${fixture.domainId} AND name = ${fixture.name} AND type = 'A'`;
+      expect(saved?.provider_ownership).toMatchObject({ record: { content: publicIpv4 } });
+    } finally {
+      await fixture.dispose();
+    }
+  }, 20_000);
+
+  test("promotes the matching manual tombstone and legacy optional AAAA when IPv6 passes", async () => {
+    const fixture = await dnsFixture("manual");
+    try {
+      await fixture.allowIpv6("failed");
+      const { route } = await createRoute(fixture.name);
+      const legacy = "www." + fixture.name;
+      const { route: legacyRoute } = await createRoute(legacy);
+      fixture.publicDns.aaaa = [publicIpv6];
+      await fixture.verify();
+      const [tombstone] = await sql`SELECT id, required FROM dns_records
+        WHERE domain_id = ${fixture.domainId} AND name = ${fixture.name} AND type = 'AAAA'`;
+      expect(tombstone?.required).toBe(false);
+      await sql`UPDATE dns_records SET withdrawal_reason = NULL, withdrawal_started_at = NULL
+        WHERE domain_id = ${fixture.domainId} AND name = ${legacy} AND type = 'AAAA'`;
+      await sql`UPDATE front_routes SET status = 'awaiting_dns' WHERE id IN ${sql([route.id, legacyRoute.id])}`;
+      await fixture.allowIpv6("passed");
+      fixture.publicDns.aaaa = [];
+      await fixture.verify();
+      expect(await certificateRequests(legacyRoute.id)).toHaveLength(0);
+      fixture.publicDns.aaaa = [publicIpv6];
+      await fixture.verify();
+      expect(await certificateRequests(route.id)).toHaveLength(1);
+      expect(await certificateRequests(legacyRoute.id)).toHaveLength(1);
+      const restored = await sql`SELECT id, required, withdrawal_reason FROM dns_records
+        WHERE domain_id = ${fixture.domainId} AND type = 'AAAA' ORDER BY name`;
+      expect(restored).toHaveLength(2);
+      expect(restored[0]).toMatchObject({ id: tombstone?.id, required: true, withdrawal_reason: null });
+      expect(restored[1]).toMatchObject({ required: true, withdrawal_reason: null });
+      expect((await call(actors.owner, "GET", fixture.path + "/dns")).body.ipv6Status).toBe("eligible");
+    } finally {
+      await fixture.dispose();
+    }
+  }, 20_000);
+
+  test("a proxied manual AAAA leaves a pending alert without a per-address removal instruction", async () => {
+    const fixture = await dnsFixture("manual");
+    try {
+      await fixture.allowIpv6("failed");
+      await createRoute(fixture.name);
+      const proxy = "2606:4700::1234";
+      fixture.publicDns.aaaa = [proxy];
+      await fixture.verify();
+      const review = (await call(actors.owner, "GET", fixture.path + "/dns")).body;
+      expect(review.ipv6Status).toBe("withdrawal_pending");
+      expect(review.lastError).toMatch(/Cloudflare proxy.*DNS only/);
+      expect(review.records.some((record: Json) => record.value === proxy)).toBe(false);
+      const alerts = () =>
+        sql`SELECT resolved_at FROM alerts WHERE dedup_key = ${"dns-aaaa-withdrawal:" + fixture.domainId}`;
+      expect((await alerts())[0]?.resolved_at).toBeNull();
+      fixture.publicDns.aaaa = [];
+      fixture.publicDns.aaaaError = true;
+      await fixture.verify();
+      expect((await call(actors.owner, "GET", fixture.path + "/dns")).body.ipv6Status).toBe(
+        "withdrawal_pending",
+      );
+      fixture.publicDns.aaaaError = false;
+      await fixture.verify();
+      expect((await call(actors.owner, "GET", fixture.path + "/dns")).body.ipv6Status).toBe("a_only");
+      expect((await alerts())[0]?.resolved_at).not.toBeNull();
+    } finally {
+      await fixture.dispose();
+    }
+  }, 20_000);
+
+  test("retiring an endpoint cancels automatic withdrawal and confirms only its old AAAA", async () => {
+    const fixture = await dnsFixture("cloudflare");
+    try {
+      await fixture.allowIpv6("passed");
+      const { route } = await createRoute(fixture.name);
+      expect((await fixture.publish(true)).status).toBe(200);
+      const own = [...fixture.providerRecords.values()].find((item) => item.type === "AAAA")!;
+      const sibling = { ...own, id: "sibling", content: "2001:db8::88" };
+      expect((await call(actors.owner, "PUT", fixture.path + "/aaaa", { enabled: false })).status).toBe(200);
+      // Restore eligibility without reconciliation, as an updated preflight result would do.
+      await sql`UPDATE domain_claims SET aaaa_enabled = true WHERE id = ${fixture.domainId}`;
+      await deleteDnsRoute(route.id);
+      await fixture.verify();
+      expect(fixture.providerRecords.has(own.id)).toBe(true);
+      const [retired] = await sql`SELECT withdrawal_reason, automatic_withdrawal FROM dns_records
+        WHERE domain_id = ${fixture.domainId} AND type = 'AAAA'`;
+      expect(retired).toMatchObject({ withdrawal_reason: "endpoint_deleted", automatic_withdrawal: false });
+      fixture.providerRecords.set(sibling.id, sibling);
+      expect((await fixture.publish()).status).toBe(200);
+      await sql`UPDATE dns_records SET provider_removed_at = now() - interval '301 seconds'
+        WHERE domain_id = ${fixture.domainId} AND type = 'AAAA'`;
+      fixture.publicDns.aaaa = [sibling.content];
+      await fixture.verify();
+      const [confirmed] =
+        await sql`SELECT status FROM dns_records WHERE domain_id = ${fixture.domainId} AND type = 'AAAA'`;
+      expect(confirmed?.status).toBe("withdrawn");
+      expect(fixture.providerRecords.get(sibling.id)).toEqual(sibling);
+      expect((await call(actors.owner, "GET", fixture.path + "/dns")).body.ipv6Status).toBe("eligible");
+    } finally {
+      await fixture.dispose();
+    }
+  }, 20_000);
+
+  test("a stalled Cloudflare review leaves DNS settings and another domain free to progress", async () => {
+    const other = await dnsFixture("manual");
+    const stalled = await dnsFixture("cloudflare");
+    const arrived = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    let review: ReturnType<typeof call> | undefined;
+    try {
+      await other.allowIpv6("passed");
+      await createRoute(other.name);
+      expect((await call(actors.owner, "PUT", other.path + "/aaaa", { enabled: false })).status).toBe(200);
+      stalled.hooks.onZone = () => {
+        arrived.resolve();
+        return released.promise;
+      };
+      review = call(actors.owner, "GET", stalled.path + "/dns");
+      await arrived.promise;
+      await Promise.race([
+        (async () => {
+          expect((await call(actors.owner, "PUT", stalled.path + "/aaaa", { enabled: false })).status).toBe(
+            200,
+          );
+          other.installResolver();
+          await other.verify();
+          const [row] =
+            await sql`SELECT status FROM dns_records WHERE domain_id = ${other.domainId} AND type = 'AAAA'`;
+          expect(row?.status).toBe("withdrawn");
+        })(),
+        Bun.sleep(4_000).then(() => {
+          throw new Error("DNS work waited for the stalled review");
+        }),
+      ]);
+    } finally {
+      released.resolve();
+      await review;
+      await stalled.dispose();
+      await other.dispose();
+    }
+  }, 20_000);
+
+  test("production DNS requests traverse the authenticated domain-worker control endpoint", async () => {
+    const fixture = await dnsFixture("cloudflare");
+    const { dnsControlHandler } = await import("../../workers/src/domains.ts");
+    const { loadEnv } = await import("./env.ts");
+    const token = loadEnv().workerTokens.domains;
+    const control = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: dnsControlHandler(token) });
+    const previousUrl = process.env.ARK_DOMAIN_WORKER_URL;
+    const previousEnv = process.env.NODE_ENV;
+    try {
+      const request = (body: unknown, bearer?: string) =>
+        fetch(new URL("/dns/publish", control.url), {
+          method: "POST",
+          headers: bearer ? { authorization: "Bearer " + bearer } : {},
+          body: JSON.stringify(body),
+        });
+      expect((await request({ domainId: fixture.domainId })).status).toBe(401);
+      expect((await request({ domainId: fixture.domainId }, "wrong-token")).status).toBe(401);
+      expect((await request({}, token)).status).toBe(422);
+      expect((await request({ domainId: fixture.domainId }, token)).status).toBe(422);
+      const before = await call(actors.owner, "GET", fixture.path + "/dns");
+      const stale = before.body.cloudflare.planHash;
+      await createRoute(fixture.name);
+      process.env.NODE_ENV = "production";
+      delete process.env.ARK_DOMAIN_WORKER_URL;
+      expect((await call(actors.owner, "GET", fixture.path + "/dns")).status).toBe(503);
+      expect((await call(actors.owner, "POST", fixture.path + "/publish", { planHash: stale })).status).toBe(
+        503,
+      );
+      process.env.ARK_DOMAIN_WORKER_URL = String(control.url);
+      expect((await call(actors.owner, "POST", fixture.path + "/publish", { planHash: stale })).status).toBe(
+        409,
+      );
+      expect(fixture.writes).toHaveLength(0);
+      expect((await fixture.publish()).status).toBe(200);
+      expect(fixture.writes.some((write) => write.body?.name === fixture.name)).toBe(true);
+    } finally {
+      if (previousUrl === undefined) delete process.env.ARK_DOMAIN_WORKER_URL;
+      else process.env.ARK_DOMAIN_WORKER_URL = previousUrl;
+      if (previousEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousEnv;
+      await control.stop(true);
+      await fixture.dispose();
+    }
+  }, 20_000);
+
+  test("schedule resumes late manual DNS and commits the first order without retrying an unrelated route", async () => {
+    const fixture = await dnsFixture("manual");
+    try {
+      const { domainsDueForDns } = await import("./modules/domain-dns.ts");
+      const endpointId = createId("ep");
+      const host = "admin." + fixture.name;
+      const { route } = await createRoute(fixture.name);
+      await sql`INSERT INTO endpoints (id, kind, hostname, domain_id, status, created_at)
+        VALUES (${endpointId}, 'admin', ${host}, ${fixture.domainId}, 'awaiting_dns', now() - interval '1 hour')`;
+      await sql`INSERT INTO dns_records (id, domain_id, type, name, relative_name, expected_value, purpose)
+        VALUES (${createId("dns")}, ${fixture.domainId}, 'A', ${host}, 'admin', ${publicIpv4}, 'Admin address')`;
+      await sql`UPDATE endpoints SET created_at = now() - interval '1 hour' WHERE domain_id = ${fixture.domainId}`;
+      await sql`UPDATE domain_claims SET created_at = now() - interval '1 hour', status = 'draft' WHERE id = ${fixture.domainId}`;
+      await sql`UPDATE front_routes SET status = 'issuing_certificate' WHERE id = ${route.id}`;
+      await sql`INSERT INTO operations (id, kind, status, idempotency_key, plan_hash, target_ids)
+        SELECT ${createId("op")}, 'certificate.issue', 'failed', ${createId("idem")}, 'fixture', jsonb_build_array(endpoint_id)
+        FROM front_routes WHERE id = ${route.id}`;
+      const due = async () => (await domainsDueForDns()).find((row) => row.domainId === fixture.domainId);
+      expect(await due()).toBeUndefined();
+      expect((await call(actors.owner, "POST", fixture.path + "/dns/watch")).status).toBe(204);
+      expect(await due()).toMatchObject({ routeEndpointsOnly: false });
+      await runDnsMaintenance();
+      await runDnsMaintenance();
+      const scheduled =
+        await sql`SELECT id, payload FROM operations WHERE idempotency_key = ${"dns.maintenance:" + fixture.domainId}`;
+      expect(scheduled).toHaveLength(1);
+      expect(scheduled[0]?.payload).toMatchObject({ scheduledDns: true, routeEndpointsOnly: false });
+
+      // A worker stopped before handling this persisted job. Run it once from the durable queue,
+      // then replay it as a second worker would after losing its completion response.
+      const orders = () =>
+        sql`SELECT id FROM operations WHERE kind = 'certificate.issue' AND target_ids ? ${endpointId}`;
+      expect(await orders()).toHaveLength(0);
+      const fence = "fd19_test_reject_certificate";
+      await sql.unsafe(`ALTER TABLE operations ADD CONSTRAINT ${fence}
+        CHECK (kind <> 'certificate.issue' OR NOT (target_ids ? '${endpointId}'))`);
+      try {
+        await expect(fixture.verify(scheduled[0]?.id)).rejects.toThrow();
+        const [uncommitted] = await sql`SELECT status FROM endpoints WHERE id = ${endpointId}`;
+        expect(uncommitted?.status).toBe("awaiting_dns");
+        expect(await orders()).toHaveLength(0);
+      } finally {
+        await sql.unsafe(`ALTER TABLE operations DROP CONSTRAINT ${fence}`);
+      }
+      await fixture.verify(scheduled[0]?.id);
+      const [state] = await sql`SELECT status FROM endpoints WHERE id = ${endpointId}`;
+      expect(state?.status).toBe("verified");
+      expect(await orders()).toHaveLength(1);
+      await fixture.verify(scheduled[0]?.id);
+      expect(await orders()).toHaveLength(1);
+      expect(await certificateRequests(route.id)).toHaveLength(1);
+    } finally {
+      await fixture.dispose();
+    }
+  }, 20_000);
+
+  test("certificate issue rechecks a changed CAA policy before invoking ACME", async () => {
+    const fixture = await dnsFixture("manual");
+    try {
+      const { route } = await createRoute("www." + fixture.name);
+      await sql`UPDATE front_routes SET status = 'awaiting_dns' WHERE id = ${route.id}`;
+      await fixture.verify();
+      const requests = await certificateRequests(route.id);
+      expect(requests).toHaveLength(1);
+      const [job] = await db.select().from(operations).where(eq(operations.id, requests[0]!.id));
+      const args = Bun.file(process.env.ARK_LEGO_ARGS_FILE!);
+      const previousArgs = (await args.exists()) ? await args.text() : null;
+      fixture.publicDns.caa = [{ critical: 0, issue: "other-ca.example" }];
+      await expect(runOperation("certificate.issue", job!)).rejects.toThrow(/CAA.*letsencrypt\.org/);
+      expect(await sql`SELECT id FROM certificates WHERE endpoint_id = ${job!.targetIds[0]!}`).toHaveLength(
+        0,
+      );
+      expect((await args.exists()) ? await args.text() : null).toBe(previousArgs);
+    } finally {
+      await fixture.dispose();
+    }
+  }, 20_000);
 
   test("route API rejects both ts.net and a configured custom tailnet suffix", async () => {
     const [edge] = await sql`SELECT stable_id, dns_name FROM tailnet_nodes WHERE source = 'edge' AND is_self`;

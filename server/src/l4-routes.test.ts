@@ -488,9 +488,11 @@ describe("concurrent L4 lifecycle and revocation recovery", () => {
     expect(await sql`SELECT id FROM front_routes WHERE endpoint_id = ${row.endpoint_id}`).toHaveLength(0);
     expect(await sql`SELECT id FROM endpoints WHERE id = ${row.endpoint_id}`).toHaveLength(0);
     expect(await sql`SELECT id FROM certificates WHERE endpoint_id = ${row.endpoint_id}`).toHaveLength(0);
-    expect(
-      await sql`SELECT id FROM dns_records WHERE domain_id = ${domainId} AND name = ${first.hostname}`,
-    ).toHaveLength(0);
+    const records = await sql`SELECT type, withdrawal_reason, automatic_withdrawal FROM dns_records
+      WHERE domain_id = ${domainId} AND name = ${first.hostname}`;
+    expect([...records]).toEqual([
+      { type: "A", withdrawal_reason: "endpoint_deleted", automatic_withdrawal: false },
+    ]);
   });
 
   test("revocation, CRL and durable jobs roll back together at each persistence boundary, then retry", async () => {

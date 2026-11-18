@@ -1,5 +1,5 @@
 import { type DomainDnsReview, type DnsReviewRecord } from "@ark-stack/shared/dns-review";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { Badge, statusVariant } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,8 @@ const ipv6Text = {
   withdrawal_pending: "IPv6 removal pending. Ark will confirm removal through public DNS.",
   a_only: "Publishing A only. IPv6 is disabled or its preflight has not passed.",
 };
+
+const watchDuration = 30 * 60_000;
 
 const removalText = {
   manual: "Remove at provider",
@@ -99,19 +101,23 @@ export function DnsReviewPanel({
   const [failure, setFailure] = useState("");
   const [feedback, setFeedback] = useState("");
   const [busy, setBusy] = useState(true);
-  const [authorize, setAuthorize] = useState(false);
+  const [authorizedPlan, setAuthorizedPlan] = useState<string | null>(null);
   const [enabling, setEnabling] = useState(false);
+  const watchUntil = useRef(0);
 
   useEffect(() => {
     let active = true;
-    let manual = false;
-    const started = Date.now();
+    setAuthorizedPlan(null);
+    watchUntil.current = 0;
     loadReview(reviewPath)
-      .then(({ review: received, providerError }) => {
+      .then(async ({ review: received, providerError }) => {
         if (!active) return;
-        manual = received.provider !== "cloudflare";
         setReview(received);
         setFailure(providerError);
+        if (received.provider !== "cloudflare") {
+          await api("/api/domains/" + received.domainId + "/dns/watch", { method: "POST", body: "{}" });
+          if (active) watchUntil.current = Date.now() + watchDuration;
+        }
       })
       .catch((error: Error) => {
         if (active) setFailure(error.message);
@@ -120,7 +126,7 @@ export function DnsReviewPanel({
         if (active) setBusy(false);
       });
     const timer = setInterval(() => {
-      if (!manual || Date.now() - started > 30 * 60_000) return;
+      if (Date.now() >= watchUntil.current) return;
       void api<DomainDnsReview>(reviewPath)
         .then((result) => {
           if (active) setReview(result);
@@ -141,6 +147,7 @@ export function DnsReviewPanel({
       await action();
       const result = await loadReview(reviewPath);
       setReview(result.review);
+      setAuthorizedPlan((current) => (current === result.review.cloudflare?.planHash ? current : null));
       setFailure(result.providerError);
     } catch (error) {
       setFailure(error instanceof Error ? error.message : "DNS request failed.");
@@ -151,6 +158,7 @@ export function DnsReviewPanel({
 
   async function verify() {
     await api("/api/domains/" + review!.domainId + "/verify", { method: "POST", body: "{}" });
+    if (review!.provider !== "cloudflare") watchUntil.current = Date.now() + watchDuration;
     setFeedback("DNS verification queued.");
   }
 
@@ -159,18 +167,18 @@ export function DnsReviewPanel({
     // Invalidate the displayed approval as soon as the request starts. A partial publish or
     // conflict requires a fresh review before the button comes back.
     setReview(null);
+    setAuthorizedPlan(null);
     await api("/api/domains/" + review!.domainId + "/publish", {
       method: "POST",
-      body: JSON.stringify({ planHash, authorizeAAAAWithdrawal: authorize || undefined }),
+      body: JSON.stringify({ planHash, authorizeAAAAWithdrawal: authorizedPlan === planHash || undefined }),
     });
-    setAuthorize(false);
     setFeedback("Cloudflare changes applied. Public DNS verification is queued.");
     await reload?.();
   }
 
   async function revoke() {
     await api("/api/domains/" + review!.domainId + "/aaaa/authorization", { method: "DELETE" });
-    setAuthorize(false);
+    setAuthorizedPlan(null);
     setFeedback("Automatic IPv6 withdrawal authorization revoked.");
   }
 
@@ -291,8 +299,8 @@ export function DnsReviewPanel({
                 type="checkbox"
                 className="mt-1"
                 disabled={busy}
-                checked={authorize}
-                onChange={(event) => setAuthorize(event.currentTarget.checked)}
+                checked={authorizedPlan === diff.planHash}
+                onChange={(event) => setAuthorizedPlan(event.currentTarget.checked ? diff.planHash : null)}
               />
               <span>Allow Ark to withdraw its AAAA records in this review if IPv6 becomes ineligible.</span>
             </label>

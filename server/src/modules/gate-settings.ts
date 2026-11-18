@@ -25,6 +25,7 @@ import { loadEnv } from "../env.ts";
 import {
   endpointDnsScope,
   desiredDns,
+  pendingWithdrawal,
   ensureEndpointDnsRecords,
   reconcileDomainDns,
   retireDnsRecord,
@@ -150,7 +151,9 @@ async function removeGateEndpoints(tx: DbTransaction, keepHostname: string | nul
         .from(dnsRecords)
         .where(endpointDnsScope(endpoint.domainId, endpoint.hostname));
       for (const record of records.filter(
-        (item) => desiredDns(item) && item.purpose.startsWith(GATE_RECORD_PURPOSE),
+        (item) =>
+          (desiredDns(item) || (pendingWithdrawal(item) && item.withdrawalReason === "ipv6")) &&
+          item.purpose.startsWith(GATE_RECORD_PURPOSE),
       )) {
         await tx
           .update(dnsRecords)

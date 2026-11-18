@@ -142,15 +142,26 @@ export class CloudflareDns {
     return reply ? evidence(reply.result) : null;
   }
 
-  async write(zoneId: string, action: DnsReviewAction) {
+  async checkRecord(
+    zoneId: string,
+    scope: CloudflareRecordEvidence | null,
+    id: string,
+    type: string,
+    name: string,
+  ) {
+    const current = await this.record(zoneId, id);
+    if (scope ? !current || !sameRecord(current, scope) : current) throw drift(type, name);
+  }
+
+  async checkRrset(zoneId: string, name: string, snapshot: CloudflareRecordEvidence[], type: string) {
+    if (planHash(await this.records(zoneId, name)) !== planHash(snapshot)) throw drift(type, name);
+  }
+
+  async write(zoneId: string, action: DnsReviewAction, marker?: string) {
     const after = action.after!;
     const creating = action.action === "create";
-    if (!creating) {
-      const current = await this.record(zoneId, action.before!.id);
-      if (!current || !sameRecord(current, action.before!)) throw drift(after.type, after.name);
-    }
     const body = cloudflareRecordBody(after);
-    if (creating) body.comment = ownershipMarker(action.recordId);
+    if (marker) body.comment = marker;
     const reply = (await this.#request<RecordResult>(
       recordPath(zoneId, creating ? undefined : action.before!.id),
       creating ? "POST" : "PATCH",
@@ -159,12 +170,8 @@ export class CloudflareDns {
     const written = evidence(reply.result);
     if (
       (!creating && written.id !== action.before!.id) ||
-      written.proxied ||
-      written.type !== after.type ||
-      written.name !== after.name ||
-      written.ttl !== after.ttl ||
-      expectedDnsValue(written.type, written.content, written.priority) !==
-        expectedDnsValue(after.type, after.content, after.priority)
+      !matchesWrite(written, after) ||
+      (marker !== undefined && written.comment !== marker)
     ) {
       throw new DnsReviewError(
         502,
@@ -174,13 +181,15 @@ export class CloudflareDns {
     return written;
   }
 
-  async delete(scope: CloudflareOwnership, reviewed: CloudflareRecordEvidence | null) {
+  async checkDeletion(scope: CloudflareOwnership, reviewed: CloudflareRecordEvidence | null) {
     const { zoneId, record } = scope;
-    const current = await this.record(zoneId, record.id);
-    if (!current && !reviewed) return;
-    if (!current || !reviewed || !sameRecord(current, record) || !sameRecord(current, reviewed)) {
-      throw drift(record.type, record.name);
-    }
+    if (reviewed && !sameRecord(reviewed, record)) throw drift(record.type, record.name);
+    await this.checkRecord(zoneId, reviewed, record.id, record.type, record.name);
+  }
+
+  async delete(scope: CloudflareOwnership, reviewed: CloudflareRecordEvidence | null) {
+    if (!reviewed) return;
+    const { zoneId, record } = scope;
     const reply = await this.#request<{ id: string }>(
       recordPath(zoneId, record.id),
       "DELETE",
@@ -192,6 +201,17 @@ export class CloudflareDns {
       throw new DnsReviewError(502, "Cloudflare did not confirm deletion of the reviewed record ID.");
     }
   }
+}
+
+export function matchesWrite(record: CloudflareRecordEvidence, after: DnsWrite) {
+  return (
+    !record.proxied &&
+    record.type === after.type &&
+    record.name === after.name &&
+    record.ttl === after.ttl &&
+    expectedDnsValue(record.type, record.content, record.priority) ===
+      expectedDnsValue(after.type, after.content, after.priority)
+  );
 }
 
 export function drift(type: string, name: string) {
@@ -208,11 +228,10 @@ export type DesiredCloudflareRecord = DnsWrite & {
 
 export async function planCloudflare(
   client: CloudflareDns,
-  zone: string,
+  zoneId: string,
   desired: DesiredCloudflareRecord[],
   withdrawals: Array<{ recordId: string; ownership: CloudflareOwnership }>,
 ) {
-  const zoneId = await client.zoneId(zone);
   const actions: DnsReviewAction[] = [];
   const deleting = new Set<string>();
   for (const { recordId, ownership } of withdrawals) {
@@ -224,7 +243,12 @@ export async function planCloudflare(
     deleting.add(record.id);
   }
   const byName = new Map<string, CloudflareRecordEvidence[]>();
-  const names = [...new Set(desired.map((record) => record.name))];
+  const names = [
+    ...new Set([
+      ...desired.map((record) => record.name),
+      ...withdrawals.map(({ ownership }) => ownership.record.name),
+    ]),
+  ];
   for (let index = 0; index < names.length; index += 8) {
     const batch = names.slice(index, index + 8);
     const snapshots = await Promise.all(batch.map((name) => client.records(zoneId, name)));

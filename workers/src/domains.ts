@@ -12,14 +12,8 @@ import {
   type DnsPublisher,
 } from "../../server/src/modules/domain-dns.ts";
 
-const token = process.env.ARK_WORKER_TOKEN;
-if (!token) throw new Error("ARK_WORKER_TOKEN is required for the domain worker control endpoint.");
-const control = Bun.serve({
-  hostname: "0.0.0.0",
-  port: Number(process.env.ARK_DOMAIN_WORKER_PORT ?? 3102),
-  idleTimeout: 60,
-  maxRequestBodySize: 16 * 1024,
-  async fetch(request) {
+export function dnsControlHandler(token: string) {
+  return async (request: Request) => {
     const path = new URL(request.url).pathname;
     if (request.method !== "POST" || !["/dns/review", "/dns/publish"].includes(path)) {
       return new Response("not found", { status: 404 });
@@ -53,16 +47,28 @@ const control = Bun.serve({
         { status: 500 },
       );
     }
-  },
-});
+  };
+}
 
-// `edge.observe` every five minutes while the edge node's LocalAPI socket is mounted (front door §3.4).
-const observeSchedule = scheduleEdgeObserve();
-const dnsSchedule = scheduleDnsMaintenance();
-try {
-  await runWorker("domains", ["domain.", "dns.", "certificate.", "edge.", "admin."], executeClaimedJob);
-} finally {
-  if (observeSchedule) clearInterval(observeSchedule);
-  clearInterval(dnsSchedule);
-  await control.stop(true);
+if (import.meta.main) {
+  const token = process.env.ARK_WORKER_TOKEN;
+  if (!token) throw new Error("ARK_WORKER_TOKEN is required for the domain worker control endpoint.");
+  const control = Bun.serve({
+    hostname: "0.0.0.0",
+    port: Number(process.env.ARK_DOMAIN_WORKER_PORT ?? 3102),
+    idleTimeout: 60,
+    maxRequestBodySize: 16 * 1024,
+    fetch: dnsControlHandler(token),
+  });
+
+  // `edge.observe` every five minutes while the edge node's LocalAPI socket is mounted (front door §3.4).
+  const observeSchedule = scheduleEdgeObserve();
+  const dnsSchedule = scheduleDnsMaintenance();
+  try {
+    await runWorker("domains", ["domain.", "dns.", "certificate.", "edge.", "admin."], executeClaimedJob);
+  } finally {
+    if (observeSchedule) clearInterval(observeSchedule);
+    clearInterval(dnsSchedule);
+    await control.stop(true);
+  }
 }
