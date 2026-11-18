@@ -377,7 +377,7 @@ export function databaseClientRolloverGuide(input: {
     branch
       ? `# Redeploy Preview branch ${JSON.stringify(branch)} using its deploy hook or the Vercel dashboard.`
       : `vercel deploy${target === "production" ? " --prod" : ""}        # or redeploy from the dashboard`,
-    '# Check database access, then press "Confirm rollover" in Ark.',
+    "# Check database access, then confirm in Ark: POST the reveal's confirm.path with its confirm.body (MFA).",
   ].join("\n");
   return {
     target,
