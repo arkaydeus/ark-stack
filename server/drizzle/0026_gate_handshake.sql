@@ -3,18 +3,17 @@
 
 -- Durable revocation journal (§3.9.3). Every authorization revocation that can leave an open
 -- upgraded connection (a WebSocket, which forward_auth never re-checks) writes a row and queues an
--- `edge.drain` in the same transaction. The drain forces a Caddy reload (even for identical text);
--- the old handlers then close their upgraded connections after `stream_close_delay` (at most 5m on
--- an SSO route), so every socket is gone by revocation + 305 s. A row is applied only after a
--- successful forced reload. While a row stays pending for more than 5 s, the edge lease leaves the
--- route out, so the edge-local watchdog withdraws it (fail closed) and a critical alert is raised.
+-- `edge.drain` in the same transaction. The worker drains the affected HAProxy backends and
+-- forces a Caddy load, including when the rendered text is identical. A row is applied after
+-- the drain and load succeed. After 5 s pending, the lease excludes the route and the watchdog
+-- withdraws it. The API raises a critical alert.
 -- No foreign key on route_id: a deleted route is withdrawn by its own drain.
 CREATE TABLE gate_revocations (
   id text PRIMARY KEY,
   route_id text NOT NULL,
   reason text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
-  -- Set by the operation whose forced reload began after this row committed.
+  -- Set by the operation whose drain began after this row committed.
   applied_at timestamptz,
   applied_by text,
   -- Set once the deadline passed and the critical alert was raised.

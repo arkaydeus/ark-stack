@@ -8,16 +8,12 @@
 // `ark_gate_revoke` function and triggers on `gate_sessions`, `front_route_access` and the MFA
 // fields on `user`, so a revocation made by Better Auth, a cascade or a script is journalled exactly like one made here.
 //
-// - The drain (and any `edge.apply`) snapshots the pending rows, forces a Caddy `/load` with
-//   `Cache-Control: must-revalidate` even for identical text, and marks the rows applied only after
-//   it succeeded. The old handlers close their upgraded connections after `stream_close_delay`,
-//   which is at most 5m on an SSO route, so every socket is gone by revocation + 305 s.
-// - A failed or interrupted drain leaves the rows pending. `ensureGateRevocationDrain` re-queues the
-//   work on claims with exponential backoff (10 s to 5 min), so it survives worker restarts and failures.
-// - A row pending for more than 5 s takes its route out of the lease the edge-local watchdog
-//   enforces (`edgeLeaseDocument`): the watchdog withdraws it (zero stream-close delay, or a Caddy
-//   stop when the old handler keeps streams open) and a critical alert is raised. The route comes
-//   back once a forced reload has applied the revocation.
+// - The drain snapshots pending rows, fences and drains the affected HAProxy backends before
+//   and after a forced Caddy load, then marks those rows applied. The next HAProxy generation
+//   re-admits routes whose revocations have been applied.
+// - Claims retry pending work with exponential backoff from 10 s to 5 min.
+// - A row pending longer than 5 s takes its route out of the watchdog lease. The watchdog
+//   fences the backend and closes its existing sessions, and the API raises a critical alert.
 
 import {
   GATE_REVOCATION_DEADLINE_MS,
@@ -32,7 +28,7 @@ import { edgePolicy } from "./edge-observe.ts";
 
 export const GATE_REVOCATION_ALERT = "gate-revocation-overdue";
 
-/** Revocations whose forced reload has not succeeded yet, oldest first. */
+/** Revocations whose route drain is still pending, oldest first. */
 export async function pendingGateRevocations(): Promise<PendingGateRevocation[]> {
   const rows = await sql`
     SELECT id, route_id, created_at FROM gate_revocations
@@ -46,7 +42,7 @@ export async function pendingGateRevocations(): Promise<PendingGateRevocation[]>
   }));
 }
 
-/** Marks revocations applied by a forced reload that began after they committed. */
+/** Marks revocations applied after the affected sessions have closed and Caddy has loaded. */
 export async function markGateRevocationsApplied(ids: string[], appliedBy: string) {
   if (!ids.length) return 0;
   const rows = await sql`
@@ -85,7 +81,7 @@ export async function edgeLeaseDocument(now = new Date()): Promise<EdgeLeaseDocu
     if (late.length) {
       await raiseAlert({
         severity: "critical",
-        title: `Gate revocation not applied within 5 s; the edge withdrew route(s) ${[...new Set(late.map((row) => String(row.route_id)))].join(", ")} until a forced reload succeeds`,
+        title: `Gate revocation not applied within 5 s; the edge withdrew route(s) ${[...new Set(late.map((row) => String(row.route_id)))].join(", ")} until the drain and config load succeed`,
         dedupKey: GATE_REVOCATION_ALERT,
       }).catch(() => undefined);
     }

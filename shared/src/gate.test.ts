@@ -3,7 +3,6 @@
 // deadline applied to the edge lease.
 import { describe, expect, test } from "bun:test";
 
-import { caddyLongLivedStreams, routeIdentityKey } from "./edge-withdrawal.ts";
 import { ValidationError } from "./errors.ts";
 import {
   GATE_REVOCATION_DEADLINE_MS,
@@ -210,9 +209,6 @@ describe("check redirect or 401", () => {
   });
 });
 
-const identity = (id: string, port: number) =>
-  routeIdentityKey({ id, hostname: `${id}.example.com`, stableId: "n1", ip: "100.64.0.9", port });
-
 describe("revocation deadline (§3.9.3)", () => {
   const routes = [{ id: "rt_a" }, { id: "rt_b" }];
   const now = new Date("2026-11-17T12:00:00Z");
@@ -233,44 +229,6 @@ describe("revocation deadline (§3.9.3)", () => {
         now,
       ),
     ).toEqual({ routes: [{ id: "rt_b" }], overdue: ["rt_a"] });
-  });
-
-  test("handlers of revoked routes whose streams outlive 5m are found for the Caddy stop", () => {
-    const config = {
-      apps: {
-        http: {
-          servers: {
-            s: {
-              routes: [
-                {
-                  handle: [
-                    { handler: "vars", ark_tailnet_route: identity("rt_a", 3000) },
-                    { handler: "reverse_proxy", upstreams: [{ dial: "api:3000" }] },
-                    {
-                      handler: "reverse_proxy",
-                      stream_close_delay: 3_600_000_000_000,
-                      upstreams: [{ dial: "100.64.0.9:3000" }],
-                    },
-                  ],
-                },
-                {
-                  handle: [
-                    { handler: "vars", ark_tailnet_route: identity("rt_b", 3001) },
-                    {
-                      handler: "reverse_proxy",
-                      stream_close_delay: 300_000_000_000,
-                      upstreams: [{ dial: "100.64.0.9:3001" }],
-                    },
-                  ],
-                },
-              ],
-            },
-          },
-        },
-      },
-    };
-    expect(caddyLongLivedStreams(config, new Set(["rt_a", "rt_b"]), 300_000)).toEqual(["100.64.0.9:3000"]);
-    expect(caddyLongLivedStreams(config, new Set(["rt_b"]), 300_000)).toEqual([]);
   });
 });
 

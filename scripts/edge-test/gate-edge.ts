@@ -13,7 +13,7 @@ import { join, resolve } from "node:path";
 import type { EdgeLeaseDocument, EdgePolicyRoute, WatchdogEvent } from "@ark-stack/shared";
 
 import type { EdgeTestRuntime } from "./runtime.ts";
-import { type EdgeStack, startEdgeStack } from "./stack.ts";
+import { type EdgeStack, httpRouterArgs, startEdgeStack } from "./stack.ts";
 
 export const bunImage =
   "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
@@ -59,6 +59,8 @@ export type GateEdgeOptions = {
   hostnames: string[];
   /** The lease's routes (§3.2); `overdue` below removes entries as the API does (§3.9.3). */
   policy: (peerIp: string) => EdgePolicyRoute[];
+  /** The runtime gate suite shares the HAProxy master socket with the in-container worker. */
+  targetedHttp?: boolean;
   /** The `api:3000` container: bundled entry point and its environment. */
   lease?: () => Promise<EdgeLeaseDocument | undefined>;
   api: { entry: string; env: Record<string, string>; hostGateway?: boolean };
@@ -73,9 +75,7 @@ export type GateEdge = {
   /** Route IDs the lease leaves out, as the API does for a revocation overdue by more than 5 s. */
   overdue: Set<string>;
   events: WatchdogEvent[];
-  edgeApply: (
-    plan: unknown,
-  ) => Promise<{ applied: boolean; httpRoutes: string[]; stoppedForStreams?: string[] }>;
+  edgeApply: (plan: unknown) => Promise<{ applied: boolean; httpRoutes: string[] }>;
   /** `GET /__seen` from inside a fixture container. */
   seen: (container: string) => Promise<unknown[]>;
   stop: () => void;
@@ -207,6 +207,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     acmeDir,
     certDir,
     edgeDir,
+    validator: options.targetedHttp,
     ports: ["127.0.0.1::80", "127.0.0.1::443"],
     edgeEnvironment: { ARK_EDGE_GATE_TOKEN: options.gateToken },
     edgeTsCommand: [
@@ -236,7 +237,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     "/fixture/app.ts",
   );
 
-  // The edge watchdog as shipped (uid 1000, read-only root, no capabilities), Caddy only.
+  // The edge watchdog as shipped (uid 1000, read-only root, no capabilities).
   runtime.containers.push(watchdogName);
   await docker(
     "run",
@@ -268,6 +269,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     "ARK_EDGE_DIR=/var/lib/ark/edge",
     "--volume",
     `${edgeDir}:/var/lib/ark/edge`,
+    ...(options.targetedHttp ? httpRouterArgs(stack) : []),
     "--volume",
     `${watchdogBundle}:/watchdog:ro`,
     "--workdir",
@@ -301,6 +303,8 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
       stack.networks.edgeControl,
       "--user",
       "1000:1000",
+      "--group-add",
+      "4400",
       "--env",
       "HOME=/tmp",
       "--env",
@@ -313,15 +317,16 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
       `${writeEdgeBundle}:/harness:ro`,
       "--volume",
       `${edgeDir}:/edge`,
+      ...(options.targetedHttp ? httpRouterArgs(stack, true) : []),
       "--workdir",
       "/tmp",
       bunImage,
       "bun",
       "/harness/write-edge.js",
-      "write",
+      options.targetedHttp ? "write-routed" : "write",
       JSON.stringify(plan),
     );
-    return JSON.parse(output) as { applied: boolean; httpRoutes: string[]; stoppedForStreams?: string[] };
+    return JSON.parse(output) as { applied: boolean; httpRoutes: string[] };
   };
 
   const seen = async (container: string) =>

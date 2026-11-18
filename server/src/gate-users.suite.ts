@@ -730,8 +730,7 @@ describe("deletion", () => {
     const drains =
       await sql`SELECT 1 FROM operations WHERE kind = 'edge.drain' AND status = 'queued' AND payload ->> 'reason' = 'gate_revocation'`;
     expect(drains).toHaveLength(1);
-    // The drain forces a reload even though nothing else changed; the old handler then closes the
-    // route's upgraded connections within its stream_close_delay (FD-11's 305 s bound).
+    // The forced reload installs the current gate configuration even when its text is unchanged.
     const loads = caddy.loads.length;
     await runDrains();
     expect(caddy.loads.length).toBe(loads + 1);

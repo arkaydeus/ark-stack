@@ -385,7 +385,7 @@ describe("SSO routes (§3.5, §3.9, FD-11)", () => {
     expect(publicBody).toContain("  handle /.ark/gate/* {\n    respond 404\n  }\n");
   });
 
-  test("SSO stream close delay is capped at 5m (revocation + 305 s, §3.9.3)", () => {
+  test("SSO stream close delay remains capped at 5m", () => {
     expect(() => checkedHttpRoute({ ...sso, options: { streamCloseDelay: "5m" } })).not.toThrow();
     expect(() => checkedHttpRoute({ ...sso, options: { streamCloseDelay: "6m" } })).toThrow(/5m/);
     // A public route keeps the FD-09 range.

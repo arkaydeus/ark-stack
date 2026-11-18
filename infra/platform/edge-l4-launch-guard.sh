@@ -8,11 +8,13 @@
 # generation symlink the domain worker swaps, so a master-CLI `reload` always reads the newest
 # generation in the mode this guard chose:
 #
-# - A configuration without any tailnet server needs no lease: the full variant; supervision stays latched after any protected generation.
-# - Otherwise the edge watchdog must answer `open` (every tailnet server authorised by a valid lease)
+# - A configuration without protected routes needs no lease. Supervision stays latched after any
+#   generation with an HTTP or L4 tailnet route.
+# - Otherwise the edge watchdog must answer `open` (every protected server authorised by a valid lease)
 #   for the full variant; else (or when the watchdog cannot be reached) the closed variant, which
-#   renders no tailnet backend. HTTP routes through Caddy keep working; tailnet routes fail closed.
-# - Once a tailnet route has existed, the watchdog must keep reporting verified HAProxy enforcement every
+#   omits L4 tailnet targets. Caddy independently checks its HTTP lease and selects its closed
+#   configuration when needed.
+# - Once a protected route has existed, the watchdog must keep reporting verified HAProxy enforcement every
 #   250 ms. After two consecutive misses, every HAProxy process is killed (listeners and established
 #   sessions), the container exits, and the next start is decided again.
 # - Started closed, the guard re-asks the watchdog and switches to the full variant (link + reload)
@@ -32,7 +34,7 @@ watchdog="${ARK_EDGE_WATCHDOG_URL:-http://edge-watchdog:2021}"
 # every reload; the validator sets the same variable to the candidate it checks.
 export ARK_EDGE_L4_GENERATION="$root/current"
 
-guarded() { grep -q '^# ark-tailnet-route ' "$full" 2>/dev/null; }
+guarded() { grep -Eq '^# ark-(tailnet|http)-route ' "$full" 2>/dev/null; }
 # `wget -T` bounds reads, not name resolution: once the watchdog container is gone, resolving its
 # name can take the resolver's 5 s timeout (Docker behind systemd-resolved). Bound the whole request.
 ask() { timeout 1 wget -q -T 1 -O - "$watchdog/v1/launch?proxy=haproxy$1" 2>/dev/null || true; }
@@ -50,7 +52,7 @@ mode=full
 latched=0
 if guarded; then latched=1; fi
 if ! guarded; then
-  reason="the configuration has no tailnet route"
+  reason="the configuration has no protected route"
 else
   decision=""
   attempt=0
@@ -64,7 +66,7 @@ else
     reason="the watchdog confirmed a valid lease"
   elif [ -r "$closed" ]; then
     mode=closed
-    reason="no valid lease (watchdog: ${decision:-unreachable}); tailnet routes are not served"
+    reason="protected routes not authorised (watchdog: ${decision:-unreachable})"
   else
     echo "ark edge-l4 launch guard: no valid lease and no closed config; refusing to start" >&2
     exit 1
@@ -85,7 +87,7 @@ kill_all() {
 # Keep heartbeat enforcement independent of launch requests and potentially slow reloads.
 # An immutable generation records that protected workers might exist, including generations
 # installed and replaced between two polls. Generations are retained while workers leave.
-protected_generation() { grep -q '^# ark-tailnet-route ' "$root"/generations/*/haproxy.cfg 2>/dev/null; }
+protected_generation() { grep -Eq '^# ark-(tailnet|http)-route ' "$root"/generations/*/haproxy.cfg 2>/dev/null; }
 supervise() {
   # Allow the first enforcement pass to inspect the newly started HAProxy.
   sleep 2
@@ -130,7 +132,7 @@ reopen() {
       elif [ "$mode" = full ] && [ "$decision" = "closed" ]; then
         point "$closed"
         mode=closed
-        echo "ark edge-l4 launch guard: lease no longer allows every tailnet route; later reloads use the closed configuration" >&2
+        echo "ark edge-l4 launch guard: lease no longer allows every protected route; later reloads use the closed configuration" >&2
       fi
     fi
     sleep 1

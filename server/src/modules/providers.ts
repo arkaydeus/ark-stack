@@ -8,11 +8,10 @@ import {
   buildStalwartPlan,
   compareInventory,
   digestFromHeaders,
-  caddyState,
   CaddyWithdrawalAdapter,
   EDGE_CERT_DIR,
   EDGE_ERRORS_DIR,
-  GATE_MAX_STREAM_CLOSE_DELAY_MS,
+  routeIdentityKey,
   edgeCertificatePaths,
   funnelDisabled,
   jmapCall,
@@ -22,6 +21,7 @@ import {
   registryManifestUrl,
   renderCaddyfile,
   renderTailscaleServe,
+  servedHttpRoutes,
   sesIdentityPlan,
   signAwsRequest,
   stalwartRef,
@@ -30,6 +30,8 @@ import {
   type EdgeHttpRoute,
   type ExternalInventory,
 } from "@ark-stack/shared";
+
+import { haproxyAdapter } from "./edge-l4.ts";
 
 const exec = promisify(execFile);
 
@@ -491,9 +493,7 @@ export async function writeEdge(input: {
   /** Front-door HTTP routes allowed by the current lease and servable (front door §3.2, §3.5). */
   httpRoutes?: EdgeHttpRoute[];
   /**
-   * Routes with a pending gate revocation (FD-11, §3.9.3). This /load is their forced reload; if a
-   * route's active handler keeps upgraded streams longer than 5m (a public route just switched to
-   * SSO), Caddy is stopped after the reload as for a removed route.
+   * Routes with a pending gate revocation (FD-11). Close their existing HAProxy sessions.
    */
   revokedRouteIds?: string[];
 }) {
@@ -535,29 +535,31 @@ export async function writeEdge(input: {
   await writeFile(nextServe, JSON.stringify(serve, null, 2), { mode: 0o600 });
   const reloadUrl = process.env.ARK_EDGE_RELOAD_URL;
   let applied = false;
-  let lingering: string[] = [];
-  const state = caddyState(dir);
-  const adapter = reloadUrl ? new CaddyWithdrawalAdapter(reloadUrl, fetch, 3_000, state) : null;
   if (reloadUrl) {
-    // A prior apply may have loaded/renamed its files but failed to stop the old streams.
-    // Retry that durable stop before inspection can mistake the new config for an empty census.
-    const pending = await state.pendingStreams();
-    if (pending.length) {
-      await adapter!.stopForStreams();
-      throw new Error("Caddy is restarting after a pending stream stop; retry edge.apply.");
-    }
-    const next = new Set(
-      [...caddy.matchAll(/^\s*vars ark_tailnet_route (\S+)\s*$/gm)].map((match) => match[1]!),
+    const caddyAdmin = new CaddyWithdrawalAdapter(reloadUrl);
+    const active = new Set(await caddyAdmin.activeRoutes());
+    const revoked = new Set(input.revokedRouteIds);
+    const allowed = new Set(
+      servedHttpRoutes({ certificates: input.certificates ?? [], httpRoutes: input.httpRoutes })
+        .filter(
+          (route) => !revoked.has(route.id) && !(route.redirectTo && active.has(routeIdentityKey(route))),
+        )
+        .map(routeIdentityKey),
     );
-    // An unreadable config is unknown, never evidence of absent streams. Abort before /load.
-    lingering = await adapter!.lingeringStreams(
-      next,
-      input.revokedRouteIds?.length
-        ? { routeIds: new Set(input.revokedRouteIds), maxMs: GATE_MAX_STREAM_CLOSE_DELAY_MS }
-        : null,
-    );
-    if (lingering.length) await adapter!.markPendingStreams(lingering);
+    const haproxy = haproxyAdapter();
+    if (
+      [...active].some((identity) => !allowed.has(identity)) &&
+      (haproxy ? await haproxy.hasLegacyHttp() : process.env.NODE_ENV === "production")
+    )
+      throw new Error("HTTP route withdrawal requires a scoped HAProxy generation.");
+    const drain = async () => {
+      const result = await haproxy?.enforceHttp(allowed);
+      if (result?.error) throw new Error(`HTTP route withdrawal failed: ${result.error}`);
+    };
+    await drain();
     await loadCaddyfile(reloadUrl, caddy);
+    // Verify again in case the launch guard reloaded HAProxy during Caddy's load.
+    await drain();
     applied = true;
   } else if (process.env.NODE_ENV === "production") {
     throw new Error("ARK_EDGE_RELOAD_URL is required to apply gateway changes in production.");
@@ -566,18 +568,11 @@ export async function writeEdge(input: {
   await rename(nextCaddy, caddyPath);
   await rename(nextServe, servePath);
   await chmod(caddyPath, 0o600);
-  // A removed route must not keep serving through open WebSockets: stop Caddy once the new files are
-  // in place, so its launch guard restarts it from them (front door §3.2, §3.5). The marker tells
-  // the edge watchdog that the restart is expected, not a failed withdrawal.
-  if (reloadUrl && lingering.length) {
-    await adapter!.stopForStreams();
-  }
   return {
     dir,
     funnel: false,
     applied,
     httpRoutes: (input.httpRoutes ?? []).map((route) => route.id),
-    ...(lingering.length ? { stoppedForStreams: lingering } : {}),
   };
 }
 
