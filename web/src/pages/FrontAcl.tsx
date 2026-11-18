@@ -207,17 +207,25 @@ export function FrontAclView({ state }: { state: PlatformState }) {
   );
 }
 
+type DiffLine = NonNullable<FrontAclSnippet["diff"]>[number];
+
+// Old and new line numbers identify each diff line uniquely.
+function keyDiffLines(diff: readonly DiffLine[]): (DiffLine & { key: string })[] {
+  const keyed: (DiffLine & { key: string })[] = [];
+  let oldLine = 0;
+  let newLine = 0;
+  for (const line of diff) {
+    if (line.op !== "add") oldLine++;
+    if (line.op !== "remove") newLine++;
+    keyed.push({ ...line, key: `${line.op}-${oldLine}-${newLine}` });
+  }
+  return keyed;
+}
+
 function DiffCard({ data }: { data: FrontAclSnippet }) {
   const [changesOnly, setChangesOnly] = useState(true);
   const changes = data.diff?.filter((line) => line.op !== "same").length ?? 0;
-  // Old and new line numbers identify each diff line uniquely.
-  let oldLine = 0;
-  let newLine = 0;
-  const keyed = (data.diff ?? []).map((line) => {
-    if (line.op !== "add") oldLine++;
-    if (line.op !== "remove") newLine++;
-    return { ...line, key: `${line.op}-${oldLine}-${newLine}` };
-  });
+  const keyed = keyDiffLines(data.diff ?? []);
   return (
     <Card>
       <CardHeader>
