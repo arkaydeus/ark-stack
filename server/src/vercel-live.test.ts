@@ -221,38 +221,63 @@ for (const [label, token] of Object.entries(refusalTokens)) {
   );
 }
 
-const deployHook = env.ARK_TEST_VERCEL_DEPLOY_HOOK;
-test.skipIf(!scopeCredentials || !deployHook)(
-  "live Vercel correlates a deploy hook with its deployment (requires ARK_TEST_VERCEL_DEPLOY_HOOK and scope credentials)",
-  async () => {
-    const [, selected] = await readProjectProbes();
-    const hook = deployHookUrl(deployHook!, projectId);
-    const project = object(selected.body);
-    const branch = hook && project && deployHookBranch(project, hook, selection);
-    if (!hook || !branch)
-      throw new Error("The scratch production hook must match the selected project and branch.");
-    const requestedAt = new Date();
-    const jobId = await triggerVercelHook(api, hook);
-    while (Date.now() - requestedAt.getTime() < 30 * 60_000) {
-      const ready = await vercelHookDeployment(
-        api,
-        { ...selection, gitBranch: branch },
-        projectToken,
-        jobId,
-        requestedAt,
-      );
-      if (ready) {
-        console.log(
-          "[FD-29 live hook proof] The exact hook job produced a matching READY production deployment.",
+for (const [target, variable] of [
+  ["production", "ARK_TEST_VERCEL_DEPLOY_HOOK"],
+  ["preview", "ARK_TEST_VERCEL_PREVIEW_DEPLOY_HOOK"],
+] as const) {
+  const deployHook = env[variable];
+  test.skipIf(!scopeCredentials || !deployHook)(
+    `live Vercel correlates a ${target} deploy hook (requires ${variable} and scope credentials)`,
+    async () => {
+      const [, selected] = await readProjectProbes();
+      const hook = deployHookUrl(deployHook!, projectId);
+      const project = object(selected.body);
+      const hookSelection = { ...selection, target };
+      const branch = hook && project && deployHookBranch(project, hook, hookSelection);
+      if (!hook || !branch)
+        throw new Error("The scratch hook must match the selected project, target and branch.");
+      const requestedAt = new Date();
+      const jobId = await triggerVercelHook(api, hook);
+      let cursor: number | undefined;
+      while (Date.now() - requestedAt.getTime() < 30 * 60_000) {
+        const hookDeployment = await vercelHookDeployment(
+          api,
+          { ...hookSelection, gitBranch: branch },
+          projectToken,
+          jobId,
+          requestedAt,
+          cursor,
         );
-        return;
+        if (hookDeployment.state === "ready") {
+          const otherBranch = await vercelHookDeployment(
+            api,
+            { ...hookSelection, gitBranch: `fd29-absent-${randomBytes(8).toString("hex")}` },
+            projectToken,
+            jobId,
+            requestedAt,
+          );
+          expect(otherBranch.state).toBe("pending");
+          console.log(
+            "[FD-29 live hook proof]",
+            JSON.stringify({
+              checkedAt: new Date().toISOString(),
+              fixture: target,
+              target: hookDeployment.target,
+              customEnvironmentAbsent: true,
+              exactReadyReceipt: true,
+              excludedByDifferentBranchFilter: true,
+            }),
+          );
+          return;
+        }
+        cursor = hookDeployment.cursor;
+        await Bun.sleep(5_000);
       }
-      await Bun.sleep(5_000);
-    }
-    throw new Error("No matching READY deployment could be established for the hook job.");
-  },
-  31 * 60_000,
-);
+      throw new Error("No matching READY deployment could be established for the hook job.");
+    },
+    31 * 60_000,
+  );
+}
 
 const redeployToken = env.ARK_TEST_VERCEL_REDEPLOY_TOKEN || projectToken;
 const baselineId = env.ARK_TEST_VERCEL_BASELINE_DEPLOYMENT_ID;

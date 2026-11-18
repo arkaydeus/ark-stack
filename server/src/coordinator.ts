@@ -2672,8 +2672,11 @@ export async function queueDailyRollover(now: Date) {
   return row ?? null;
 }
 
+const rolloverAlertSweeps = [evaluateRolloverAlerts, evaluateVercelTokenAlerts];
+
+type RolloverAlertSweep = { nextAt: number; running?: Promise<void> };
 type RolloverTickState = {
-  lastAlerts?: number;
+  alertSweeps?: RolloverAlertSweep[];
   alertTask?: Promise<void>;
   timers?: Map<string, ReturnType<typeof setTimeout>>;
   tickMs?: number;
@@ -2691,18 +2694,23 @@ export async function rolloverTick(
   const runtime = { ...clientOperationRuntime, ...overrides };
   const now = runtime.now();
   const queued = await queueDailyRollover(now);
-  if (!state.alertTask && (!state.lastAlerts || now.getTime() - state.lastAlerts >= 3_600_000)) {
-    state.lastAlerts = now.getTime();
-    state.alertTask = Promise.allSettled([evaluateRolloverAlerts(now), evaluateVercelTokenAlerts(now)])
-      .then((results) => {
-        for (const result of results) {
-          if (result.status === "rejected") console.error("Rollover alert evaluation failed");
-        }
+  const sweeps = (state.alertSweeps ??= rolloverAlertSweeps.map<RolloverAlertSweep>(() => ({ nextAt: 0 })));
+  rolloverAlertSweeps.forEach((evaluate, index) => {
+    const sweep = sweeps[index]!;
+    if (sweep.running || now.getTime() < sweep.nextAt) return;
+    sweep.running = evaluate(now)
+      .then(() => {
+        sweep.nextAt = runtime.now().getTime() + 3_600_000;
+      })
+      .catch(() => {
+        sweep.nextAt = runtime.now().getTime() + 5_000;
+        console.error("Rollover alert evaluation failed");
       })
       .finally(() => {
-        state.alertTask = undefined;
+        sweep.running = undefined;
       });
-  }
+  });
+  state.alertTask = Promise.all(sweeps.map((sweep) => sweep.running)).then(() => {});
   const timers = state.timers;
   if (timers) {
     for (const item of await dueRetirements({ now, lookaheadMs: (state.tickMs ?? 1_000) * 2 })) {
@@ -2728,7 +2736,7 @@ export function startRolloverScheduler(
   tickMs = Number(process.env.ARK_ROLLOVER_TICK_MS ?? 1_000),
   overrides: Partial<ClientOperationRuntime> = {},
 ) {
-  const state = { timers: new Map<string, ReturnType<typeof setTimeout>>(), tickMs, lastAlerts: 0 };
+  const state = { timers: new Map<string, ReturnType<typeof setTimeout>>(), tickMs };
   let running = false;
   const tick = () => {
     if (running) return;

@@ -41,6 +41,7 @@ const { withPgbouncerLock } = await import("./modules/pgbouncer-lock.ts");
 const clients = await import("./modules/db-clients.ts");
 const rollover = await import("./modules/db-client-rollover.ts");
 const coordinator = await import("./coordinator.ts");
+const { evaluateAlerts, raiseAlert } = await import("./modules/alerts.ts");
 const vercel = await import("./modules/vercel-integrations.ts");
 const { vercelConnectBinding } = await import("./modules/vercel-api.ts");
 const { loadPoolerPolicy, poolerEdgeInput } = await import("./modules/pooler-policy.ts");
@@ -1173,7 +1174,6 @@ describe("rollover recovery and concurrency", () => {
     const [count] =
       await sql`SELECT count(*)::int AS n FROM operations WHERE payload->>'certificateId' = ${c.first.id}`;
     expect(count!.n).toBe(1);
-    const { evaluateAlerts } = await import("./modules/alerts.ts");
     await evaluateAlerts();
     const [alertCount] =
       await sql`SELECT count(*)::int AS n FROM alerts WHERE dedup_key IN (SELECT 'op-failed:' || id FROM operations WHERE payload->>'certificateId' = ${c.first.id})`;
@@ -1414,11 +1414,20 @@ describe("FD-29 Vercel delivery", () => {
     | "invalidToken";
   type Options = {
     refusal?: Refusal;
-    push?: "ready" | "error" | "partial" | "unknownReceipt" | "timeout" | "upsertUnavailable";
+    push?:
+      | "ready"
+      | "error"
+      | "partial"
+      | "partialOnce"
+      | "unknownReceipt"
+      | "timeout"
+      | "upsertRejected"
+      | "upsertUnsettled";
     beforeEnv?: () => Promise<void>;
     beforeHook?: () => Promise<void>;
     environment?: Map<string, string>;
-    onPoll?: (poll: number) => Promise<void>;
+    previewOverrides?: Map<string, Map<string, string>>;
+    onPoll?: (poll: number, url: URL) => Promise<void | Response>;
     beforeProbe?: () => Promise<void>;
     expiresAt?: Date;
   };
@@ -1430,7 +1439,8 @@ describe("FD-29 Vercel delivery", () => {
       authenticated: boolean;
     }> = [];
     let polls = 0;
-    const branch = input.gitBranch ?? "main";
+    let writes = 0;
+    const branch = input.gitBranch ?? (input.target === "preview" ? "fd29-preview" : "main");
     const transport: VercelTransport = async (url, init) => {
       const method = init.method ?? "GET";
       const headers = new Headers(init.headers);
@@ -1495,17 +1505,24 @@ describe("FD-29 Vercel delivery", () => {
       }
       if (url.pathname === `/v10/projects/${projectId}/env`) {
         await options.beforeEnv?.();
-        if (options.push === "upsertUnavailable") return Response.json({}, { status: 503 });
+        writes++;
+        if (options.push === "upsertRejected") return Response.json({}, { status: 429 });
+        if (options.push === "upsertUnsettled") throw new Error("The provider outcome is unknown");
         if (!Array.isArray(body)) return Response.json({}, { status: 400 });
         // Vercel may accept one entry and refuse the other. Existing deployments keep their env.
-        const accepted = options.push === "partial" ? body.slice(0, 1) : body;
+        const partial = options.push === "partial" || (options.push === "partialOnce" && writes === 1);
+        const accepted = partial ? body.slice(0, 1) : body;
         for (const entry of accepted) {
-          options.environment?.set(String(entry?.key), String(entry?.value));
+          const environment =
+            entry.gitBranch && options.previewOverrides
+              ? options.previewOverrides.get(String(entry.gitBranch))
+              : options.environment;
+          environment?.set(String(entry.key), String(entry.value));
         }
         return Response.json(
           {
             created: accepted.map(({ key, type, target, gitBranch }) => ({ key, type, target, gitBranch })),
-            failed: options.push === "partial" ? [{ error: { message: input.token } }] : [],
+            failed: partial ? [{ error: { message: input.token } }] : [],
           },
           { status: 201 },
         );
@@ -1517,7 +1534,8 @@ describe("FD-29 Vercel delivery", () => {
         return Response.json({ job: { id: jobId, state: "PENDING" } }, { status: 201 });
       }
       if (url.pathname === "/v7/deployments") {
-        await options.onPoll?.(++polls);
+        const response = await options.onPoll?.(++polls, url);
+        if (response) return response;
         const readyState =
           options.push === "error"
             ? "ERROR"
@@ -1527,7 +1545,7 @@ describe("FD-29 Vercel delivery", () => {
         const expected = {
           source: "git-deploy-hook",
           projectId,
-          target: input.target === "preview" ? null : "production",
+          target: input.target,
         };
         return Response.json({
           deployments: [
@@ -1676,7 +1694,8 @@ describe("FD-29 Vercel delivery", () => {
   test("seals only a project-verified token and hook, queues after trust reload, delivers only after READY and cleans up on disconnect", async () => {
     clock = new Date();
     const { clientId, first } = await issueClient("vercelready", "preview");
-    const input = inputFor("verified", "preview");
+    const input = { ...inputFor("verified", "preview"), gitBranch: undefined };
+    const hookBranch = "fd29-preview";
     const ref = actorRef(clientId);
     const mock = mockApi(input, {
       beforeProbe: () => noConnection(clientId),
@@ -1686,7 +1705,7 @@ describe("FD-29 Vercel delivery", () => {
     expect(connected).toMatchObject({
       projectId,
       target: "preview",
-      gitBranch: input.gitBranch,
+      gitBranch: hookBranch,
       tokenExpiresAt: at(clock, 30),
     });
     expect(mock.calls.map(({ path }) => path).toSorted()).toEqual(expectedProbes);
@@ -1728,9 +1747,21 @@ describe("FD-29 Vercel delivery", () => {
     expect(await claim.json()).toMatchObject({ jobs: [{ id: pushId, kind: "integration.vercel_push" }] });
     const [op] = await sql`SELECT * FROM operations WHERE id = ${pushId}`;
 
+    const defaults = new Map([[VERCEL_ENV_NAMES.key, "default-key"]]);
+    const overrides = new Map([
+      [VERCEL_ENV_NAMES.cert, "old-cert"],
+      [VERCEL_ENV_NAMES.key, "old-key"],
+    ]);
     const push = mockApi(input, {
       push: "ready",
+      environment: defaults,
+      previewOverrides: new Map([[hookBranch, overrides]]),
       onPoll: async () => {
+        const pem = Buffer.from(overrides.get(VERCEL_ENV_NAMES.cert)!, "base64").toString();
+        const key = Buffer.from(overrides.get(VERCEL_ENV_NAMES.key)!, "base64");
+        expect(pem).toBe(pending.certPem!);
+        expect(new X509Certificate(pem).checkPrivateKey(createPrivateKey(key))).toBe(true);
+        expect(defaults.get(VERCEL_ENV_NAMES.key)).toBe("default-key");
         const certificates = await chain(clientId);
         expect(certificates.find((row) => row.id === first.id)?.rolloverState).toBe("current");
         expect(certificates.find((row) => row.id === pending.id)).toMatchObject({
@@ -1759,7 +1790,7 @@ describe("FD-29 Vercel delivery", () => {
     const target = {
       type: "sensitive",
       target: ["preview"],
-      gitBranch: input.gitBranch,
+      gitBranch: hookBranch,
     };
     const env = mutations[0]!.body!;
     expect(env).toEqual([
@@ -2033,7 +2064,7 @@ describe("FD-29 Vercel delivery", () => {
     const { clientId, first } = await issueClient("verceldailyretry");
     const ref = actorRef(clientId);
     const input = inputFor("retry");
-    const mock = mockApi(input, { push: "upsertUnavailable", expiresAt: at(clock, 120) });
+    const mock = mockApi(input, { push: "upsertRejected", expiresAt: at(clock, 120) });
     await vercel.connectVercel(ref, input, mock);
     try {
       clock = at(first.notAfter, -29);
@@ -2049,6 +2080,14 @@ describe("FD-29 Vercel delivery", () => {
           vercelPush: (operation) => vercel.pushVercelRollover(operation, mock),
         }),
       ).rejects.toThrow(/Manual rollover is available/);
+      const genericKey = `op-failed:${initial}`;
+      await evaluateAlerts();
+      expect(await openAlert(genericKey)).toBeUndefined();
+      await raiseAlert({
+        dedupKey: genericKey,
+        title: "Operation integration.vercel_push failed",
+        severity: "warning",
+      });
 
       clock = at(clock, 1);
       const retryDay = await coordinator.rolloverTick(runtime);
@@ -2071,6 +2110,9 @@ describe("FD-29 Vercel delivery", () => {
         }),
       ).resolves.toMatchObject({ certificateId: pending.id, deploymentId });
       expect((await openAlert(rollover.vercelPushAlertKey(clientId)))?.resolved_at).toBeTruthy();
+      await evaluateAlerts();
+      expect((await openAlert(genericKey))?.resolved_at).toBeTruthy();
+      await sql`DELETE FROM alerts WHERE dedup_key = ${genericKey}`;
     } finally {
       await vercel.disconnectVercel(ref);
       await park(clientId);
@@ -2084,6 +2126,7 @@ describe("FD-29 Vercel delivery", () => {
     const input = inputFor("retryreceipt");
     try {
       const pending = await issueEarly(clientId);
+      const requestedAt = clock;
       const slow = mockApi(input, { push: "timeout" });
       await vercel.connectVercel(ref, input, slow);
       const initial = await queuedPushId(clientId);
@@ -2105,9 +2148,47 @@ describe("FD-29 Vercel delivery", () => {
       const [retry] = await sql`SELECT id FROM operations WHERE kind = 'integration.vercel_push'
         AND payload->>'clientId' = ${clientId} AND status = 'queued'`;
       expect(retry?.id).toBeDefined();
-      const ready = mockApi(input);
+      const firstCursor = requestedAt.getTime() + 1_000;
+      const crowded = mockApi(input, {
+        onPoll: async (_poll, url) => {
+          const cursor = Number(url.searchParams.get("until") ?? firstCursor);
+          return Response.json({
+            deployments: [{ uid: "dpl_UnrelatedFD29", source: "git-deploy-hook", readyState: "READY" }],
+            pagination: { next: cursor - 1 },
+          });
+        },
+      });
       await expect(
         runQueued(String(retry?.id), {
+          ...runtime,
+          vercelPush: (operation) => vercel.pushVercelRollover(operation, crowded),
+        }),
+      ).rejects.toThrow(/Manual rollover is available/);
+      expect(crowded.calls).toHaveLength(5);
+
+      clock = at(clock, 1);
+      await vercel.queueVercelPush(ref, pending.id, clock);
+      const [lastRetry] = await sql`SELECT id FROM operations WHERE kind = 'integration.vercel_push'
+        AND payload->>'clientId' = ${clientId} AND status = 'queued'`;
+      const ready = mockApi(input, {
+        onPoll: async (_poll, url) => {
+          expect(url.searchParams.get("until")).toBe(String(firstCursor - 5));
+          return Response.json({
+            deployments: [
+              {
+                uid: deploymentId,
+                source: "git-deploy-hook",
+                projectId,
+                target: "production",
+                meta: { deployHookJobId: jobId },
+                readyState: "READY",
+              },
+            ],
+          });
+        },
+      });
+      await expect(
+        runQueued(String(lastRetry?.id), {
           ...runtime,
           vercelPush: (operation) => vercel.pushVercelRollover(operation, ready),
         }),
@@ -2120,6 +2201,222 @@ describe("FD-29 Vercel delivery", () => {
       await park(clientId);
     }
   });
+
+  test("an alert sweep retries a database rejection independently of retirement and the other sweep", async () => {
+    clock = new Date();
+    const retiring = await issueClient("vercelalertretiring");
+    clock = at(retiring.first.notAfter, -2);
+    const recipient = await issueClient("vercelalertretry");
+    const ref = actorRef(recipient.clientId);
+    const input = inputFor("alert-retry");
+    await vercel.connectVercel(ref, input, mockApi(input, { expiresAt: at(clock, 45) }));
+    const [integration] =
+      await sql`SELECT id FROM vercel_integrations WHERE database_client_id = ${ref.clientId}`;
+    const expiryKey = `vercel-token-expiry:${integration!.id}`;
+    vercelExpiryKeys.add(expiryKey);
+    const trigger = sql(`fd29_alert_failure_${suffix}`);
+    const state: NonNullable<Parameters<typeof coordinator.rolloverTick>[1]> = {};
+    try {
+      await sql.unsafe(`CREATE FUNCTION fd29_alert_failure_${suffix}() RETURNS trigger
+        LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Vercel alert test rejection'; END; $$`);
+      await sql`CREATE TRIGGER ${trigger} BEFORE INSERT ON alerts FOR EACH ROW
+        WHEN (NEW.dedup_key LIKE 'vercel-token-expiry:%') EXECUTE FUNCTION ${trigger}()`;
+      clock = at(retiring.first.notAfter, 0, 1);
+      await sql`UPDATE vercel_integrations SET token_expires_at = ${at(clock, 10).toISOString()}::timestamptz
+        WHERE id = ${integration!.id}`;
+      const tick = await coordinator.rolloverTick(runtime, state);
+      await state.alertTask;
+      expect(tick.retired).toContainEqual(expect.objectContaining({ certificateId: retiring.first.id }));
+      expect(await openAlert(expiryKey)).toBeUndefined();
+      const nextSweepTimes = state.alertSweeps?.map(({ nextAt }) => nextAt);
+      expect(nextSweepTimes).toEqual([clock.getTime() + 3_600_000, clock.getTime() + 5_000]);
+
+      await sql`DROP TRIGGER ${trigger} ON alerts`;
+      clock = at(clock, 0, 5_000);
+      await coordinator.rolloverTick(runtime, state);
+      await state.alertTask;
+      expect(await openAlert(expiryKey)).toMatchObject({ severity: "warning", resolved_at: null });
+      expect(state.alertSweeps?.[0]?.nextAt).toBe(nextSweepTimes?.[0]);
+    } finally {
+      await sql`DROP TRIGGER IF EXISTS ${trigger} ON alerts`;
+      await sql`DROP FUNCTION IF EXISTS ${trigger}()`;
+      await vercel.disconnectVercel(ref);
+      await park(retiring.clientId, recipient.clientId);
+    }
+  });
+
+  for (const readyOn of ["last response", "final lookup"] as const) {
+    test(`delivers READY from the ${readyOn} at the polling deadline`, async () => {
+      clock = new Date();
+      const { clientId } = await issueClient(
+        readyOn === "last response" ? "vercelboundary1" : "vercelboundary2",
+      );
+      const ref = actorRef(clientId);
+      const input = inputFor(readyOn.replace(" ", "_"));
+      try {
+        const pending = await issueEarly(clientId);
+        const deadline = at(clock, 0, 30 * 60_000);
+        const mock = mockApi(input, {
+          onPoll: async (poll) => {
+            if (poll === 2 && readyOn === "last response") clock = deadline;
+            if (poll === 2 && readyOn === "final lookup") expect(clock).toEqual(deadline);
+          },
+        });
+        await vercel.connectVercel(ref, input, mock);
+        const job = await queuedPushId(clientId);
+        await expect(
+          runQueued(job, {
+            ...runtime,
+            vercelPush: (operation) =>
+              vercel.pushVercelRollover(operation, {
+                ...mock,
+                sleep: async () => {
+                  clock = at(deadline, 0, readyOn === "last response" ? -1 : 0);
+                },
+              }),
+          }),
+        ).resolves.toMatchObject({ certificateId: pending.id, deploymentId });
+        expect(mock.calls.filter(({ path }) => path.startsWith("/v7/deployments"))).toHaveLength(2);
+        expect(await openAlert(rollover.vercelPushAlertKey(clientId))).toBeUndefined();
+      } finally {
+        await vercel.disconnectVercel(ref);
+        await park(clientId);
+      }
+    });
+  }
+
+  test("repairs an incomplete pair before the hook and backs off with Retry-After while polling", async () => {
+    clock = new Date();
+    const { clientId } = await issueClient("vercelpartialrepair");
+    const ref = actorRef(clientId);
+    const input = inputFor("partial_repair");
+    const environment = new Map([
+      [VERCEL_ENV_NAMES.cert, "old-cert"],
+      [VERCEL_ENV_NAMES.key, "old-key"],
+    ]);
+    const delays: number[] = [];
+    try {
+      const pending = await issueEarly(clientId);
+      const mock = mockApi(input, {
+        push: "partialOnce",
+        environment,
+        beforeHook: async () => {
+          const cert = Buffer.from(environment.get(VERCEL_ENV_NAMES.cert)!, "base64").toString();
+          const key = Buffer.from(environment.get(VERCEL_ENV_NAMES.key)!, "base64");
+          expect(cert).toBe(pending.certPem!);
+          expect(new X509Certificate(cert).checkPrivateKey(createPrivateKey(key))).toBe(true);
+        },
+        onPoll: async (poll) => {
+          if (poll === 1 || poll === 3) return Response.json({}, { status: 429 });
+          if (poll === 2) return Response.json({}, { status: 503, headers: { "Retry-After": "25" } });
+        },
+      });
+      await vercel.connectVercel(ref, input, mock);
+      const job = await queuedPushId(clientId);
+      await expect(
+        runQueued(job, {
+          ...runtime,
+          vercelPush: (operation) =>
+            vercel.pushVercelRollover(operation, {
+              ...mock,
+              sleep: async (delay) => {
+                delays.push(delay);
+                clock = at(clock, 0, delay);
+              },
+            }),
+        }),
+      ).resolves.toMatchObject({ certificateId: pending.id, deploymentId });
+      expect(mock.calls.filter(({ path }) => path.startsWith("/v10/"))).toHaveLength(2);
+      expect(mock.calls.filter(({ path }) => path.startsWith("/v1/"))).toHaveLength(1);
+      expect(mock.calls.filter(({ path }) => path.startsWith("/v7/"))).toHaveLength(4);
+      expect(delays).toHaveLength(3);
+      expect(delays[0]).toBeGreaterThanOrEqual(10_000);
+      expect(delays[1]).toBe(25_000);
+      expect(delays[2]).toBeGreaterThanOrEqual(40_000);
+      expect(await openAlert(rollover.vercelPushAlertKey(clientId))).toBeUndefined();
+    } finally {
+      await vercel.disconnectVercel(ref);
+      await park(clientId);
+    }
+  });
+
+  for (const outcome of ["settled", "unsettled"] as const) {
+    test(`defers a replacement push while the disconnected integration's write is ${outcome === "settled" ? "running" : "unconfirmed"}`, async () => {
+      clock = new Date();
+      const oldClient = await issueClient(outcome === "settled" ? "vercelold" : "vercelambiguous");
+      const replacement = await issueClient(outcome === "settled" ? "vercelreplacement" : "verceldeferred");
+      const oldRef = actorRef(oldClient.clientId);
+      const nextRef = actorRef(replacement.clientId);
+      const input = inputFor("old");
+      const nextInput = inputFor("replacement");
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const environment = new Map<string, string>();
+      const old = mockApi(input, {
+        environment,
+        push: outcome === "unsettled" ? "upsertUnsettled" : undefined,
+        beforeEnv: async () => {
+          entered.resolve();
+          await release.promise;
+        },
+      });
+      const next = mockApi(nextInput, { environment });
+      await issueEarly(oldClient.clientId);
+      const pending = await issueEarly(replacement.clientId);
+      await vercel.connectVercel(oldRef, input, old);
+      const oldJob = await queuedPushId(oldClient.clientId);
+      const pushing = runQueued(oldJob, {
+        ...runtime,
+        vercelPush: (operation) => vercel.pushVercelRollover(operation, old),
+      });
+      try {
+        await Promise.race([entered.promise, pushing]);
+        await vercel.disconnectVercel(oldRef);
+        expect((await vercel.vercelIntegrationStatus(oldRef)).integration).toBeNull();
+        expect(await sql`SELECT id FROM secrets WHERE resource_type = 'vercel_integration'`).toHaveLength(0);
+        await vercel.connectVercel(nextRef, nextInput, next);
+        const nextJob = await queuedPushId(replacement.clientId);
+        const nextRuntime = {
+          ...runtime,
+          vercelPush: (operation: Parameters<typeof vercel.pushVercelRollover>[0]) =>
+            vercel.pushVercelRollover(operation, next),
+        };
+        await expect(runQueued(nextJob, nextRuntime)).rejects.toThrow(/Manual rollover is available/);
+        expect(next.calls.some(({ method }) => method === "POST")).toBe(false);
+        expect(await openAlert(rollover.vercelPushAlertKey(replacement.clientId))).toMatchObject({
+          title: expect.stringContaining("environment write is unsettled"),
+        });
+
+        release.resolve();
+        expect(await pushing).toEqual({ skipped: true });
+        clock = at(clock, 1);
+        await vercel.queueVercelPush(nextRef, pending.id, clock);
+        const [retry] = await sql`SELECT id FROM operations WHERE kind = 'integration.vercel_push'
+          AND payload->>'clientId' = ${replacement.clientId} AND status = 'queued'`;
+        if (outcome === "unsettled") {
+          await expect(runQueued(String(retry!.id), nextRuntime)).rejects.toThrow(
+            /Manual rollover is available/,
+          );
+          expect(next.calls.some(({ method }) => method === "POST")).toBe(false);
+        } else {
+          await expect(runQueued(String(retry!.id), nextRuntime)).resolves.toMatchObject({
+            certificateId: pending.id,
+          });
+          const cert = Buffer.from(environment.get(VERCEL_ENV_NAMES.cert)!, "base64").toString();
+          const key = Buffer.from(environment.get(VERCEL_ENV_NAMES.key)!, "base64");
+          expect(cert).toBe(pending.certPem!);
+          expect(new X509Certificate(cert).checkPrivateKey(createPrivateKey(key))).toBe(true);
+        }
+      } finally {
+        release.resolve();
+        await pushing.catch(() => {});
+        await sql`DELETE FROM vercel_env_writes WHERE operation_id = ${oldJob}`;
+        await vercel.disconnectVercel(oldRef);
+        await vercel.disconnectVercel(nextRef);
+        await park(oldClient.clientId, replacement.clientId);
+      }
+    }, 15_000);
+  }
 
   for (const phase of ["probe", "environment", "hook", "poll"] as const) {
     test(`local recovery proceeds during an in-flight Vercel ${phase} request`, async () => {
@@ -2188,9 +2485,10 @@ describe("FD-29 Vercel delivery", () => {
   for (const mode of ["partial", "error", "timeout", "unknownReceipt"] as const) {
     test(`leaves the old certificate usable after a ${mode} delivery failure`, async () => {
       clock = new Date();
-      const { clientId, first } = await issueClient(`vercel${mode.toLowerCase()}`);
+      const target = mode === "partial" ? "preview" : "production";
+      const { clientId, first } = await issueClient(`vercel${mode.toLowerCase()}`, target);
       const ref = actorRef(clientId);
-      const input = inputFor(mode);
+      const input = inputFor(mode, target);
       const pending = await issueEarly(clientId);
       const current = await clients.revealDatabaseClient(ref);
       const oldKey = Buffer.from(current.privateKey!).toString("base64");
@@ -2236,6 +2534,10 @@ describe("FD-29 Vercel delivery", () => {
         expect(environment.get(VERCEL_ENV_NAMES.cert)).toBe(Buffer.from(next!.certPem!).toString("base64"));
         expect(environment.get(VERCEL_ENV_NAMES.key) === oldKey).toBe(true);
         expect(mock.calls.some(({ path }) => path.startsWith("/v7/deployments"))).toBe(false);
+        expect(mock.calls.filter(({ path }) => path.startsWith("/v10/"))).toHaveLength(2);
+        expect((await openAlert(rollover.vercelPushAlertKey(clientId)))?.title).toContain(
+          `mismatched certificate and key for ${projectId} (preview · fd29-preview)`,
+        );
       }
       const oldCa = await caPem(first.caId);
       expect(await bundleFile()).toContain(oldCa);
@@ -2244,11 +2546,19 @@ describe("FD-29 Vercel delivery", () => {
       expect(oldLeaf.checkPrivateKey(createPrivateKey(current.privateKey!))).toBe(true);
       expect(old!.notAfter > clock).toBe(true);
       expect(await openAlert(rollover.vercelPushAlertKey(clientId))).toMatchObject({
-        severity: "warning",
+        severity: mode === "partial" ? "critical" : "warning",
         resolved_at: null,
       });
       await assertNoCopies(input.token);
-      await revealSuccessor(clientId);
+      const status = await rollover.rolloverStatus({ ...ref, now: clock });
+      const revealed = await revealSuccessor(clientId);
+      if (mode === "partial") {
+        for (const guide of [status.guide, revealed.guide]) {
+          expect(guide.commands).toContain(projectId);
+          expect(guide.commands.match(/--git-branch='fd29-preview'/g)).toHaveLength(2);
+          expect(guide.commands).toContain('Redeploy Preview branch "fd29-preview"');
+        }
+      }
       await rollover.confirmRolloverDelivery({ databaseId, clientId, certificateId: pending.id, now: clock });
       expect((await openAlert(rollover.vercelPushAlertKey(clientId)))?.resolved_at).toBeTruthy();
       expect((await vercel.vercelIntegrationStatus(ref)).integration?.lastPushStatus).toBe("cancelled");

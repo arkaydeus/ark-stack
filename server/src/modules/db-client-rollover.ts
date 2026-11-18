@@ -30,7 +30,7 @@ import {
 } from "@ark-stack/shared";
 import { and, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 
-import { db } from "../db.ts";
+import { db, type DbTransaction } from "../db.ts";
 import { loadEnv } from "../env.ts";
 import {
   alerts,
@@ -58,6 +58,23 @@ const DAY_MS = 86_400_000;
 export const rolloverAlertKey = (clientId: string) => `${ROLLOVER_ALERT_PREFIX}${clientId}`;
 export const vercelPushAlertKey = (clientId: string) => `vercel-push:${clientId}`;
 export const retirementAlertKey = (certificateId: string) => `${RETIREMENT_ALERT_PREFIX}${certificateId}`;
+
+async function vercelRecoveryScope(clientId: string, executor: Pick<DbTransaction, "select"> = db) {
+  const [row] = await executor
+    .select({
+      projectId: vercelIntegrations.vercelProjectId,
+      target: vercelIntegrations.envTarget,
+      gitBranch: vercelIntegrations.hookBranch,
+    })
+    .from(vercelIntegrations)
+    .where(
+      and(
+        eq(vercelIntegrations.databaseClientId, clientId),
+        sql`${vercelIntegrations.scopeVerifiedAt} IS NOT NULL`,
+      ),
+    );
+  return row;
+}
 
 function isUniqueViolation(error: unknown) {
   let current: unknown = error;
@@ -434,6 +451,7 @@ export async function revealRolloverSuccessor(input: {
         : null,
       guide: databaseClientRolloverGuide({
         environment: client.environment,
+        vercelScope: await vercelRecoveryScope(client.id, tx),
         secrets: { certPem: successor.certPem, keyPem },
       }),
       confirm: {
@@ -660,7 +678,10 @@ export async function rolloverStatus(input: { databaseId: string; clientId: stri
       deliveredAt: row.deliveredAt,
       retiredAt: row.retiredAt,
     })),
-    guide: databaseClientRolloverGuide({ environment: client.environment }),
+    guide: databaseClientRolloverGuide({
+      environment: client.environment,
+      vercelScope: await vercelRecoveryScope(client.id),
+    }),
   };
 }
 

@@ -334,7 +334,7 @@ export function DatabasesView({ state, reload }: { state: PlatformState; reload:
               <Badge variant={statusVariant(item.status)}>{item.status}</Badge>
               <span>{item.exposure}</span>
               <div className="flex flex-wrap gap-2">
-                {state.user.role === "owner" && item.exposure === "public" && (
+                {state.user.role === "owner" && (
                   <Button
                     size="sm"
                     variant="outline"

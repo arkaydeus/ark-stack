@@ -244,7 +244,10 @@ function VercelConnection({ database, client }: { database: Database; client: Cl
       )}
       {integration?.lastPushStatus === "failed" && (
         <p role="alert" className="text-sm text-destructive">
-          Vercel delivery failed. Reveal the successor, redeploy and confirm manually.
+          Vercel delivery failed. Check the delivery alert before using the manual rollover guide to replace
+          both sensitive values in project {integration.projectId} for {integration.target}
+          {integration.gitBranch ? ` branch ${integration.gitBranch}` : ""}. Redeploy and verify database
+          access before confirming.
         </p>
       )}
       {status?.connectEnabled && !status.eligible && !connected && (
@@ -265,7 +268,7 @@ function VercelConnection({ database, client }: { database: Database; client: Cl
                 required
               />
               {client.environment === "preview" && (
-                <Field label="Preview branch (optional)" name="vercelBranch" />
+                <Field label="Preview branch (defaults to the deploy hook branch)" name="vercelBranch" />
               )}
               <Field label="Project token" name="vercelToken" type="password" autoComplete="off" required />
               <Field label="Deploy hook URL" name="vercelHook" type="password" autoComplete="off" required />

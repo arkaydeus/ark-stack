@@ -34,7 +34,8 @@ export type VercelScopeProof = {
 
 // Record reviewed, redacted live evidence in source before enabling connections. The public
 // AuthToken schema currently documents user and team scopes only. No environment toggle can
-// substitute for confirming the parser and the two project-scope denials against the real API.
+// substitute for confirming the parser, the two project-scope denials and Preview hook
+// correlation against the real API.
 export function reviewedVercelScopeProof(): VercelScopeProof | null {
   return null;
 }
@@ -46,6 +47,11 @@ type RequestInput = {
   method?: "GET" | "POST";
   token?: string;
   body?: unknown;
+};
+type VercelResponse = {
+  status: VercelCall["status"];
+  body: unknown;
+  retryAfter?: string | null;
 };
 export type VercelCall = { endpoint: string; method: string; status: number | "network_error" };
 export type VercelObserver = (call: VercelCall) => void;
@@ -62,7 +68,7 @@ export class VercelApi {
     private readonly observe: VercelObserver = () => {},
   ) {}
 
-  async request(input: RequestInput) {
+  async request(input: RequestInput): Promise<VercelResponse> {
     const method = input.method ?? "GET";
     let status: VercelCall["status"] = "network_error";
     try {
@@ -77,7 +83,11 @@ export class VercelApi {
         signal: AbortSignal.timeout(10_000),
       });
       status = response.status;
-      return { status, body: (await response.json().catch(() => undefined)) as unknown };
+      return {
+        status,
+        body: (await response.json().catch(() => undefined)) as unknown,
+        retryAfter: response.headers.get("retry-after"),
+      };
     } catch {
       // Transport exceptions can contain URLs (including the secret deploy hook) or headers.
       return { status, body: undefined };
@@ -208,6 +218,12 @@ export function deployHookBranch(project: Record<string, unknown>, hook: URL, se
   return ref;
 }
 
+export class VercelEnvWriteError extends Error {
+  constructor(readonly outcome: "partial" | "ambiguous" | "rejected") {
+    super("Vercel did not confirm every sensitive environment variable update.");
+  }
+}
+
 export async function upsertVercelVariables(
   api: VercelApi,
   selection: VercelSelection,
@@ -230,11 +246,12 @@ export async function upsertVercelVariables(
     token,
     body: entries.length === 1 ? entries[0] : entries,
   });
+  if (status === "network_error" || status >= 500) throw new VercelEnvWriteError("ambiguous");
+  if (status !== 201) throw new VercelEnvWriteError(status >= 200 && status < 300 ? "partial" : "rejected");
   const { created, failed } = object(body) ?? {};
   const rows = Array.isArray(created) ? created : [created];
   const unconfirmed = new Set(variables.map(({ key }) => key));
   if (
-    status !== 201 ||
     !Array.isArray(failed) ||
     failed.length !== 0 ||
     rows.length !== variables.length ||
@@ -251,7 +268,7 @@ export async function upsertVercelVariables(
       );
     })
   ) {
-    throw new Error("Vercel did not confirm every sensitive environment variable update.");
+    throw new VercelEnvWriteError("partial");
   }
 }
 
@@ -275,37 +292,63 @@ export async function vercelHookDeployment(
   token: string,
   jobId: string,
   requestedAt: Date,
+  cursor?: number,
+  canContinue = () => true,
 ) {
   const url = vercelUrl("/v7/deployments", selection.teamId);
+  const since = requestedAt.getTime() - 10_000;
   url.searchParams.set("projectId", selection.projectId);
-  url.searchParams.set("since", String(requestedAt.getTime() - 10_000));
+  url.searchParams.set("since", String(since));
   url.searchParams.set("limit", "100");
   if (selection.gitBranch) url.searchParams.set("branch", selection.gitBranch);
-  const { status, body } = await api.request({ endpoint: "/v7/deployments", url, token });
-  if (status === "network_error" || status === 429 || status >= 500) return null;
-  const rows = object(body)?.deployments;
-  if (status !== 200 || !Array.isArray(rows)) throw new Error("Vercel deployment status is unavailable.");
-  const matching = rows
-    .map(object)
-    .filter(
-      (row) =>
-        row?.source === "git-deploy-hook" &&
-        (row.uid === jobId || object(row.meta)?.deployHookJobId === jobId),
-    );
-  if (!matching.length) return null;
-  const row = matching[0];
-  if (
-    matching.length !== 1 ||
-    row?.projectId !== selection.projectId ||
-    (selection.target === "production"
-      ? row.target !== "production"
-      : row.target != null || row.customEnvironment != null) ||
-    typeof row.uid !== "string" ||
-    !deploymentIdPattern.test(row.uid)
-  ) {
-    throw new Error("Vercel reported an unexpected deployment for the deploy hook.");
+  for (let page = 0; page < 5; page++) {
+    if (cursor !== undefined) url.searchParams.set("until", String(cursor));
+    const { status, body, retryAfter } = await api.request({ endpoint: "/v7/deployments", url, token });
+    if (status === "network_error" || status === 429 || status >= 500) {
+      return { state: "retry", cursor, retryAfter } as const;
+    }
+    const rows = object(body)?.deployments;
+    if (status !== 200 || !Array.isArray(rows)) throw new Error("Vercel deployment status is unavailable.");
+    const matching = rows
+      .map(object)
+      .filter(
+        (row) =>
+          row?.source === "git-deploy-hook" &&
+          (row.uid === jobId || object(row.meta)?.deployHookJobId === jobId),
+      );
+    if (matching.length) {
+      const row = matching[0];
+      const meta = object(row?.meta);
+      const branch = meta?.githubCommitRef ?? meta?.gitlabCommitRef ?? meta?.bitbucketCommitRef;
+      if (
+        matching.length !== 1 ||
+        row?.projectId !== selection.projectId ||
+        (branch != null && selection.gitBranch && branch !== selection.gitBranch) ||
+        row.customEnvironment != null ||
+        (selection.target === "production"
+          ? row.target !== "production"
+          : row.target != null && row.target !== "preview") ||
+        typeof row.uid !== "string" ||
+        !deploymentIdPattern.test(row.uid)
+      ) {
+        throw new Error("Vercel reported an unexpected deployment for the deploy hook.");
+      }
+      if (row.readyState === "ERROR" || row.readyState === "CANCELED")
+        throw new Error("The Vercel deployment failed or was canceled.");
+      return row.readyState === "READY"
+        ? ({ state: "ready", deploymentId: row.uid, target: row.target ?? null } as const)
+        : ({ state: "pending", cursor } as const);
+    }
+    const next = object(object(body)?.pagination)?.next;
+    if (
+      typeof next !== "number" ||
+      !Number.isSafeInteger(next) ||
+      next <= since ||
+      (cursor !== undefined && next >= cursor)
+    )
+      return { state: "pending" } as const;
+    cursor = next;
+    if (!canContinue()) break;
   }
-  if (row.readyState === "ERROR" || row.readyState === "CANCELED")
-    throw new Error("The Vercel deployment failed or was canceled.");
-  return row.readyState === "READY" ? row.uid : null;
+  return { state: "pending", cursor } as const;
 }

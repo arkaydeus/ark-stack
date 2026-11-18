@@ -3,7 +3,9 @@ import { expect, test } from "@playwright/test";
 import { createServer } from "../web/node_modules/vite/dist/node/index.js";
 import { vercelConnectBinding } from "../server/src/modules/vercel-api.ts";
 
-test("Vercel connect binds the exact credentials to step-up and clears secrets", async ({ page }) => {
+test("an owner can connect and disconnect Vercel on a private database with credential step-up", async ({
+  page,
+}) => {
   const vite = await createServer({
     root: new URL("../web", import.meta.url).pathname,
     server: {
@@ -23,7 +25,7 @@ test("Vercel connect binds the exact credentials to step-up and clears secrets",
   });
   try {
     await vite.listen();
-    const database = { id: "mdb_fixture", name: "fixture", roles: [], exposure: "public", status: "ready" };
+    const database = { id: "mdb_fixture", name: "fixture", roles: [], exposure: "private", status: "ready" };
     const client = { id: "dbc_fixture", name: "Fixture client", environment: "preview" };
     const credentials = {
       projectId: "prj_Fixture",
@@ -38,6 +40,7 @@ test("Vercel connect binds the exact credentials to step-up and clears secrets",
     const path = `**/api/databases/${database.id}/clients/${client.id}/vercel-integration`;
     const submissions: { kind: string; body: unknown }[] = [];
     let connected = false;
+    let connectEnabled = true;
     await page.route("**/api/**", (route) => route.fulfill({ json: {} }));
     await page.route("**/api/auth/get-session", (route) =>
       route.fulfill({
@@ -68,7 +71,7 @@ test("Vercel connect binds the exact credentials to step-up and clears secrets",
       if (route.request().method() === "GET") {
         return route.fulfill({
           json: {
-            connectEnabled: true,
+            connectEnabled,
             eligible: true,
             requiresReconnect: false,
             integration: connected
@@ -83,9 +86,15 @@ test("Vercel connect binds the exact credentials to step-up and clears secrets",
           },
         });
       }
-      submissions.push({ kind: route.request().method(), body: route.request().postDataJSON() });
+      const kind = route.request().method();
+      submissions.push({ kind, body: route.request().postData() ? route.request().postDataJSON() : null });
+      if (kind === "DELETE") {
+        connected = false;
+        return route.fulfill({ json: { disconnected: true } });
+      }
       if (submissions.length === 2) return route.fulfill({ status: 422, json: { error: "Fixture refusal" } });
       connected = true;
+      connectEnabled = false;
       return route.fulfill({ json: { ok: true } });
     });
     await page.goto(vite.resolvedUrls!.local[0]! + "#/databases");
@@ -99,7 +108,9 @@ test("Vercel connect binds the exact credentials to step-up and clears secrets",
     await page
       .getByLabel("Other project ID in the same team", { exact: true })
       .fill(credentials.otherProjectId);
-    await page.getByLabel("Preview branch (optional)", { exact: true }).fill(credentials.gitBranch);
+    await page
+      .getByLabel("Preview branch (defaults to the deploy hook branch)", { exact: true })
+      .fill(credentials.gitBranch);
     for (const attempt of [0, 1]) {
       await token.fill(credentials.token);
       await hook.fill(credentials.deployHook);
@@ -132,7 +143,26 @@ test("Vercel connect binds the exact credentials to step-up and clears secrets",
       },
       { kind: "PUT", body: credentials },
     ];
-    expect(submissions).toEqual([...attempt, ...attempt]);
+    await expect(page.getByText("Token expiry", { exact: true })).toBeVisible();
+    await expect(page.getByText(credentials.gitBranch, { exact: false })).toBeVisible();
+    await ownerPassword.fill(password);
+    await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+    await expect(page.getByText("Vercel disconnected. Continue with manual rollover.")).toBeVisible();
+    await expect(page.getByText("Token expiry", { exact: true })).toHaveCount(0);
+    await expect(ownerPassword).toHaveCount(0);
+    expect(submissions).toEqual([
+      ...attempt,
+      ...attempt,
+      {
+        kind: "step-up",
+        body: {
+          password,
+          action: "credential.rotate",
+          request: { databaseId: database.id, clientId: client.id, vercelIntegration: "disconnect" },
+        },
+      },
+      { kind: "DELETE", body: null },
+    ]);
   } finally {
     await vite.close();
   }

@@ -21,6 +21,27 @@ const project = (deployHooks: object[]) => ({ link: { productionBranch: "main", 
 const envResponse = (created: unknown) =>
   new VercelApi(async () => Response.json({ created, failed: [] }, { status: 201 }));
 
+test("single-variable canary sends an object and accepts its sensitive acknowledgement", async () => {
+  const variable = { key: "ARK_CANARY", value: "canary-value" };
+  const api = new VercelApi(async (url, init) => {
+    expect(url.searchParams.get("upsert")).toBe("true");
+    expect(JSON.parse(String(init.body))).toEqual({
+      ...variable,
+      type: "sensitive",
+      target: ["preview"],
+      gitBranch: "preview",
+    });
+    return Response.json(
+      {
+        created: { key: variable.key, type: "sensitive", target: ["preview"], gitBranch: "preview" },
+        failed: [],
+      },
+      { status: 201 },
+    );
+  });
+  await expect(upsertVercelVariables(api, selection, "mock-token", [variable])).resolves.toBeUndefined();
+});
+
 test("an env batch requires one sensitive acknowledgement per key at the requested target and branch", async () => {
   const variables = [
     { key: "ARK_DB_CLIENT_CERT_B64", value: "mock-cert" },
@@ -79,10 +100,52 @@ test("a hook receipt cannot prove an ambiguous, wrong-project or wrong-target de
     [{ ...match, projectId: selection.otherProjectId }],
     [{ ...match, target: "production" }],
     [{ ...match, customEnvironment: { id: "env_Other" } }],
+    [{ ...match, meta: { deployHookJobId: jobId, githubCommitRef: "other" } }],
   ]) {
     const api = new VercelApi(async () => Response.json({ deployments }));
     await expect(vercelHookDeployment(api, selection, "mock-token", jobId, new Date())).rejects.toThrow(
       /unexpected deployment/,
     );
+  }
+});
+
+test("looks past 100 unrelated deployments and accepts exact Preview receipts with either API target shape", async () => {
+  const requestedAt = new Date();
+  const next = requestedAt.getTime() + 10;
+  const jobId = "HookJobTestFixture";
+  const deploymentId = "dpl_Matching";
+  for (const target of [null, "preview"]) {
+    const queries: (string | null)[] = [];
+    const api = new VercelApi(async (url) => {
+      expect(url.searchParams.get("branch")).toBe("preview");
+      const until = url.searchParams.get("until");
+      queries.push(until);
+      return until === null
+        ? Response.json({
+            deployments: Array.from({ length: 100 }, (_, index) => ({
+              uid: `dpl_Unrelated${index}`,
+              source: "git-deploy-hook",
+              readyState: "READY",
+            })),
+            pagination: { next },
+          })
+        : Response.json({
+            deployments: [
+              {
+                uid: deploymentId,
+                source: "git-deploy-hook",
+                projectId: selection.projectId,
+                target,
+                meta: { deployHookJobId: jobId, githubCommitRef: "preview" },
+                readyState: "READY",
+              },
+            ],
+          });
+    });
+    expect(await vercelHookDeployment(api, selection, "mock-token", jobId, requestedAt)).toMatchObject({
+      state: "ready",
+      deploymentId,
+    });
+    expect(queries).toEqual([null, String(next)]);
   }
 });

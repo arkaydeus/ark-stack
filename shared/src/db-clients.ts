@@ -345,8 +345,13 @@ export const rolloverConfirmInput = z.object({ certificateId: z.string().min(1).
 export function databaseClientRolloverGuide(input: {
   environment: string;
   secrets?: { certPem: string; keyPem: string | null };
+  vercelScope?: { projectId: string; target: "production" | "preview"; gitBranch: string | null };
 }) {
-  const target = input.environment;
+  const target = input.vercelScope?.target ?? input.environment;
+  const branch = target === "preview" ? input.vercelScope?.gitBranch : null;
+  const project = input.vercelScope?.projectId;
+  const branchArg = branch ? "'" + branch.replaceAll("'", "'\\''") + "'" : "";
+  const envScope = branch ? `--environment preview --git-branch=${branchArg}` : target;
   const secrets = input.secrets;
   const env: VercelEnvVar[] = [
     {
@@ -366,10 +371,13 @@ export function databaseClientRolloverGuide(input: {
   ];
   const commands = [
     "# Reveal the new bundle once in Ark (step-up), then:",
-    `base64 -i client-next.crt | tr -d '\\n' | vercel env add ${VERCEL_ENV_NAMES.cert} ${target} --sensitive --force`,
-    `base64 -i client-next.key | tr -d '\\n' | vercel env add ${VERCEL_ENV_NAMES.key} ${target} --sensitive --force`,
-    `vercel deploy${target === "production" ? " --prod" : ""}        # or redeploy from the dashboard`,
-    '# Then press "Confirm rollover" in Ark.',
+    ...(project ? [`# Link this checkout to Vercel project ${project} before updating the variables.`] : []),
+    `base64 -i client-next.crt | tr -d '\\n' | vercel env add ${VERCEL_ENV_NAMES.cert} ${envScope} --sensitive --force`,
+    `base64 -i client-next.key | tr -d '\\n' | vercel env add ${VERCEL_ENV_NAMES.key} ${envScope} --sensitive --force`,
+    branch
+      ? `# Redeploy Preview branch ${JSON.stringify(branch)} using its deploy hook or the Vercel dashboard.`
+      : `vercel deploy${target === "production" ? " --prod" : ""}        # or redeploy from the dashboard`,
+    '# Check database access, then press "Confirm rollover" in Ark.',
   ].join("\n");
   return {
     target,
@@ -378,6 +386,7 @@ export function databaseClientRolloverGuide(input: {
     notes: [
       "The old certificate admits new connections until its expiry, and its role's sessions are closed by expiry + 5 s; redeploy any time before then.",
       "Clients must reconnect and refresh their pools after the redeploy. Check the --force and --sensitive flag spellings against your Vercel CLI version.",
+      ...(branch ? ["Branch-specific commands require Vercel CLI 64.6.0 or later."] : []),
     ],
   };
 }

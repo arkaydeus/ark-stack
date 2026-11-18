@@ -11,7 +11,7 @@ import { z } from "zod";
 
 import { db, type DbTransaction } from "../db.ts";
 import { loadEnv } from "../env.ts";
-import { databaseClients, operations, secrets, vercelIntegrations } from "../schema.ts";
+import { databaseClients, operations, secrets, vercelEnvWrites, vercelIntegrations } from "../schema.ts";
 import { raiseAlert, resolveAlert } from "./alerts.ts";
 import {
   evaluateRolloverAlerts,
@@ -34,6 +34,7 @@ import {
   upsertVercelVariables,
   VercelApi,
   type VercelCall,
+  VercelEnvWriteError,
   type VercelScopeProof,
   type VercelSelection,
   type VercelTransport,
@@ -93,7 +94,7 @@ function scopeSelection(row: VerifiedIntegration): VercelSelection {
     teamId: row.vercelTeamId,
     otherProjectId: row.otherProjectId,
     target: row.envTarget,
-    gitBranch: row.gitBranch,
+    gitBranch: row.envTarget === "preview" ? row.hookBranch : null,
   };
 }
 
@@ -103,7 +104,7 @@ function publicIntegration(row: VerifiedIntegration, now = new Date()) {
     tokenExpiryStatus: remaining <= 0 ? "expired" : remaining <= 30 * DAY_MS ? "expiring" : "valid",
     projectId: row.vercelProjectId,
     target: row.envTarget,
-    gitBranch: row.gitBranch,
+    gitBranch: row.envTarget === "preview" ? row.hookBranch : null,
     tokenExpiresAt: row.tokenExpiresAt,
     lastPushAt: row.lastPushAt,
     lastPushStatus: row.lastPushStatus,
@@ -278,7 +279,7 @@ export async function connectVercel(
         tokenExpiresAt: verification.expiresAt,
         deployHookSecretId,
         envTarget: input.target,
-        gitBranch: input.gitBranch,
+        gitBranch: input.target === "preview" ? verification.branch : null,
         hookBranch: verification.branch,
         scopeVerifiedAt: now(),
         createdBy: ref.actorId,
@@ -442,6 +443,13 @@ type PushOperation = Pick<typeof operations.$inferSelect, "id" | "payload" | "cl
 type PushRuntime = ConnectionRuntime & { sleep?: (ms: number) => Promise<unknown> };
 type PushContext = { tx: DbTransaction; row: VerifiedIntegration; cert: Certificate };
 
+function pollBackoff(failures: number, retryAfter: string | null | undefined, now: number) {
+  const delay = Math.min(60_000, 5_000 * 2 ** failures);
+  const header = retryAfter?.trim() ?? "";
+  const providerDelay = /^\d+$/.test(header) ? Number(header) * 1_000 : Date.parse(header) - now;
+  return Math.max(delay + Math.floor(Math.random() * 1_000), providerDelay || 0);
+}
+
 export async function pushVercelRollover(operation: PushOperation, runtime: PushRuntime = {}) {
   const ref = pushPayload.parse(operation.payload);
   const now = runtime.now ?? (() => new Date());
@@ -482,6 +490,13 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
   if (!integration) return { skipped: true };
   const selection = scopeSelection(integration);
   const audit = providerAudit({ ...ref, operationId: operation.id }, selection, runtime.transport);
+  const writeScope = {
+    projectId: selection.projectId,
+    target: selection.target,
+    gitBranch: selection.gitBranch ?? "",
+  };
+  let pairMayBeMixed = false;
+  let writeUnsettled = false;
   async function credentials(tx: DbTransaction, row: VerifiedIntegration) {
     if (row.tokenExpiresAt <= now()) throw new Error("The Vercel token has expired.");
     const token = await openSecret(tx, row.tokenSecretId, TOKEN_KIND);
@@ -494,12 +509,14 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
     const prepared = await withPending(async ({ tx, row, cert }) => {
       if (!proof) throw new Error("Vercel connection awaits live verification of project token scope.");
       if (row.pushCertificateId === cert.id && row.hookRequestedAt) {
+        if (row.envTarget === "preview" && !row.gitBranch)
+          throw new Error("The recorded Preview push did not write to the verified hook branch.");
         if (!row.hookJobId)
           throw new Error("Vercel hook receipt is unknown. Use manual certificate rollover.");
         return {
           requestedAt: row.hookRequestedAt,
           jobId: row.hookJobId,
-          retry: row.lastPushStatus === "failed",
+          cursor: row.hookLookupUntil ?? undefined,
         };
       }
       const { token, hook } = await credentials(tx, row);
@@ -513,6 +530,7 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
           lastPushStatus: "pushing",
           hookRequestedAt: null,
           hookJobId: null,
+          hookLookupUntil: null,
         })
         .where(eq(vercelIntegrations.id, row.id));
       const variables = [
@@ -531,8 +549,54 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
       );
       if (verified.branch !== integration.hookBranch)
         throw new Error("The Vercel deploy hook has changed branch.");
-      if (!(await withPending(async () => true))) return { skipped: true };
-      await upsertVercelVariables(audit.api, selection, token, variables).finally(audit.flush);
+      const reserved = await withPending(async ({ tx }) => {
+        const [write] = await tx
+          .insert(vercelEnvWrites)
+          .values({ ...writeScope, operationId: operation.id, startedAt: now() })
+          .onConflictDoNothing()
+          .returning({ operationId: vercelEnvWrites.operationId });
+        return !!write;
+      });
+      if (reserved === undefined) return { skipped: true };
+      if (!reserved) {
+        writeUnsettled = true;
+        throw new Error("An earlier Vercel environment write has not settled.");
+      }
+      // Keep the reservation across both attempts. Disconnect and claim loss can remove local
+      // credentials immediately, but only a settled provider response releases the scope.
+      let settled = true;
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (!(await withPending(async () => true))) return { skipped: true };
+          settled = false;
+          try {
+            await upsertVercelVariables(audit.api, selection, token, variables);
+            settled = true;
+            pairMayBeMixed = false;
+            break;
+          } catch (error) {
+            if (!(error instanceof VercelEnvWriteError)) throw error;
+            settled = error.outcome !== "ambiguous";
+            pairMayBeMixed ||= error.outcome !== "rejected";
+            if (error.outcome !== "partial" || attempt === 1) throw error;
+          }
+        }
+      } finally {
+        writeUnsettled = !settled;
+        if (settled) {
+          await db
+            .delete(vercelEnvWrites)
+            .where(
+              and(
+                eq(vercelEnvWrites.projectId, writeScope.projectId),
+                eq(vercelEnvWrites.target, writeScope.target),
+                eq(vercelEnvWrites.gitBranch, writeScope.gitBranch),
+                eq(vercelEnvWrites.operationId, operation.id),
+              ),
+            );
+        }
+        await audit.flush();
+      }
 
       // Commit dispatch intent before the non-idempotent call. An unknown receipt requires
       // manual delivery because the provider may already have accepted the hook.
@@ -540,7 +604,7 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
         const at = now();
         await tx
           .update(vercelIntegrations)
-          .set({ hookRequestedAt: at })
+          .set({ hookRequestedAt: at, gitBranch: selection.gitBranch })
           .where(eq(vercelIntegrations.id, row.id));
         return at;
       });
@@ -559,24 +623,23 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
     if (!requestedAt || !jobId) return { skipped: true };
 
     const deadline = requestedAt.getTime() + PUSH_WINDOW_MS;
-    // A later attempt can check the recorded deployment once after the original polling window.
-    // New deployments are only created before dispatch intent is recorded.
-    let retry = prepared.retry;
+    let cursor = prepared.cursor;
+    let failures = 0;
     while (true) {
       const finalCheck = now().getTime() >= deadline;
-      if (finalCheck && !retry) break;
-      retry = false;
       const token = await withPending(async ({ tx, row }) => (await credentials(tx, row)).token);
       if (!token) return { skipped: true };
-      const deploymentId = await vercelHookDeployment(
+      const deployment = await vercelHookDeployment(
         audit.api,
         { ...selection, gitBranch: integration.hookBranch },
         token,
         jobId,
         requestedAt,
+        cursor,
+        () => finalCheck || now().getTime() < deadline,
       ).finally(audit.flush);
-      if (!finalCheck && now().getTime() >= deadline) break;
-      if (deploymentId) {
+      if (deployment.state === "ready") {
+        const { deploymentId } = deployment;
         const deliveredAt = now();
         const delivered = await withPending(async ({ tx, row }) => {
           await recordRolloverDelivery(tx, { ...ref, source: "integration", now: deliveredAt });
@@ -586,6 +649,7 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
               lastPushAt: deliveredAt,
               lastPushStatus: "delivered",
               lastDeploymentId: deploymentId,
+              hookLookupUntil: null,
             })
             .where(eq(vercelIntegrations.id, row.id));
           return true;
@@ -595,9 +659,23 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
         await evaluateRolloverAlerts(deliveredAt, ref.clientId);
         return { certificateId: ref.certificateId, deploymentId, deliveredAt: deliveredAt.toISOString() };
       }
+      cursor = deployment.cursor;
       if (finalCheck) break;
-      await sleep(Math.min(5_000, deadline - now().getTime()));
+      failures = deployment.state === "retry" ? failures + 1 : 0;
+      const remaining = Math.max(0, deadline - now().getTime());
+      const delay =
+        deployment.state === "retry" ? pollBackoff(failures, deployment.retryAfter, now().getTime()) : 5_000;
+      // A throttled request must not run again before its retry time, even at the deadline.
+      if (deployment.state === "retry" && delay > remaining) break;
+      if (remaining) await sleep(Math.min(delay, remaining));
     }
+    // Retrospective retries have a bounded page budget. Resume an unfinished search next time.
+    await withPending(async ({ tx, row }) => {
+      await tx
+        .update(vercelIntegrations)
+        .set({ hookLookupUntil: cursor ?? null })
+        .where(eq(vercelIntegrations.id, row.id));
+    });
     throw new Error("The Vercel deployment was not ready within 30 minutes.");
   } catch {
     const failed = await withPending(async ({ tx, row, cert }) => {
@@ -607,17 +685,24 @@ export async function pushVercelRollover(operation: PushOperation, runtime: Push
           lastPushAt: now(),
           lastPushStatus: "failed",
           ...(row.pushCertificateId !== cert.id
-            ? { pushCertificateId: cert.id, hookRequestedAt: null, hookJobId: null }
+            ? { pushCertificateId: cert.id, hookRequestedAt: null, hookJobId: null, hookLookupUntil: null }
             : {}),
         })
         .where(eq(vercelIntegrations.id, row.id));
       return true;
     });
     if (!failed) return { skipped: true };
+    const scope = `${selection.projectId} (${selection.target}${selection.gitBranch ? ` · ${selection.gitBranch}` : ""})`;
+    const recovery =
+      "Reveal the successor, set both sensitive variables from the guide, redeploy that target and confirm after checking database access.";
     await raiseAlert({
       dedupKey: vercelPushAlertKey(ref.clientId),
-      severity: "warning",
-      title: `Vercel certificate delivery failed for ${selection.projectId}. Reveal the successor, redeploy and confirm to finish manually.`,
+      severity: pairMayBeMixed || writeUnsettled ? "critical" : "warning",
+      title: writeUnsettled
+        ? `Vercel environment write is unsettled for ${scope}. New automated writes are blocked. Verify the earlier write has settled before changing either value. ${recovery}`
+        : pairMayBeMixed
+          ? `Vercel may have a mismatched certificate and key for ${scope}. Pause new deployments until both values are repaired. ${recovery}`
+          : `Vercel certificate delivery failed for ${scope}. ${recovery}`,
     });
     if (!(await withPending(async () => true))) await resolveAlert(vercelPushAlertKey(ref.clientId), now());
     // Keep upstream errors, URLs and response bodies out of operations and worker logs.

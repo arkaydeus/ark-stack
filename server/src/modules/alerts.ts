@@ -1,5 +1,5 @@
 import { createId } from "@ark-stack/shared";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, ne } from "drizzle-orm";
 
 import { db } from "../db.ts";
 import { alerts, backups, certificates, operations } from "../schema.ts";
@@ -89,11 +89,13 @@ export async function resolveAlert(dedupKey: string, at = new Date()) {
 }
 
 export async function evaluateAlerts() {
+  // The per-client Vercel alert spans retries and resolves after either delivery path succeeds.
+  const vercelPushKind = "integration.vercel_push";
   const activeKeys = new Set<string>();
   const failed = await db
     .select()
     .from(operations)
-    .where(eq(operations.status, "failed"))
+    .where(and(eq(operations.status, "failed"), ne(operations.kind, vercelPushKind)))
     .orderBy(desc(operations.updatedAt))
     .limit(100);
   for (const operation of failed) {
@@ -160,7 +162,7 @@ export async function evaluateAlerts() {
     if (alert.dedupKey.startsWith("op-failed:")) {
       const operationId = alert.dedupKey.slice("op-failed:".length);
       const [operation] = await db.select().from(operations).where(eq(operations.id, operationId));
-      if (!operation || operation.status !== "failed") {
+      if (!operation || operation.status !== "failed" || operation.kind === vercelPushKind) {
         await db.update(alerts).set({ resolvedAt: new Date() }).where(eq(alerts.id, alert.id));
       }
       continue;

@@ -961,6 +961,7 @@ export const vercelIntegrations = pgTable(
     pushCertificateId: text("push_certificate_id"),
     hookRequestedAt: timestamp("hook_requested_at", { withTimezone: true }),
     hookJobId: text("hook_job_id"),
+    hookLookupUntil: bigint("hook_lookup_until", { mode: "number" }),
     lastPushAt: timestamp("last_push_at", { withTimezone: true }),
     lastPushStatus: text("last_push_status"),
     lastDeploymentId: text("last_deployment_id"),
@@ -988,6 +989,18 @@ export const vercelIntegrations = pgTable(
       .on(table.vercelProjectId, table.envTarget, table.hookBranch)
       .where(sql`${table.scopeVerifiedAt} IS NOT NULL`),
   ],
+);
+
+export const vercelEnvWrites = pgTable(
+  "vercel_env_writes",
+  {
+    projectId: text("project_id").notNull(),
+    target: text("target").notNull(),
+    gitBranch: text("git_branch").notNull(),
+    operationId: text("operation_id").notNull(),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.projectId, table.target, table.gitBranch] })],
 );
 
 // Off-VPS backup destinations (R8): both kinds are required for "backups healthy".

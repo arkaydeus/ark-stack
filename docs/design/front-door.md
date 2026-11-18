@@ -1747,14 +1747,15 @@ The integration automates delivery for active production and preview clients wit
 **Flow** (`integration.vercel_push`, domain worker):
 
 1. `POST https://api.vercel.com/v10/projects/{projectId}/env?upsert=true` with both `ARK_DB_CLIENT_CERT_B64` and `ARK_DB_CLIENT_KEY_B64` in one request. Each value is a base64-encoded PEM.
-   - Use `type: "sensitive"` for both variables and the client environment as the target (`production`, or `preview` with an optional `gitBranch`). [Create env vars](https://vercel.com/docs/rest-api/projects/create-one-or-more-environment-variables)
-   - Vercel can accept part of a batch. Ark triggers the deploy hook only after Vercel confirms both writes. Existing deployments keep their env vars. Before starting a separate deployment after a failed update, complete both writes through retry or manual rollover so the build receives a matching pair.
+   - Use `type: "sensitive"` for both variables and the client environment as the target. For Preview, write both values to the verified hook branch. An optional branch entered at enrollment must match that hook. [Create env vars](https://vercel.com/docs/rest-api/projects/create-one-or-more-environment-variables)
+   - Vercel can accept part of a batch. Ark retries both values once after an incomplete acknowledgement and triggers the hook only after Vercel confirms both writes. Existing deployments retain their env vars. A potentially mixed pair raises a critical alert with the project, target and recovery instructions. Pause new builds until both values are repaired.
+   - A scope reservation keyed by project, target and effective Preview branch blocks competing writes across claims and disconnects. A confirmed provider response releases it. An indeterminate write retains the reservation for operator reconciliation. [Recover an unsettled write](../operating.md#vercel-certificate-rollover-recovery)
    - Before connecting, deploy an application that reads both variables (§3.12) and confirm the reviewed pooler policy admits its Vercel egress. Connection leaves the reviewed source policy in effect.
    - Revoking the database client disables its role and removes the integration credentials.
 2. **Redeploy**, because env changes "only apply to new deployments" ([env vars](https://vercel.com/docs/environment-variables)).
    - **Enabled path:** the deploy hook. It builds the branch head as a new deployment, which picks up current env vars, but it is limited to 60 triggers per hour per project and needs a Git-connected project.
    - **Awaiting live proof:** `POST /v13/deployments` with the last production `deploymentId` and `withLatestCommit: true`. Whether this redeploy picks up env vars changed after the original deployment is **unverified** ("All project settings and environment variables are inherited from the original unless explicitly overridden"), so FD-29 must test it before relying on it.
-3. Poll the deployment linked to the hook job for up to 30 minutes. On success, atomically record `delivered_at`, supersede the predecessor, destroy the successor’s sealed key and promote the successor to `current` (§3.10.4). On failure, keep the successor `pending` and raise an alert for manual delivery. The old certificate still works until T. Vercel jobs have their own worker slot so edge observation can renew its lease while builds are running. The daily rollover retries a pre-dispatch failure while the successor remains pending. A reclaimed job resumes polling the recorded hook job within the same deadline. A later retry can check that known deployment once without triggering a new one. If dispatch may have happened and Ark lacks the receipt, use manual delivery.
+3. Poll for the exact hook job and project on the hook branch for up to 30 minutes, following deployment pagination and backing off on transient provider errors. Process a READY result returned by the boundary poll. On success, atomically record `delivered_at`, supersede the predecessor, destroy the successor’s sealed key and promote the successor to `current` (§3.10.4). On failure, keep the successor `pending` and raise a per-client alert for manual delivery. The old certificate still works until T. Vercel jobs have their own worker slot so edge observation can renew its lease while builds are running. The daily rollover retries a pre-dispatch failure while the successor remains pending. A reclaimed job resumes polling the recorded hook job within the same deadline. A later retry can recheck the hook receipt and resume an unfinished page search without triggering a new build. If dispatch may have happened and Ark lacks the receipt, use manual delivery.
 4. Audit every call: endpoint, project, target and status. Values are never logged.
 
 **Security trade-off.** This must be shown in the UI before connecting:
@@ -1773,7 +1774,7 @@ The integration automates delivery for active production and preview clients wit
 **Opt-in live checks.** Run `bun --no-env-file test server/src/vercel-live.test.ts` against disposable Vercel projects. Each check reports a skip when its environment variables are unset. Pass credentials through the environment.
 
 - For the scope proof, set `ARK_TEST_VERCEL_PROJECT_ID`, `ARK_TEST_VERCEL_TEAM_ID`, `ARK_TEST_VERCEL_OTHER_PROJECT_ID` and `ARK_TEST_VERCEL_PROJECT_TOKEN`. Select two distinct projects in the same team. For the refusal fixtures, also set `ARK_TEST_VERCEL_TEAM_TOKEN`, `ARK_TEST_VERCEL_ACCOUNT_TOKEN`, `ARK_TEST_VERCEL_OTHER_PROJECT_TOKEN`, `ARK_TEST_VERCEL_EXPIRED_TOKEN` and `ARK_TEST_VERCEL_NO_EXPIRY_TOKEN` as available. The output records the four exact probe statuses, bounded metadata field names, value types and scope-denial codes. Record the reviewed evidence and update the source-controlled proof in `server/src/modules/vercel-api.ts` to enable connections. The published token schema describes user and team scopes. The project scope fields and denials require live confirmation. [Vercel OpenAPI](https://openapi.vercel.sh)
-- To test hook delivery, also supply `ARK_TEST_VERCEL_DEPLOY_HOOK` for the scratch project’s production branch. This starts one deployment and checks that the returned hook job can be matched to a ready deployment.
+- To test hook delivery, supply `ARK_TEST_VERCEL_DEPLOY_HOOK` for the scratch project’s production branch and `ARK_TEST_VERCEL_PREVIEW_DEPLOY_HOOK` for a non-production branch. Each starts one deployment and emits redacted proof of the exact READY match, target, custom environment exclusion and branch filtering. Review the Preview proof before enabling connection.
 - To check env inheritance, deploy a scratch app whose uncached `/api/ark-fd29-canary` returns only the hex SHA-256 of `ARK_FD29_REDEPLOY_CANARY`. Set that sensitive production variable before making the baseline deployment. Supply the scratch project and team IDs, `ARK_TEST_VERCEL_REDEPLOY_TOKEN` or the project token, `ARK_TEST_VERCEL_BASELINE_DEPLOYMENT_ID`, and `ARK_TEST_VERCEL_CANARY_BASELINE`. If deployment protection is enabled, supply `ARK_TEST_VERCEL_AUTOMATION_BYPASS` for the scratch project. The check changes the canary, creates a production redeployment via `deploymentId`, reads the new deployment’s canary digest to establish whether it changed, and restores the project variable for future builds.
 
 ### 3.11 Public port limits and allowlists (nftables)
@@ -1944,14 +1945,14 @@ Ark fills this in from the platform region setting (§3.15).
 
 - **With the Vercel integration** (§3.10.5), Ark updates both variables about 30 days before expiry and redeploys.
 
-- **For manual rollover or recovery after a failed push**, the client page shows the commands to update both variables before redeploying and confirming. Use the configured target and branch for preview deployments.
+- **For manual rollover or recovery after a failed push**, the client page shows the commands to update both variables before redeploying and confirming. A connected Preview client’s guide names the project and the verified hook branch and uses `--environment preview --git-branch` (Vercel CLI 64.6.0 or later).
 
 ```bash
 # Reveal the new bundle once in Ark (step-up), then:
 base64 -i client-next.crt | tr -d '\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive --force
 base64 -i client-next.key | tr -d '\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive --force
 vercel deploy --prod        # or redeploy from the dashboard
-# Then press "Confirm rollover" in Ark.
+# Check database access, then press "Confirm rollover" in Ark.
 ```
 
 The old certificate admits new connections until expiry and its role is drained by expiry +5 s, so redeploys can happen at any time within the 30-day window. (Check the `--force` and `--sensitive` flag spellings against the current Vercel CLI when FD-22 writes the guide: **unverified**.)
