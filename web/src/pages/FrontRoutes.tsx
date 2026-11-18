@@ -2,7 +2,9 @@
 // Lists every route with its listener, TLS mode and who it admits, lets an owner create TLS-TCP,
 // raw-TCP and postgres routes and enable or disable them, and explains which protocols can be routed
 // by name (TLS from the first byte, on 443, a shared SNI port or the 5432 router) and which need a
-// dedicated raw port.
+// dedicated raw port. HTTP routes have per-route controls (FD-23): a per-client rate limit and
+// required client certificates, and mTLS routes of any kind list, issue and revoke their client
+// certificates.
 
 import { type FormEvent, Fragment, useEffect, useState } from "react";
 
@@ -10,7 +12,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, Input, Label } from "@/components/ui/input";
-import type { FrontListeners, FrontRouteSummary, PlatformState } from "@/lib/types";
+import type { FrontListeners, FrontRouteSummary, PlatformState, RouteClientCertificates } from "@/lib/types";
 import { api, parseCidrList } from "@/lib/utils";
 
 import { InlineError } from "./Auth";
@@ -37,6 +39,9 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
   const [listeners, setListeners] = useState<FrontListeners | null>(null);
   const [error, setError] = useState("");
   const [openDns, setOpenDns] = useState<string | null>(null);
+  const [openPanel, setOpenPanel] = useState<{ id: string; panel: "controls" | "certificates" } | null>(null);
+  const toggle = (id: string, panel: "controls" | "certificates") =>
+    setOpenPanel((open) => (open?.id === id && open.panel === panel ? null : { id, panel }));
   const [refreshRevision, setRefreshRevision] = useState(0);
   const refresh = () => setRefreshRevision((revision) => revision + 1);
   const routeRevision = JSON.stringify(state.operations.map(({ id, status }) => [id, status]));
@@ -103,13 +108,41 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
                     </span>
                   )}
                 </span>
-                <span className="mono">{route.l4?.tlsMode ?? route.accessMode ?? "-"}</span>
+                <span className="flex flex-wrap items-center gap-1">
+                  <span className="mono">{route.l4?.tlsMode ?? route.accessMode ?? "-"}</span>
+                  {route.mtls && <Badge variant="info">client certificate</Badge>}
+                  {route.rateLimit && (
+                    <Badge variant="neutral">
+                      {route.rateLimit.requests}/{route.rateLimit.window}
+                    </Badge>
+                  )}
+                </span>
                 <span>{admitsBadge(route) ?? <span className="text-muted-foreground">-</span>}</span>
                 <span className="flex flex-wrap items-center gap-2">
                   <Badge variant={route.enabled ? "success" : "neutral"}>
                     {route.enabled ? "enabled" : "disabled"}
                   </Badge>
                   <Badge variant={route.status === "ready" ? "success" : "warning"}>{route.status}</Badge>
+                  {isOwner && route.kind === "http" && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-expanded={openPanel?.id === route.id && openPanel.panel === "controls"}
+                      onClick={() => toggle(route.id, "controls")}
+                    >
+                      Controls
+                    </Button>
+                  )}
+                  {isOwner && hasClientCertificates(route) && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-expanded={openPanel?.id === route.id && openPanel.panel === "certificates"}
+                      onClick={() => toggle(route.id, "certificates")}
+                    >
+                      Certificates
+                    </Button>
+                  )}
                   {route.domain && canReviewDns && (
                     <Button
                       size="sm"
@@ -124,6 +157,16 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
                 {isOwner && <RouteActions route={route} onChanged={refresh} />}
                 {route.lastError && <p className="col-span-full text-xs text-red-200">{route.lastError}</p>}
               </div>
+              {isOwner && openPanel?.id === route.id && openPanel.panel === "controls" && (
+                <div className="border-t border-border p-4">
+                  <HttpControlsPanel route={route} onChanged={refresh} />
+                </div>
+              )}
+              {isOwner && openPanel?.id === route.id && openPanel.panel === "certificates" && (
+                <div className="border-t border-border p-4">
+                  <ClientCertificatesPanel route={route} />
+                </div>
+              )}
               {openDns === route.id && route.domain && canReviewDns && (
                 <div className="border-t border-border p-4">
                   <DnsReviewPanel reviewPath={`/api/front/routes/${route.id}/dns`} owner={isOwner} />
@@ -240,6 +283,291 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
           </p>
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function hasClientCertificates(route: FrontRouteSummary) {
+  return route.kind === "http" ? route.mtls === true : route.l4?.tlsMode === "terminate_mtls";
+}
+
+const RATE_WINDOW = /^([1-9][0-9]{0,5})(s|m|h)$/;
+const WINDOW_SECONDS = { s: 1, m: 60, h: 3_600 } as const;
+
+/** Client-side check of a rate limit (FD-23); the API applies the same bounds. */
+function rateLimitError(requests: number, window: string) {
+  if (!Number.isInteger(requests) || requests < 1 || requests > 100_000)
+    return "Requests must be a whole number from 1 to 100000.";
+  const match = RATE_WINDOW.exec(window);
+  const seconds = match ? Number(match[1]) * WINDOW_SECONDS[match[2] as keyof typeof WINDOW_SECONDS] : 0;
+  if (!match || seconds < 1 || seconds > 3_600) return "The window must be from 1s to 1h, such as 10s or 1m.";
+  return "";
+}
+
+/**
+ * Owner controls of an HTTP route (FD-23): a per-client rate limit and required client certificates.
+ * Removing or raising the limit, or turning certificates off, loosens exposure and consumes the
+ * exposure.public step-up; tightening needs none, so an unused grant simply expires.
+ */
+function HttpControlsPanel({ route, onChanged }: { route: FrontRouteSummary; onChanged: () => void }) {
+  const [limited, setLimited] = useState(Boolean(route.rateLimit));
+  const [mtls, setMtls] = useState(route.mtls === true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState("");
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const requests = Number(String(form.get("requests") ?? "").trim());
+    const period = String(form.get("window") ?? "").trim();
+    setError("");
+    setSaved("");
+    const invalid = limited ? rateLimitError(requests, period) : "";
+    if (invalid) {
+      setError(invalid);
+      return;
+    }
+    const body = { rateLimit: limited ? { requests, window: period } : null, mtls };
+    if (
+      mtls &&
+      !route.mtls &&
+      !window.confirm("Require a client certificate? Open connections without one are closed.")
+    )
+      return;
+    setBusy(true);
+    try {
+      await api("/api/step-up", {
+        method: "POST",
+        body: JSON.stringify({
+          password: form.get("password"),
+          action: "exposure.public",
+          request: { routeId: route.id, ...body },
+        }),
+      });
+      await api(`/api/front/routes/${route.id}`, { method: "PATCH", body: JSON.stringify(body) });
+      setSaved("Saved. The edge applies the change within seconds.");
+      onChanged();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save the route controls.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="grid gap-4 md:grid-cols-2" onSubmit={submit}>
+      <label className="flex items-start gap-2 text-sm md:col-span-2">
+        <input
+          type="checkbox"
+          className="mt-1"
+          checked={limited}
+          onChange={(event) => setLimited(event.target.checked)}
+        />
+        <span>
+          Limit requests per client
+          <span className="block text-xs text-muted-foreground">
+            Requests over the limit from one client address get 429 with Retry-After, before the login gate
+            and the upstream.
+          </span>
+        </span>
+      </label>
+      {limited && (
+        <>
+          <Field
+            label="Requests"
+            name="requests"
+            type="number"
+            min={1}
+            max={100000}
+            defaultValue={route.rateLimit?.requests ?? 60}
+            required
+          />
+          <Field
+            label="Per window (1s to 1h)"
+            name="window"
+            defaultValue={route.rateLimit?.window ?? "1m"}
+            pattern="[1-9][0-9]*(s|m|h)"
+            required
+          />
+        </>
+      )}
+      <label className="flex items-start gap-2 text-sm md:col-span-2">
+        <input
+          type="checkbox"
+          className="mt-1"
+          checked={mtls}
+          onChange={(event) => setMtls(event.target.checked)}
+        />
+        <span>
+          Require a client certificate (mTLS)
+          <span className="block text-xs text-muted-foreground">
+            The TLS handshake fails without an unrevoked certificate from this route’s own CA. Works with
+            either access mode: with Ark login, users need both a certificate and a sign-in. Switching it off
+            retires the CA and every certificate it issued.
+          </span>
+        </span>
+      </label>
+      <Field
+        label="Current password"
+        name="password"
+        type="password"
+        autoComplete="current-password"
+        required
+      />
+      {error && (
+        <div className="md:col-span-2">
+          <InlineError>{error}</InlineError>
+        </div>
+      )}
+      {saved && <p className="text-sm md:col-span-2">{saved}</p>}
+      <div className="md:col-span-2">
+        <Button disabled={busy}>Save controls</Button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * Client certificates of an mTLS route (terminate_mtls, FD-14; HTTP mTLS, FD-23). Issuing needs a
+ * credential.rotate step-up bound to the route and the exact request; revoking tightens and needs none.
+ */
+function ClientCertificatesPanel({ route }: { route: FrontRouteSummary }) {
+  const [list, setList] = useState<RouteClientCertificates | null>(null);
+  const [revision, setRevision] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [issued, setIssued] = useState<{
+    certPem: string;
+    caCertPem: string;
+    keySecretId: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<RouteClientCertificates>(`/api/front/routes/${route.id}/client-certificates`)
+      .then((value) => !cancelled && setList(value))
+      .catch((cause) => !cancelled && setError(cause instanceof Error ? cause.message : "Could not load."));
+    return () => {
+      cancelled = true;
+    };
+    // `revision` reloads the list after an issue or revoke.
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
+  }, [route.id, revision]);
+
+  async function issue(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const csrPem = String(form.get("csrPem") ?? "").trim();
+    const body: Record<string, string> = { name: String(form.get("name") ?? "").trim() };
+    if (csrPem) body.csrPem = csrPem;
+    setBusy(true);
+    setError("");
+    setIssued(null);
+    try {
+      await api("/api/step-up", {
+        method: "POST",
+        body: JSON.stringify({
+          password: form.get("password"),
+          action: "credential.rotate",
+          request: { routeId: route.id, ...body },
+        }),
+      });
+      const result = await api<{ certPem: string; caCertPem: string; keySecretId: string | null }>(
+        `/api/front/routes/${route.id}/client-certificates`,
+        { method: "POST", body: JSON.stringify(body) },
+      );
+      formElement.reset();
+      setIssued(result);
+      setRevision((value) => value + 1);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not issue the certificate.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revoke(certificateId: string, name: string) {
+    if (!window.confirm(`Revoke ${name}? Its connections to ${route.hostname} are closed.`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/front/routes/${route.id}/client-certificates/${certificateId}/revoke`, {
+        method: "POST",
+        body: "{}",
+      });
+      setRevision((value) => value + 1);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not revoke the certificate.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4 text-sm">
+      {error && <InlineError>{error}</InlineError>}
+      {list?.ca && (
+        <p>
+          Route CA <span className="mono">{list.ca.id}</span> ({list.ca.status}). Clients must present a
+          certificate it issued; revoked and expired certificates are refused in the TLS handshake.
+        </p>
+      )}
+      {list && list.certificates.length === 0 && <p className="empty-state">No client certificates yet.</p>}
+      {list?.certificates.map((item) => (
+        <div key={item.id} className="flex flex-wrap items-center gap-2">
+          <strong>{item.subjectCn}</strong>
+          <span className="mono text-xs">{item.serial}</span>
+          <Badge variant={item.status === "issued" ? "success" : "neutral"}>{item.status}</Badge>
+          <span className="text-xs text-muted-foreground">expires {item.notAfter.slice(0, 10)}</span>
+          {item.status === "issued" && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => void revoke(item.id, item.subjectCn)}
+            >
+              Revoke
+            </Button>
+          )}
+        </div>
+      ))}
+      <form className="grid gap-4 md:grid-cols-2" onSubmit={issue}>
+        <Field label="Certificate name" name="name" placeholder="laptop-alice" maxLength={64} required />
+        <Field
+          label="Current password"
+          name="password"
+          type="password"
+          autoComplete="current-password"
+          required
+        />
+        <div className="md:col-span-2">
+          <Label htmlFor={`csr-${route.id}`}>CSR (optional)</Label>
+          <textarea
+            id={`csr-${route.id}`}
+            name="csrPem"
+            className="min-h-20 w-full rounded-lg border border-input bg-background p-3 font-mono text-xs"
+            placeholder="-----BEGIN CERTIFICATE REQUEST----- (empty: Ark generates a key you reveal once)"
+          />
+        </div>
+        <div className="md:col-span-2">
+          <Button disabled={busy}>Issue certificate</Button>
+        </div>
+      </form>
+      {issued && (
+        <div className="space-y-2">
+          <p>
+            Issued.{" "}
+            {issued.keySecretId
+              ? `Reveal the generated private key once as secret ${issued.keySecretId} (secret.reveal step-up).`
+              : "Use the private key of your CSR."}
+          </p>
+          <pre className="mono overflow-x-auto rounded-lg border border-border p-3 text-xs">
+            {issued.certPem}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }

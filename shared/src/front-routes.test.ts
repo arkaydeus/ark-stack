@@ -215,6 +215,49 @@ describe("route request policy", () => {
     expect(looseningChanges(current, { redirectTo: "app.example.com" })).toEqual([]);
     expect(looseningChanges(current, { allowSensitivePort: true })).toEqual(["allowSensitivePort"]);
   });
+
+  test("FD-23: removing or raising a rate limit and turning client certificates off loosen", () => {
+    const current = {
+      targetInput: "home.tail1234.ts.net",
+      targetPort: 3000,
+      accessMode: "public",
+      redirectTo: null,
+      status: "ready",
+      rateLimit: { requests: 60, window: "1m" },
+      mtls: true,
+    };
+    expect(looseningChanges(current, { rateLimit: null })).toEqual(["rateLimit"]);
+    expect(looseningChanges(current, { rateLimit: { requests: 120, window: "1m" } })).toEqual(["rateLimit"]);
+    // Same sustained rate, bigger burst: more requests from one client before the limit.
+    expect(looseningChanges(current, { rateLimit: { requests: 600, window: "10m" } })).toEqual(["rateLimit"]);
+    expect(looseningChanges(current, { rateLimit: { requests: 30, window: "1m" } })).toEqual([]);
+    expect(looseningChanges(current, { rateLimit: { requests: 60, window: "2m" } })).toEqual([]);
+    expect(
+      looseningChanges({ ...current, rateLimit: null }, { rateLimit: { requests: 5, window: "1s" } }),
+    ).toEqual([]);
+    expect(looseningChanges(current, { mtls: false })).toEqual(["mtls"]);
+    expect(looseningChanges({ ...current, mtls: false }, { mtls: true })).toEqual([]);
+    expect(looseningChanges(current, { mtls: true, rateLimit: current.rateLimit })).toEqual([]);
+  });
+
+  test("FD-23: rateLimit and mtls are HTTP-only request fields", () => {
+    const input = frontRouteCreateInput.parse({
+      hostname: "www.example.com",
+      target: "home",
+      targetPort: 3000,
+      rateLimit: { requests: 10, window: "1s" },
+      mtls: true,
+    });
+    expect(() => assertFieldsForKind("http", input)).not.toThrow();
+    for (const kind of ["tls", "tcp", "postgres"] as const)
+      expect(() => assertFieldsForKind(kind, input)).toThrow(/rateLimit, mtls cannot be set/);
+    expect(frontRouteUpdateInput.parse({ rateLimit: null })).toEqual({ rateLimit: null });
+    expect(frontRouteUpdateInput.parse({ mtls: false })).toEqual({ mtls: false });
+    expect(() =>
+      frontRouteUpdateInput.parse({ rateLimit: { requests: 1, window: "1s", key: "x" } }),
+    ).toThrow();
+    expect(() => frontRouteUpdateInput.parse({ mtls: "yes" })).toThrow();
+  });
 });
 
 /** Caddy `path` matcher semantics for the patterns used here: `*` matches any run of characters. */

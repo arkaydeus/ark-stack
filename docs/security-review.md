@@ -117,6 +117,8 @@ The FD-10, FD-11 and FD-12 DB cases live in `server/src/gate-*.suite.ts`; their 
 - Header stripping (`X-Ark-*`, forged `X-Forwarded-*`, `Server`, `Via`).
 - `Location` rewriting.
 - Body and timeout limits.
+- Optional per-route rate limits (FD-23): a per-client-address `rate_limit` zone from the pinned `caddy-ratelimit` plugin (v0.1.0, module hash checked at build), ordered before `forward_auth` and the upstream, answering a static 429.
+- Optional HTTP mTLS (FD-23): `client_auth` `require_and_verify` against the route's own `http-client` CA only, then a `leaf` allowlist of its unrevoked, unexpired certificates that are not in its CRL. Caddy runs the check from `VerifyConnection` and disables session tickets for client-auth policies, so a resumed session cannot skip it. An unusable CA omits the route. Revocation goes through the gate revocation journal (forced reload and HAProxy session drain, with the 5 s watchdog deadline). It combines with Ark login, and `strict_sni_host` keeps one hostname's connection from reaching another.
 
 **Tests:**
 
@@ -127,8 +129,18 @@ The FD-10, FD-11 and FD-12 DB cases live in `server/src/gate-*.suite.ts`; their 
 - [DB] `server/src/gate-login.suite.ts`: `X-Forwarded-Host` and `X-Forwarded-Proto` are ignored.
 - [H: `test:edge`] `scripts/test-edge-config.ts`: header stripping, `Server`/`Via` removal and Ark certificates on a live Caddy.
 - [H: `test:edge`] `scripts/test-edge-l4.ts`: 421 on an SNI/Host mismatch; forged `X-Forwarded-For` and `X-Ark-*` are not passed upstream.
+- FD-23 rate limits and HTTP mTLS:
+  - [U] `shared/src/edge-http-controls.test.ts`: limit bounds; the zone is site-level, before the gate handlers and `forward_auth`; the 429 hides `Server`; routes without controls render as before; the CA and leaf allowlist; an empty list admits nobody; an invalid limit or CA omits the route.
+  - [U] `server/src/modules/route-crl.test.ts`: a CRL-listed, revoked, expired or not-yet-valid certificate is never admitted; a missing or unreadable CRL admits nobody.
+  - [U] `shared/src/front-routes.test.ts`: removing or raising a limit, or switching mTLS off, needs a step-up; both fields are HTTP-only.
+  - [U] `scripts/edge-test/edge-image.test.ts`: the `edge` service builds the `edge-caddy` stage on the official Caddy digest, with the plugin version and hash pinned.
+  - [DB] `server/src/http-route-controls.test.ts`: validation, step-ups, the route CA and CRL, issuance re-rendering the edge, revocation journaling a gate revocation and leaving the allowlist, and switching mTLS on and off.
+  - [H: `test:edge`] `scripts/test-edge-http-controls.ts`: through HAProxy, 429 above the limit while another route is unaffected; a TLS alert, not an HTTP status, without a certificate, with a rogue-CA certificate, with an unadmitted certificate and with a revoked serial after the CRL update; the revoking apply closes that client's open connection; a valid certificate is served; 421 both ways; upper-case SNI; mTLS with Ark login.
 
-**Gaps:** body-size and timeout limits are checked only as rendered text. No harness sends an oversized body or a slow request and expects 413 or 408.
+**Gaps:**
+
+- Body-size and timeout limits are checked only as rendered text. No harness sends an oversized body or a slow request and expects 413 or 408.
+- **Design limit, untested.** HTTP rate-limit counters live in one Caddy process and can start again after a config reload, and IPv6 clients are counted per address rather than per /64. The kernel per-source limits on 443 still group IPv6 per /64.
 
 ### B5: Caddy ↔ Ark API (`forward_auth`, login origin)
 
@@ -303,7 +315,7 @@ These items need a follow-up ticket. None of them is covered by the tests listed
 
 1. B1, code and test: no per-source nftables limits on mail TCP 25/465/587/993.
 2. B2 and B7: no test of the frontend-wide HAProxy `sc0` limits on 443 and the SNI ports.
-3. B4: no runtime test of the body-size and timeout limits (413/408).
+3. B4: no runtime test of the body-size and timeout limits (413/408). HTTP rate-limit counters are per process and per IPv6 address (FD-23).
 4. B5: no `/api/gate/check` test with an unregistered route `Host`.
 5. B9: no harness proof that tailnet-only administration is unreachable on public 443.
 6. B10: Cloudflare token scope is neither checked nor tested.

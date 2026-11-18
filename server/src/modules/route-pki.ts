@@ -4,8 +4,12 @@
 // must be current (an expired CRL fails every handshake). Revoking a certificate regenerates the CRL;
 // the serial also enters the route's lease policy fingerprint, so the running HAProxy servers of the
 // old policy are fenced and their sessions drained in every worker before the new CRL is reloaded.
+//
+// HTTP mTLS routes (FD-23) have an `http-client` CA. Caddy has no CRL support, so the edge renders the
+// CA's certificates that are neither revoked nor listed in its CRL (`admittedClientCertificates`); the
+// CRL is still kept current here, for clients and audits that read it.
 
-import { eq, and } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 
 import { db } from "../db.ts";
 import { privateCas } from "../schema.ts";
@@ -22,7 +26,7 @@ export async function routeCrlsDue(now = new Date()) {
   const cas = await db
     .select()
     .from(privateCas)
-    .where(and(eq(privateCas.purpose, "tcp-client"), eq(privateCas.status, "active")));
+    .where(and(inArray(privateCas.purpose, ["tcp-client", "http-client"]), eq(privateCas.status, "active")));
   const revoked = await revokedSerials(cas.map((ca) => ca.id));
   return cas
     .filter(

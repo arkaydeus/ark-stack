@@ -130,5 +130,31 @@ USER haproxy
 ENTRYPOINT ["/usr/local/bin/bun", "/opt/ark/haproxy-validator.js"]
 CMD []
 
+# Edge Caddy (docs/design/front-door.md FD-23): the pinned official Caddy 2.11.9 image, with its binary
+# replaced by an xcaddy build of the same Caddy release plus github.com/mholt/caddy-ratelimit (an
+# unofficial plugin) for HTTP route rate limits. The builder is the official 2.11.9 builder by digest.
+# The plugin is pinned to one tagged version; Go verifies every module against the checksum database,
+# and the build fails unless the binary records exactly the expected module hash, reports v2.11.9 and
+# carries the rate_limit handler. Everything else (filesystem, users, the file capability) is the
+# official image. The bump procedure is in docs/operating.md ("Third-party image pins").
+FROM caddy:2.11.9-builder@sha256:f9beaa5ddbe7df6f26ebbcf9cbf44e05a1917b9bba464f0c3229038d7e2e6e13 AS edge-caddy-build
+ARG CADDY_VERSION=v2.11.9
+ARG CADDY_RATELIMIT_MODULE=github.com/mholt/caddy-ratelimit
+ARG CADDY_RATELIMIT_VERSION=v0.1.0
+ARG CADDY_RATELIMIT_SUM=h1:73lOvdSLSoBGPT5l61nrTzh9liax+IDfXeQDtfzNcZ4=
+# The capability is set in the runtime stage, as the official image does.
+ENV XCADDY_SETCAP=0
+RUN set -eu; \
+  xcaddy build "$CADDY_VERSION" --with "$CADDY_RATELIMIT_MODULE@$CADDY_RATELIMIT_VERSION" --output /out/caddy; \
+  go version -m /out/caddy | awk -v m="$CADDY_RATELIMIT_MODULE" -v v="$CADDY_RATELIMIT_VERSION" -v s="$CADDY_RATELIMIT_SUM" \
+    '$1 == "dep" && $2 == m && $3 == v && $4 == s { found = 1 } END { exit !found }'; \
+  /out/caddy version | grep -q "^$CADDY_VERSION "; \
+  /out/caddy list-modules | grep -qx http.handlers.rate_limit
+
+FROM caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c AS edge-caddy
+COPY --from=edge-caddy-build /out/caddy /usr/bin/caddy
+RUN setcap cap_net_bind_service=p /usr/bin/caddy && caddy version | grep -q '^v2.11.9 ' \
+  && caddy list-modules | grep -qx http.handlers.rate_limit
+
 # Keep mail-worker last: Compose services that build without a target (api, migrate) use the last stage.
 FROM runtime AS mail-worker

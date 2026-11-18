@@ -29,6 +29,12 @@
 // L4 route's admission policy renames its HAProxy servers (the lease fingerprint), so a live route's
 // old sessions are drained in every HAProxy worker.
 //
+// HTTP routes may also carry a per-client rate limit and require client certificates (FD-23). An
+// HTTP mTLS route has its own `http-client` CA (`client_ca_id`), created with the route or when mTLS
+// is switched on, and retired when it is switched off. Caddy admits exactly the CA's unrevoked,
+// unexpired certificates, so issuing one re-renders the edge, and revoking one goes through the gate
+// revocation journal: the route's sessions are drained around the forced reload that drops it.
+//
 // Preparation validates without writes; final validation and grant consumption share the mutation
 // transaction, so conflicts roll back the grant. Every action is audited.
 
@@ -47,6 +53,9 @@ import {
   type SupportedRouteKind,
   checkGateRouteSettings,
   createId,
+  HTTP_CLIENT_CERTIFICATE_LIMIT,
+  httpRateLimit,
+  type HttpRateLimit,
   planHash,
   looseningChanges,
   normalizeRedirectTo,
@@ -60,12 +69,13 @@ import {
   type FrontRouteUpdateInput,
   type OperationKind,
 } from "@ark-stack/shared";
-import { and, desc, eq, sql as statement } from "drizzle-orm";
+import { and, desc, eq, gt, sql as statement } from "drizzle-orm";
 
 import { db, type DbTransaction } from "../db.ts";
 import {
   auditEvents,
   certificates,
+  clientCertificates,
   dnsRecords,
   domainClaims,
   endpoints,
@@ -119,6 +129,41 @@ function redirectOf(route: Pick<RouteRow, "httpOptions">) {
 function allowedOriginsOf(route: Pick<RouteRow, "httpOptions">) {
   const value = route.httpOptions?.allowedOrigins;
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/** The stored rate limit of an HTTP route (FD-23), or undefined when the stored value is invalid. */
+function storedRateLimit(route: Pick<RouteRow, "rateLimit">): HttpRateLimit | null | undefined {
+  try {
+    return httpRateLimit(route.rateLimit);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Validates a requested rate limit as a request error (422). */
+function requestedRateLimit(value: unknown) {
+  try {
+    return httpRateLimit(value);
+  } catch (error) {
+    throw new FrontRouteError(422, (error as Error).message);
+  }
+}
+
+/** HTTP mTLS (FD-23): the route's own client CA with a first (empty) CRL, in the caller's transaction. */
+async function createHttpClientCa(routeId: string, tx: DbTransaction) {
+  const ca = await pki.createPrivateCa({ purpose: "http-client", name: `Route ${routeId}` }, tx);
+  await pki.generateCaCrl({ caId: ca.id }, tx);
+  return ca;
+}
+
+/** Retires a route's client CA once no route uses it (deletion, or HTTP mTLS switched off). */
+async function retireRouteCa(tx: DbTransaction, caId: string) {
+  const [shared] = await tx
+    .select({ id: frontRoutes.id })
+    .from(frontRoutes)
+    .where(eq(frontRoutes.clientCaId, caId))
+    .limit(1);
+  if (!shared) await tx.update(privateCas).set({ status: "retired" }).where(eq(privateCas.id, caId));
 }
 
 /** Bypass paths and Origin exceptions belong to SSO routes only (§3.9.4, §3.9.5). */
@@ -312,6 +357,9 @@ function summarize(
     bypassPaths: route.bypassPaths,
     allowedOrigins: allowedOriginsOf(route),
     redirectTo: redirectOf(route),
+    // FD-23: the per-client request limit (null: none) and required client certificates.
+    rateLimit: route.kind === "http" ? (storedRateLimit(route) ?? null) : null,
+    mtls: route.kind === "http" && route.clientCaId !== null,
     l4: l4Summary(route),
     enabled: route.enabled,
     status: route.status,
@@ -431,6 +479,9 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
     kind === "http"
       ? gateSettings(accessMode, input, { bypassPaths: [], allowedOrigins: [] })
       : { bypassPaths: [], allowedOrigins: [] };
+  // FD-23: HTTP rate limit and client certificates (HTTP_ONLY fields, refused on other kinds).
+  const rateLimit = kind === "http" ? requestedRateLimit(input.rateLimit) : null;
+  const mtls = kind === "http" && input.mtls === true;
   const hostname = await publicRouteHostname(input.hostname);
   const domain = routeDomainFor(hostname, await db.select().from(domainClaims));
   if (!domain) {
@@ -503,6 +554,8 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
     targetPort: input.targetPort,
     accessMode,
     ...gate,
+    rateLimit,
+    mtls,
     pinned,
     records,
   };
@@ -553,7 +606,9 @@ export async function commitRouteCreate(
       const clientCa =
         plan.l4?.tlsMode === "terminate_mtls"
           ? await pki.createPrivateCa({ purpose: "tcp-client", name: `Route ${routeId}` }, tx)
-          : null;
+          : plan.mtls
+            ? await createHttpClientCa(routeId, tx)
+            : null;
       let endpointId = plan.endpoint?.id;
       if (endpointId) {
         const [existing] = await tx
@@ -592,7 +647,9 @@ export async function commitRouteCreate(
               clientCaId: clientCa?.id ?? null,
               compatPort: plan.l4.compatPort,
             }
-          : {}),
+          : plan.kind === "http"
+            ? { clientCaId: clientCa?.id ?? null, rateLimit: plan.rateLimit }
+            : {}),
         targetInput: plan.targetInput,
         targetNodeStableId: plan.pinned.stableId,
         targetIp: plan.pinned.ip,
@@ -628,6 +685,9 @@ export async function commitRouteCreate(
                 bypassPaths: plan.bypassPaths,
                 allowedOrigins: plan.allowedOrigins,
                 redirectTo: plan.redirectTo,
+                rateLimit: plan.rateLimit,
+                mtls: plan.mtls,
+                clientCaId: clientCa?.id ?? null,
               }
             : { l4: plan.l4, clientCaId: clientCa?.id ?? null }),
           records,
@@ -715,6 +775,14 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     route.kind === "http"
       ? gateSettings(accessMode, input, currentGate)
       : { bypassPaths: [], allowedOrigins: [] };
+  // FD-23: an invalid stored limit counts as none, so replacing it is never mistaken for tightening.
+  const currentRateLimit = route.kind === "http" ? (storedRateLimit(route) ?? null) : null;
+  const rateLimit =
+    route.kind === "http" && input.rateLimit !== undefined
+      ? requestedRateLimit(input.rateLimit)
+      : currentRateLimit;
+  const currentMtls = route.kind === "http" && route.clientCaId !== null;
+  const mtls = route.kind === "http" ? (input.mtls ?? currentMtls) : false;
   const current = {
     targetInput: route.targetInput,
     targetPort: route.targetPort,
@@ -722,6 +790,8 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     redirectTo: redirectOf(route),
     status: route.status,
     ...currentGate,
+    rateLimit: currentRateLimit,
+    mtls: currentMtls,
   };
   const loosening = looseningChanges(current, {
     targetInput: input.target === undefined ? undefined : targetInput,
@@ -731,12 +801,16 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     allowSensitivePort: input.allowSensitivePort,
     bypassPaths: gate.bypassPaths,
     allowedOrigins: gate.allowedOrigins,
+    rateLimit: input.rateLimit === undefined ? undefined : rateLimit,
+    mtls: input.mtls === undefined ? undefined : mtls,
   });
   if (l4) loosening.push(...l4LooseningChanges(l4.current, l4.next));
   // Tightening the gate of a route that may have open upgraded connections (§3.9.3).
+  // Switching client certificates on (FD-23) also ends connections admitted without one.
   const gateTightened =
     route.kind === "http" &&
     ((accessMode === "sso" && route.accessMode !== "sso") ||
+      (mtls && !currentMtls) ||
       currentGate.bypassPaths.some((path) => !gate.bypassPaths.includes(path)) ||
       currentGate.allowedOrigins.some((origin) => !gate.allowedOrigins.includes(origin)));
   const repin = loosening.some((item) => ["target", "targetPort", "reconfirmTarget"].includes(item));
@@ -765,6 +839,9 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     changes.bypassPaths = { from: currentGate.bypassPaths, to: gate.bypassPaths };
   if (JSON.stringify(gate.allowedOrigins) !== JSON.stringify(currentGate.allowedOrigins))
     changes.allowedOrigins = { from: currentGate.allowedOrigins, to: gate.allowedOrigins };
+  if (JSON.stringify(rateLimit) !== JSON.stringify(currentRateLimit))
+    changes.rateLimit = { from: currentRateLimit, to: rateLimit };
+  if (mtls !== currentMtls) changes.mtls = { from: currentMtls, to: mtls };
   if (pinned && (pinned.stableId !== route.targetNodeStableId || pinned.ip !== route.targetIp))
     changes.pinned = {
       from: { stableId: route.targetNodeStableId, ip: route.targetIp },
@@ -780,6 +857,8 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     ...gate,
     gateTightened,
     redirectTo,
+    rateLimit,
+    mtls,
     pinned,
     loosening,
     changes,
@@ -814,6 +893,13 @@ export async function commitRouteUpdate(
       l4?.tlsMode === "terminate_mtls" && !route.clientCaId
         ? (await pki.createPrivateCa({ purpose: "tcp-client", name: `Route ${route.id}` }, tx)).id
         : route.clientCaId;
+    // HTTP mTLS (FD-23): a new route CA when switched on, none (and the old CA retired) when off.
+    const httpClientCaId =
+      route.kind !== "http"
+        ? null
+        : plan.mtls
+          ? (route.clientCaId ?? (await createHttpClientCa(route.id, tx)).id)
+          : null;
     const updated = await tx
       .update(frontRoutes)
       .set({
@@ -838,7 +924,9 @@ export async function commitRouteUpdate(
               clientCaId,
               ...(route.kind === "postgres" ? { compatPort: l4.compatPort } : {}),
             }
-          : {}),
+          : route.kind === "http"
+            ? { clientCaId: httpClientCaId, rateLimit: plan.rateLimit }
+            : {}),
         targetInput: plan.targetInput,
         targetPort: plan.targetPort,
         targetNodeStableId: plan.pinned?.stableId ?? route.targetNodeStableId,
@@ -853,6 +941,8 @@ export async function commitRouteUpdate(
       .where(currentRoute(route.id, plan.version))
       .returning({ id: frontRoutes.id });
     if (!updated.length) throw new FrontRouteError(409, "The route changed state; reload and retry.");
+    if (route.kind === "http" && route.clientCaId && !httpClientCaId)
+      await retireRouteCa(tx, route.clientCaId);
     // Open WebSockets admitted under the looser gate are closed by a forced reload (§3.9.3).
     if (plan.gateTightened) {
       await tx.execute(
@@ -910,8 +1000,11 @@ export async function prepareRouteEnable(routeId: string) {
   requireManaged(route);
   await publicRouteHostname(endpoint.hostname);
   if (route.enabled) throw new FrontRouteError(409, "The route is already enabled.");
-  if (route.kind === "http") assertSupportedAccessMode(route.accessMode, "enable");
-  else {
+  if (route.kind === "http") {
+    assertSupportedAccessMode(route.accessMode, "enable");
+    if (storedRateLimit(route) === undefined)
+      throw new FrontRouteError(409, "The route's stored rate limit is invalid; set it again first.");
+  } else {
     currentL4(route);
     l4Check(() => assertL4Enableable(route));
   }
@@ -1006,15 +1099,7 @@ export async function commitRouteDelete(
       .returning({ id: frontRoutes.id });
     if (!removed.length) throw new FrontRouteError(409, "The route changed state; reload and retry.");
     // The route's own client CA issues nothing more once the route is gone.
-    if (route.clientCaId) {
-      const [shared] = await tx
-        .select({ id: frontRoutes.id })
-        .from(frontRoutes)
-        .where(eq(frontRoutes.clientCaId, route.clientCaId))
-        .limit(1);
-      if (!shared)
-        await tx.update(privateCas).set({ status: "retired" }).where(eq(privateCas.id, route.clientCaId));
-    }
+    if (route.clientCaId) await retireRouteCa(tx, route.clientCaId);
     const others = await tx
       .select({ id: frontRoutes.id })
       .from(frontRoutes)
@@ -1219,18 +1304,15 @@ export async function routesCertificateFailed(endpointId: string, message: strin
   });
 }
 
-// ---- Route client certificates (terminate_mtls, §3.8.4, FD-14) ---------------------------------------
+// ---- Route client certificates (terminate_mtls, §3.8.4, FD-14; HTTP mTLS, FD-23) ----------------------
 
 async function mtlsRoute(routeId: string) {
   const { route, endpoint } = await loadRoute(routeId);
-  if (
-    (route.kind !== "tls" && route.kind !== "postgres") ||
-    route.tlsMode !== "terminate_mtls" ||
-    !route.clientCaId
-  ) {
+  const l4Mtls = (route.kind === "tls" || route.kind === "postgres") && route.tlsMode === "terminate_mtls";
+  if (!(l4Mtls || route.kind === "http") || !route.clientCaId) {
     throw new FrontRouteError(
       409,
-      "Client certificates exist only for tls or postgres routes in terminate_mtls mode.",
+      "Client certificates exist only for tls or postgres routes in terminate_mtls mode and for HTTP routes with mtls.",
     );
   }
   return { route, endpoint, caId: route.clientCaId };
@@ -1267,13 +1349,35 @@ export async function listRouteClientCertificates(routeId: string) {
   };
 }
 
-/** Issues a 90-day client certificate from the route CA: a generated key, or the caller's CSR. */
+/**
+ * Issues a 90-day client certificate from the route CA: a generated key, or the caller's CSR. HTTP
+ * routes admit exact certificates (FD-23), so the edge is re-rendered to include the new one.
+ */
 export async function issueRouteClientCertificate(
   routeId: string,
   input: { name: string; csrPem?: string },
   actor: RouteActor,
+  enqueue?: RouteEnqueue,
 ) {
-  const { caId } = await mtlsRoute(routeId);
+  const { route, caId } = await mtlsRoute(routeId);
+  if (route.kind === "http") {
+    // The edge renders each admitted certificate; past the limit it would omit the route instead.
+    const [row] = await db
+      .select({ n: statement<number>`count(*)::int` })
+      .from(clientCertificates)
+      .where(
+        and(
+          eq(clientCertificates.caId, caId),
+          eq(clientCertificates.status, "issued"),
+          gt(clientCertificates.notAfter, new Date()),
+        ),
+      );
+    if ((row?.n ?? 0) >= HTTP_CLIENT_CERTIFICATE_LIMIT)
+      throw new FrontRouteError(
+        409,
+        `The route already has ${HTTP_CLIENT_CERTIFICATE_LIMIT} client certificates; revoke unused ones first.`,
+      );
+  }
   let issued: Awaited<ReturnType<typeof pki.issueClientCertificate>>;
   try {
     issued = await pki.issueClientCertificate({
@@ -1292,6 +1396,7 @@ export async function issueRouteClientCertificate(
     serial: issued.certificate.serial,
     keySource: input.csrPem === undefined ? "generated" : "csr",
   });
+  if (route.kind === "http") await enqueue?.({ kind: "edge.apply", targetIds: ["platform"] });
   return {
     id: issued.certificate.id,
     serial: issued.certificate.serial,
@@ -1306,6 +1411,10 @@ export async function issueRouteClientCertificate(
  * Revokes a route client certificate: the CRL is regenerated, and the serial enters the route's lease
  * policy fingerprint, so its HAProxy servers are fenced and every session drained (current and
  * leaving workers) before the generation with the new CRL is reloaded. Tightening: no step-up.
+ *
+ * HTTP mTLS routes (FD-23) use the gate revocation journal instead (§3.9.3): its forced reload loads
+ * the Caddy config without the certificate, and the route's HAProxy sessions (WebSockets included)
+ * are drained around it. If that does not happen within 5 s, the watchdog withdraws the route.
  */
 export async function revokeRouteClientCertificate(
   routeId: string,
@@ -1324,6 +1433,21 @@ export async function revokeRouteClientCertificate(
       tx,
     );
     const generatedCrl = await pki.generateCaCrl({ caId }, tx);
+    if (route.kind === "http") {
+      await tx.execute(
+        statement`SELECT set_config('ark.gate_revocation_reason', 'client_certificate_revoked', true)`,
+      );
+      await tx.execute(statement`SELECT ark_gate_revoke(${routeId}, 'client_certificate_revoked')`);
+      await auditRoute(
+        actor,
+        "front_route.client_certificate_revoke",
+        routeId,
+        { certificateId, serial: revokedCertificate.serial, crlNumber: generatedCrl.crlNumber },
+        undefined,
+        tx,
+      );
+      return { revoked: revokedCertificate, crl: generatedCrl };
+    }
     // Durable work and the desired policy commit together. No post-commit enqueue gap.
     const payload = {
       routeIds: [routeId],

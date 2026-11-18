@@ -230,6 +230,10 @@ export type FrontRouteSummary = {
   hostname: string;
   listenPort: number;
   accessMode: string | null;
+  /** HTTP routes (FD-23): requests per window per client address, or null for no limit. */
+  rateLimit?: { requests: number; window: string } | null;
+  /** HTTP routes (FD-23): a client certificate from the route's own CA is required. */
+  mtls?: boolean;
   enabled: boolean;
   status: string;
   lastError: string | null;
@@ -246,6 +250,21 @@ export type FrontRouteSummary = {
     clientCaId: string | null;
     admits: "internet" | "allowlist" | "nobody";
   } | null;
+};
+
+/** `GET /api/front/routes/:id/client-certificates` (FD-14 terminate_mtls, FD-23 HTTP mTLS). */
+export type RouteClientCertificates = {
+  ca: { id: string; name: string; status: string; certPem: string; notAfter: string } | null;
+  certificates: Array<{
+    id: string;
+    subjectCn: string;
+    serial: string;
+    notAfter: string;
+    status: string;
+    revokedAt: string | null;
+    certPem: string | null;
+    keySecretId: string | null;
+  }>;
 };
 
 /** `GET /api/front/listeners` (§3.8.2, FD-14). */

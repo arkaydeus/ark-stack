@@ -21,6 +21,7 @@ import {
   type EdgeL4TlsMode,
   type L4Limits,
 } from "./edge-l4.ts";
+import { rateLimitPerSecond, type HttpRateLimit } from "./edge-http.ts";
 import { ValidationError } from "./errors.ts";
 import { checkAllowedOrigins, checkBypassPaths } from "./gate.ts";
 import { normalizeHostname } from "./hostnames.ts";
@@ -66,6 +67,10 @@ const limitsInput = z
   .strict();
 const cidrList = z.array(z.string().trim().min(1).max(64)).max(64);
 const tlsModeInput = z.enum(["passthrough", "terminate", "terminate_mtls", "plain"]);
+// HTTP routes (FD-23): per-client request limit; checked in full by `httpRateLimit`.
+const rateLimitInput = z
+  .object({ requests: z.number().int(), window: z.string().trim().min(1).max(16) })
+  .strict();
 
 export const frontRouteCreateInput = z
   .object({
@@ -82,6 +87,10 @@ export const frontRouteCreateInput = z
     allowedOrigins: z.array(z.string()).optional(),
     // Apex `www` canonicalisation (§3.5): answer with a redirect to this hostname instead.
     redirectTo: routeHostname.nullable().optional(),
+    // HTTP routes (FD-23): a per-client request limit, and required client certificates from the
+    // route's own CA (HTTP mTLS), combinable with either access mode.
+    rateLimit: rateLimitInput.nullable().optional(),
+    mtls: z.boolean().optional(),
     // `tls` and `tcp` routes (FD-14).
     listenPort: port.optional(),
     tlsMode: tlsModeInput.optional(),
@@ -102,6 +111,8 @@ export const frontRouteUpdateInput = z
     accessMode: z.enum(["public", "sso"]).optional(),
     allowSensitivePort: z.boolean().optional(),
     redirectTo: routeHostname.nullable().optional(),
+    rateLimit: rateLimitInput.nullable().optional(),
+    mtls: z.boolean().optional(),
     // `tls` and `tcp` routes (FD-14). The listener and kind never change; recreate the route.
     tlsMode: tlsModeInput.optional(),
     sourceCidrs: cidrList.optional(),
@@ -115,7 +126,7 @@ export const frontRouteUpdateInput = z
   .strict()
   .refine((value) => Object.values(value).some((item) => item !== undefined), {
     message:
-      "Change at least one of target, targetPort, accessMode, redirectTo, bypassPaths, allowedOrigins, tlsMode, sourceCidrs, allowInternet, protocolAuthConfirmed, limits or compatPort.",
+      "Change at least one of target, targetPort, accessMode, redirectTo, bypassPaths, allowedOrigins, rateLimit, mtls, tlsMode, sourceCidrs, allowInternet, protocolAuthConfirmed, limits or compatPort.",
   });
 
 export type FrontRouteCreateInput = z.infer<typeof frontRouteCreateInput>;
@@ -196,6 +207,10 @@ export type RouteExposure = {
   bypassPaths?: string[];
   /** Owner-approved Origin exceptions (§3.9.4): each new one widens the browser contract. */
   allowedOrigins?: string[];
+  /** Per-client request limit (FD-23): removing or raising it loosens. */
+  rateLimit?: HttpRateLimit | null;
+  /** Required client certificates (FD-23): turning them off loosens. */
+  mtls?: boolean;
 };
 
 /**
@@ -224,6 +239,17 @@ export function looseningChanges(
     changes.push("bypassPaths");
   if (next.allowedOrigins?.some((origin) => !(current.allowedOrigins ?? []).includes(origin)))
     changes.push("allowedOrigins");
+  if (next.mtls === false && current.mtls === true) changes.push("mtls");
+  if (next.rateLimit !== undefined) {
+    const before = current.rateLimit ?? null;
+    const after = next.rateLimit;
+    // A higher sustained rate or a larger burst admits more requests from one client.
+    if (
+      rateLimitPerSecond(after) > rateLimitPerSecond(before) ||
+      (after?.requests ?? Number.POSITIVE_INFINITY) > (before?.requests ?? Number.POSITIVE_INFINITY)
+    )
+      changes.push("rateLimit");
+  }
   return changes;
 }
 
@@ -243,7 +269,7 @@ export type L4RouteSettings = {
 };
 
 /** HTTP-only fields a `tls` or `tcp` route must not carry, and L4 fields an HTTP route must not. */
-const HTTP_ONLY = ["accessMode", "redirectTo", "bypassPaths", "allowedOrigins"] as const;
+const HTTP_ONLY = ["accessMode", "redirectTo", "bypassPaths", "allowedOrigins", "rateLimit", "mtls"] as const;
 const L4_ONLY = [
   "listenPort",
   "tlsMode",
