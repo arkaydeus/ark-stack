@@ -222,7 +222,7 @@ export const dnsRecords = pgTable(
     }>(),
     automaticWithdrawal: boolean("automatic_withdrawal").notNull().default(false),
     publishedAt: timestamp("published_at", { withTimezone: true }),
-    withdrawalReason: text("withdrawal_reason").$type<"ipv6" | "endpoint_deleted">(),
+    withdrawalReason: text("withdrawal_reason").$type<"ipv6" | "endpoint_deleted" | "address_changed">(),
     withdrawalStartedAt: timestamp("withdrawal_started_at", { withTimezone: true }),
     providerRemovedAt: timestamp("provider_removed_at", { withTimezone: true }),
     withdrawalConfirmedAt: timestamp("withdrawal_confirmed_at", { withTimezone: true }),

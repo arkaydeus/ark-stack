@@ -1137,18 +1137,35 @@ export async function routesAfterCertificate(input: {
   return { observe: input.status === "issued" };
 }
 
-/** Records a failed issuance on the waiting routes; `POST /api/domains/:id/verify` retries it. */
-export async function routesCertificateFailed(endpointId: string, message: string) {
-  const routes = (await routesOn(endpointId)).filter((route) => route.status === "issuing_certificate");
-  for (const route of routes) {
-    await db
-      .update(frontRoutes)
-      .set({
-        lastError: `Certificate issuance failed: ${message.slice(0, 500)}. Verify the domain again to retry.`,
-        updatedAt: new Date(),
-      })
-      .where(currentRoute(route.id, route.version));
-  }
+/** Return pre-order DNS failures to the observer. Failed ACME orders use the explicit retry. */
+export async function routesCertificateFailed(endpointId: string, message: string, rejectedOrderId?: string) {
+  await db.transaction(async (tx) => {
+    const routes = (await routesOn(endpointId, tx)).filter((route) => route.status === "issuing_certificate");
+    if (rejectedOrderId && routes.length) {
+      await tx
+        .update(operations)
+        .set({
+          payload: statement`${operations.payload} || '{"dnsRecheckRejected": true}'::jsonb`,
+        })
+        .where(eq(operations.id, rejectedOrderId));
+      await tx
+        .update(endpoints)
+        .set({ status: "awaiting_dns", lastVerifiedAt: null })
+        .where(eq(endpoints.id, endpointId));
+    }
+    for (const route of routes) {
+      await tx
+        .update(frontRoutes)
+        .set({
+          ...(rejectedOrderId ? { status: "awaiting_dns" as const } : {}),
+          lastError: rejectedOrderId
+            ? message.slice(0, 500)
+            : `Certificate issuance failed: ${message.slice(0, 500)}. Verify the domain again to retry.`,
+          updatedAt: new Date(),
+        })
+        .where(and(currentRoute(route.id, route.version), eq(frontRoutes.status, "issuing_certificate")));
+    }
+  });
 }
 
 // ---- Route client certificates (terminate_mtls, §3.8.4, FD-14) ---------------------------------------

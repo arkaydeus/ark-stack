@@ -17,7 +17,7 @@ export type CloudflareOwnership = {
 
 export type DnsReviewAction = {
   recordId: string;
-  action: "keep" | "update" | "create" | "delete";
+  action: "keep" | "update" | "create" | "delete" | "blocked";
   before: CloudflareRecordEvidence | null;
   after: {
     type: string;
@@ -27,6 +27,7 @@ export type DnsReviewAction = {
     proxied: false;
     priority?: number;
   } | null;
+  reason?: string;
   deletionScope?: CloudflareOwnership;
   canAuthorizeWithdrawal?: boolean;
 };
@@ -59,4 +60,14 @@ export type DomainDnsReview = {
     planHash: string;
     actions: DnsReviewAction[];
   } | null;
+};
+
+export type DnsPublishStatus = {
+  operationId: string;
+  status: string;
+  error: string | null;
+  errorStatus: number | null;
+  applied: number;
+  total: number | null;
+  verificationOperationId: string | null;
 };

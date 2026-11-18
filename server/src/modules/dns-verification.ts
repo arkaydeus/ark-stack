@@ -40,21 +40,28 @@ export async function emptyIfNoDnsData<T>(lookup: Promise<T[]>): Promise<T[]> {
   }
 }
 
-function permitsHttp01(value: string) {
-  const [issuer, ...parameters] = value.split(";");
-  return (
-    issuer.trim().replace(/\.$/, "").toLowerCase() === "letsencrypt.org" &&
-    parameters.every((parameter) => {
-      const [key, setting] = parameter.trim().split("=");
-      return (
-        key.trim().toLowerCase() !== "validationmethods" ||
-        setting?.split(",").some((method) => method.trim() === "http-01")
-      );
-    })
-  );
+function letsEncryptPolicy(policy: string) {
+  const [issuer, ...parameters] = policy.split(";");
+  if (issuer.trim().replace(/\.$/, "").toLowerCase() !== "letsencrypt.org") return null;
+  const settings = parameters.map((parameter) => {
+    const [key, ...values] = parameter.trim().split("=");
+    return { key: key.trim().toLowerCase(), value: values.join("=").trim() };
+  });
+  if (
+    settings.some(
+      ({ key, value }) =>
+        key === "validationmethods" && !value.split(",").some((method) => method.trim() === "http-01"),
+    )
+  )
+    return null;
+  return settings.filter(({ key }) => key === "accounturi").map(({ value }) => value);
 }
 
-async function caaError(hostname: string, lookup: (name: string) => Promise<CaaRecord[]>) {
+async function caaError(
+  hostname: string,
+  lookup: (name: string) => Promise<CaaRecord[]>,
+  accountUri: () => Promise<string | null>,
+) {
   const labels = hostname.split(".");
   for (let index = 0; index < labels.length; index++) {
     const name = labels.slice(index).join(".");
@@ -66,8 +73,18 @@ async function caaError(hostname: string, lookup: (name: string) => Promise<CaaR
       (record) => record.critical & 128 && !["issue", "issuewild", "iodef"].some((tag) => tag in record),
     );
     const issues = records.flatMap((record) => (typeof record.issue === "string" ? [record.issue] : []));
-    if (unsupported || (issues.length && !issues.some(permitsHttp01))) {
+    const policies = issues.flatMap((value) => {
+      const policy = letsEncryptPolicy(value);
+      return policy === null ? [] : [policy];
+    });
+    if (unsupported || (issues.length && !policies.length)) {
       return `CAA at ${name} blocks Let's Encrypt HTTP-01. Allow letsencrypt.org in its CAA issue records, then recheck DNS.`;
+    }
+    // RFC 8657 treats duplicate accounturi parameters as unsatisfiable.
+    if (policies.length && !policies.some((policy) => policy.length === 0)) {
+      const account = await accountUri();
+      if (!account || !policies.some((policy) => policy.length === 1 && policy[0] === account))
+        return `CAA accounturi at ${name} does not permit Ark's active Let's Encrypt account. Authorize the active account or adjust the restriction, then recheck DNS.`;
     }
     // issuewild alone does not restrict non-wildcard certificates. The nearest RRset wins.
     return null;
@@ -80,6 +97,7 @@ export async function dnsBlockingError(input: {
   records: StoredDnsRecord[];
   addresses: (type: string, name: string) => Promise<string[]>;
   caa: (name: string) => Promise<CaaRecord[]>;
+  accountUri: () => Promise<string | null>;
 }) {
   const { hostname, records, addresses, caa } = input;
   const [ipv4, ipv6] = await Promise.all([
@@ -99,5 +117,5 @@ export async function dnsBlockingError(input: {
   );
   if (unexpectedIpv6)
     return `Unexpected AAAA ${hostname} → ${unexpectedIpv6}. Remove or correct it at the DNS provider, then recheck DNS.`;
-  return caaError(hostname, caa);
+  return caaError(hostname, caa, input.accountUri);
 }

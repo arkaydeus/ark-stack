@@ -14,6 +14,7 @@ import {
   canViewProject,
   classifySql,
   createId,
+  dnsPublishInput,
   decryptSecret,
   deriveSesSmtpPassword,
   dnsRecordVerified,
@@ -55,7 +56,7 @@ import {
   verifyTarget,
   type TargetEvidence,
 } from "./modules/offsite-backups.ts";
-import { issueCertificateFiles } from "./modules/certificates.ts";
+import { acmeAccountUri, issueCertificateFiles } from "./modules/certificates.ts";
 import { edgeL4Configured, haproxyAdapter, missingL4Routes, writeEdgeL4 } from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import { edgeL4Routes, enabledSniPorts, type OmittedL4Route } from "./modules/l4-routes.ts";
@@ -794,11 +795,8 @@ async function verifyDomain(operation: OperationRow) {
       ? `DNS ownership proof ${ownership.name} is not yet published correctly.`
       : null;
 
-  const proxyAaaaHosts = new Set(
-    domain.proxyAaaaHosts.filter((name) =>
-      allEndpoints.some((endpoint) => endpoint.exposure === "public" && endpoint.hostname === name),
-    ),
-  );
+  const checkedProxyHosts = new Set<string>();
+  const proxyAaaaHosts = new Set<string>();
   const endpointChecks: Array<{
     endpoint: (typeof endpointRows)[number];
     required: StoredDnsRecord[];
@@ -818,14 +816,15 @@ async function verifyDomain(operation: OperationRow) {
         records: required,
         addresses,
         caa,
+        accountUri: () => acmeAccountUri(endpoint.hostname),
       });
       if (required.some((record) => record.type === "AAAA")) {
-        proxyAaaaHosts.delete(endpoint.hostname);
+        checkedProxyHosts.add(endpoint.hostname);
       } else {
         const found = await addresses("AAAA", endpoint.hostname).catch(() => null);
         if (found) {
+          checkedProxyHosts.add(endpoint.hostname);
           if (found.some(isCloudflareProxyAddress)) proxyAaaaHosts.add(endpoint.hostname);
-          else proxyAaaaHosts.delete(endpoint.hostname);
           unexpectedAaaa = found.filter((ip) => !isCloudflareProxyAddress(ip));
         }
       }
@@ -842,6 +841,7 @@ async function verifyDomain(operation: OperationRow) {
   }
 
   const verifiedEndpointIds = new Set<string>();
+  let remainingProxyHosts: string[] = [];
   const blocked = await commitDnsSnapshot(snapshot, async (tx, locked) => {
     await saveProjection(tx, locked.stored, locked.records);
     await confirmWithdrawals(tx, confirmed, now);
@@ -881,6 +881,20 @@ async function verifyDomain(operation: OperationRow) {
         }
       }
       if (blockingError) errors.push({ hostname: endpoint.hostname, error: blockingError });
+      if (
+        !blockingError &&
+        endpoint.kind === "mail" &&
+        domain.dnsProvider === "cloudflare" &&
+        active.some(
+          (record) =>
+            record.type === "MX" &&
+            record.required &&
+            (!record.publishedAt || !observations.get(record.id)?.ok),
+        )
+      ) {
+        blockingError = "The incoming mail MX record needs review and public DNS verification.";
+        errors.push({ hostname: endpoint.hostname, error: blockingError });
+      }
       const verified =
         !blockingError && (endpoint.exposure !== "public" || (required.length > 0 && !pending.length));
       await tx
@@ -926,27 +940,51 @@ async function verifyDomain(operation: OperationRow) {
           continue;
       }
 
+      // A recovery may overlap the original job's completion. Give it a distinct queue key;
+      // the operation target fence keeps it from executing while the old order is running.
+      const [rejectedOrder] =
+        endpoint.kind === "route"
+          ? await tx
+              .select({ id: operations.id })
+              .from(operations)
+              .where(
+                and(
+                  eq(operations.kind, "certificate.issue"),
+                  drizzleSql`${operations.targetIds} ? ${endpoint.id}`,
+                  drizzleSql`${operations.payload} @> '{"dnsRecheckRejected": true}'::jsonb`,
+                ),
+              )
+              .orderBy(desc(operations.createdAt), desc(operations.id))
+              .limit(1)
+          : [];
       // Readiness, route lifecycle, and their certificate handoff commit together.
       await enqueueInTransaction(tx, {
         kind: "certificate.issue",
         actorId: operation.actorId ?? undefined,
         targetIds: [endpoint.id],
         payload: { verifiedDns: true },
+        idempotencyKey: rejectedOrder && "certificate.issue:dns-recovery:" + rejectedOrder.id,
       });
     }
+    const retainedProxyHosts = locked.domain.proxyAaaaHosts.filter(
+      (name) =>
+        !checkedProxyHosts.has(name) &&
+        locked.endpointRows.some((endpoint) => endpoint.exposure === "public" && endpoint.hostname === name),
+    );
+    remainingProxyHosts = [...retainedProxyHosts, ...proxyAaaaHosts].toSorted();
     await tx
       .update(domainClaims)
       .set({
-        status: ownershipError ? domain.status : "verified",
+        status: ownershipError ? locked.domain.status : "verified",
         lastError: ownershipError ?? autoErrors[0] ?? errors[0]?.error ?? null,
-        proxyAaaaHosts: [...proxyAaaaHosts].toSorted(),
+        proxyAaaaHosts: remainingProxyHosts,
         updatedAt: now,
       })
       .where(eq(domainClaims.id, domainId));
     return errors;
   });
 
-  const pendingName = withdrawals.find((record) => record.type === "AAAA")?.name ?? [...proxyAaaaHosts][0];
+  const pendingName = withdrawals.find((record) => record.type === "AAAA")?.name ?? remainingProxyHosts[0];
   const dedupKey = `dns-aaaa-withdrawal:${domainId}`;
   if (pendingName) {
     await raiseAlert({
@@ -994,11 +1032,16 @@ async function verifyDomain(operation: OperationRow) {
 }
 
 async function issueCertificate(operation: OperationRow) {
+  if (operation.payload.dnsRecheckRejected === true)
+    throw new Error(
+      "The previous DNS check blocked this certificate order. DNS verification will queue a new order.",
+    );
   const endpointId = operation.targetIds[0];
   const [endpoint] = await db.select().from(endpoints).where(eq(endpoints.id, endpointId));
   if (!endpoint) throw new Error("Endpoint not found.");
   const action = operation.kind === "certificate.renew" ? "renew" : "run";
   let issued: Awaited<ReturnType<typeof issueCertificateFiles>>;
+  let attemptedOrder = false;
   try {
     // The DNS check and certificate order are separate jobs. Recheck policy and address
     // eligibility in case a toggle, preflight result or resolver answer changed in between.
@@ -1020,6 +1063,7 @@ async function issueCertificate(operation: OperationRow) {
         records: required,
         addresses: publicAddresses,
         caa: dnsResolver.caa ?? (async () => []),
+        accountUri: () => acmeAccountUri(endpoint.hostname),
       });
       if (error) throw new Error(error);
       if (
@@ -1050,9 +1094,15 @@ async function issueCertificate(operation: OperationRow) {
       }
       await commitDnsSnapshot(snapshot, async () => {});
     }
+    attemptedOrder = true;
     issued = await issueCertificateFiles(endpoint.hostname, action);
   } catch (error) {
-    if (endpoint.kind === "route") await routesCertificateFailed(endpoint.id, (error as Error).message);
+    if (endpoint.kind === "route")
+      await routesCertificateFailed(
+        endpoint.id,
+        (error as Error).message,
+        !attemptedOrder && action === "run" ? operation.id : undefined,
+      );
     throw error;
   }
   if (!issued.fingerprint || !issued.expiresAt) {
@@ -1745,18 +1795,17 @@ async function changeMode(operation: OperationRow) {
 }
 
 async function publishDns(operation: OperationRow) {
-  const hash = operation.payload.planHash;
-  if (typeof hash !== "string" || !operation.actorId)
-    throw new Error("Review the Cloudflare DNS diff before publishing.");
-  const [actor] = await db.select().from(platformAccess).where(eq(platformAccess.userId, operation.actorId));
-  if (actor?.role !== "owner" && actor?.role !== "operator")
+  const input = dnsPublishInput.parse(operation.payload.reviewed ?? { planHash: operation.payload.planHash });
+  const [actor] = await db
+    .select()
+    .from(platformAccess)
+    .where(eq(platformAccess.userId, operation.actorId ?? ""));
+  if (
+    (actor?.role !== "owner" && actor?.role !== "operator") ||
+    (operation.payload.role && actor.role !== operation.payload.role)
+  )
     throw new Error("DNS publisher is no longer authorized.");
-  const result = await publishReviewedDns(
-    operation.targetIds[0],
-    { planHash: hash },
-    { userId: actor.userId, role: actor.role },
-  );
-  await addStep(operation.id, "dns-publish", result);
+  await publishReviewedDns(operation, input, { userId: actor.userId, role: actor.role });
 }
 
 export async function runDnsMaintenance() {

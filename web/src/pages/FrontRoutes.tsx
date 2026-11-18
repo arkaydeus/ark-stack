@@ -27,12 +27,12 @@ function admitsBadge(route: FrontRouteSummary) {
   return <Badge variant="info">{route.l4.sourceCidrs.length} CIDR(s)</Badge>;
 }
 
-/** Loads once per mount; App remounts it (by key) when the platform's operation list changes. */
 export function FrontRoutesView({ state }: { state: PlatformState }) {
   const [routes, setRoutes] = useState<FrontRouteSummary[] | null>(null);
   const [listeners, setListeners] = useState<FrontListeners | null>(null);
   const [error, setError] = useState("");
   const [openDns, setOpenDns] = useState<string | null>(null);
+  const routeRevision = JSON.stringify(state.operations.map(({ id, status }) => [id, status]));
 
   useEffect(() => {
     let cancelled = false;
@@ -44,6 +44,7 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
         if (cancelled) return;
         setRoutes(list.routes);
         setListeners(ports);
+        setError("");
       })
       .catch(
         (cause) => !cancelled && setError(cause instanceof Error ? cause.message : "Could not load routes."),
@@ -51,7 +52,9 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+    // The operation revision invalidates the route list without remounting the open DNS review.
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
+  }, [routeRevision]);
 
   return (
     <div className="space-y-4">
@@ -100,7 +103,7 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
                   )}
                 </span>
               </div>
-              {openDns === route.id && (
+              {openDns === route.id && route.domain && state.user.role !== "viewer" && (
                 <div className="border-t border-border p-4">
                   <DnsReviewPanel
                     reviewPath={"/api/front/routes/" + route.id + "/dns"}

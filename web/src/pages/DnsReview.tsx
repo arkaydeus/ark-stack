@@ -1,4 +1,8 @@
-import { type DomainDnsReview, type DnsReviewRecord } from "@ark-stack/shared/dns-review";
+import {
+  type DnsPublishStatus,
+  type DomainDnsReview,
+  type DnsReviewRecord,
+} from "@ark-stack/shared/dns-review";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { Badge, statusVariant } from "@/components/ui/badge";
@@ -103,6 +107,12 @@ export function DnsReviewPanel({
   const [busy, setBusy] = useState(true);
   const [authorizedPlan, setAuthorizedPlan] = useState<string | null>(null);
   const [enabling, setEnabling] = useState(false);
+  const [publishPath, setPublishPath] = useState<string | null>(null);
+  const [publishProgress, setPublishProgress] = useState("");
+  const reloadRef = useRef(reload);
+  useEffect(() => {
+    reloadRef.current = reload;
+  }, [reload]);
   const watchUntil = useRef(0);
 
   useEffect(() => {
@@ -143,6 +153,7 @@ export function DnsReviewPanel({
     setBusy(true);
     setFailure("");
     setFeedback("");
+    setPublishProgress("");
     try {
       await action();
       const result = await loadReview(reviewPath);
@@ -162,18 +173,86 @@ export function DnsReviewPanel({
     setFeedback("DNS verification queued.");
   }
 
+  useEffect(() => {
+    if (!publishPath) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function poll(path: string) {
+      try {
+        // A conflict is also a terminal operation result. Its body carries the progress.
+        const response = await fetch(path, { signal: controller.signal });
+        if (!response.ok && response.status !== 409) throw new Error("Could not read DNS publish status.");
+        const result = (await response.json()) as DnsPublishStatus;
+        if (controller.signal.aborted) return;
+        if (
+          result.status === "failed" ||
+          result.status === "cancelled" ||
+          result.status === "needs_recovery"
+        ) {
+          setFailure(result.error ?? "Cloudflare publish did not complete. Reload the DNS review.");
+          setBusy(false);
+          setPublishPath(null);
+          return;
+        }
+        if (result.status === "succeeded") {
+          setFeedback("Cloudflare changes applied. Public DNS verification is queued.");
+          const next = await loadReview(reviewPath).catch(() => null);
+          if (controller.signal.aborted) return;
+          if (next) setReview(next.review);
+          setFailure(next?.providerError ?? "Reload the DNS review to see the updated records.");
+          setBusy(false);
+          setPublishPath(null);
+          void reloadRef.current?.();
+          return;
+        }
+        setPublishProgress(
+          result.total === null
+            ? "Cloudflare publish queued…"
+            : `Checking Cloudflare records (${result.applied} of ${result.total})…`,
+        );
+      } catch {
+        if (controller.signal.aborted) return;
+        setPublishProgress("Reconnecting to the DNS publish operation…");
+      }
+      timer = setTimeout(() => void poll(path), 1_000);
+    }
+    void poll(publishPath);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [publishPath, reviewPath]);
+
   async function publish() {
-    const planHash = review!.cloudflare!.planHash;
-    // Invalidate the displayed approval as soon as the request starts. A partial publish or
-    // conflict requires a fresh review before the button comes back.
+    if (!review?.cloudflare || busy) return;
+    const { planHash } = review.cloudflare;
+    const path = "/api/domains/" + review.domainId + "/publish";
+    const submission = {
+      planHash,
+      authorizeAAAAWithdrawal: authorizedPlan === planHash || undefined,
+      requestId: crypto.randomUUID?.(),
+    };
     setReview(null);
     setAuthorizedPlan(null);
-    await api("/api/domains/" + review!.domainId + "/publish", {
-      method: "POST",
-      body: JSON.stringify({ planHash, authorizeAAAAWithdrawal: authorizedPlan === planHash || undefined }),
-    });
-    setFeedback("Cloudflare changes applied. Public DNS verification is queued.");
-    await reload?.();
+    setFailure("");
+    setFeedback("");
+    setBusy(true);
+    setPublishProgress("Submitting Cloudflare publish…");
+    try {
+      const send = () =>
+        api<{ operationId: string }>(path, {
+          method: "POST",
+          body: JSON.stringify(submission),
+        });
+      // Retrying a dropped submission uses the same identity and returns the same operation.
+      const result = await send().catch((error) =>
+        error instanceof TypeError ? send() : Promise.reject(error),
+      );
+      setPublishPath(path + "/" + result.operationId);
+    } catch (error) {
+      setFailure(error instanceof Error ? error.message : "DNS publish request failed.");
+      setBusy(false);
+    }
   }
 
   async function revoke() {
@@ -211,10 +290,15 @@ export function DnsReviewPanel({
       <section className="space-y-3" aria-label="DNS review" aria-busy={busy}>
         {busy && (
           <p role="status" className="text-sm text-muted-foreground">
-            Loading DNS review…
+            {publishProgress || "Loading DNS review…"}
           </p>
         )}
         {failure && <InlineError>{failure}</InlineError>}
+        {!busy && feedback && (
+          <p role="status" className="text-sm text-muted-foreground">
+            {feedback}
+          </p>
+        )}
         {!busy && (
           <Button size="sm" variant="outline" onClick={() => void run(async () => {})}>
             Reload DNS review
@@ -259,7 +343,11 @@ export function DnsReviewPanel({
               return (
                 <li className="grid gap-2 p-3 text-sm sm:grid-cols-[5rem_1fr_2fr]" key={action.recordId}>
                   <span>
-                    <Badge variant={action.action === "delete" ? "warning" : "neutral"}>
+                    <Badge
+                      variant={
+                        action.action === "delete" || action.action === "blocked" ? "warning" : "neutral"
+                      }
+                    >
                       {action.action}
                     </Badge>
                   </span>
@@ -282,6 +370,7 @@ export function DnsReviewPanel({
                         <code>{action.after.content}</code> · {action.after.ttl}s · DNS only
                       </p>
                     )}
+                    {action.reason && <p>{action.reason}</p>}
                     {action.deletionScope && (
                       <p className="text-xs text-muted-foreground">
                         Record <code>{action.deletionScope.record.id}</code>
@@ -311,8 +400,8 @@ export function DnsReviewPanel({
         records={diff ? review.records.filter((record) => record.providerRemoval) : review.records}
       />
       <div className="flex flex-wrap gap-2">
-        {diff && (
-          <Button size="sm" disabled={busy} onClick={() => void run(publish)}>
+        {diff?.actions.some((action) => action.action !== "blocked") && (
+          <Button size="sm" disabled={busy} onClick={() => void publish()}>
             Publish reviewed DNS
           </Button>
         )}

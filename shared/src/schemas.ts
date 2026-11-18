@@ -63,6 +63,7 @@ export const dnsPublishInput = z
   .object({
     planHash: z.string().regex(/^[a-f0-9]{64}$/),
     authorizeAAAAWithdrawal: z.literal(true).optional(),
+    requestId: z.string().uuid().optional(),
   })
   .strict();
 

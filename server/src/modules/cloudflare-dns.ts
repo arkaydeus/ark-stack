@@ -226,6 +226,9 @@ export type DesiredCloudflareRecord = DnsWrite & {
   ownership: CloudflareOwnership | null;
 };
 
+const zoneError = (oldZoneId: string) =>
+  `Ownership belongs to Cloudflare zone ${oldZoneId}. Restore access to that zone and confirm the old record is removed before changing this zone.`;
+
 export async function planCloudflare(
   client: CloudflareDns,
   zoneId: string,
@@ -236,7 +239,17 @@ export async function planCloudflare(
   const deleting = new Set<string>();
   for (const { recordId, ownership } of withdrawals) {
     const { record } = ownership;
-    if (ownership.zoneId !== zoneId || deleting.has(record.id)) throw drift(record.type, record.name);
+    if (ownership.zoneId !== zoneId) {
+      actions.push({
+        recordId,
+        action: "blocked",
+        before: record,
+        after: null,
+        reason: zoneError(ownership.zoneId),
+      });
+      continue;
+    }
+    if (deleting.has(record.id)) throw drift(record.type, record.name);
     const current = await client.record(zoneId, record.id);
     if (current && !sameRecord(current, record)) throw drift(record.type, record.name);
     actions.push({ recordId, action: "delete", before: current, after: null, deletionScope: ownership });
@@ -258,6 +271,16 @@ export async function planCloudflare(
     const snapshot = byName.get(record.name)!;
     const surviving = snapshot.filter((item) => !deleting.has(item.id));
     const existing = surviving.filter((item) => item.type === record.type);
+    if (ownership && ownership.zoneId !== zoneId) {
+      actions.push({
+        recordId,
+        action: "blocked",
+        before: ownership.record,
+        after: { ...record, proxied: false },
+        reason: zoneError(ownership.zoneId),
+      });
+      continue;
+    }
     if (
       addressTypes.has(record.type) &&
       (existing.length > 1 || surviving.some((item) => item.type === "CNAME" && record.type !== "CNAME"))
@@ -271,7 +294,15 @@ export async function planCloudflare(
     try {
       mutation = chooseCloudflareMutation(existing, record);
     } catch (error) {
-      throw new DnsReviewError(409, (error as Error).message);
+      if (record.type !== "MX") throw new DnsReviewError(409, (error as Error).message);
+      actions.push({
+        recordId,
+        action: "blocked",
+        before: existing[0] ?? null,
+        after: { ...record, proxied: false },
+        reason: (error as Error).message,
+      });
+      continue;
     }
     const before = mutation.action === "create" ? null : existing.find((item) => item.id === mutation.id)!;
     const action =

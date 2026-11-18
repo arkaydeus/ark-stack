@@ -133,7 +133,8 @@ import {
   dnsRecordValues,
   domainDnsReview,
   pendingWithdrawal,
-  publishReviewedDns,
+  queueDnsPublish,
+  dnsPublishStatus,
   revokeAaaaWithdrawal,
   watchManualDns,
 } from "./modules/domain-dns.ts";
@@ -1472,7 +1473,7 @@ app.post("/api/domains/:id/dns/watch", async (c) => {
   return c.body(null, 204);
 });
 
-async function dnsWorkerRequest<T>(path: "review" | "publish", body: object, local: () => Promise<T>) {
+async function dnsWorkerReview<T>(domainId: string, local: () => Promise<T>) {
   const url = process.env.ARK_DOMAIN_WORKER_URL;
   if (!url) {
     if (process.env.NODE_ENV === "production")
@@ -1481,10 +1482,10 @@ async function dnsWorkerRequest<T>(path: "review" | "publish", body: object, loc
   }
   let response: Response;
   try {
-    response = await fetch(new URL("/dns/" + path, url), {
+    response = await fetch(new URL("/dns/review", url), {
       method: "POST",
       headers: { authorization: "Bearer " + env.workerTokens.domains, "content-type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ domainId }),
       signal: AbortSignal.timeout(55_000),
     });
   } catch {
@@ -1513,7 +1514,7 @@ async function getDnsReview(domainId: string, localOnly: boolean) {
     .where(eq(domainClaims.id, domainId));
   if (!domain) throw new DnsReviewError(404, "Domain not found.");
   if (domain.provider !== "cloudflare") return domainDnsReview(domainId);
-  return dnsWorkerRequest("review", { domainId }, () => domainDnsReview(domainId));
+  return dnsWorkerReview(domainId, () => domainDnsReview(domainId));
 }
 
 app.get("/api/domains/:id/dns", async (c) => {
@@ -1536,10 +1537,20 @@ app.post("/api/domains/:id/publish", async (c) => {
     userId: access.userId,
     role: access.role === "owner" ? ("owner" as const) : ("operator" as const),
   };
-  const result = await dnsWorkerRequest("publish", { domainId, input, actor }, () =>
-    publishReviewedDns(domainId, input, actor),
-  );
-  return c.json(result);
+  const accepted = await queueDnsPublish(domainId, input, actor);
+  c.header("location", `/api/domains/${domainId}/publish/${accepted.operationId}`);
+  c.header("cache-control", "no-store");
+  return c.json(accepted, 202);
+});
+
+app.get("/api/domains/:id/publish/:operationId", async (c) => {
+  const access = c.get("access");
+  requireOperator(access);
+  const domainId = c.req.param("id");
+  requireDomain(access, domainId, "manage");
+  c.header("cache-control", "no-store");
+  const result = await dnsPublishStatus(domainId, c.req.param("operationId"));
+  return c.json(result, result.status === "failed" && result.errorStatus === 409 ? 409 : 200);
 });
 
 app.put("/api/domains/:id/aaaa", async (c) => {
