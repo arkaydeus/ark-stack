@@ -4,15 +4,19 @@
 // - `ark_route_base`: deferred removal of Server/Via/X-Powered-By, nosniff, a referrer policy, removal
 //   of client-forged `X-Ark-*`, and static 502/503/504 pages that name no internal host;
 // - HSTS, a request body limit, and the reserved `/.ark/gate/*` namespace;
+// - for `sso` routes (FD-11, §3.9): the exact callback and logout rewrites to the API with the edge
+//   token (wrong methods 405, every other `/.ark/gate/*` path 404 without touching the API), the
+//   bypass paths behind the mandatory raw-URI guard (`/api/gate/bypass-check`), and `forward_auth`
+//   to `/api/gate/check` before everything else;
 // - `reverse_proxy` to the pinned tailnet address with the gate cookie stripped upstream, Set-Cookie
 //   `Domain=` removed (cookies become host-only on the public name), no buffering for WebSockets,
 //   `stream_close_delay` across reloads, and dial/response-header timeouts;
 // - the Location policy below;
 // - or, for an apex route with `redirectTo`, a 308 to the canonical hostname and nothing else.
 //
-// Only `public` access is implemented. The login origin exists (FD-10, `gateLoginSiteBody` in edge.ts),
-// but the gate handshake and forward_auth (FD-11) do not yet, so an `sso` route is never rendered:
-// `planEdge` omits it and `renderCaddyfile` refuses it (fail closed).
+// `public` routes render no gate. `sso` routes (FD-11) render `forward_auth` to the API; their
+// `stream_close_delay` is capped at 5 minutes, so a revocation's forced reload closes every upgraded
+// connection within 305 s of the event (§3.9.3, GATE_MAX_STREAM_CLOSE_DELAY_MS).
 //
 // Location policy. Caddy evaluates it on the raw upstream value in `handle_response`, before the
 // `header_down` rewrite runs. In order:
@@ -48,6 +52,16 @@
 
 import { routeIdentityKey } from "./edge-withdrawal.ts";
 import { ValidationError } from "./errors.ts";
+import {
+  GATE_BYPASS_CHECK_API,
+  GATE_CALLBACK_API,
+  GATE_CALLBACK_PATH,
+  GATE_CHECK_API,
+  GATE_LOGOUT_PATH,
+  GATE_LOGOUT_ROUTE_API,
+  GATE_MAX_STREAM_CLOSE_DELAY_MS,
+  checkBypassPaths,
+} from "./gate.ts";
 import { normalizeHostname } from "./hostnames.ts";
 import { checkTailnetAddress, parseIpLiteral } from "./tailnet.ts";
 import { backendKey } from "./tailnet-observe.ts";
@@ -92,9 +106,9 @@ export type EdgeHttpRoute = {
   stableId: string;
   ip: string;
   port: number;
-  /** Only `public` is rendered before FD-11; anything else fails the render. */
+  /** `public`, or `sso` behind the login gate (FD-11). */
   access: "public" | "sso";
-  /** SSO bypass paths (FD-11); validated, never rendered for public routes. */
+  /** SSO bypass paths (§3.9.5), behind the raw-URI guard; never rendered for public routes. */
   bypassPaths?: string[];
   /** Apex canonicalisation: answer every request with a 308 to this hostname. */
   redirectTo?: string | null;
@@ -182,9 +196,8 @@ function tailnetIp(value: string, what: string) {
 export function checkedHttpRoute(route: EdgeHttpRoute) {
   if (typeof route.id !== "string" || !ROUTE_ID.test(route.id))
     throw new ValidationError(`Route id ${JSON.stringify(route.id)} is invalid.`);
-  if (route.access !== "public") {
-    // Fail closed: before FD-11 there is no forward_auth to render, and a gated route must never be
-    // served as public.
+  if (route.access !== "public" && route.access !== "sso") {
+    // Fail closed: an unknown mode is never served as public.
     throw new ValidationError(
       `Route ${route.id} has access mode ${JSON.stringify(route.access)}, which this release cannot serve.`,
     );
@@ -201,11 +214,23 @@ export function checkedHttpRoute(route: EdgeHttpRoute) {
     if (typeof path !== "string" || !BYPASS_PATH.test(path) || path.split("/").includes(".."))
       throw new ValidationError(`Bypass path ${JSON.stringify(path)} is invalid.`);
   }
+  // SSO bypasses must not cover the whole site or shadow the gate's own /.ark/gate/* handlers.
+  const bypassPaths = route.access === "sso" ? checkBypassPaths(route.bypassPaths ?? []) : [];
   const redirectTo = route.redirectTo ? checkedName(route.redirectTo, "redirectTo") : null;
   if (redirectTo?.endsWith(".ts.net"))
     throw new ValidationError(`redirectTo ${redirectTo} is a tailnet name.`);
   if (redirectTo === hostname) throw new ValidationError(`Route ${route.id} redirects to itself.`);
   const options = httpRouteOptions(route.options as Record<string, unknown> | undefined);
+  if (route.access === "sso" && !redirectTo) {
+    // A revocation's forced reload closes upgraded connections after the old handler's delay, so a
+    // longer delay would break the 305 s bound (§3.9.3).
+    const match = DURATION.exec(options.streamCloseDelay)!;
+    const ms = Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS];
+    if (ms > GATE_MAX_STREAM_CLOSE_DELAY_MS)
+      throw new ValidationError(
+        `Route ${route.id}: streamCloseDelay ${options.streamCloseDelay} is longer than 5m, the most an SSO route allows.`,
+      );
+  }
   const ips = new Map([[ip.canonical, ip]]);
   for (const extra of route.internalIps ?? []) {
     const parsed = tailnetIp(extra, "Internal address");
@@ -224,6 +249,8 @@ export function checkedHttpRoute(route: EdgeHttpRoute) {
     ip: ip.canonical,
     port: route.port,
     upstream: backendKey(ip.canonical, route.port),
+    access: route.access,
+    bypassPaths,
     redirectTo,
     options,
     internalIps: [...ips.values()],
@@ -382,8 +409,16 @@ export const HTTP_ROUTE_SNIPPETS = (errorsDir: string) => `(ark_route_base) {
 }
 `;
 
-/** The site body (after `bind` and `tls`) of one checked route. */
-export function httpRouteSiteBody(route: CheckedHttpRoute) {
+const API_UPSTREAM = /^[A-Za-z0-9.-]+:\d{1,5}$/;
+
+/** The edge token as a runtime placeholder: it never appears in the rendered file. */
+const EDGE_TOKEN = "{env.ARK_EDGE_GATE_TOKEN}";
+
+/**
+ * The site body (after `bind` and `tls`) of one checked route. `apiUpstream` is where the edge
+ * reaches the API (`api:3000`); only `sso` routes use it.
+ */
+export function httpRouteSiteBody(route: CheckedHttpRoute, apiUpstream = "api:3000") {
   const { options } = route;
   const hsts = options.hsts ? '  header Strict-Transport-Security "max-age=31536000"\n' : "";
   if (route.redirectTo) {
@@ -406,17 +441,7 @@ ${hsts}  redir https://${route.redirectTo}{uri} 308
   const errors = policy.rejects
     .map((reject) => `          error @ark_location_${reject.name} 502\n`)
     .join("");
-  return `  import ark_route_base
-${hsts}  request_body {
-    max_size ${options.maxBodyMb}MB
-  }
-  # Reserved for the login gate (FD-11).
-  handle /.ark/gate/* {
-    respond 404
-  }
-  handle {
-    vars ark_tailnet_route ${routeIdentityKey(route)}
-    reverse_proxy ${route.upstream} {
+  const upstream = `    reverse_proxy ${route.upstream} {
       import ark_upstream
 ${options.upstreamHost === "target" ? "      header_up Host {upstream_hostport}\n" : ""}      stream_close_delay ${options.streamCloseDelay}
 ${options.streamTimeout ? `      stream_timeout ${options.streamTimeout}\n` : ""}      transport http {
@@ -436,6 +461,63 @@ ${policy.rewrite ? `          header Location ${token(`(?i)${policy.rewrite.patt
         }
       }
     }
+`;
+  const identity = `    vars ark_tailnet_route ${routeIdentityKey(route)}\n`;
+  const head = `  import ark_route_base
+${hsts}  request_body {
+    max_size ${options.maxBodyMb}MB
   }
+`;
+  if (route.access !== "sso") {
+    return `${head}  # Reserved for the login gate (FD-11): public routes answer every /.ark/gate/* path with 404.
+  handle /.ark/gate/* {
+    respond 404
+  }
+  handle {
+${identity}${upstream}  }
+`;
+  }
+  if (!API_UPSTREAM.test(apiUpstream))
+    throw new ValidationError(`API upstream ${JSON.stringify(apiUpstream)} is not host:port.`);
+  // The exact route-host gate handlers (§3.9.4): GET callback and POST logout are rewritten to their
+  // API handlers with the query preserved; a wrong method is 405 and every other /.ark/gate/* path
+  // is 404, before any bypass, forward_auth or upstream. The prefix is never mapped onto /api/gate/*.
+  const gateHandler = (path: string, name: string, method: string, api: string) => `  handle ${path} {
+    @ark_gate_${name}_method not method ${method}
+    respond @ark_gate_${name}_method 405
+    rewrite * ${api}
+    reverse_proxy ${apiUpstream} {
+      header_up X-Ark-Edge-Token ${EDGE_TOKEN}
+      header_up X-Ark-Route ${route.id}
+    }
+  }
+`;
+  const bypass = route.bypassPaths.length
+    ? `  # Bypass paths (§3.9.5) skip the session check, never the mandatory raw-URI guard: the API
+  # answers 204 only for an unambiguous original request target under one of these paths, else 400.
+  @ark_bypass path ${route.bypassPaths.join(" ")}
+  handle @ark_bypass {
+${identity}    forward_auth ${apiUpstream} {
+      uri ${GATE_BYPASS_CHECK_API}?route=${route.id}
+      header_up X-Ark-Original-Uri {http.request.orig_uri}
+      header_up X-Ark-Edge-Token ${EDGE_TOKEN}
+    }
+${upstream}  }
+`
+    : "";
+  return `${head}  # Login gate (docs/design/front-door.md §3.9, FD-11).
+${gateHandler(GATE_CALLBACK_PATH, "callback", "GET", GATE_CALLBACK_API)}${gateHandler(GATE_LOGOUT_PATH, "logout", "POST", GATE_LOGOUT_ROUTE_API)}  handle /.ark/gate/* {
+    respond 404
+  }
+${bypass}  handle {
+${identity}    # Every other request needs a gate session for this route. Origin, Upgrade and Sec-Fetch-Site
+    # reach the check unchanged; X-Ark-Upgrade repeats Upgrade for the WebSocket Origin contract.
+    forward_auth ${apiUpstream} {
+      uri ${GATE_CHECK_API}?route=${route.id}
+      header_up X-Ark-Edge-Token ${EDGE_TOKEN}
+      header_up X-Ark-Upgrade {http.request.header.Upgrade}
+      copy_headers X-Ark-User X-Ark-Email
+    }
+${upstream}  }
 `;
 }

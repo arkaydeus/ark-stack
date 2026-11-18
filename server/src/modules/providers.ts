@@ -14,6 +14,7 @@ import {
   CaddyWithdrawalAdapter,
   EDGE_CERT_DIR,
   EDGE_ERRORS_DIR,
+  GATE_MAX_STREAM_CLOSE_DELAY_MS,
   edgeCertificatePaths,
   funnelDisabled,
   jmapCall,
@@ -559,6 +560,12 @@ export async function writeEdge(input: {
   appRoutes?: EdgeAppRoute[];
   /** Front-door HTTP routes allowed by the current lease and servable (front door §3.2, §3.5). */
   httpRoutes?: EdgeHttpRoute[];
+  /**
+   * Routes with a pending gate revocation (FD-11, §3.9.3). This /load is their forced reload; if a
+   * route's active handler keeps upgraded streams longer than 5m (a public route just switched to
+   * SSO), Caddy is stopped after the reload as for a removed route.
+   */
+  revokedRouteIds?: string[];
 }) {
   const dir = process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform");
   await mkdir(dir, { recursive: true });
@@ -613,7 +620,12 @@ export async function writeEdge(input: {
       [...caddy.matchAll(/^\s*vars ark_tailnet_route (\S+)\s*$/gm)].map((match) => match[1]!),
     );
     // An unreadable config is unknown, never evidence of absent streams. Abort before /load.
-    lingering = await adapter!.lingeringStreams(next);
+    lingering = await adapter!.lingeringStreams(
+      next,
+      input.revokedRouteIds?.length
+        ? { routeIds: new Set(input.revokedRouteIds), maxMs: GATE_MAX_STREAM_CLOSE_DELAY_MS }
+        : null,
+    );
     if (lingering.length) await adapter!.markPendingStreams(lingering);
     await loadCaddyfile(reloadUrl, caddy);
     applied = true;

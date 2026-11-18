@@ -12,8 +12,11 @@
 //   are never requested before this point.
 // - ready: an issued certificate and a fresh passing probe. Only `edge.observe` writes `ready`.
 //
-// `enable` is refused before `ready`. `edge.apply` renders enabled `ready` public routes allowed by
-// the lease into the edge (FD-09, modules/edge-routes.ts and shared/src/edge-http.ts).
+// `enable` is refused before `ready`. `edge.apply` renders enabled `ready` routes allowed by the
+// lease into the edge (FD-09, modules/edge-routes.ts and shared/src/edge-http.ts): `public` routes
+// directly, `sso` routes (the default) behind the login gate (FD-11, §3.9) with their bypass paths
+// and Origin exceptions. Tightening an enabled route's gate (public -> sso, removing a bypass path
+// or an Origin exception) records a gate revocation in the same transaction (§3.9.3).
 //
 // Preparation validates without writes; final validation and grant consumption share the mutation
 // transaction, so conflicts roll back the grant. Every action is audited.
@@ -24,6 +27,7 @@ import {
   assertSupportedAccessMode,
   assertSupportedRouteKind,
   backendKey,
+  checkGateRouteSettings,
   createId,
   looseningChanges,
   normalizeRedirectTo,
@@ -80,6 +84,33 @@ type DomainRow = typeof domainClaims.$inferSelect;
 function redirectOf(route: Pick<RouteRow, "httpOptions">) {
   const value = route.httpOptions?.redirectTo;
   return typeof value === "string" ? value : null;
+}
+
+function allowedOriginsOf(route: Pick<RouteRow, "httpOptions">) {
+  const value = route.httpOptions?.allowedOrigins;
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/** Bypass paths and Origin exceptions belong to SSO routes only (§3.9.4, §3.9.5). */
+function gateSettings(
+  accessMode: "public" | "sso",
+  input: { bypassPaths?: unknown; allowedOrigins?: unknown },
+  current: { bypassPaths: string[]; allowedOrigins: string[] },
+) {
+  let checked: ReturnType<typeof checkGateRouteSettings>;
+  try {
+    checked = checkGateRouteSettings(input);
+  } catch (error) {
+    throw new FrontRouteError(422, (error as Error).message);
+  }
+  const bypassPaths = checked.bypassPaths ?? current.bypassPaths;
+  const allowedOrigins = checked.allowedOrigins ?? current.allowedOrigins;
+  if (accessMode === "public" && (bypassPaths.length || allowedOrigins.length))
+    throw new FrontRouteError(
+      422,
+      'Bypass paths and allowed origins apply only to access mode "sso"; clear them for a public route.',
+    );
+  return { bypassPaths, allowedOrigins };
 }
 
 export async function auditRoute(
@@ -174,6 +205,8 @@ function summarize(
     hostname: endpoint.hostname,
     listenPort: route.listenPort,
     accessMode: route.accessMode,
+    bypassPaths: route.bypassPaths,
+    allowedOrigins: allowedOriginsOf(route),
     redirectTo: redirectOf(route),
     enabled: route.enabled,
     status: route.status,
@@ -261,6 +294,9 @@ export type RouteCreatePlan = Awaited<ReturnType<typeof prepareRouteCreate>>;
 export async function prepareRouteCreate(input: FrontRouteCreateInput) {
   assertSupportedRouteKind(input.kind);
   assertSupportedAccessMode(input.accessMode, "create");
+  // The schema default: behind the login gate (FD-11).
+  const accessMode = input.accessMode ?? "sso";
+  const gate = gateSettings(accessMode, input, { bypassPaths: [], allowedOrigins: [] });
   const hostname = normalizeRouteHostname(input.hostname);
   const domain = routeDomainFor(hostname, await db.select().from(domainClaims));
   if (!domain) {
@@ -314,7 +350,8 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
     redirectTo,
     targetInput,
     targetPort: input.targetPort,
-    accessMode: "public" as const,
+    accessMode,
+    ...gate,
     pinned,
     records,
   };
@@ -430,7 +467,11 @@ export async function commitRouteCreate(
         targetIp: plan.pinned.ip,
         targetPort: plan.targetPort,
         accessMode: plan.accessMode,
-        httpOptions: plan.redirectTo ? { redirectTo: plan.redirectTo } : {},
+        bypassPaths: plan.bypassPaths,
+        httpOptions: {
+          ...(plan.redirectTo ? { redirectTo: plan.redirectTo } : {}),
+          ...(plan.allowedOrigins.length ? { allowedOrigins: plan.allowedOrigins } : {}),
+        },
         enabled: false,
         status: "draft",
         createdBy: actor.userId,
@@ -449,6 +490,8 @@ export async function commitRouteCreate(
           targetPort: plan.targetPort,
           pinned: plan.pinned,
           accessMode: plan.accessMode,
+          bypassPaths: plan.bypassPaths,
+          allowedOrigins: plan.allowedOrigins,
           redirectTo: plan.redirectTo,
           records: plan.records,
           status: "draft",
@@ -499,12 +542,16 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
   }
   const targetInput = input.target?.trim() ?? route.targetInput;
   const targetPort = input.targetPort ?? route.targetPort;
+  const accessMode = input.accessMode ?? route.accessMode;
+  const currentGate = { bypassPaths: route.bypassPaths, allowedOrigins: allowedOriginsOf(route) };
+  const gate = gateSettings(accessMode, input, currentGate);
   const current = {
     targetInput: route.targetInput,
     targetPort: route.targetPort,
     accessMode: route.accessMode,
     redirectTo: redirectOf(route),
     status: route.status,
+    ...currentGate,
   };
   const loosening = looseningChanges(current, {
     targetInput: input.target === undefined ? undefined : targetInput,
@@ -512,7 +559,14 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     accessMode: input.accessMode,
     redirectTo: input.redirectTo === undefined ? undefined : redirectTo,
     allowSensitivePort: input.allowSensitivePort,
+    bypassPaths: gate.bypassPaths,
+    allowedOrigins: gate.allowedOrigins,
   });
+  // Tightening the gate of a route that may have open upgraded connections (§3.9.3).
+  const gateTightened =
+    (accessMode === "sso" && route.accessMode !== "sso") ||
+    currentGate.bypassPaths.some((path) => !gate.bypassPaths.includes(path)) ||
+    currentGate.allowedOrigins.some((origin) => !gate.allowedOrigins.includes(origin));
   const repin = loosening.some((item) => ["target", "targetPort", "reconfirmTarget"].includes(item));
   const pinned = repin ? await pinTarget(targetInput, targetPort, input.allowSensitivePort) : null;
   const changes: Record<string, { from: unknown; to: unknown }> = {};
@@ -521,6 +575,10 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
   if (input.accessMode !== undefined && input.accessMode !== route.accessMode)
     changes.accessMode = { from: route.accessMode, to: input.accessMode };
   if (redirectTo !== redirectOf(route)) changes.redirectTo = { from: redirectOf(route), to: redirectTo };
+  if (JSON.stringify(gate.bypassPaths) !== JSON.stringify(currentGate.bypassPaths))
+    changes.bypassPaths = { from: currentGate.bypassPaths, to: gate.bypassPaths };
+  if (JSON.stringify(gate.allowedOrigins) !== JSON.stringify(currentGate.allowedOrigins))
+    changes.allowedOrigins = { from: currentGate.allowedOrigins, to: gate.allowedOrigins };
   if (pinned && (pinned.stableId !== route.targetNodeStableId || pinned.ip !== route.targetIp))
     changes.pinned = {
       from: { stableId: route.targetNodeStableId, ip: route.targetIp },
@@ -532,7 +590,9 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     version,
     targetInput,
     targetPort,
-    accessMode: input.accessMode ?? route.accessMode,
+    accessMode,
+    ...gate,
+    gateTightened,
     redirectTo,
     pinned,
     loosening,
@@ -552,6 +612,8 @@ export async function commitRouteUpdate(
   const httpOptions = { ...route.httpOptions };
   if (plan.redirectTo) httpOptions.redirectTo = plan.redirectTo;
   else delete httpOptions.redirectTo;
+  if (plan.allowedOrigins.length) httpOptions.allowedOrigins = plan.allowedOrigins;
+  else delete httpOptions.allowedOrigins;
   await db.transaction(async (tx) => {
     await authorize?.(tx);
     const updated = await tx
@@ -562,6 +624,7 @@ export async function commitRouteUpdate(
         targetNodeStableId: plan.pinned?.stableId ?? route.targetNodeStableId,
         targetIp: plan.pinned?.ip ?? route.targetIp,
         accessMode: plan.accessMode,
+        bypassPaths: plan.bypassPaths,
         httpOptions,
         status,
         lastError: plan.pinned ? null : route.lastError,
@@ -570,6 +633,13 @@ export async function commitRouteUpdate(
       .where(currentRoute(route.id, plan.version))
       .returning({ id: frontRoutes.id });
     if (!updated.length) throw new FrontRouteError(409, "The route changed state; reload and retry.");
+    // Open WebSockets admitted under the looser gate are closed by a forced reload (§3.9.3).
+    if (plan.gateTightened) {
+      await tx.execute(
+        statement`SELECT set_config('ark.gate_revocation_reason', 'route_gate_tightened', true)`,
+      );
+      await tx.execute(statement`SELECT ark_gate_revoke(${route.id}, 'route_gate_tightened')`);
+    }
   });
   const live = route.enabled && route.status === "ready";
   const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
@@ -609,7 +679,7 @@ export async function commitRouteUpdate(
 
 // ---- Enable, disable, delete ------------------------------------------------------------------
 
-/** Checks for `enable`: an implemented access mode, and a `ready` route that is not yet enabled. */
+/** Checks for `enable`: a supported access mode, and a `ready` route that is not yet enabled. */
 export async function prepareRouteEnable(routeId: string) {
   const { route, endpoint, version } = await loadRoute(routeId);
   requireHttp(route);
