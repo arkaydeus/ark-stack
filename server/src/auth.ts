@@ -10,7 +10,7 @@ import { CLIENT_IP_HEADER } from "./client-ip.ts";
 import { db } from "./db.ts";
 import { loadEnv } from "./env.ts";
 import { originForRequest, registeredHosts } from "./origin-hosts.ts";
-import { account, session, twoFactor, user, verification } from "./schema.ts";
+import { account, gateUsers, session, twoFactor, user, verification } from "./schema.ts";
 import { resolveSessionOrigin } from "./session-origin.ts";
 
 const env = loadEnv();
@@ -131,9 +131,17 @@ export const auth = betterAuth({
       create: {
         before: async (data, context) => {
           try {
-            return {
-              data: { ...data, origin: resolveSessionOrigin(data, context, originForRequest) },
-            };
+            const origin = resolveSessionOrigin(data, context, originForRequest);
+            // Gate users (FD-12, §3.9.6) sign in only on the login origin: an admin-origin session is
+            // never minted for them, whichever path asks (password sign-in, TOTP rotation, recovery).
+            if (origin === "admin" && typeof data.userId === "string") {
+              const [gate] = await db
+                .select({ userId: gateUsers.userId })
+                .from(gateUsers)
+                .where(eq(gateUsers.userId, data.userId));
+              if (gate) throw new Error("This account can sign in only on the login origin.");
+            }
+            return { data: { ...data, origin } };
           } catch (error) {
             throw new APIError("FORBIDDEN", { message: (error as Error).message });
           }

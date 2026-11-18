@@ -7,7 +7,9 @@
 //
 // e2e/gate.spec.ts then checks: an unauthenticated GET is redirected to the login origin; after
 // password and TOTP the browser lands on the original path with `__Host-ark_gate` (Secure, HttpOnly,
-// SameSite=Lax, no Domain); the upstream sees `X-Ark-User` and never the gate cookie.
+// SameSite=Lax, no Domain); the upstream sees `X-Ark-User` and never the gate cookie. FD-12: a gate
+// user created through the owner API must enroll TOTP in the browser before the route opens, and
+// deleting them closes their open WebSocket through the revocation journal.
 //
 // Needs Docker, a loopback PostgreSQL in DATABASE_URL (as `mise run test:e2e`) and Playwright's
 // Chromium (`bunx playwright install chromium`).
@@ -197,7 +199,8 @@ try {
     30_000,
   );
 
-  // A gate user with TOTP and access to the route (gate-user management itself is FD-12).
+  // A user with TOTP and access to the route, seeded directly (the FD-12 case creates its gate user
+  // through the owner API instead).
   Object.assign(process.env, serverEnv);
   const { auth } = await import("../server/src/auth.ts");
   const { sql } = await import("../server/src/db.ts");
@@ -332,13 +335,77 @@ try {
     }
     return claimed.rows.length;
   };
+  // FD-12: an owner with assured MFA calls the real admin API (`/api/step-up`, `/api/gate/users`,
+  // `PUT /api/front/routes/:id/access`) exactly as the admin SPA does.
+  const ownerEmail = `owner-${suffix}@example.test`;
+  const owner = await ctx.internalAdapter.createUser(
+    { name: "Owner", email: ownerEmail, emailVerified: true },
+    { method: "email-password" },
+  );
+  await ctx.internalAdapter.linkAccount({
+    userId: owner.id,
+    providerId: "credential",
+    accountId: owner.id,
+    password: await ctx.password.hash(password),
+  });
+  await sql`INSERT INTO platform_access (user_id, role) VALUES (${owner.id}, 'owner')`;
+  await sql`UPDATE "user" SET two_factor_enabled = true, mfa_enrolled_at = now() - interval '1 minute' WHERE id = ${owner.id}`;
+  const ownerSession = await ctx.internalAdapter.createSession(owner.id, false, { origin: "admin" });
+  const { authCookieName: ownerCookieName } = await import("../server/src/auth.ts");
+  const ownerCookie = `${ownerCookieName("session_token")}=${encodeURIComponent(
+    `${ownerSession.token}.${createHmac("sha256", ctx.secret).update(ownerSession.token).digest("base64")}`,
+  )}`;
+  const adminApi = async (path: string, method: string, body: unknown) => {
+    const response = await fetch(`${apiBase}${path}`, {
+      method,
+      headers: {
+        host: adminHost,
+        origin: `https://${adminHost}`,
+        "content-type": "application/json",
+        cookie: ownerCookie,
+      },
+      body: JSON.stringify(body),
+    });
+    const result = (await response.json()) as Record<string, unknown>;
+    if (!response.ok) throw new Error(`${method} ${path}: ${response.status} ${JSON.stringify(result)}`);
+    return result;
+  };
+  const stepUp = (action: string, request: Record<string, unknown>) =>
+    adminApi("/api/step-up", "POST", { password, action, request });
+  let gateUser: { id: string; email: string } | null = null;
+
   control = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       try {
         const action = new URL(request.url).pathname.slice(1);
-        if (action === "prepare") {
+        if (action === "gate-user-create") {
+          // Created, revealed once and granted the route through the real owner API (FD-12).
+          const body = { email: `gate-${createId("x").slice(2, 10)}@example.test` };
+          await stepUp("role.grant", { ...body, gateUsers: "create" });
+          const created = (await adminApi("/api/gate/users", "POST", body)).user as {
+            id: string;
+            email: string;
+          };
+          await stepUp("secret.reveal", { gateUserTemporaryPassword: created.id });
+          const { password: temporary } = await adminApi(
+            `/api/gate/users/${created.id}/temporary-password`,
+            "POST",
+            {},
+          );
+          const userIds = [user.id, created.id];
+          await stepUp("role.grant", { routeId, userIds });
+          await adminApi(`/api/front/routes/${routeId}/access`, "PUT", { userIds });
+          gateUser = created;
+          return Response.json({ id: created.id, email: created.email, password: temporary });
+        } else if (action === "gate-user-delete") {
+          if (!gateUser) throw new Error("No gate user was created.");
+          await stepUp("role.grant", { gateUsers: "delete", userId: gateUser.id });
+          const result = await adminApi(`/api/gate/users/${gateUser.id}`, "DELETE", {});
+          gateUser = null;
+          return Response.json(result);
+        } else if (action === "prepare") {
           rejectLoad = false;
           await sql`UPDATE operations SET status = 'queued', heartbeat_at = NULL WHERE status = 'running' AND payload ->> 'reason' = 'gate_revocation'`;
           await sql`INSERT INTO two_factor (id, user_id, secret, backup_codes, verified)
@@ -349,6 +416,14 @@ try {
           await sql`UPDATE front_routes SET access_mode = 'sso' WHERE id = ${routeId}`;
           // Finish earlier event's pending drain before opening this event's socket.
           await sql`UPDATE operations SET updated_at = now() - interval '10 minutes' WHERE status = 'failed'`;
+          // A previous case can end the moment the watchdog stops Caddy (its socket closes then);
+          // the launch guard restarts it within a moment. Drain only once its admin API answers.
+          await waitFor(
+            "the Caddy admin API after a watchdog stop",
+            async () =>
+              (await fetch(`http://127.0.0.1:${adminBridge!.port}/config/`)).ok ? true : undefined,
+            30_000,
+          );
           await worker();
           await edge!.edgeApply(
             planEdge({
@@ -452,7 +527,7 @@ try {
       ARK_E2E_GATE_USER_ID: user.id,
     },
   );
-  console.log("FD-11 gate browser test passed.");
+  console.log("FD-11/FD-12 gate browser tests passed.");
 } catch (error) {
   failed = true;
   console.error(`\n${(error as Error).stack ?? error}`);

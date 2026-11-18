@@ -66,6 +66,11 @@ import {
   isGateLoginPath,
   GATE_EDGE_API_PATHS,
   checkLoginNext,
+  gateUserCreateBinding,
+  gateUserDeleteBinding,
+  gateUserInput,
+  gateUserRevealBinding,
+  GATE_USER_PASSWORD_SECRET_KIND,
   routeAccessInput,
   buildDomainPlan,
   nextBackupStatus,
@@ -151,7 +156,13 @@ import {
   type GateResponse,
 } from "./modules/gate.ts";
 import { edgeLeaseDocument } from "./modules/gate-revocations.ts";
-import { gateMessagePage, gateNonce, gatePageHeaders, loginPage } from "./gate-pages.ts";
+import { enrollPage, gateMessagePage, gateNonce, gatePageHeaders, loginPage } from "./gate-pages.ts";
+import {
+  createGateUser,
+  deleteGateUser,
+  listGateUsers,
+  revealGateUserPassword,
+} from "./modules/gate-users.ts";
 import { raiseAlert } from "./modules/alerts.ts";
 import {
   backupHealth,
@@ -1000,6 +1011,12 @@ async function requireSecretScope(access: Access, secret: typeof secrets.$inferS
   ) {
     throw new HTTPException(403, {
       message: "Database client credentials are revealed only through the client's one-time reveal.",
+    });
+  }
+  // A gate user's temporary password leaves only through `/api/gate/users/:id/temporary-password`.
+  if (secret.kind === GATE_USER_PASSWORD_SECRET_KIND) {
+    throw new HTTPException(403, {
+      message: "A gate user's temporary password is revealed only through its own one-time reveal.",
     });
   }
   if (!secret.resourceId || !secret.resourceType) {
@@ -3566,6 +3583,74 @@ app.put("/api/front/routes/:id/access", async (c) => {
   return c.json({ routeId, ...result, users: await listRouteAccess(routeId) });
 });
 
+// Gate users (front door §3.9.6, FD-12): login-origin-only accounts for SSO routes, with no
+// `platform_access` row. Owner only. Creating and deleting need MFA and a `role.grant` step-up bound
+// to the exact request; the one-time temporary password leaves only through its own reveal, with a
+// `secret.reveal` step-up, exactly once. Deletion cascades sessions, gate sessions and route access,
+// and journals the forced-reload drain for every affected route in the same transaction (§3.9.3).
+app.get("/api/gate/users", async (c) => {
+  requireOwner(c.get("access"));
+  c.header("cache-control", "no-store");
+  return c.json({ users: await listGateUsers() });
+});
+
+app.post("/api/gate/users", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const request = (await c.req.json()) as Record<string, unknown>;
+  const input = gateUserInput.parse(request);
+  const created = await createGateUser(
+    input,
+    { userId: access.userId, role: access.role },
+    () =>
+      requirePrivileged(
+        access,
+        c.get("session"),
+        "role.grant",
+        privilegedRequestHash("role.grant", gateUserCreateBinding(request)),
+      ),
+    c.get("requestOrigin").host,
+  );
+  c.header("cache-control", "no-store");
+  return c.json({ user: created }, 201);
+});
+
+app.post("/api/gate/users/:id/temporary-password", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const userId = c.req.param("id");
+  const password = await revealGateUserPassword(userId, { userId: access.userId, role: access.role }, (tx) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "secret.reveal",
+      privilegedRequestHash("secret.reveal", gateUserRevealBinding(userId)),
+      tx,
+    ),
+  );
+  c.header("cache-control", "no-store");
+  return c.json({ id: userId, password });
+});
+
+app.delete("/api/gate/users/:id", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const userId = c.req.param("id");
+  const result = await deleteGateUser(userId, { userId: access.userId, role: access.role }, (tx) =>
+    requirePrivileged(
+      access,
+      c.get("session"),
+      "role.grant",
+      privilegedRequestHash("role.grant", gateUserDeleteBinding(userId)),
+      tx,
+    ),
+  );
+  return c.json(result);
+});
+
 app.get("/api/metrics", async (c) => {
   const [ops, backupRows, certs] = await Promise.all([
     db.select().from(operations),
@@ -3612,8 +3697,25 @@ app.get("/gate/login", async (c) => {
   if (c.get("requestOrigin")?.origin !== "gate") return c.json({ error: "Not found." }, 404);
   const next = checkLoginNext(c.req.query("next"));
   const current = await gateLoginSession(c);
+  if (current && !current.user.twoFactorEnabled) return c.redirect(gateEnrollPath(next), 303);
   if (current && next) return c.redirect(next, 303);
   return gateHtml(c, 200, (nonce) => loginPage({ nonce, next, signedInAs: current?.user.email ?? null }));
+});
+
+/** The forced-enrollment page, carrying a validated relative authorize `next` through. */
+function gateEnrollPath(next: string | null) {
+  return next ? `/gate/enroll?next=${encodeURIComponent(next)}` : "/gate/enroll";
+}
+
+// Forced first TOTP enrollment (§3.9.6, FD-12). A login-origin session whose user has not enrolled
+// TOTP can reach nothing else: authorize and the gate check require MFA assurance, so it is sent here.
+app.get("/gate/enroll", async (c) => {
+  if (c.get("requestOrigin")?.origin !== "gate") return c.json({ error: "Not found." }, 404);
+  const next = checkLoginNext(c.req.query("next"));
+  const current = await gateLoginSession(c);
+  if (!current) return c.redirect(next ? `/gate/login?next=${encodeURIComponent(next)}` : "/gate/login", 303);
+  if (current.user.twoFactorEnabled) return c.redirect(next ?? "/gate/login", 303);
+  return gateHtml(c, 200, (nonce) => enrollPage({ nonce, next, email: current.user.email }));
 });
 
 app.get("/gate/authorize", async (c) => {
@@ -3625,6 +3727,8 @@ app.get("/gate/authorize", async (c) => {
     const next = `/gate/authorize${url.search}`;
     return c.redirect(`/gate/login?next=${encodeURIComponent(next)}`, 303);
   }
+  // No TOTP yet (a new gate user's first login): enroll first, then come back here.
+  if (!current.user.twoFactorEnabled) return c.redirect(gateEnrollPath(`/gate/authorize${url.search}`), 303);
   const outcome = await gateAuthorize({
     routeId: url.searchParams.get("route"),
     state: url.searchParams.get("state"),

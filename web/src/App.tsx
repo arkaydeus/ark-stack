@@ -12,6 +12,7 @@ import {
   Settings2,
   ShieldCheck,
   ShipWheel,
+  UserRoundCheck,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
@@ -21,6 +22,7 @@ import type { PlatformState } from "@/lib/types";
 import { api, cn, onActionError } from "@/lib/utils";
 import { AuthScreen, MfaSetup } from "@/pages/Auth";
 import { FrontAclView } from "@/pages/FrontAcl";
+import { GateUsersView } from "@/pages/GateUsers";
 import { FrontRoutesView } from "@/pages/FrontRoutes";
 import {
   ActivityView,
@@ -48,6 +50,7 @@ const navigation = [
   { id: "updates", label: "Updates", icon: RefreshCw },
   { id: "front-routes", label: "Front door routes", icon: Network },
   { id: "front-acl", label: "Front door ACL", icon: ShieldCheck, ownerOnly: true },
+  { id: "gate-users", label: "Gate users", icon: UserRoundCheck, ownerOnly: true },
   { id: "settings", label: "Settings", icon: Settings2 },
 ] as const;
 
@@ -226,6 +229,7 @@ function ViewBody({
   if (view === "updates") return <UpdatesView state={state} reload={reload} />;
   if (view === "front-routes") return <FrontRoutesView key={state.operations.length} state={state} />;
   if (view === "front-acl") return <FrontAclView state={state} />;
+  if (view === "gate-users") return <GateUsersView state={state} />;
   if (view === "settings") return <SettingsView state={state} reload={reload} />;
   return <Overview state={state} reload={reload} />;
 }

@@ -295,6 +295,39 @@ export const routeAccessInput = z
 
 export type RouteAccessInput = z.infer<typeof routeAccessInput>;
 
+/**
+ * `POST /api/gate/users` (FD-12, §3.9.6): a login-origin-only account. The password is generated
+ * server-side and revealed once; the request never carries one.
+ */
+export const gateUserInput = z
+  .object({
+    email: z.string().trim().toLowerCase().max(254).pipe(z.email()),
+    name: z.string().trim().min(1).max(100).optional(),
+  })
+  .strict();
+
+export type GateUserInput = z.infer<typeof gateUserInput>;
+
+/**
+ * The `role.grant` step-up bindings for gate-user changes. A server-set `gateUsers` key keeps them
+ * apart from every other `role.grant` request (route access lists bind `{ routeId, userIds }`).
+ */
+export function gateUserCreateBinding(request: Record<string, unknown>) {
+  return { ...request, gateUsers: "create" };
+}
+
+export function gateUserDeleteBinding(userId: string) {
+  return { gateUsers: "delete", userId };
+}
+
+/** The `secret.reveal` step-up binding for a gate user's one-time temporary password. */
+export function gateUserRevealBinding(userId: string) {
+  return { gateUserTemporaryPassword: userId };
+}
+
+/** `secrets.kind` of a gate user's temporary password; only its own one-time endpoint reveals it. */
+export const GATE_USER_PASSWORD_SECRET_KIND = "gate-user.temporary-password";
+
 /** One revocation still waiting for its forced reload, as the lease endpoint reports it. */
 export type PendingGateRevocation = { id: string; routeId: string; createdAt: string };
 
