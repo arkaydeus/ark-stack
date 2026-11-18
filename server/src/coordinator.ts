@@ -57,8 +57,10 @@ import {
   type TargetEvidence,
 } from "./modules/offsite-backups.ts";
 import { issueCertificateFiles } from "./modules/certificates.ts";
-import { edgeL4Configured, haproxyAdapter, writeEdgeL4 } from "./modules/edge-l4.ts";
+import { edgeL4Configured, haproxyAdapter, missingL4Routes, writeEdgeL4 } from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
+import { edgeL4Routes, enabledSniPorts, type OmittedL4Route } from "./modules/l4-routes.ts";
+import { refreshRouteCrls, routeCrlsDue } from "./modules/route-pki.ts";
 import {
   ensureGateRevocationDrain,
   markGateRevocationsApplied,
@@ -2471,12 +2473,21 @@ export async function withEdgeLock<T>(work: () => Promise<T>) {
 }
 
 // HAProxy SNI router on 443 (front door §3.8.5, FD-25): HTTP, admin and login hostnames go to Caddy
-// over PROXY v2; unknown SNI goes to Caddy too; non-TLS is rejected after 5 s. TLS-TCP routes arrive
-// with FD-14, so no tailnet backend is rendered here yet. The HTTP hostnames are exactly the ones the
-// same plan gives Caddy a site for (FD-09): servable routes with an issued certificate, never an
-// omitted or unservable route.
-export function edgeL4Input(plan: Pick<Awaited<ReturnType<typeof edgePlan>>, "certificates">) {
-  return { httpHostnames: servedHttpHostnames(plan), tlsRoutes: [] };
+// over PROXY v2; unknown SNI goes to Caddy too; non-TLS is rejected after 5 s. The HTTP hostnames are
+// exactly the ones the same plan gives Caddy a site for (FD-09): servable routes with an issued
+// certificate, never an omitted or unservable route. TLS-TCP routes (on 443 or an enabled shared SNI
+// port) and raw-TCP routes (dedicated ports) are the lease-allowed `tls`/`tcp` routes (FD-14).
+export function edgeL4Input(
+  plan: Pick<Awaited<ReturnType<typeof edgePlan>>, "certificates">,
+  l4: Partial<Pick<Awaited<ReturnType<typeof edgeL4Routes>>, "tlsRoutes" | "tcpRoutes">> = {},
+  sniPorts: number[] = [],
+) {
+  return {
+    httpHostnames: servedHttpHostnames(plan),
+    tlsRoutes: l4.tlsRoutes ?? [],
+    tcpRoutes: l4.tcpRoutes ?? [],
+    sniPorts,
+  };
 }
 
 async function applyEdgeL4(operation: OperationRow) {
@@ -2485,8 +2496,13 @@ async function applyEdgeL4(operation: OperationRow) {
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
     settings?.adminHostname,
   );
-  const written = await withEdgeLock(() => writeEdgeL4(edgeL4Input(plan)));
-  await addStep(operation.id, "edge-l4-apply", written);
+  // Route CAs must carry a current CRL: OpenSSL refuses every client certificate once it expires.
+  const crls = await refreshRouteCrls();
+  const sniPorts = enabledSniPorts();
+  const l4 = await edgeL4Routes({ policyRoutes: (await edgePolicy()).routes, sniPorts });
+  const written = await withEdgeLock(() => writeEdgeL4(edgeL4Input(plan, l4, sniPorts)));
+  const omitted: OmittedL4Route[] = l4.omitted;
+  await addStep(operation.id, "edge-l4-apply", { ...written, omittedL4Routes: omitted, crls });
   return written;
 }
 
@@ -2507,7 +2523,23 @@ async function observeEdge(operation: OperationRow) {
     operationId: operation.id,
   });
   const reconcile = await reconcileServedRoutes();
-  await addStep(operation.id, "edge-observe", { ...result, reconcile });
+  const l4Adapter = haproxyAdapter();
+  let l4Recovery: { missing?: string[]; error?: string } = {};
+  if (edgeL4Configured() && l4Adapter) {
+    try {
+      const missing = await missingL4Routes((await edgePolicy()).routes, l4Adapter.master);
+      if (missing.length) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+      l4Recovery = { missing };
+    } catch (error) {
+      // Inspection uncertainty needs a durable retry, too.
+      await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+      l4Recovery = { error: (error as Error).message };
+    }
+  }
+  // Weekly route CRL refresh (FD-14): edge.l4_apply regenerates due CRLs before rendering.
+  const crlsDue = (await routeCrlsDue()).length;
+  if (crlsDue && edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+  await addStep(operation.id, "edge-observe", { ...result, reconcile, l4Recovery, routeCrlsDue: crlsDue });
   return { ...result, reconcile };
 }
 

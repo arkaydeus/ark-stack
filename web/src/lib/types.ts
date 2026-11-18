@@ -170,3 +170,35 @@ export type PlatformState = {
   }>;
   providers?: { cloudflare: boolean; ses: boolean; stalwart: boolean; alertWebhook: boolean };
 };
+
+/** `GET /api/front/routes` (FD-08, FD-14). */
+export type FrontRouteSummary = {
+  id: string;
+  kind: "http" | "tls" | "tcp" | "postgres";
+  hostname: string;
+  listenPort: number;
+  accessMode: string | null;
+  enabled: boolean;
+  status: string;
+  lastError: string | null;
+  l4: {
+    tlsMode: string | null;
+    sourceCidrs: string[];
+    allowInternet: boolean;
+    internetConfirmedAt: string | null;
+    protocolAuthConfirmed: boolean;
+    limits: { maxConn: number; perSourceConn: number; perSourceRate: number } | null;
+    clientCaId: string | null;
+    admits: "internet" | "allowlist" | "nobody";
+  } | null;
+};
+
+/** `GET /api/front/listeners` (§3.8.2, FD-14). */
+export type FrontListeners = {
+  sniRouterPort: number;
+  sharedSniPorts: { available: number[]; enabled: number[] };
+  tcpPorts: { start: number; end: number };
+  reservedPorts: number[];
+  tlsModes: string[];
+  guidance: Array<{ protocol: string; tlsFirst: string; byName: string; kind: string | null; notes: string }>;
+};

@@ -7,6 +7,7 @@ import { ValidationError } from "./errors.ts";
 import {
   ROUTE_RECORD_PURPOSE,
   UnsupportedRouteError,
+  assertFieldsForKind,
   assertSupportedAccessMode,
   assertSupportedRouteKind,
   checkGateRouteSettings,
@@ -84,10 +85,10 @@ describe("route address records (§3.13.1)", () => {
 });
 
 describe("route request policy", () => {
-  test("only http routes can be created", () => {
-    expect(() => assertSupportedRouteKind(undefined)).not.toThrow();
-    expect(() => assertSupportedRouteKind("http")).not.toThrow();
-    for (const kind of ["tls", "tcp", "postgres", "udp"]) {
+  test("http, tls and tcp routes can be created; postgres waits for FD-26", () => {
+    expect(assertSupportedRouteKind(undefined)).toBe("http");
+    for (const kind of ["http", "tls", "tcp"] as const) expect(assertSupportedRouteKind(kind)).toBe(kind);
+    for (const kind of ["postgres", "udp"]) {
       expect(() => assertSupportedRouteKind(kind)).toThrow(UnsupportedRouteError);
     }
   });
@@ -113,6 +114,23 @@ describe("route request policy", () => {
       expect(() => checkGateRouteSettings({ bypassPaths: [path] })).toThrow(ValidationError);
     for (const origin of ["http://app.example.com", "https://app.example.com/path", "null", "*"])
       expect(() => checkGateRouteSettings({ allowedOrigins: [origin] })).toThrow(ValidationError);
+  });
+
+  test("gate settings are HTTP-only across route create and update inputs", () => {
+    const gate = { bypassPaths: ["/hooks/*"], allowedOrigins: ["https://app.example.com"] };
+    const create = frontRouteCreateInput.parse({
+      hostname: "a.example.com",
+      target: "home",
+      targetPort: 3000,
+      ...gate,
+    });
+    const update = frontRouteUpdateInput.parse(gate);
+    for (const input of [create, update]) {
+      expect(() => assertFieldsForKind("http", input)).not.toThrow();
+      for (const kind of ["tls", "tcp"] as const) {
+        expect(() => assertFieldsForKind(kind, input)).toThrow(/bypassPaths, allowedOrigins cannot be set/);
+      }
+    }
   });
 
   test("new bypass paths and Origin exceptions loosen; removing them tightens", () => {
@@ -166,7 +184,7 @@ describe("route request policy", () => {
         hostname: "a.example.com",
         target: "x",
         targetPort: 1,
-        tlsMode: "plain",
+        unknownOption: true,
       }),
     ).toThrow();
     expect(() =>

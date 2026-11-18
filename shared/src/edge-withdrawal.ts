@@ -19,6 +19,14 @@ export type EdgePolicyRoute = {
   ip: string;
   port: number;
   stableId: string;
+  /**
+   * L4 routes only (`tls`, `tcp`, FD-14): a fingerprint of the route's admission policy (CIDRs,
+   * limits, TLS mode, client CA and its revoked serials). It is part of the identity key and so of
+   * the HAProxy server name: a policy change makes every running server of the old policy
+   * unauthorised, so the watchdog and `edge.drain` fence and drain it in every worker before the
+   * restricted generation is reloaded (§3.8.6). Caddy routes never carry one.
+   */
+  policy?: string;
 };
 
 /** The read-only lease and policy document the watchdog polls. */
@@ -118,13 +126,16 @@ export function caddyTailnetBackends(config: unknown) {
   return [...found].toSorted();
 }
 
-/** Identity metadata survives Caddyfile adaptation in a native `vars` handler. */
+/**
+ * Identity metadata survives Caddyfile adaptation in a native `vars` handler. An L4 route's policy
+ * fingerprint (FD-14) is appended as a fifth element; HTTP identities are unchanged.
+ */
 export function routeIdentityKey(
-  route: Pick<EdgePolicyRoute, "id" | "hostname" | "stableId" | "ip" | "port">,
+  route: Pick<EdgePolicyRoute, "id" | "hostname" | "stableId" | "ip" | "port" | "policy">,
 ) {
-  return encodeURIComponent(
-    JSON.stringify([route.id, route.hostname, route.stableId, backendKey(route.ip, route.port)]),
-  );
+  const identity = [route.id, route.hostname, route.stableId, backendKey(route.ip, route.port)];
+  if (route.policy) identity.push(route.policy);
+  return encodeURIComponent(JSON.stringify(identity));
 }
 
 function identityMatches(identity: string, backend: string, hosts: string[]) {

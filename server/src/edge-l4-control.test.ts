@@ -124,3 +124,38 @@ test("edge.l4_apply configuration errors are recorded by coordinator operation h
     await db.delete(operations).where(eq(operations.id, operation.id));
   }
 });
+
+test("L4 reconciliation ignores leaving copies and recovers missing or fenced accepting servers", async () => {
+  const { missingL4Routes } = await import("./modules/edge-l4.ts");
+  const { haproxyServerName } = await import("@ark-stack/shared");
+  const route = {
+    id: "rt_recover",
+    kind: "tls" as const,
+    hostname: "recover.example.com",
+    stableId: "nRecover",
+    ip: "100.88.1.20",
+    port: 1883,
+    policy: "1234567890abcdef",
+  };
+  const master = new HaproxyMaster("/unused");
+  master.workers = async () => [
+    { pid: 1, type: "worker", reloads: 0, section: "current" },
+    { pid: 2, type: "worker", reloads: 1, section: "old" },
+  ];
+  const server = {
+    backend: "be_rt_recover",
+    server: haproxyServerName(route),
+    addr: route.ip,
+    port: route.port,
+    adminState: 0,
+    operState: 2,
+    key: `${route.ip}:${route.port}`,
+  };
+  let current: (typeof server)[] = [];
+  master.servers = async (pid) => (pid === 1 ? current : [server]);
+  expect(await missingL4Routes([route], master)).toEqual([route.id]);
+  current = [{ ...server, adminState: 1 }];
+  expect(await missingL4Routes([route], master)).toEqual([route.id]);
+  current = [server];
+  expect(await missingL4Routes([route], master)).toEqual([]);
+});

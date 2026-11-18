@@ -3,7 +3,7 @@ import { chmod, chown, mkdir, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-import { generateInstallSecrets, mergeInstallEnv } from "@ark-stack/shared";
+import { applyEdgeSniPorts, generateInstallSecrets, mergeInstallEnv } from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
 import { configureEdgeAuthKey } from "./install-edge-auth.ts";
@@ -32,6 +32,12 @@ await Bun.write(envPath, mergeInstallEnv(hasEnv ? existing : template, generated
 // `.env` holds every platform secret and `Bun.write` creates it 0644.
 await chmod(envPath, 0o600);
 const edgeAuthKey = await configureEdgeAuthKey(envPath);
+// Shared SNI ports for tls routes (FD-14): ARK_EDGE_SNI_PORTS from the environment, else from .env.
+// Each enabled port is published on edge-ts; the API and domain worker accept tls routes only there.
+const sni = applyEdgeSniPorts(await Bun.file(envPath).text(), process.env.ARK_EDGE_SNI_PORTS);
+await Bun.write(envPath, sni.env);
+await chmod(envPath, 0o600);
+console.log(`Shared SNI ports: ${sni.ports.length ? sni.ports.join(", ") : "none (443 only)"}`);
 for (const path of [
   "certs",
   "acme",

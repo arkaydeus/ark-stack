@@ -3,6 +3,8 @@
 // the domain worker's user, groups and mounts.
 import {
   HaproxyMaster,
+  haproxyServerName,
+  type EdgePolicyRoute,
   HaproxyWithdrawalAdapter,
   installEdgeL4Generation,
   renderEdgeL4Generation,
@@ -67,6 +69,26 @@ export async function writeEdgeL4(input: EdgeL4Input, env: Record<string, string
     ...result,
     reloadLog: result.reloadLog?.slice(-1_000),
     httpHostnames: generation.manifest.httpHostnames,
-    tlsRoutes: generation.manifest.routes.map((route) => route.id),
+    sniPorts: generation.manifest.sniPorts,
+    tlsRoutes: generation.manifest.routes.filter((route) => route.kind === "tls").map((route) => route.id),
+    tcpRoutes: generation.manifest.routes.filter((route) => route.kind === "tcp").map((route) => route.id),
   };
+}
+
+/** Desired-versus-running recovery examines accepting workers, never a leaving worker's copy. */
+export async function missingL4Routes(routes: EdgePolicyRoute[], master: HaproxyMaster) {
+  const servers = (
+    await Promise.all(
+      (await master.workers())
+        .filter((worker) => worker.section === "current")
+        .map((worker) => master.servers(worker.pid)),
+    )
+  ).flat();
+  return routes
+    .filter(
+      (route) =>
+        (route.kind === "tls" || route.kind === "tcp") &&
+        !servers.some((server) => server.server === haproxyServerName(route) && !(server.adminState & 1)),
+    )
+    .map((route) => route.id);
 }

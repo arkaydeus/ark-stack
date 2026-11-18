@@ -13,7 +13,7 @@
 #   for the full variant; else (or when the watchdog cannot be reached) the closed variant, which
 #   renders no tailnet backend. HTTP routes through Caddy keep working; tailnet routes fail closed.
 # - Once a tailnet route has existed, the watchdog must keep reporting verified HAProxy enforcement every
-#   second. After two consecutive misses, every HAProxy process is killed (listeners and established
+#   250 ms. After two consecutive misses, every HAProxy process is killed (listeners and established
 #   sessions), the container exits, and the next start is decided again.
 # - Started closed, the guard re-asks the watchdog and switches to the full variant (link + reload)
 #   once the lease allows it; told `closed` while full, it points the link back at the closed variant
@@ -93,12 +93,12 @@ supervise() {
   while kill -0 "$haproxy_pid" 2>/dev/null; do
     if guarded || protected_generation; then latched=1; fi
     if [ "$latched" = 1 ]; then
-      heartbeat="$(timeout 1 wget -q -T 1 -O - "$watchdog/v1/supervise?proxy=haproxy" 2>/dev/null || true)"
+      heartbeat="$(timeout 0.5 wget -q -T 1 -O - "$watchdog/v1/supervise?proxy=haproxy" 2>/dev/null || true)"
       if [ "$heartbeat" = "ok" ]; then
         misses=0
       else
         # One miss is tolerated: the master CLI stalls while a reload re-executes HAProxy, which can
-        # delay a single enforcement pass. Two consecutive misses (about 2-4 s) stop HAProxy.
+        # delay a single enforcement pass. Two consecutive misses take at most 1.5 s (including poll phase and HTTP timeouts).
         misses=$((misses + 1))
       fi
       if [ "$misses" -ge 2 ]; then
@@ -107,9 +107,9 @@ supervise() {
         return
       fi
       # Never spend the remaining shutdown budget on launch polling after a missed heartbeat.
-      if [ "$heartbeat" != "ok" ]; then sleep 1; continue; fi
+      if [ "$heartbeat" != "ok" ]; then sleep 0.25; continue; fi
     fi
-    sleep 1
+    sleep 0.25
   done
 }
 # A separate process may block on the CLI without delaying heartbeat enforcement.

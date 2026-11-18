@@ -75,7 +75,19 @@ describe("edge-ts", () => {
   });
 
   test("publishes the edge's ports and carries the edge-admin alias", () => {
-    expect(edgeTs.ports).toEqual(["80:80", "443:443", "41642:41642/udp"]);
+    expect(edgeTs.ports).toEqual([
+      "80:80",
+      "443:443",
+      // Shared SNI ports (FD-14): published only when the installer enabled them; otherwise only on
+      // an ephemeral loopback port where nothing listens.
+      "${ARK_EDGE_SNI_PORT_8883:-127.0.0.1::8883}",
+      "${ARK_EDGE_SNI_PORT_5671:-127.0.0.1::5671}",
+      "${ARK_EDGE_SNI_PORT_636:-127.0.0.1::636}",
+      "${ARK_EDGE_SNI_PORT_6380:-127.0.0.1::6380}",
+      // Dedicated raw TCP route ports (FD-14).
+      "20000-20049:20000-20049",
+      "41642:41642/udp",
+    ]);
     expect(edgeTs.networks).toEqual({ admin: {}, "edge-control": { aliases: ["edge-admin"] } });
     expect(compose.networks["edge-control"]?.internal).toBe(true);
   });

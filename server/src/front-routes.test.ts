@@ -870,10 +870,11 @@ describe("lifecycle regression coverage", () => {
     expect(await openGrants(actors.owner)).toBe(grants - 1);
   });
 
-  test("every HTTP mutation refuses other kinds and preserves resources and grants", async () => {
-    for (const kind of ["tls", "tcp", "postgres"]) {
+  test("every mutation refuses unmanaged kinds (postgres, FD-26) and preserves resources and grants", async () => {
+    // tls and tcp routes are managed since FD-14 (server/src/l4-routes.test.ts).
+    for (const kind of ["postgres"]) {
       const { route } = await createRoute(`kind-${kind}.${zone}`);
-      await sql`UPDATE front_routes SET kind = ${kind}, status = 'ready', enabled = true WHERE id = ${route.id}`;
+      await sql`UPDATE front_routes SET kind = ${kind}, tls_mode = 'passthrough', status = 'ready', enabled = true WHERE id = ${route.id}`;
       const certId = createId("crt");
       await sql`INSERT INTO certificates (id, endpoint_id, names, status, last_deployed_at)
         VALUES (${certId}, ${route.endpointId ?? (await routeRow(route.id))!.endpoint_id}, '[]', 'issued', now())`;
