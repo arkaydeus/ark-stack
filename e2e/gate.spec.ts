@@ -1,6 +1,7 @@
-// FD-11 (docs/design/front-door.md §3.9.2): the login gate in a real browser, against the containerised
-// edge, the real API and a fake upstream. Run by scripts/test-e2e-gate.ts, which starts all of them
-// and points Chromium at the edge through a CONNECT proxy; skipped in the regular browser run.
+// FD-11 and FD-12 (docs/design/front-door.md §3.9.2, §3.9.6): the login gate in a real browser,
+// against the containerised edge, the real API and a fake upstream. Run by scripts/test-e2e-gate.ts,
+// which starts all of them and points Chromium at the edge through a CONNECT proxy; skipped in the
+// regular browser run.
 import { expect, test } from "@playwright/test";
 
 import { totpCode } from "./totp.ts";
@@ -91,6 +92,92 @@ async function signIn(page: import("@playwright/test").Page) {
   await page.waitForURL(`${appUrl}/headers`);
 }
 
+async function openSocket(page: import("@playwright/test").Page) {
+  await page.evaluate(
+    async (url) => {
+      const state = window as unknown as { gateSocket: WebSocket; gateSocketClosed: boolean };
+      state.gateSocketClosed = false;
+      state.gateSocket = new WebSocket(url);
+      state.gateSocket.addEventListener("close", () => {
+        state.gateSocketClosed = true;
+      });
+      await new Promise<void>((resolve, reject) => {
+        state.gateSocket.addEventListener("open", () => resolve(), { once: true });
+        state.gateSocket.addEventListener("error", () => reject(new Error("socket failed to open")), {
+          once: true,
+        });
+      });
+    },
+    `${appUrl.replace("https:", "wss:")}/ws`,
+  );
+}
+
+async function expectSocketClosed(page: import("@playwright/test").Page, started: number) {
+  await expect
+    .poll(
+      async () => page.evaluate(() => (window as unknown as { gateSocketClosed: boolean }).gateSocketClosed),
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+  expect(Date.now() - started).toBeLessThan(305_000);
+}
+
+// FD-12 (§3.9.6). Runs before the socket cases below: the last of them deletes the seeded user.
+test("a gate user created in Ark must enroll TOTP before the route opens; deleting them closes their WebSocket", async ({
+  page,
+}) => {
+  test.setTimeout(90_000);
+  await fixture("prepare");
+  const created = (await fixture("gate-user-create")) as unknown as {
+    id: string;
+    email: string;
+    password: string;
+  };
+
+  // First login with the once-revealed temporary password: no TOTP challenge, enrollment instead.
+  await page.goto(`${appUrl}/headers`);
+  await expect(page).toHaveURL(new RegExp(`^https://${loginHost.replaceAll(".", "\\.")}/gate/login\\?next=`));
+  await page.getByLabel("Email").fill(created.email);
+  await page.getByLabel("Password").fill(created.password);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page).toHaveURL(
+    new RegExp(`^https://${loginHost.replaceAll(".", "\\.")}/gate/enroll\\?next=`),
+  );
+  // The route is still closed to this browser.
+  const closed = await page.context().request.get(`${appUrl}/headers`, {
+    headers: { accept: "application/json" },
+    maxRedirects: 0,
+  });
+  expect(closed.status()).toBe(401);
+
+  await page.getByLabel("Password").fill(created.password);
+  await page.getByRole("button", { name: "Set up authenticator" }).click();
+  const key = page.getByTestId("totp-secret");
+  await expect(key).toHaveText(/^[A-Za-z2-7]{16,}=*$/);
+  const secret = (await key.innerText()).trim();
+  await page.getByLabel("Authenticator code").fill(totpCode(secret));
+  await page.getByRole("button", { name: "Verify and continue" }).click();
+  await page.waitForURL(`${appUrl}/headers`);
+  const seen = JSON.parse(await page.locator("body").innerText()) as Record<string, string>;
+  expect(seen["x-ark-user"]).toBe(created.id);
+  expect(seen["x-ark-email"]).toBe(created.email);
+
+  // The owner deletes the user through the API while a socket is open; the journal drains it.
+  await openSocket(page);
+  const started = Date.now();
+  const deleted = (await fixture("gate-user-delete")) as unknown as { revokedRouteIds: string[] };
+  expect(deleted.revokedRouteIds).toEqual([process.env.ARK_E2E_GATE_ROUTE_ID]);
+  expect((await fixture("status")).pending).toBeGreaterThan(0);
+  await fixture("worker");
+  expect((await fixture("status")).pending).toBe(0);
+  expect(
+    await page.evaluate(
+      async () => (await fetch("/headers", { headers: { accept: "application/json" } })).status,
+    ),
+  ).toBe(401);
+  await expectSocketClosed(page, started);
+});
+
 for (const source of ["signed-in", "access-denied"]) {
   test(`rendered sign-out works from the ${source} page and invalidates the route session`, async ({
     page,
@@ -142,23 +229,7 @@ for (const event of [
     test.setTimeout(60_000);
     await fixture("prepare");
     await signIn(page);
-    await page.evaluate(
-      async (url) => {
-        const state = window as unknown as { gateSocket: WebSocket; gateSocketClosed: boolean };
-        state.gateSocketClosed = false;
-        state.gateSocket = new WebSocket(url);
-        state.gateSocket.addEventListener("close", () => {
-          state.gateSocketClosed = true;
-        });
-        await new Promise<void>((resolve, reject) => {
-          state.gateSocket.addEventListener("open", () => resolve(), { once: true });
-          state.gateSocket.addEventListener("error", () => reject(new Error("socket failed to open")), {
-            once: true,
-          });
-        });
-      },
-      `${appUrl.replace("https:", "wss:")}/ws`,
-    );
+    await openSocket(page);
     const started = Date.now();
     if (event === "route-logout") {
       expect(
@@ -201,13 +272,6 @@ for (const event of [
           async () => (await fetch("/headers", { headers: { accept: "application/json" } })).status,
         ),
       ).toBe(401);
-    await expect
-      .poll(
-        async () =>
-          page.evaluate(() => (window as unknown as { gateSocketClosed: boolean }).gateSocketClosed),
-        { timeout: 20_000 },
-      )
-      .toBe(true);
-    expect(Date.now() - started).toBeLessThan(305_000);
+    await expectSocketClosed(page, started);
   });
 }

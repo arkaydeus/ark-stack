@@ -747,6 +747,19 @@ export const gateRevocations = pgTable(
   ],
 );
 
+// 0029 (FD-12): gate users (docs/design/front-door.md §3.9.6). Login-origin-only accounts the owner
+// creates for SSO routes; triggers keep this table and `platform_access` mutually exclusive.
+export const gateUsers = pgTable("gate_users", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => user.id, { onDelete: "cascade" }),
+  createdBy: text("created_by").references(() => user.id, { onDelete: "set null" }),
+  temporaryPasswordSecretId: text("temporary_password_secret_id").references(() => secrets.id, {
+    onDelete: "set null",
+  }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const clientCertificates = pgTable(
   "client_certificates",
   {
