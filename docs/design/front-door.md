@@ -1957,14 +1957,14 @@ Ark fills this in from the platform region setting (§3.15).
 
 - **With the Vercel integration** (§3.10.5), Ark updates both variables about 30 days before expiry and redeploys.
 
-- **For manual rollover or recovery after a failed push**, the rollover status endpoint (`GET …/clients/:clientId/rollover`) and the successor's one-time reveal return the commands to update both variables before redeploying and confirming. A connected Preview client’s guide names the project and the verified hook branch and uses `--environment preview --git-branch` (Vercel CLI 64.6.0 or later).
+- **For manual rollover or recovery after a failed push**, the rollover status endpoint (`GET …/clients/:clientId/rollover`) and the successor's one-time reveal return the commands to update both variables before redeploying and confirming. A connected Preview client’s guide names the project and the verified hook branch and uses `--environment preview --git-branch` (Vercel CLI 64.7.0 or later).
 
 ```bash
 # Reveal the new bundle once in Ark (step-up), then:
 base64 -i client-next.crt | tr -d '\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive --force
 base64 -i client-next.key | tr -d '\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive --force
 vercel deploy --prod        # or redeploy from the dashboard
-# Check database access, then press "Confirm rollover" in Ark.
+# Check database access, then confirm in Ark: POST the reveal's confirm.path with its confirm.body (MFA).
 ```
 
 The old certificate admits new connections until expiry and its role is drained by expiry +5 s, so redeploys can happen at any time within the 30-day window. (The `--force` and `--sensitive` spellings were verified against Vercel CLI 63.1.0 for FD-22.)
