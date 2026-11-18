@@ -6,12 +6,12 @@ Vercel functions have no stable egress addresses, so Ark does not allowlist them
 
 - TLS 1.3 to PgBouncer, with Ark's publicly trusted certificate for the database hostname;
 - a **client certificate** from the app environment's own private CA (`client_tls_sslmode = verify-full`);
-- **SCRAM** for that environment's login role, which is a `runtime` role (production) or a `readonly` role (every other environment);
+- **SCRAM** for that environment's login role. The default role is `runtime` in production and `readonly` in other environments. The issuing owner can explicitly choose either role;
 - the per-source nftables limits on 5432 and the pooler-wide source policy in HAProxy.
 
 Vercel Static IPs are not used (decision R2).
 
-The steps were followed end to end against a local Ark stack, using the same drivers from an empty directory, with one manual rollover. The commands and output are in [Verification](#verification).
+For a disposable local connectivity check before and after rollover, see [Verification](#verification).
 
 ## Contents
 
@@ -37,7 +37,7 @@ On the Ark side you need:
 
 On your side you need:
 
-- A Next.js project linked to a Vercel project (`vercel link`). A fresh `npx create-next-app@latest` is fine.
+- A TypeScript Next.js project using the App Router and linked to a Vercel project (`vercel link`). A fresh `npx create-next-app@latest` works. If you chose a `src/` directory, put the example files under it.
 - The Vercel CLI. `vercel env add … --sensitive` and `--force` exist in CLI 63.x. Branch-scoped Preview variables (`--environment preview --git-branch`) need CLI 64.6.0 or later.
 - `jq`, `base64` and `openssl`, to save and check the files.
 
@@ -87,46 +87,67 @@ On your side you need:
 
 ## 3. Issue a client certificate
 
-One client is one app environment. The login role is `<database>_<client>_<environment>`, for example `appdb_storefront_production`. Client and environment names are lowercase letters and digits only. `production` gets a `runtime` role. Every other environment, `preview` included, gets a `readonly` role, which is refused `INSERT`, `UPDATE` and `DELETE`. Each client gets its own private CA, its own password and a 90-day certificate.
+Before generating keys or saving either reveal, prepare a private directory on a trusted machine. Keep the linked Vercel project as your working directory and use the paths below for secret files. Reopen this shell or prepare a new private directory if you rotate from a different session.
+
+```bash
+umask 077
+secrets_dir=$(mktemp -d "${TMPDIR:-/tmp}/ark-db-client.XXXXXXXX")
+printf '%s\n' "$secrets_dir"
+```
+
+One client is one app environment. The login role is `<database>_<client>_<environment>`, for example `appdb_storefront_production`. Client and environment names are lowercase letters and digits only. Production defaults to `runtime`, and every other environment defaults to `readonly`. An explicit `roleKind` overrides the default. For Preview, use `environment: "preview", roleKind: "readonly"` and verify `readOnly: true` in the issue response. A read-only role is refused `INSERT`, `UPDATE` and `DELETE`. Each client gets its own private CA, its own password and a 90-day certificate.
+
+**Advanced: bring your own key.** If you want Ark to sign a CSR, generate a private key and its PEM PKCS#10 request inside the private directory. For example, for the production role above:
+
+```bash
+client_key="$secrets_dir/local-client.key"
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj '/CN=appdb_storefront_production' -keyout "$client_key" -out "$secrets_dir/client.csr"
+```
+
+Set `csrPem` on `issueBody` below to the full contents of `client.csr` (at most 16 KiB) before requesting step-up, and use that same body in the issue call. Ark signs the CSR and returns `privateKey: null` in the reveal. Keep `client_key` pointing at your locally generated key for §4. A CSR client needs a new CSR at each rollover (§7).
 
 ```js
-const body = { name: "storefront", environment: "production" };
-await stepUp("credential.rotate", { databaseId, ...body });
-const { clientId, operationId, role } = await ark("POST", `/api/databases/${databaseId}/clients`, body);
+const issueBody = { name: "storefront", environment: "production" };
+await stepUp("credential.rotate", { databaseId, ...issueBody });
+const { clientId, operationId, role, readOnly } = await ark(
+  "POST",
+  `/api/databases/${databaseId}/clients`,
+  issueBody,
+);
 ```
 
 The `database.client_issue` operation creates the role and CA, signs the certificate, rewrites PgBouncer's CA bundle and userlist, and reloads PgBouncer over its admin socket. Wait until `GET /api/databases/:id/clients` shows the client with `status: "active"`. It is `"provisioning"` until issuance completes. The Operations list in the UI shows the same.
 
-**Reveal once.** The certificate's private key and the password are shown exactly once. The sealed key is deleted in the same transaction, and a second reveal returns 409, so save the response before closing the console:
+**Reveal once.** The password and any Ark-generated private key are shown exactly once. The sealed key is deleted in the same transaction, and a second reveal returns 409. Save the response to `reveal.json` inside the private directory before closing the console:
 
 ```js
 await stepUp("secret.reveal", { databaseId, clientId });
 const reveal = await ark("POST", `/api/databases/${databaseId}/clients/${clientId}/reveal`);
-copy(JSON.stringify(reveal)); // Chrome/Edge devtools; otherwise print it and save it as reveal.json
+copy(JSON.stringify(reveal)); // Chrome/Edge devtools; save in the private directory and clear the clipboard
 ```
 
-Save it as `reveal.json` on a trusted machine and write the two PEM files. Use `jq -j`, not `-r`. The extra newline that `-r` adds still gives a valid PEM, but its base64 then differs from the values Ark shows in `reveal.vercel.env`:
+Extract the PEM with `jq -j` to preserve the exact bytes Ark base64-encodes in `reveal.vercel.env`. Run the key extraction only for an Ark-generated key. For a CSR client, keep `client_key` set to your matching local key and skip its assignment and extraction below.
 
 ```bash
-jq -j .certificate.pem reveal.json > client.crt
-jq -j .privateKey      reveal.json > client.key && chmod 600 client.key
-openssl x509 -in client.crt -noout -subject -issuer -enddate
+jq -e -j .certificate.pem "$secrets_dir/reveal.json" > "$secrets_dir/client.crt"
+client_key="$secrets_dir/client.key"
+jq -e -j '.privateKey | strings' "$secrets_dir/reveal.json" > "$client_key" # generated key only
+openssl x509 -in "$secrets_dir/client.crt" -noout -subject -issuer -enddate
 # subject=CN=appdb_storefront_production
 # issuer=CN=Ark db-client CA storefront/production, serialNumber=pca-…
 # notAfter=…   (90 days)
 ```
 
-The reveal also contains:
+The reveal includes the following fields.
 
 - `server`: the host, port 5432, database, user, `sslmode=verify-full` and TLS 1.3;
-- `vercel.env`: every value, already base64-encoded;
+- `vercel.env`: the environment values, with PEM files already base64-encoded;
 - `vercel.commands`: the commands below with your names filled in;
 - `vercel.nodePostgres`: the module from §5;
 - `vercel.vercelJson`: the region snippet.
 
 `GET /api/databases/:id/clients/:clientId/vercel` returns the same guide with placeholders instead of secrets, at any time.
-
-**Advanced: bring your own key.** Send `csrPem` (a PEM PKCS#10 request of at most 16 KiB) in the issue body. Ark then signs it without ever holding the key, and the reveal returns `privateKey: null`. The CSR is parsed by Ark's own DER parser (`server/src/modules/x509.ts`). A CSR client cannot be rolled over automatically: at T−30 the rollover alert asks for a new CSR (see §7).
 
 ## 4. Set the Vercel environment variables
 
@@ -137,13 +158,14 @@ vercel env add ARK_DB_HOST production          # db.example.com
 vercel env add ARK_DB_NAME production          # appdb
 vercel env add ARK_DB_USER production          # appdb_storefront_production
 vercel env add ARK_DB_PASSWORD production --sensitive
-base64 -i client.crt | tr -d '\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive
-base64 -i client.key | tr -d '\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive
+base64 -i "$secrets_dir/client.crt" | tr -d '\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive
+base64 -i "$client_key" | tr -d '\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive
 ```
 
 - `vercel env add` reads the value from stdin when it is piped, and prompts otherwise. `--sensitive` stores the value as a Secret.
 - Generated passwords use the characters `!@#%^&*`. When you copy one into a local `.env` file (for `next dev`), **single-quote it**, because a `#` starts a comment in dotenv files. `vercel env pull` writes quoted values for you.
 - `base64 -i FILE` works with both macOS and GNU `base64`.
+- Once you've verified delivery, remove the reveal JSON and temporary PEM copies from the private directory. Keep any private key you need for future deployments in your secret store.
 
 ## 5. Connect from Next.js
 
@@ -151,6 +173,7 @@ Install the driver and Vercel's helper:
 
 ```bash
 npm install pg @vercel/functions
+npm install -D @types/pg
 ```
 
 Create `lib/db.ts`. This is the module Ark returns as `vercel.nodePostgres`:
@@ -181,20 +204,20 @@ export const pool = new Pool({
 attachDatabasePool(pool);
 ```
 
-Then query from a route handler, for example `app/api/notes/route.ts`:
+Then create `app/api/db-check/route.ts` for the connectivity check. This works on an empty database and returns only a status.
 
 ```ts
+import { connection } from "next/server";
 import { pool } from "@/lib/db";
 
-export const dynamic = "force-dynamic";
-
 export async function GET() {
-  const { rows } = await pool.query("SELECT id, body FROM notes ORDER BY id LIMIT 20");
-  return Response.json(rows);
+  await connection(); // run the database check for each request, including with Cache Components
+  await pool.query("SELECT 1 AS ok");
+  return Response.json({ ok: true });
 }
 ```
 
-Deploy with `vercel deploy --prod` and open `/api/notes`.
+Run `npm run build`, deploy with `vercel deploy --prod`, then open `/api/db-check` and check for `{"ok":true}`. Remove the check route once you have your application's own health check.
 
 - **Keep `sslmode`, `sslcert`, `sslkey` and `sslrootcert` out of any connection string.** If node-postgres sees one of them, it replaces the whole `ssl` object.
 - **`attachDatabasePool`** releases idle pool clients before a function suspends. Keep the pool at module scope, with a low idle timeout and a `max` above 1.
@@ -249,11 +272,13 @@ Delivering the successor resolves the alert: a manual confirmation (§7) or the 
 
 The manual path is the default and the recommended one for production apps that hold sensitive data. In steady state it means one reveal and one redeploy about every 60 days, with a 30-day window. You can also start a rollover early, for example to test this procedure or to replace a key you suspect has leaked.
 
-1. **(Early rollover only) issue the successor now.** Skip this when the T−30 job has already issued one. A CSR client must send `csrPem` here.
+1. **Issue the successor if needed.** Skip this when the T−30 job has already issued one. For a CSR client, generate a fresh key and CSR as in §3, using the same login role in the subject and distinct paths such as `local-client-next.key` and `client-next.csr`. Keep that key for deployment. Send `rolloverBody` as the POST body and include all its fields in the step-up binding.
 
    ```js
-   await stepUp("credential.rotate", { databaseId, clientId, rollover: true });
-   await ark("POST", `/api/databases/${databaseId}/clients/${clientId}/rollover`, {});
+   const successorCsr = ""; // For a CSR client, paste the full PEM from client-next.csr inside backticks.
+   const rolloverBody = successorCsr ? { csrPem: successorCsr } : {};
+   await stepUp("credential.rotate", { databaseId, clientId, rollover: true, ...rolloverBody });
+   await ark("POST", `/api/databases/${databaseId}/clients/${clientId}/rollover`, rolloverBody);
    ```
 
    Wait for the `database.client_rollover` operation. `GET …/rollover` then shows `status: "pending"`.
@@ -263,36 +288,49 @@ The manual path is the default and the recommended one for production apps that 
    ```js
    await stepUp("secret.reveal", { databaseId, clientId, rollover: true });
    const next = await ark("POST", `/api/databases/${databaseId}/clients/${clientId}/rollover/reveal`);
-   copy(JSON.stringify(next)); // save as reveal-next.json
+   copy(JSON.stringify(next)); // save as reveal-next.json in the private directory from §3
    ```
 
    The response contains:
 
-   - `certificate` and `privateKey`;
+   - `certificate` and `privateKey` (`null` for a CSR client);
    - `guide`, with the commands and the base64 values in `guide.env`;
    - `predecessor`, the certificate being replaced and its `notAfter`;
    - `confirm`, the exact confirmation call.
 
-3. **Replace the two values and redeploy:**
+3. **Extract the successor certificate and select its key.** For an Ark-generated key, extract it from the reveal. For a CSR client, skip the `next_key` assignment and key extraction below, and set `next_key="$secrets_dir/local-client-next.key"` (or the path where you saved the new key).
 
    ```bash
-   jq -j .certificate.pem reveal-next.json > client-next.crt
-   jq -j .privateKey      reveal-next.json > client-next.key && chmod 600 client-next.key
-   base64 -i client-next.crt | tr -d '\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive --force
-   base64 -i client-next.key | tr -d '\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive --force
+   jq -e -j .certificate.pem "$secrets_dir/reveal-next.json" > "$secrets_dir/client-next.crt"
+   next_key="$secrets_dir/client-next.key"
+   jq -e -j '.privateKey | strings' "$secrets_dir/reveal-next.json" > "$next_key" # generated key only
+   ```
+
+   Check that the public keys printed by these two commands match before uploading either file:
+
+   ```bash
+   openssl x509 -in "$secrets_dir/client-next.crt" -pubkey -noout
+   openssl pkey -in "$next_key" -pubout
+   ```
+
+   Replace the two values and redeploy:
+
+   ```bash
+   base64 -i "$secrets_dir/client-next.crt" | tr -d '\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive --force
+   base64 -i "$next_key" | tr -d '\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive --force
    vercel deploy --prod        # or redeploy from the dashboard
    ```
 
    For a branch-scoped Preview client, use `--environment preview --git-branch=<branch>` and redeploy that branch. Env changes apply only to new deployments.
 
-4. **Check database access** on the new deployment, for example by opening `/api/notes`.
+4. **Check database access** on the new deployment using `/api/db-check` or your application's health check.
 5. **Confirm delivery in Ark.** This needs MFA but no step-up:
 
    ```js
    await ark("POST", next.confirm.path, next.confirm.body); // …/rollover/confirm {certificateId}
    ```
 
-   The successor becomes `current` and the predecessor `superseded`. The alert resolves, and `GET …/rollover` reports `delivered`. Confirmation needs no PgBouncer reload. A confirmation is refused if the successor was never revealed, because an unrevealed generated key cannot have been deployed.
+   The successor becomes `current` and the predecessor `superseded`. The alert resolves, and `GET …/rollover` reports `delivered`. Confirmation needs no PgBouncer reload and requires the one-time reveal. Remove the temporary bundle and PEM copies as in §4.
 
 The old certificate keeps admitting **new** connections until its own `notAfter`. Its role is then drained by `notAfter + 5 s`, so an old deployment that is still running stops working at that point. Redeploy any time inside the window. Delivery is not observed use: Ark cannot see which certificate a session used.
 
@@ -350,61 +388,77 @@ New handshakes then fail with `unknown ca`, and established sessions are closed.
 | `certificate has expired`                                            | The deployment still runs certificate N after T. Complete §7.                                                                                                            |
 | `self-signed certificate` / `unable to verify the first certificate` | The database hostname is not serving a trusted Let's Encrypt certificate yet (staging or development certificate). Finish issuance; do not disable `rejectUnauthorized`. |
 | Connection times out, or is refused at the TCP level                 | The pooler policy does not allow the source (§2), or per-source limits are exceeded (`ArkDatabaseIngressDrops`).                                                         |
-| `permission denied for table …` on `INSERT`/`UPDATE`/`DELETE`        | Preview and other non-production clients are read-only by design.                                                                                                        |
+| `permission denied for table …` on `INSERT`/`UPDATE`/`DELETE`        | Check the client's `readOnly` flag and the table grants. Preview and other non-production clients use read-only roles by default.                                        |
 
 ## Verification
 
-The guide was followed on 18 November 2026 against a local stack. It ran the real `app-postgres` and `pgbouncer-public` Compose services from `infra/platform/docker-compose.yml`, with PgBouncer published on `127.0.0.1:5432`, and used the migrated platform database from `mise run test:db:up`.
+Use a disposable Ark installation with its own application PostgreSQL and PgBouncer. Set up the database hostname and TLS as in §1, create the public `appdb` and allow your test source as in §2, then issue and reveal a test client as in §3. The query needs no migrations or fixture data. On a loopback fixture, use a server certificate that matches the host in the reveal, publish PgBouncer on loopback port 5432, and set `NODE_EXTRA_CA_CERTS` to the fixture’s server CA before running Node. Keep hostname and certificate verification on.
 
-**Ark side.** Ark's own modules performed each step: `issueDatabaseClient`, `revealDatabaseClient`, `databaseClientVercelGuide`, `issueSuccessor` (early), `revealRolloverSuccessor` and `confirmRolloverDelivery`, plus the database worker's `planPgbouncer` render and a `RELOAD` over the admin socket. These are the functions behind the API calls above. Two things were not exercised:
+In an empty working directory with Node 22, install the drivers, then save both modules from §5 under `lib/`:
 
-- The HTTP session, MFA and step-up layer, which `server/src/db-clients.test.ts` and `server/src/db-client-rollover.test.ts` cover.
-- The production retirement drain. The walkthrough simulated it by planning N as retired, and `mise run test:pgbouncer` runs the real one.
-
-**Reader side.** The reader steps ran in an empty directory with `npm install pg@8.23.1 @vercel/functions@3.11.3 postgres@4.1.1` and Node 22. The guide's own commands produced the files and env values, and §5's modules ran unchanged. Two things stood in for the real setup:
-
-- `localhost` with a self-signed certificate (`NODE_EXTRA_CA_CERTS`) stood in for `db.example.com` and its Let's Encrypt certificate.
-- A local `.env.local` stood in for `vercel env add`.
-
-```text
-[ark] client issued: role appdb_storefront_production
-[ark] GET …/vercel commands:
-vercel env add ARK_DB_HOST production          # localhost
-vercel env add ARK_DB_NAME production          # appdb
-vercel env add ARK_DB_USER production          # appdb_storefront_production
-vercel env add ARK_DB_PASSWORD production --sensitive
-base64 -i client.crt | tr -d '\n' | vercel env add ARK_DB_CLIENT_CERT_B64 production --sensitive
-base64 -i client.key | tr -d '\n' | vercel env add ARK_DB_CLIENT_KEY_B64 production --sensitive
-[ark] vercel.json: {"regions":["iad1"]}
-+ jq -j .certificate.pem reveal.json > client.crt; jq -j .privateKey reveal.json > client.key
-subject=CN=appdb_storefront_production
-issuer=CN=Ark db-client CA storefront/production, serialNumber=pca-…
-reveal vercel.env == shell-produced values for ARK_DB_HOST, ARK_DB_NAME, ARK_DB_USER, ARK_DB_PASSWORD, ARK_DB_CLIENT_CERT_B64, ARK_DB_CLIENT_KEY_B64
-+ node --experimental-strip-types --env-file=.env.local query.ts            (lib/db.ts, node-postgres)
-{"role":"appdb_storefront_production","db":"appdb","note":"hello from Ark","tls":"TLSv1.3"}
-+ node --experimental-strip-types --env-file=.env.local query-postgresjs.ts (lib/sql.ts, postgres.js)
-{"role":"appdb_storefront_production","notes":1}
-+ same pool without ARK_DB_CLIENT_CERT_B64/KEY (expect refusal)
-refused: … tlsv13 alert certificate required …
-[ark] successor issued: {"outcome":"issued",…}   PgBouncer RELOAD; CA bundle now trusts 2 generation(s)
-[ark] GET …/rollover: {"status":"pending",…}
-+ base64 -i client-next.{crt,key} | tr -d '\n'  -> replace ARK_DB_CLIENT_CERT_B64 / ARK_DB_CLIENT_KEY_B64
-rollover reveal guide.env == shell-produced values for ARK_DB_CLIENT_CERT_B64, ARK_DB_CLIENT_KEY_B64
-+ (redeploy) query.ts with the new certificate
-{"role":"appdb_storefront_production","db":"appdb","note":"hello from Ark","tls":"TLSv1.3"}
-+ the old deployment's certificate still connects during the overlap
-{"role":"appdb_storefront_production","db":"appdb","note":"hello from Ark","tls":"TLSv1.3"}
-[ark] POST …/rollover/confirm: {"alreadyDelivered":false,"successor":{"rolloverState":"current",…},"predecessor":{"rolloverState":"superseded",…,"retirementDeadline":"<notAfter + 5 s>"}}
-[ark] GET …/rollover after confirm: {"status":"delivered",…}
-[ark] (predecessor retired) PgBouncer RELOAD; CA bundle now trusts 1 generation(s)
-+ new certificate
-{"role":"appdb_storefront_production","db":"appdb","note":"hello from Ark","tls":"TLSv1.3"}
-+ old certificate (expect refusal)
-refused: … tlsv1 alert unknown ca …
-WALKTHROUGH PASSED
+```bash
+npm init -y
+npm pkg set type=module
+npm install pg @vercel/functions postgres
+mkdir -p lib
 ```
 
-Two steps did not work as first written, and this guide now includes the fixes:
+Save this as `query.ts`:
 
-- Saving the PEMs with `jq -r` changed the base64 values.
-- An unquoted password containing `#` was truncated in a dotenv file, which gave `SASL authentication failed`.
+```ts
+import { pool } from "./lib/db.ts";
+
+try {
+  const { rows } = await pool.query("SELECT 1 AS ok");
+  if (rows[0]?.ok !== 1) throw new Error("Unexpected connectivity result");
+  console.log(JSON.stringify(rows[0]));
+} finally {
+  await pool.end();
+}
+```
+
+To check postgres.js too, save this as `query-postgresjs.ts`:
+
+```ts
+import { sql } from "./lib/sql.ts";
+
+try {
+  const [row] = await sql`SELECT 1 AS ok`;
+  if (row?.ok !== 1) throw new Error("Unexpected connectivity result");
+  console.log(JSON.stringify(row));
+} finally {
+  await sql.end();
+}
+```
+
+Instead of uploading to Vercel for this local check, save the same values in the private directory from §3. Use the matching `client_key` from issuance:
+
+```bash
+umask 077
+{
+  printf 'ARK_DB_HOST=%s\n' "$(jq -r .server.host "$secrets_dir/reveal.json")"
+  printf 'ARK_DB_NAME=%s\n' "$(jq -r .server.database "$secrets_dir/reveal.json")"
+  printf 'ARK_DB_USER=%s\n' "$(jq -r .role "$secrets_dir/reveal.json")"
+  printf "ARK_DB_PASSWORD='%s'\n" "$(jq -r .password "$secrets_dir/reveal.json")"
+  printf 'ARK_DB_CLIENT_CERT_B64=%s\n' "$(base64 -i "$secrets_dir/client.crt" | tr -d '\n')"
+  printf 'ARK_DB_CLIENT_KEY_B64=%s\n' "$(base64 -i "$client_key" | tr -d '\n')"
+} > "$secrets_dir/initial.env"
+node --experimental-strip-types --env-file="$secrets_dir/initial.env" query.ts
+node --experimental-strip-types --env-file="$secrets_dir/initial.env" query-postgresjs.ts
+```
+
+Both commands should print `{"ok":1}`. Issue, reveal and check the successor key pair using §7. Use the locally verified pair to replace the two certificate variables, then run the same scripts with the successor:
+
+```bash
+grep -v '^ARK_DB_CLIENT_' "$secrets_dir/initial.env" > "$secrets_dir/next.env"
+{
+  printf 'ARK_DB_CLIENT_CERT_B64=%s\n' "$(base64 -i "$secrets_dir/client-next.crt" | tr -d '\n')"
+  printf 'ARK_DB_CLIENT_KEY_B64=%s\n' "$(base64 -i "$next_key" | tr -d '\n')"
+} >> "$secrets_dir/next.env"
+node --experimental-strip-types --env-file="$secrets_dir/next.env" query.ts
+node --experimental-strip-types --env-file="$secrets_dir/next.env" query-postgresjs.ts
+```
+
+Confirm delivery in Ark once the successor passes. While the two certificates overlap, the initial credentials should still work. After retirement, a fresh process using `initial.env` should fail TLS and the same process using `next.env` should still succeed. Remove the temporary files when done.
+
+The local check ran both drivers and a fresh Next.js 16.4.6 production build against an empty database through the actual Compose `app-postgres` and `pgbouncer-public` services before and after CSR rollover. It used a test platform database from `mise run test:db:up`, a loopback server certificate and local env files. The fixture called Ark modules directly and simulated retirement by reloading the reduced CA bundle. For the real retirement drain and reconnection, run `mise run test:pgbouncer` with the [disposable database setup](../operating.md#local-acceptance). The owner API checks in `server/src/db-clients.test.ts` and `server/src/db-client-rollover.test.ts` cover the session and step-up gates. A disposable API check also verified the documented CSR binding and the Preview role override. Live Vercel delivery requires the separate opt-in suite.

@@ -66,6 +66,36 @@ describe("documentation check", () => {
     );
   });
 
+  test.each([
+    [
+      "HTTP request lines",
+      "```http\nPOST /api/databases/:id/clients/:clientId/revoke HTTP/1.1\nPOST /api/definitely-missing HTTP/1.1\n```",
+      "endpoint: POST /api/definitely-missing",
+    ],
+    [
+      "inline command paths",
+      "Run `bun scripts/check-docs.ts` or `bun scripts/definitely-missing.ts`.",
+      "path: scripts/definitely-missing.ts",
+    ],
+    [
+      "line citations and host ports",
+      "See `scripts/check-docs.ts:47124` and `Dockerfile:47124`. Connect to `localhost:47124`.",
+      "port: 47124",
+    ],
+    ["both endpoints of port ranges", "TCP 20000–20049 and ports 20000-47123.", "port: 47123"],
+    [
+      "wildcards with fixed suffixes",
+      "Set `ARK_DB_*_B64`, `ARK_TEST_S3_*` or `ARK_DB_*_NOT_REAL`.",
+      "env var: ARK_DB_*_NOT_REAL",
+    ],
+  ])("checks %s", (_, doc, diagnostic) => {
+    expect(
+      checkMarkdown(ctx, "docs/guides/fixture.md", doc, "full").map(
+        ({ kind, detail }) => `${kind}: ${detail}`,
+      ),
+    ).toEqual([diagnostic]);
+  });
+
   test("the operator docs, guides and design links have no drift", () => {
     const problems = checkDocs(root).map(
       ({ file, line, kind, detail }) => `${file}:${line}: ${kind}: ${detail}`,

@@ -242,14 +242,15 @@ The FD-10, FD-11 and FD-12 DB cases live in `server/src/gate-*.suite.ts`; their 
 
 **Controls:**
 
-- Tailnet-only administration (`adminMode: "tailnet"`).
+- Tailnet mode (`adminMode: "tailnet"`) omits the admin site from the public edge. Public mode serves the admin origin over HTTPS. Both modes enforce the same authentication and authorization below.
 - Better Auth with MFA.
 - Single-use step-up grants bound to the exact request.
 - Owner-only route management (R12).
 
 **Tests:**
 
-- [U] `shared/src/edge.test.ts`: tailnet admin mode serves no public admin site.
+- [U] `shared/src/edge.test.ts`: the renderer omits the public admin site in tailnet mode and renders the HTTPS site in public mode.
+- [DB] `server/src/coordinator-edge.test.ts`: mode changes require verified edge state and revoke sessions when applied.
 - [U] `shared/src/authz.test.ts`: MFA assurance; privileged actions require a recent step-up.
 - [DB] `server/src/access.test.ts`: `requireOwner`; grants are consumed once, and replay, mismatch and expiry are rejected.
 - [DB] `server/src/front-routes.test.ts`: operators get 403 even with a grant; owners need MFA; loosening needs a grant.
@@ -268,7 +269,7 @@ The FD-10, FD-11 and FD-12 DB cases live in `server/src/gate-*.suite.ts`; their 
 - A scoped Cloudflare token (Zone:DNS:Edit plus Zone:Read) and a reviewed DNS diff.
 - The optional, project-scoped, expiring Vercel token, with connection disabled until the live proof is recorded.
 - Write-only or append-only object-storage credentials and a home `rest-server --append-only`.
-- No Tailscale credential of any kind (R10).
+- R10 keeps Tailscale policy credentials (API keys and OAuth clients) out of Ark. Enrolment uses separate scoped auth keys, and each running Tailscale node retains its own device credentials.
 
 **Tests:**
 
@@ -287,7 +288,7 @@ The FD-10, FD-11 and FD-12 DB cases live in `server/src/gate-*.suite.ts`; their 
   - [U] `tests/security/backup-no-expire.test.ts`: nothing on the VPS runs `pgbackrest expire`.
   - [H: `test:backups`] `scripts/test-backups.ts` and `scripts/backup-test/provider-policies.test.ts`: MinIO and the emulated R2 lock recipe.
   - [LIVE: `test:backups-hosted`] `scripts/test-backups-hosted.ts`.
-- No Tailscale credential:
+- Tailscale credential boundaries:
   - [U] `server/src/edge-socket-policy.test.ts`: the API has no tailscaled socket; the watchdog holds no socket, database credential or root key.
   - [U] `tests/security/policy.test.ts`: Funnel stays disabled.
 

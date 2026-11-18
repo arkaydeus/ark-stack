@@ -23,7 +23,7 @@ flowchart LR
 - **The executor** answers a fixed set of token-authenticated actions on the internal `backup-management` network: `status`, `stanza-create`, `check`, `backup` (full, diff or incr), `stage`, `release-stage` and `prune-stages`. There is no generic command, no shell and no Docker socket, and **`pgbackrest expire` is never run on the VPS** (enforced by `tests/security/backup-no-expire.test.ts`).
 - **Staging.** Every repo2 writer takes the executor lock: `archive-push` and `backup` shared, staging exclusive. A stage forces a WAL switch, waits until that segment is in repo2, then copies the completed repository under the exclusive lock (`cp --reflink=auto`, which clones where the filesystem can and copies otherwise). While the copy runs, `archive-push` waits; PostgreSQL keeps the segment in `pg_wal` and retries, so WAL is fenced, never dropped. The stage's `manifest.json` records the stanza, backup labels, WAL segment and the **last recoverable time**: the instant of the WAL switch, claimed only when a backup finished before it.
 - **Export.** The backup worker (on `backup-egress`) uploads each stage as an immutable restic snapshot to `s3:<endpoint>/<bucket>/<prefix>/restic`, tagged `source=pg:<stanza>` and `stage=<id>`, and records a per-destination manifest (`backup_exports`). Each target has its own export operation, and bounded export lanes let healthy destinations continue while another destination stalls. Mail snapshots and reviewed volumes go to the same restic repository.
-- **Schedules.** Weekly full and daily differential backups per cluster, an export to every target every five minutes, and the append-only canary weekly and whenever a target is saved. **Nothing runs until execution is switched on:** set `ARK_BACKUP_EXECUTE=1` in `.env` and recreate `backup-worker` (`docker compose --env-file .env -f infra/platform/docker-compose.yml up -d backup-worker`). The Compose default is `0`, and the installer does not set it. With `0`, no schedule is queued, and an explicitly queued job fails instead of reporting success. Set `ARK_BACKUP_REQUIRED=1` as well to make the API refuse to start while execution is off.
+- **Schedules.** With backup execution enabled, Ark queues weekly full and daily differential backups per cluster, exports to every target every five minutes, and weekly canaries. Set `ARK_BACKUP_EXECUTE=1` in `.env` and recreate `backup-worker` (`docker compose --env-file .env -f infra/platform/docker-compose.yml up -d backup-worker`). The Compose default is `0`, and the installer leaves it off. With execution off, backup and export scheduling is disabled and manually queued jobs requiring execution fail. Target verification on save or manual request and tailnet observation can still run and contact providers. Under the shipped Compose configuration the two backup flags reach only `backup-worker`. With execution off, `ARK_BACKUP_REQUIRED=1` makes execution jobs report that backups are required but not enabled. The API can still start.
 
 Live pgBackRest `*.info` files are never put under a lock or in the bucket: they are mutable. Only completed, staged copies are exported, so each restic snapshot keeps its own `backup.info` and `archive.info`, and the metadata history is immutable too.
 
@@ -43,14 +43,13 @@ In **Backups → Add an S3-compatible target** (owner only; saving needs your pa
 | Repository password (`repositoryPassword`)         | The restic password, at least 24 characters. Generate it, **store it off-host**, and never change it (a new prefix means a new repo; Ark refuses a different password for the same repository). |
 | R2 verifier (`verifierAccountId`, `verifierToken`) | R2 only: the Cloudflare account ID and a separate **read-only** API token that can read the bucket's lock rules (`GET /accounts/{id}/r2/buckets/{bucket}/lock`). Never a writer credential.     |
 
-**Order of steps.** The generated writer and bucket protection policies are computed for a saved target, so:
+**Order of steps.** Follow the recipe for your provider:
 
 1. Create the bucket with its lock or retention as in the recipe.
-2. Create the writer credential with a temporary policy from the recipe.
+2. Create the writer credential. For AWS and MinIO, use the temporary policy from the recipe. For [Backblaze B2](#backblaze-b2) and [Cloudflare R2](#cloudflare-r2), use the provider-native credentials and protections described below.
 3. Save the target.
-4. Copy **Writer policy** and **Bucket protection policy** from the target card, or `writerPolicy` and `bucketProtectionPolicy` from `GET /api/backups/targets`.
-5. Apply them at the provider.
-6. Select **Run append-only check** (`POST /api/backups/targets/:id/verify`).
+4. **AWS and MinIO only:** copy **Writer policy** and **Bucket protection policy** from the target card, or `writerPolicy` and `bucketProtectionPolicy` from `GET /api/backups/targets`. Apply them at the provider.
+5. Select **Run append-only check** (`POST /api/backups/targets/:id/verify`).
 
 The target stays unhealthy until the check reports **append-only: yes**.
 
@@ -58,7 +57,7 @@ The API is `GET /api/backups/targets`, `PUT /api/backups/targets/s3` (with `id` 
 
 ### Provider recipes
 
-The UI shows the same recipes (`PROVIDER_RECIPES` in `shared/src/backup-targets.ts`), and the generated writer policy for each target.
+The UI shows the same recipes (`PROVIDER_RECIPES` in `shared/src/backup-targets.ts`) and labels the generated policies for AWS and MinIO.
 
 **AWS S3** (`https://s3.<region>.amazonaws.com`, virtual-host style)
 
@@ -69,12 +68,16 @@ The UI shows the same recipes (`PROVIDER_RECIPES` in `shared/src/backup-targets.
 
 restic deletes its own lock files under `locks/` when a backup ends, so a credential with no delete permission at all would break `restic backup`. On a versioned bucket that delete only adds a delete marker.
 
-**Backblaze B2** (`https://s3.<region>.backblazeb2.com`, virtual-host style)
+#### Backblaze B2
+
+Use `https://s3.<region>.backblazeb2.com` with virtual-host style addressing.
 
 1. Enable Object Lock on the bucket with a default retention of at least the recovery window. B2 keeps file versions natively.
 2. Create an application key scoped to the bucket **without** `deleteFiles`, `bypassGovernance`, `writeBucketRetentions`, `writeBuckets`, `deleteBuckets` and `writeFileLegalHolds`. `writeFiles` still lets restic hide its lock files; hidden versions remain recoverable. The canary reads the key's own capabilities from `b2_authorize_account`.
 
-**Cloudflare R2** (`https://<account-id>.r2.cloudflarestorage.com`, region `auto`, virtual-host style)
+#### Cloudflare R2
+
+Use `https://<account-id>.r2.cloudflarestorage.com` with region `auto` and virtual-host style addressing.
 
 1. Add bucket lock rules on `<prefix>/restic/data/`, `index/`, `snapshots/`, `keys/`, `<prefix>/restic/config` and `<prefix>/ark-canary/` with **Indefinite** retention. Finite Age/Date rules expire on old config, keys and reused packs even when recent snapshots still depend on them. **Do not lock `<prefix>/restic/locks/`**: restic must remove its lock files. The canary ignores disabled rules, non-Indefinite rules and any rule whose prefix also covers `locks/` (for example a single rule on `<prefix>/` or `<prefix>/restic/`), so such rules count as no protection.
 2. R2 tokens have no no-delete level ("Object Read & Write"), so the lock rules are the only control. Scope the token to this bucket.
@@ -173,12 +176,56 @@ Pruning happens **on the home machine**, never from the VPS: append-only mode re
 
 To recover, a machine on the tailnet uses the same repository with `restic -r rest:http://backup-home.<tailnet>.ts.net:8000/ark/ restore …` (`RESTIC_REST_USERNAME`, `RESTIC_REST_PASSWORD`, `RESTIC_PASSWORD`), or restores directly from `/srv/restic/ark` on the home machine. PostgreSQL snapshots have the same layout as on S3 (`source=pg:<stanza>`, `stage=<id>`). `scripts/offsite-restore.ts` (below) reads only S3 repositories, so a PostgreSQL recovery from the home machine is manual:
 
-1. `restic restore <snapshot> --target /tmp/ark-restore` the stage you want. Its `repo2/` tree and `manifest.json` are inside.
-2. Run the matching `ark-postgres` or `ark-app-postgres` image with `--network none`. Mount the restored tree and an empty PGDATA volume, and set `PGBACKREST_REPO2_PATH=<restored>/repo2` and `PGBACKREST_REPO2_CIPHER_PASS=<ARK_PLATFORM_PG_REPO_CIPHER_PASS or ARK_APP_PG_REPO_CIPHER_PASS>`.
-3. As `postgres` (`gosu postgres`), run `pgbackrest --stanza=<stanza> --repo=2 --type=time --target=<time> --target-action=promote restore`. These are the same commands `scripts/offsite-restore.ts` runs after its own `restic restore`.
-4. Start PostgreSQL on that PGDATA with no network.
+1. Extract a snapshot for `source=pg:ark-platform` or `source=pg:ark-app` to a private scratch directory on the recovery machine. The following Bash commands assume restic is pointed at the home repository.
 
-The automated PITR proof (`mise run test:backups`) covers the S3 path only. No test restores from the REST repository.
+   ```bash
+   umask 077
+   scratch=$(mktemp -d "${TMPDIR:-/tmp}/ark-restore.XXXXXXXX")
+   restic snapshots --tag source=pg:ark-platform # or source=pg:ark-app
+   read -r -p "Snapshot ID: " snapshot_id
+   restic restore "$snapshot_id" --target "$scratch"
+   find "$scratch" -name manifest.json
+   ```
+
+   Check the selected snapshot’s `manifest.json` and choose a UTC `target_time` no later than `lastRecoverableAt`, in the form `YYYY-MM-DD HH:MM:SS+00`. For snapshots tagged `layout=relative-v1`, the repo is at `$scratch/repo2`. For an older snapshot use the `repo2` directory alongside its manifest, and translate its path under `$scratch` to the same relative path under `/restore` in the next step.
+
+2. Select the exact image used for the source cluster. Use the platform `ark-postgres` image, stanza `ark-platform`, and the off-host copy of `ARK_PLATFORM_PG_REPO_CIPHER_PASS` for the control database. Use `ark-app-postgres`, stanza `ark-app`, and `ARK_APP_PG_REPO_CIPHER_PASS` for the application cluster. Set `image`, `stanza` and `target_time` before running this in Bash. The commands use a new scratch volume for PGDATA and override the Ark entrypoint to run only the manual restore.
+
+   ```bash
+   export PGBACKREST_REPO2_PATH=/restore/repo2 # adjust for an older snapshot
+   read -rs -p 'pgBackRest repo2 cipher passphrase: ' PGBACKREST_REPO2_CIPHER_PASS
+   printf '\n'
+   export PGBACKREST_REPO2_CIPHER_PASS
+   recovery="$(basename "$scratch")"
+   pgdata="${recovery}-pgdata"
+   docker volume create "$pgdata"
+   docker run --rm --network none --user 0 \
+     -v "$scratch:/restore" -v "$pgdata:/var/lib/postgresql/data" \
+     -e PGBACKREST_REPO2_PATH -e PGBACKREST_REPO2_CIPHER_PASS \
+     --entrypoint /bin/sh "$image" -ec '
+       chown -R postgres:postgres /restore /var/lib/postgresql/data
+       chmod 0700 /var/lib/postgresql/data
+       exec gosu postgres pgbackrest --stanza="$1" --repo=2 --type=time \
+         --target="$2" --target-action=promote restore
+     ' restore "$stanza" "$target_time"
+   ```
+
+3. Use the stock PostgreSQL entrypoint to replay WAL and promote. Keep the same repo available read-only throughout replay, with networking and archiving off:
+
+   ```bash
+   docker run -d --name "$recovery" --network none \
+     -v "$scratch:/restore:ro" -v "$pgdata:/var/lib/postgresql/data" \
+     -e PGBACKREST_REPO2_PATH -e PGBACKREST_REPO2_CIPHER_PASS \
+     --entrypoint docker-entrypoint.sh "$image" \
+     postgres -c archive_mode=off -c listen_addresses=
+   unset PGBACKREST_REPO2_CIPHER_PASS
+   docker logs "$recovery"
+   docker exec "$recovery" psql -U ark_migration -d ark_platform -c 'SELECT pg_is_in_recovery();'
+   ```
+
+   For `ark-app`, use `-U ark_cluster_admin -d postgres` instead. Wait for `pg_is_in_recovery()` to return `false`, then inspect your data before using it. Keep the scratch repository and PGDATA until you've verified the recovery and exported any data you need.
+
+The automated PITR proof (`mise run test:backups`) covers the S3 path. Home REST recovery uses the manual procedure above.
 
 ## The append-only canary (S3)
 

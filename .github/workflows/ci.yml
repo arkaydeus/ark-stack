@@ -73,13 +73,14 @@ jobs:
       - run: bunx tsc --noEmit -p scripts/tsconfig.publish.json
       - run: bunx tsc --noEmit -p scripts/tsconfig.pgbouncer.json
       - run: bunx tsc --noEmit -p scripts/tsconfig.test-db.json
+      - run: bunx tsc --noEmit -p scripts/tsconfig.docs.json
       - run: ARK_TEST_DB_DOCKER=1 bun --no-env-file test scripts/test-db.test.ts
       - name: Install OpenSSL for PKI tests and the PostgreSQL client for the loopback smoke test
         run: sudo apt-get update && sudo apt-get install -y postgresql-client openssl
       # tests/browser/flows.test.ts checks the built UI, so build it before the unit tests.
       - run: bun run --cwd web build
       # The server suite includes the bounded DER fuzz and OpenSSL CSR differential tests.
-      - run: bun test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts
+      - run: bun test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts
       - run: ARK_DOCKER_INTEGRATION=1 go test ./...
         working-directory: agent
       - run: bunx playwright install --with-deps chromium

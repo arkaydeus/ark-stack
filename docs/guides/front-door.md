@@ -90,7 +90,7 @@ Then **enable** the route (`POST /api/front/routes/:id/enable`, with `exposure.p
 2. **Create gate users** under **Gate users**, or with `POST /api/gate/users` and `{ "email", "name"? }`. This needs a `role.grant` step-up bound to `{ ...body, gateUsers: "create" }`. Reveal the temporary password once with `POST /api/gate/users/:id/temporary-password` (`secret.reveal`). The user must enrol TOTP on first sign-in.
 3. **Grant access per route** with `PUT /api/front/routes/:id/access` and `{ "userIds": [...] }` (`role.grant` bound to `{ routeId, userIds }`). Access lists hold individual users only.
 
-A browser without a route session is redirected to `https://login.example.com/gate/authorize` and comes back through `https://www.example.com/.ark/gate/callback` with a host-only `__Host-ark_gate` cookie for that route. The upstream receives `X-Ark-User` and `X-Ark-Email`, never the cookies. Non-HTML requests get `401` with `WWW-Authenticate: Ark-Gate`.
+A browser without a route session is redirected to `https://login.example.com/gate/authorize` and comes back through `https://www.example.com/.ark/gate/callback` with a host-only `__Host-ark_gate` cookie for that route. The upstream receives `X-Ark-User` and `X-Ark-Email`. Caddy strips the Ark gate cookie and forwards application cookies. Non-HTML requests get `401` with `WWW-Authenticate: Ark-Gate`.
 
 Options for `sso` routes:
 
@@ -130,7 +130,7 @@ POST /api/front/routes            (step-up: exposure.public, bound to the body)
 | `terminate`      | HAProxy terminates TLS with the hostname's Let's Encrypt certificate and forwards plaintext over WireGuard. Needs a restricted, non-empty `sourceCidrs`.                                                    |
 | `terminate_mtls` | As `terminate`, and the client must present a certificate from the route's own CA, checked against its CRL. Issue certificates with `POST /api/front/routes/:id/client-certificates` (`credential.rotate`). |
 
-**Admission.** Every L4 route has its own allowlist and limits. The defaults are `maxConn` 50, `perSourceConn` 10 and `perSourceRate` 20 per 10 s for `tls`, and 20/5/10 for `tcp`. HAProxy applies them before TLS termination, so the real source address counts. An empty `sourceCidrs` denies everyone, and the route cannot be enabled. `allowInternet: true` is the only way to open a route to everyone. CIDRs broader than /8 (IPv4) or /16 (IPv6) are refused unless `allowInternet` is set.
+**Admission.** Every L4 route has its own allowlist and limits. The defaults are `maxConn` 50, `perSourceConn` 10 and `perSourceRate` 20 per 10 s for `tls`, and 20/5/10 for `tcp`. HAProxy applies them before TLS termination, so the real source address counts. An empty `sourceCidrs` with `allowInternet: false` denies everyone and prevents enabling the route. To admit the internet in an eligible mode, submit an empty list and `allowInternet: true` with owner step-up. Supplied CIDRs must always be /8 or narrower for IPv4 and /16 or narrower for IPv6. Raw TCP also requires confirmation of protocol authentication for internet-wide admission, and TLS `terminate` without mTLS always needs a restricted list.
 
 **Shared SNI ports** (8883, 5671, 636, 6380) are opt-in at install time: set `ARK_EDGE_SNI_PORTS`, run `mise run host:install`, then `mise run edge:rejoin`. See [TLS-TCP and raw-TCP routes](../operating.md#tls-tcp-and-raw-tcp-routes).
 
@@ -244,7 +244,7 @@ const sql = postgres({
 
 `sslmode=verify-full` (or `require`) is mandatory: libpq refuses direct negotiation with `sslmode=prefer`, so a client cannot be downgraded to plaintext.
 
-**Compatibility port.** A `passthrough` route can set `compatPort` (20000–20049) for drivers without direct TLS. The target then answers `SSLRequest` itself, under the route's allowlist and limits. Plaintext `CancelRequest` packets always go to PgBouncer, so drivers that cancel in plaintext cannot cancel queries on a route. libpq 17+ cancels over direct TLS.
+**Compatibility port.** A `passthrough` route can set `compatPort` (20000–20049) for drivers without direct TLS. The target then answers `SSLRequest` itself, under the route's allowlist and limits. On that dedicated port, raw TCP, including separate plaintext `CancelRequest` connections, is forwarded to the target. On the shared port 5432, HAProxy sends plaintext `CancelRequest` to PgBouncer, so cancellation for a named Postgres route on 5432 needs the driver to use direct TLS with the route’s SNI for the cancellation connection.
 
 ## 7. The tailnet ACL snippet
 
@@ -254,7 +254,7 @@ Ark holds **no Tailscale credential that can write policy** (decision R10). It g
 - `GET /api/front/acl` for all routes and the home backup target;
 - `GET /api/front/routes/:id/acl` for one route.
 
-The snippet declares the four Ark tags. It has one host alias per target machine and one grant per target `host:port`: `tag:ark-edge` for routes, `tag:ark-backup` for the home backup target. A `tests` block makes Tailscale **reject the policy** if a broader pre-existing rule would let the edge reach anything else. The tests sample common and configured ports, observed non-target nodes and the other Ark tags.
+The snippet declares the four Ark tags. It has one host alias per target machine and one grant per target `host:port`: `tag:ark-edge` for routes, `tag:ark-backup` for the home backup target. The `tests` block contains sampled assertions against common and configured ports, observed non-target nodes and other Ark tags. Tailscale rejects the policy when those assertions fail. Access outside the sample can still pass native validation.
 
 ```jsonc
 {
@@ -267,7 +267,7 @@ The snippet declares the four Ark tags. It has one host alias per target machine
 
 - Never give `tag:ark-edge` a grant that the snippet did not generate. Never give any Ark tag a destination grant other than the documented admin and SSH grants.
 - Remove or narrow catch-all rules (the default `"src": ["*"], "dst": ["*"]`) before pasting.
-- For an every-port check of a candidate policy, run `bun scripts/audit-tailnet-policy.ts global-snippet.hujson candidate-policy.hujson`. It changes nothing.
+- For an offline comparison across TCP and UDP port ranges, run `bun scripts/audit-tailnet-policy.ts global-snippet.hujson candidate-policy.hujson`. It checks known destinations against a fresh global snippet and rejects unsupported policy constructs. Review the full policy too. See the [audit scope](../operating.md#tailnet-policy-snippet).
 - The page also recommends **Tailnet Lock** and shows an optional `tag:ark-vps` Tailscale SSH policy in `check` mode.
 
 Details: [Tailnet policy snippet](../operating.md#tailnet-policy-snippet).
@@ -334,6 +334,6 @@ The external probe is `scripts/ipv6-preflight-probe.ts`. It runs either as a man
 
 ## 9. Withdrawal, revocation and what to audit
 
-Disabling, deleting or re-targeting a route, a failed identity check or an expired observation lease all withdraw the route. HAProxy fences its dedicated backend and closes its sessions, including in workers that are still draining after a reload. Caddy answers `503` for it. Unrelated routes keep serving. The watchdog withdraws within a second of the lease saying so, and stops Caddy only as a fallback when it cannot verify scoped control. Revoking a gate user's access drains the affected route within 5 s, or the watchdog withdraws it.
+Disabling, deleting or re-targeting a route, a failed identity check or an expired observation lease all withdraw the route. HAProxy fences its dedicated backend and closes its sessions, including in workers that are still draining after a reload. Caddy answers `503` for it. Unrelated routes keep serving. The watchdog checks the lease every second by default. The withdrawal budget is five seconds, including closure of existing sessions. The watchdog stops Caddy as a fallback when it cannot verify scoped control. Revoking a gate user's access drains the affected route within 5 s, or the watchdog withdraws it.
 
 Runbooks for revoking routes, gate users and database clients are in [Revocation](../operating.md#revocation). The security boundaries and the tests that cover them are in [`docs/security-review.md`](../security-review.md).
