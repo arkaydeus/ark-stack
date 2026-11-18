@@ -9,6 +9,7 @@ import {
 import { ValidationError } from "./errors.ts";
 import { ADMIN_CLIENT_IP_AUTH_PATHS, GATE_LOGIN_AUTH_PATHS } from "./gate-login.ts";
 import { normalizeHostname } from "./hostnames.ts";
+import { IPV6_PREFLIGHT_HTTP_PATH } from "./ipv6-preflight.ts";
 
 /** Where the `edge` container mounts Ark's lego certificates (read-only), one directory per hostname. */
 export const EDGE_CERT_DIR = "/var/lib/ark/certs";
@@ -397,6 +398,9 @@ ${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
   return `${CADDY_GLOBAL_BLOCK}
 
 ${snippets}:80 {
+  log
+  @otherRequests not path ${IPV6_PREFLIGHT_HTTP_PATH}*
+  log_skip @otherRequests
 ${input.generation ? `  vars ark_edge_generation ${input.generation}\n` : ""}  @challenge path /.well-known/acme-challenge/*
   handle @challenge {
     root * ${input.challengeDir}

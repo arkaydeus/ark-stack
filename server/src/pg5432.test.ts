@@ -430,7 +430,7 @@ describe("postgres routes (§3.8.3)", () => {
     expect(config).toContain(
       `use_backend be_${id}_pg if tls_client_hello { req.ssl_sni -i pg-home.${zone} }`,
     );
-    expect(config).toContain(`frontend fe_${id}_compat\n    bind :20017`);
+    expect(config).toContain(`frontend fe_${id}_compat\n    bind :::20017 v4v6`);
     const { frontIngressRules } = await import("./modules/front-ingress.ts");
     const { DB_INGRESS_LIMIT_DEFAULTS } = await import("@ark-stack/shared");
     const firewall = frontIngressRules(edgeL4Input({ certificates: [] }, l4), DB_INGRESS_LIMIT_DEFAULTS);

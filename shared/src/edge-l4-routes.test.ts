@@ -162,7 +162,7 @@ describe("TLS-TCP routes (§3.8.5)", () => {
       tlsRoutes: [{ ...mqtt, listenPort: 8883 }],
     }).files["haproxy.cfg"]!;
     const frontend = block(shared, "frontend fe_tls8883");
-    expect(frontend).toContain("    bind :8883\n");
+    expect(frontend).toContain("    bind :::8883 v4v6\n");
     expect(frontend).toContain(
       "    tcp-request content accept if { req.ssl_hello_type 1 }\n    tcp-request content reject\n",
     );
@@ -192,7 +192,7 @@ describe("raw-TCP routes (§3.8.5)", () => {
 
   test("one frontend per dedicated port: allowlist, per-source and total limits, then the target", () => {
     const frontend = block(config, "frontend fe_rt_t001");
-    expect(frontend).toContain("bind :20001");
+    expect(frontend).toContain("bind :::20001 v4v6");
     expect(frontend).toContain("track-sc1 src table ad_src_rt_t001");
     expect(frontend).toContain("track-sc2 int(1) table ad_total_rt_t001");
     expect(frontend).toContain("lua.ark-admit rt_t001 20 5 10");

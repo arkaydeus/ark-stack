@@ -28,7 +28,7 @@ volumes:
   ark_mail_data:
 
 networks:
-  mail-public: {}
+  mail-public: { enable_ipv6: true }
   mail-management:
     external: true
     name: ark_mail_management

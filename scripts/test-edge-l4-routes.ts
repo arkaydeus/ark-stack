@@ -831,8 +831,8 @@ async function perSourceLimitTest(report: Report) {
   );
   await closeAll();
   // The inner terminating frontend (behind the abns PROXY loop) logs the original source address when
-  // the session ends; `show sess` only shows the abns peer. HAProxy's stdout log may drop lines in a
-  // burst, so use isolated sessions from B on a quiet router.
+  // the session ends; `show sess` only shows the abns peer. The dual-stack socket can log this
+  // IPv4 source in mapped form. Use isolated sessions from B to avoid discarded burst log lines.
   let fromB = "";
   for (let attempt = 0; attempt < 5 && !fromB; attempt++) {
     await Bun.sleep(1_000);
@@ -842,7 +842,11 @@ async function perSourceLimitTest(report: Report) {
     fromB =
       (await logsOf(stack.edgeL4))
         .split("\n")
-        .findLast((line) => line.startsWith(`${agents.B.ip}:`) && line.includes(" fe_rt_lim1_tls~ ")) ?? "";
+        .findLast(
+          (line) =>
+            (line.startsWith(`${agents.B.ip}:`) || line.startsWith(`::ffff:${agents.B.ip}:`)) &&
+            line.includes(" fe_rt_lim1_tls~ "),
+        ) ?? "";
   }
   expect(
     report,

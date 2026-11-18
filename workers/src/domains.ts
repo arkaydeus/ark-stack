@@ -1,12 +1,15 @@
-import { secureEqual } from "@ark-stack/shared";
+import { IPV6_PREFLIGHT_HTTP_PATH, secureEqual } from "@ark-stack/shared";
+import { join } from "node:path";
 import { runWorker } from "./runtime.ts";
 import {
   executeClaimedJob,
+  enqueue,
   scheduleDnsMaintenance,
   scheduleEdgeObserve,
 } from "../../server/src/coordinator.ts";
 import { DnsReviewError } from "../../server/src/modules/cloudflare-dns.ts";
 import { domainDnsReview } from "../../server/src/modules/domain-dns.ts";
+import { ipv6PreflightKind } from "../../server/src/modules/ipv6-preflight.ts";
 
 export function dnsControlHandler(token: string) {
   return async (request: Request) => {
@@ -46,6 +49,7 @@ export function runDomainJobs(
   return Promise.all([
     runWorker("domains", ["domain.", "dns.", "certificate.", "edge.", "admin."], executor, options),
     runWorker("domains", ["integration."], executor, options),
+    runWorker("domains", [ipv6PreflightKind], executor, options),
   ]);
 }
 
@@ -64,6 +68,16 @@ if (import.meta.main) {
   const observeSchedule = scheduleEdgeObserve();
   const dnsSchedule = scheduleDnsMaintenance();
   try {
+    const edgeDir = process.env.ARK_EDGE_DIR;
+    if (edgeDir && process.env.ARK_IPV6_HOST_SNAPSHOT) {
+      // An existing generation predates the HTTP source logging added alongside native IPv6.
+      const active = await Bun.file(join(edgeDir, "Caddyfile"))
+        .text()
+        .catch(() => "");
+      if (!active.includes(IPV6_PREFLIGHT_HTTP_PATH)) {
+        await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
+      }
+    }
     await runDomainJobs();
   } finally {
     if (observeSchedule) clearInterval(observeSchedule);

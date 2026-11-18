@@ -1120,7 +1120,7 @@ export async function changeAaaaSetting(
   enabled: boolean,
   authorize: (tx: DbTransaction) => Promise<unknown>,
 ) {
-  await db.transaction(async (tx) => {
+  return db.transaction(async (tx) => {
     const { domain, settings } = await lockedDnsDomain(tx, domainId);
     if (enabled && !domain.aaaaEnabled) await authorize(tx);
     await tx
@@ -1128,6 +1128,7 @@ export async function changeAaaaSetting(
       .set({ aaaaEnabled: enabled, updatedAt: new Date() })
       .where(eq(domainClaims.id, domainId));
     await reconcileDomainDns(tx, { ...domain, aaaaEnabled: enabled }, settings);
+    return { ipv6Status: settings?.ipv6Status ?? "unchecked" };
   });
 }
 
@@ -1154,7 +1155,7 @@ export async function watchManualDns(domainId: string) {
     .where(and(eq(domainClaims.id, domainId), ne(domainClaims.dnsProvider, "cloudflare")));
 }
 
-/** FD-27 supplies the IPv6 status. The domain worker reacts to persisted changes and retries withdrawals. */
+/** The domain worker reconciles IPv6 preflight changes and retries pending withdrawals. */
 export async function domainsDueForDns() {
   const [domains, records, endpointRows, [settings], waitingRoutes, orders, issued] = await Promise.all([
     db.select().from(domainClaims),

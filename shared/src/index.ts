@@ -51,3 +51,4 @@ export * from "./update-policy.ts";
 
 export * from "./caddy-state.ts";
 export * from "./pooler-policy.ts";
+export * from "./ipv6-preflight.ts";

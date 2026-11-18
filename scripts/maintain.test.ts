@@ -9,13 +9,17 @@ test.each([
   { fail: false, mail: false },
   { fail: false, mail: true },
   { fail: true, mail: true },
+  { fail: false, mail: true, legacyIpv6: true },
+  { fail: false, mail: true, legacyIpv6: true, hardened: true },
 ])(
-  "signed maintenance preserves mail state and stops on an edge initialization error (%p)",
-  async ({ fail, mail }) => {
+  "signed maintenance preserves mail state and checks prerequisites before stopping services (%p)",
+  async ({ fail, mail, legacyIpv6, hardened }) => {
     const dir = await mkdtemp(join(tmpdir(), "ark-maintain-edge-"));
     try {
       const image = `example/worker@sha256:${"a".repeat(64)}`;
-      const compose = `services:\n${["domain-worker", "edge", "edge-l4", "edge-watchdog", "mail-worker"].map((name) => `  ${name}:\n    image: ${image}`).join("\n")}\n`;
+      const compose =
+        `services:\n${["domain-worker", "edge", "edge-l4", "edge-watchdog", "mail-worker", "edge-ts"].map((name) => `  ${name}:\n    image: ${image}`).join("\n")}\n` +
+        (legacyIpv6 ? "networks:\n  admin: { enable_ipv6: true }\n" : "");
       const { privateKey, publicKey } = generateKeyPairSync("ed25519");
       const bundle = {
         version: "test",
@@ -29,7 +33,10 @@ test.each([
       );
       await Bun.write(join(dir, "compose.yml"), compose);
       await Bun.write(join(dir, "release.json"), JSON.stringify(bundle));
-      await Bun.write(join(dir, ".env"), `ARK_MAIL_ENABLED=${mail ? 1 : 0}\n`);
+      await Bun.write(
+        join(dir, ".env"),
+        `ARK_MAIL_ENABLED=${mail ? 1 : 0}\nARK_HOST_HARDENING=${hardened ? 1 : 0}\n`,
+      );
       await mkdir(join(dir, "bin"));
       await mkdir(join(dir, "scripts"));
       await symlink(join(import.meta.dir, "../node_modules"), join(dir, "node_modules"));
@@ -38,12 +45,13 @@ test.each([
         "edge-namespace.ts",
         "host-deployment-lock.ts",
         "install-host-hardening.ts",
+        "install-docker-ipv6.ts",
       ]) {
         await copyFile(join(import.meta.dir, script), join(dir, "scripts", script));
       }
       await Bun.write(
         join(dir, "bin/docker"),
-        `#!${process.execPath}\nimport { appendFileSync } from "node:fs";\nconst args = process.argv.slice(2);\nappendFileSync(process.env.TEST_CALLS, JSON.stringify(args)+"\\n");\nif (process.env.TEST_FAIL === "1" && args.includes("scripts/prepare-edge-upgrade.ts")) process.exit(1);\n`,
+        `#!${process.execPath}\nimport { appendFileSync } from "node:fs";\nconst args = process.argv.slice(2);\nappendFileSync(process.env.TEST_CALLS, JSON.stringify(args)+"\\n");\nif (args[0] === "network" && args[1] === "ls") console.log("legacy");\nif (args[0] === "network" && args[1] === "inspect") console.log(JSON.stringify([{ EnableIPv6: false }]));\nif (process.env.TEST_FAIL === "1" && args.includes("scripts/prepare-edge-upgrade.ts")) process.exit(1);\n`,
       );
       await chmod(join(dir, "bin/docker"), 0o755);
       const child = Bun.spawn(
@@ -71,11 +79,26 @@ test.each([
         },
       );
       const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-      expect(code, stderr).toBe(fail ? 1 : 0);
-      const calls = (await Bun.file(join(dir, "calls")).text())
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as string[]);
+      expect(code, stderr).toBe(fail || legacyIpv6 ? 1 : 0);
+      const callLog = Bun.file(join(dir, "calls"));
+      const calls = (await callLog.exists())
+        ? (await callLog.text())
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line) as string[])
+        : [];
+      if (legacyIpv6) {
+        expect(stderr).toContain("mise run host:install");
+        expect(calls).toEqual(
+          hardened
+            ? []
+            : [
+                ["network", "ls", "-q", "--filter", "name=^ark-platform_admin$"],
+                ["network", "inspect", "ark-platform_admin"],
+              ],
+        );
+        return;
+      }
       const stop = calls.findIndex((args) => args.includes("stop") && args.includes("edge-l4"));
       const init = calls.findIndex((args) => args.includes("scripts/prepare-edge-upgrade.ts"));
       const up = calls.findIndex((args) => args.includes("up"));

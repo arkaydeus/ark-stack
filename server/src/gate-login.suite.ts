@@ -21,6 +21,7 @@ import { betterAuth } from "better-auth/minimal";
 const { app } = await import("./app.ts");
 const { auth, authBaseURL, authCookieName, AUTH_COOKIE_KEYS } = await import("./auth.ts");
 const { sql } = await import("./db.ts");
+const { ipv6PreflightResultPath } = await import("./modules/ipv6-preflight.ts");
 const { refreshLoginHost } = await import("./origin-hosts.ts");
 const { enqueue, runOperation } = await import("./coordinator.ts");
 const { prepareGateSettings, commitGateSettings, enqueueGateOperation } =
@@ -121,12 +122,14 @@ function totp(uri: string) {
 }
 
 // Routes that take no browser session: worker, metrics, health, setup status, Better Auth itself, and
-// the gate's edge handlers (FD-11), which answer 401 to anything without the edge token.
+// the gate's edge handlers (FD-11) and the signed IPv6 report callback.
 const sessionFree = (path: string) =>
   path.startsWith("/api/internal/") ||
   path.startsWith("/api/auth/") ||
   (GATE_EDGE_API_PATHS as readonly string[]).includes(path) ||
-  ["/api/health", "/api/setup/status", "/api/metrics/prometheus", "/api/*"].includes(path);
+  ["/api/health", "/api/setup/status", "/api/metrics/prometheus", ipv6PreflightResultPath, "/api/*"].includes(
+    path,
+  );
 
 type User = { id: string; email: string };
 
@@ -323,6 +326,17 @@ describe("session separation", () => {
         body: route.method === "GET" ? undefined : {},
       });
       expect(response.status, `${route.method} ${path}`).toBe(403);
+    }
+  });
+
+  test("the IPv6 callback requires a signed report regardless of browser session", async () => {
+    for (const cookie of [undefined, gate.cookie, ownerAdmin.cookie]) {
+      const base = { host: adminHost, path: ipv6PreflightResultPath, cookie };
+      const report = { id: "missing-challenge", checks: [] };
+      expect((await call({ ...base, body: { report } })).status).toBe(422);
+      const response = await call({ ...base, body: { report, signature: "A".repeat(43) } });
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain("The signed IPv6 request is invalid");
     }
   });
 

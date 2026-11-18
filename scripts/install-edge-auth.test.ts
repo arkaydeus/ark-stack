@@ -42,6 +42,7 @@ async function fixture() {
   for (const name of [
     "install.ts",
     "install-edge-auth.ts",
+    "install-docker-ipv6.ts",
     "install-edge-l4.ts",
     "install-host-hardening.ts",
     "install-mail-submission.ts",

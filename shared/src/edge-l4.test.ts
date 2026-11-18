@@ -54,7 +54,7 @@ describe("edge-l4 rendering (§3.8.5 fe_tls443)", () => {
   const config = generation.files["haproxy.cfg"]!;
 
   test("443 accepts only a TLS ClientHello within 5 s and sends HTTP, login and unknown SNI to Caddy", () => {
-    expect(config).toContain("frontend fe_tls443\n    bind :443\n");
+    expect(config).toContain("frontend fe_tls443\n    bind :::443 v4v6\n");
     expect(config).toContain("    tcp-request inspect-delay 5s\n");
     expect(config).toContain(
       "    tcp-request content accept if { req.ssl_hello_type 1 }\n    tcp-request content reject\n",

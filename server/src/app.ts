@@ -25,6 +25,7 @@ import {
   secureEqual,
   adoptionPreview,
   assertCidrs,
+  ipv6ProbeReport,
   canMutateQueue,
   classifyDiscovery,
   checkPoolerPolicy,
@@ -137,6 +138,16 @@ import {
 import { loadPoolerPolicy } from "./modules/pooler-policy.ts";
 import { db, sql } from "./db.ts";
 import { loadEnv } from "./env.ts";
+import {
+  ipv6PreflightChallenge,
+  ipv6PreflightKey,
+  ipv6PreflightKind,
+  ipv6PreflightTarget,
+  ipv6PreflightResultPath,
+  ipv6Settings,
+  ipv6Summary,
+  verifyIpv6Submission,
+} from "./modules/ipv6-preflight.ts";
 import { revealSecret } from "./coordinator.ts";
 import { getChallenge } from "./modules/certificates.ts";
 import { DnsReviewError } from "./modules/cloudflare-dns.ts";
@@ -602,7 +613,7 @@ app.all("/api/auth/*", async (c) => {
 const workerPrefixes: Record<string, string[]> = {
   database: ["database.", "pgbouncer."],
   // `integration.` (front door §3.4): the domain worker is the only worker with external egress.
-  domains: ["domain.", "dns.", "certificate.", "edge.", "admin.", "integration."],
+  domains: ["domain.", "dns.", "certificate.", "edge.", "admin.", "integration.", ipv6PreflightKind],
   mail: ["mail.", "mailbox.", "ses."],
   backup: [
     "backup.",
@@ -751,7 +762,13 @@ app.get("/api/internal/jobs", async (c) => {
   if (!requested.length || requested.some((item) => !allowed.has(item))) {
     throw new HTTPException(403, { message: "A valid worker job allowlist is required." });
   }
-  const claimed = await claimQueued({ limit: 1, kindPrefixes: requested });
+  const preflight = requested.includes(ipv6PreflightKind);
+  const claimed = await claimQueued({
+    limit: 1,
+    kindPrefixes: requested.filter((kind) => kind !== ipv6PreflightKind),
+    exactKinds: preflight ? [ipv6PreflightKind] : [],
+    excludeKinds: preflight ? [] : [ipv6PreflightKind],
+  });
   return c.json({ jobs: claimed.rows.map((row) => ({ ...row, claimToken: claimed.token })) });
 });
 
@@ -915,6 +932,29 @@ app.get("/api/metrics/prometheus", async (c) => {
     ...(await backupTargetMetrics()),
   ];
   return c.text(`${lines.join("\n")}\n`, 200, { "content-type": "text/plain; version=0.0.4" });
+});
+
+// The one-time signed request authorizes this off-host callback without an admin cookie.
+app.post(ipv6PreflightResultPath, async (c) => {
+  const type = c.req.header("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (type !== "application/json")
+    throw new HTTPException(415, { message: "An IPv6 report requires application/json." });
+  const { signature, report } = z
+    .object({
+      signature: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+      report: ipv6ProbeReport,
+    })
+    .parse(await c.req.json().catch(() => null));
+  if (!(await verifyIpv6Submission(report, signature, env.authSecret))) {
+    throw new HTTPException(403, { message: "The signed IPv6 request is invalid, expired or already used." });
+  }
+  const operation = await enqueue({
+    kind: ipv6PreflightKind,
+    targetIds: [ipv6PreflightTarget],
+    payload: { report },
+    idempotencyKey: `ipv6.preflight.result:${report.id}`,
+  });
+  return c.json({ operationId: operation.id }, 202);
 });
 
 app.use("/api/*", async (c, next) => {
@@ -1371,6 +1411,13 @@ app.post("/api/wizard", async (c) => {
     })
     .where(eq(platformSettings.id, "default"));
   await db.update(platformSetup).set({ wizardCompleted: true }).where(eq(platformSetup.id, "default"));
+  if (input.publicIpv6) {
+    await enqueue({
+      kind: ipv6PreflightKind,
+      targetIds: [ipv6PreflightTarget],
+      idempotencyKey: ipv6PreflightKey,
+    });
+  }
   await grantAccess(access.userId, { domainId });
   const verify =
     input.dnsProvider === "cloudflare"
@@ -1597,7 +1644,7 @@ app.put("/api/domains/:id/aaaa", async (c) => {
     .object({ enabled: z.boolean() })
     .strict()
     .parse(await c.req.json());
-  await changeAaaaSetting(domainId, input.enabled, (tx) =>
+  const ipv6 = await changeAaaaSetting(domainId, input.enabled, (tx) =>
     requirePrivileged(
       access,
       session,
@@ -1612,7 +1659,7 @@ app.put("/api/domains/:id/aaaa", async (c) => {
     payload: { routeEndpointsOnly: true },
   });
   await audit(access.userId, "dns.aaaa", "domain", domainId, input, operation.id, access.role);
-  return c.json({ operationId: operation.id });
+  return c.json({ operationId: operation.id, ...ipv6 });
 });
 
 app.delete("/api/domains/:id/aaaa/authorization", async (c) => {
@@ -3718,6 +3765,40 @@ app.put("/api/settings/gate", async (c) => {
     authorize,
   );
   return c.json({ ...(await gateSettingsSummary()), ...result, records: plan.records });
+});
+
+app.get("/api/settings/ipv6/preflight", async (c) => {
+  requireOwner(c.get("access"));
+  requireMfa(c.get("session"));
+  const settings = await ipv6Settings();
+  const id = c.req.query("operationId") ?? settings?.ipv6Evidence?.operationId;
+  c.header("cache-control", "no-store");
+  return c.json({
+    ...ipv6Summary(settings),
+    manual: typeof id === "string" ? await ipv6PreflightChallenge(id, env.authSecret) : null,
+  });
+});
+
+app.post("/api/settings/ipv6/preflight", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const operation = await enqueue({
+    kind: ipv6PreflightKind,
+    targetIds: [ipv6PreflightTarget],
+    actorId: access.userId,
+    idempotencyKey: ipv6PreflightKey,
+  });
+  await audit(
+    access.userId,
+    "settings.ipv6_preflight",
+    "platform",
+    "platform",
+    {},
+    operation.id,
+    access.role,
+  );
+  return c.json({ operationId: operation.id }, 202);
 });
 
 // Tailscale policy snippets (front door §3.7, FD-07). Owner-only, like route management (R12):
