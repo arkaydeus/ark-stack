@@ -151,7 +151,7 @@ export async function startClusters(label: string): Promise<Clusters> {
     "admin",
     "edge-control",
     "database-management",
-    "database-loopback",
+    "pgbouncer-ingress",
     "backup-management",
     "backup-egress",
     // FD-30: the Compose backup-worker also joins backup-tailnet (backup-ts's SOCKS5 network).

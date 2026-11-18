@@ -1,15 +1,16 @@
+// `ARK_ALLOWLIST_HELPER` for hosts that apply the tcp/5432 nft policy (`inet ark_db_ingress`, FD-18
+// per-source limits) without the `database-ingress` reconciler. Since FD-26 nothing here opens or closes
+// the public port: HAProxy's `fe_pg5432` owns 5432 and renders `be_pgbouncer` only while a database is
+// published (docs/design/front-door.md §3.8.3).
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 
-import { dbIngressAllowlistEnforced } from "@ark-stack/shared";
+import { dbIngressAllowlistEnforced, sha256Hex } from "@ark-stack/shared";
 
 const file = process.argv[2] ?? join(process.cwd(), "tmp", "pgbouncer", "allowlist.nft");
 const dir = join(file, "..");
-const composeFile =
-  process.env.ARK_PLATFORM_COMPOSE ?? join(process.cwd(), "infra/platform/docker-compose.yml");
-const exposeFile = join(dir, "expose");
 const statusFile = join(dir, "allowlist.status");
 
 if (!existsSync(file)) {
@@ -34,28 +35,22 @@ function run(command: string, args: string[]) {
   });
 }
 
-const expose = existsSync(exposeFile) ? (await Bun.file(exposeFile).text()).trim() === "1" : false;
-
+const rules = await Bun.file(file).text();
 try {
   await run("nft", ["-f", file]);
   const listed = await run("nft", ["list", "table", "inet", "ark_db_ingress"]);
   if (!listed.includes("ark_db")) throw new Error("nft readback did not show ark_db_ingress");
-  if (expose && process.env.ARK_PUBLIC_DB_CONTROL === "1") {
-    await run("docker", ["compose", "-f", composeFile, "up", "-d", "database-ingress", "pgbouncer-public"]);
-  }
   // An empty allowlist installs only the per-source limits, so the table exists but no CIDR
   // allowlist is enforced. Report that honestly rather than claiming enforcement.
-  const enforced = dbIngressAllowlistEnforced(await Bun.file(file).text());
-  await writeFile(statusFile, `applied=true\nenforced=${enforced}\nexposed=${expose}\nerror=\n`, {
-    mode: 0o600,
-  });
-} catch (error) {
-  if (process.env.ARK_PUBLIC_DB_CONTROL === "1") {
-    await run("docker", ["compose", "-f", composeFile, "restart", "database-ingress"]).catch(() => undefined);
-  }
   await writeFile(
     statusFile,
-    `applied=false\nenforced=false\nexposed=false\nerror=${error instanceof Error ? error.message : "failed"}\n`,
+    `applied=true\nenforced=${dbIngressAllowlistEnforced(rules)}\npolicy_hash=${sha256Hex(rules)}\nerror=\n`,
+    { mode: 0o600 },
+  );
+} catch (error) {
+  await writeFile(
+    statusFile,
+    `applied=false\nenforced=false\npolicy_hash=${sha256Hex(rules)}\nerror=${error instanceof Error ? error.message : "failed"}\n`,
     { mode: 0o600 },
   );
   console.error(error instanceof Error ? error.message : error);

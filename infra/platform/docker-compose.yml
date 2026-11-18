@@ -371,8 +371,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
-    # Loopback only. The host-namespace ingress binds 5432 after nftables is installed.
-    ports: ["127.0.0.1:15432:5432"]
+    # No published port (FD-26): HAProxy's fe_pg5432 in edge-ts owns public 5432 and reaches PgBouncer
+    # over the internal pgbouncer-ingress network (docs/design/front-door.md §3.8.3).
     volumes:
       - ../../tmp/pgbouncer:/var/lib/ark/pgbouncer:ro
       - ../../tmp/certs:/var/lib/ark/certs:ro
@@ -381,9 +381,9 @@ services:
     depends_on:
       app-postgres: { condition: service_healthy }
     restart: unless-stopped
-    # A non-internal bridge is required for Docker to publish the host loopback port.
-    # Backends remain exclusively on the isolated database-management bridge.
-    networks: [database-management, database-loopback]
+    # Backends stay on the isolated database-management bridge. pgbouncer-ingress (internal) is shared
+    # with edge-ts only, so the edge namespace can reach PgBouncer but never app-postgres.
+    networks: [database-management, pgbouncer-ingress]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
 
@@ -396,6 +396,8 @@ services:
       target: database-ingress
     command: [bun, run, --cwd, scripts, database-ingress.ts]
     network_mode: host
+    # The host-namespace nftables reconciler (ark_db_ingress: per-source limits on tcp/5432, matched on
+    # the input and forward hooks). It no longer listens on 5432: edge-l4 owns the public port (FD-26).
     # nft needs NET_ADMIN as root across exec. DAC_OVERRIDE permits this writer to read
     # the 0600 policy and write snapshots in the installer-owned (1000:1000) directories.
     # The API still sees only the dedicated read-only metrics mount.
@@ -404,13 +406,10 @@ services:
     cap_add: [NET_ADMIN, DAC_OVERRIDE]
     environment:
       ARK_PGBOUNCER_DIR: /var/lib/ark/pgbouncer
-      ARK_PGBOUNCER_LOOPBACK_PORT: "15432"
-      ARK_PUBLIC_DB_PORT: "5432"
       ARK_DB_INGRESS_METRICS_DIR: /var/lib/ark/db-ingress
     volumes:
       - ../../tmp/pgbouncer:/var/lib/ark/pgbouncer
       - ../../tmp/db-ingress:/var/lib/ark/db-ingress
-    depends_on: [pgbouncer-public]
     restart: unless-stopped
     pids_limit: 64
 
@@ -445,6 +444,10 @@ services:
     ports:
       - "80:80" # Caddy: ACME HTTP-01 and HTTPS redirects
       - "443:443" # edge-l4: HAProxy SNI router in front of Caddy (127.0.0.1:8443)
+      # edge-l4: PostgreSQL router (fe_pg5432, FD-26): PgBouncer for classic/no-SNI/DB-hostname
+      # connections, postgres routes by direct-TLS SNI. Docker DNAT keeps the client source, so
+      # ark_db_ingress's forward-hook limits still apply.
+      - "5432:5432"
       # Shared SNI ports for tls routes (front door §3.8.2, FD-14), chosen at install time
       # (ARK_EDGE_SNI_PORTS). The installer sets ARK_EDGE_SNI_PORT_<n>=<n>:<n> for an enabled port;
       # a disabled one is published only on an ephemeral loopback port, where HAProxy never listens.
@@ -468,6 +471,9 @@ services:
       # process and the tailnet containers — can rewrite public routing.
       edge-control:
         aliases: [edge-admin]
+      # HAProxy -> pgbouncer-public:5432 only (FD-26). Never database-management: app-postgres stays
+      # unreachable from the edge namespace.
+      pgbouncer-ingress: {}
     restart: unless-stopped
 
   # The backup node (tag:ark-backup, docs/design/front-door.md §3.18.3, FD-30). Separate from edge-ts
@@ -701,7 +707,8 @@ networks:
   admin: {}
   edge-control: { internal: true }
   database-management: { internal: true }
-  database-loopback: {}
+  # FD-26: edge-ts (HAProxy fe_pg5432) -> pgbouncer-public:5432, internal only; no other member.
+  pgbouncer-ingress: { internal: true }
   # FD-21: backup worker <-> PostgreSQL executors (port 8432), internal only.
   backup-management: { internal: true }
   # FD-21: backup worker -> S3-compatible targets (internet).

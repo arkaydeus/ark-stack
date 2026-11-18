@@ -3,8 +3,7 @@
 // an alert and fails the operation; the expiry alert keeps tracking the certificate still served.
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
-import { createServer, connect } from "node:net";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -15,6 +14,7 @@ if (!process.env.DATABASE_URL && existsSync(".env")) {
 }
 
 const { runOperation, enqueue, PGBOUNCER_RELOAD_ALERT } = await import("./coordinator.ts");
+const { poolerEdgeInput } = await import("./modules/pooler-policy.ts");
 const { evaluateAlerts } = await import("./modules/alerts.ts");
 const pooler = await import("./modules/pgbouncer.ts");
 const { PgbouncerReloadError } = pooler;
@@ -30,6 +30,7 @@ const {
   managedDatabases,
   databaseRoles,
   databaseClients,
+  platformSettings,
   privateCas,
   secrets,
 } = await import("./schema.ts");
@@ -51,6 +52,7 @@ const secretId = createId("sec");
 let caId = "";
 let caKeyId = "";
 let clientKeyId: string | null = null;
+let savedPooler: Partial<typeof platformSettings.$inferSelect> | null = null;
 
 beforeAll(async () => {
   work = await mkdtemp(join(tmpdir(), "ark-pgbouncer-reload-"));
@@ -72,12 +74,35 @@ beforeAll(async () => {
     process.env[name] = value;
   }
   delete saved.ARK_LEGO_BIN;
+  // The public test database requests an unrestricted pooler (no CIDRs), so adopt exactly that as the
+  // explicit pooler-wide policy (FD-26): without it the database could never become ready.
+  const [current] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  savedPooler = current
+    ? {
+        poolerSourceCidrs: current.poolerSourceCidrs,
+        poolerAllowInternet: current.poolerAllowInternet,
+        poolerInternetConfirmedAt: current.poolerInternetConfirmedAt,
+        poolerFencedAt: current.poolerFencedAt,
+        poolerFenceReason: current.poolerFenceReason,
+      }
+    : null;
+  const openPooler = {
+    poolerSourceCidrs: [],
+    poolerAllowInternet: true,
+    poolerInternetConfirmedAt: new Date(),
+  };
+  await db
+    .insert(platformSettings)
+    .values({ id: "default", ...openPooler })
+    .onConflictDoUpdate({ target: platformSettings.id, set: openPooler });
   await db
     .insert(endpoints)
     .values({ id: endpointId, kind: "database", hostname, exposure: "public", status: "verified" });
 });
 
 afterAll(async () => {
+  if (savedPooler)
+    await db.update(platformSettings).set(savedPooler).where(eq(platformSettings.id, "default"));
   for (const name of Object.keys(overrides)) {
     if (saved[name] === undefined) delete process.env[name];
     else process.env[name] = saved[name];
@@ -166,9 +191,9 @@ describe("database endpoint certificate renewal (§3.14)", () => {
       lastDeployedAt: new Date(Date.now() - 86_400_000),
     });
     const reload = (await db.select().from(operations).where(eq(operations.id, operationIds[1]!)))[0]!;
-    await Bun.write(join(overrides.ARK_PGBOUNCER_DIR!, "expose"), "1\n");
     const error = await runOperation("pgbouncer.reload", reload).catch((caught: unknown) => caught);
-    expect(await Bun.file(join(overrides.ARK_PGBOUNCER_DIR!, "expose")).text()).toBe("0\n");
+    // No client is admitted yet: public admission is fenced at the edge before the failed reload.
+    expect((await poolerEdgeInput()).pooler).toBeNull();
     expect(error).toBeInstanceOf(PgbouncerReloadError);
     expect((error as InstanceType<typeof PgbouncerReloadError>).attempts).toBe(3);
 
@@ -273,7 +298,11 @@ describe("payload-less renewal recovery", () => {
       expect(alert!.resolvedAt).toBeInstanceOf(Date);
       const [database] = await db.select().from(managedDatabases).where(eq(managedDatabases.id, databaseId));
       expect(database!.status).toBe("ready");
-      expect(await Bun.file(join(overrides.ARK_PGBOUNCER_DIR!, "expose")).text()).toBe("1\n");
+      // A confirmed reload with an admitted client lifts the fence: PgBouncer is routed on 5432.
+      const edge = await poolerEdgeInput();
+      expect(edge.fence).toBeNull();
+      expect(edge.pooler).toMatchObject({ hostname, allowInternet: true, sourceCidrs: [] });
+      expect(edge.evaluation.status).toBe("published");
 
       // Publicly trusted renewals use the same recovery path and become issued/testing.
       await db
@@ -315,103 +344,30 @@ describe("payload-less renewal recovery", () => {
   });
 });
 
-async function tcpReply(port: number) {
-  return new Promise<string>((done, reject) => {
-    const socket = connect({ host: "127.0.0.1", port });
-    let output = "";
-    socket.setTimeout(1000, () => socket.destroy(new Error("TCP probe timed out")));
-    socket.on("data", (chunk) => {
-      output += chunk;
-    });
-    socket.on("end", () => done(output));
-    socket.on("error", reject);
+test("revoking the last client fences public admission at the edge before a failed admin reload", async () => {
+  // PgBouncer keeps its old admission configuration when RELOAD fails; the edge must stop routing to it.
+  expect((await poolerEdgeInput()).pooler).not.toBeNull();
+  await db.update(databaseClients).set({ status: "revoked" }).where(eq(databaseClients.id, clientId));
+  const operation = await enqueue({
+    kind: "pgbouncer.reload",
+    targetIds: [endpointId],
+    payload: { nonce: createId("n") },
   });
-}
-
-async function listening(server: ReturnType<typeof createServer>) {
-  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
-  return (server.address() as { port: number }).port;
-}
-
-test("revoking the last client closes the live ingress before a failed admin reload", async () => {
-  // The backend models the still-running pooler retaining its old admission configuration.
-  const backend = createServer((socket) => socket.end("old admission still live\n"));
-  const backendPort = await listening(backend);
-  const reservation = createServer();
-  const publicPort = await listening(reservation);
-  await new Promise<void>((done) => reservation.close(() => done()));
-  const bin = join(work, "bin");
-  await mkdir(bin);
-  // Exercise the real ingress watcher/listener. Only privileged nft execution is replaced.
-  // Like `nft -f -`, the stub must drain stdin: one that exits unread makes the watcher's rules
-  // write fail with EPIPE, which on Linux kills the watcher before it opens the listener.
-  const nft = join(bin, "nft");
-  await Bun.write(nft, "#!/bin/sh\ncat >/dev/null\necho ark_db_ingress\n");
-  await chmod(nft, 0o700);
-  await Bun.write(join(overrides.ARK_PGBOUNCER_DIR!, "expose"), "1\n");
-  const ingress = Bun.spawn([process.execPath, "--no-env-file", resolve("scripts/database-ingress.ts")], {
-    env: {
-      ...process.env,
-      PATH: `${bin}:${process.env.PATH}`,
-      ARK_PUBLIC_DB_PORT: String(publicPort),
-      ARK_PGBOUNCER_LOOPBACK_PORT: String(backendPort),
-    },
-    stdout: "ignore",
-    stderr: "pipe",
-  });
-  try {
-    let opened = false;
-    for (let attempt = 0; attempt < 100; attempt++) {
-      if (
-        await tcpReply(publicPort).then(
-          () => true,
-          () => false,
-        )
-      ) {
-        opened = true;
-        break;
-      }
-      await Bun.sleep(20);
-    }
-    expect(opened).toBe(true);
-    expect(await tcpReply(publicPort)).toContain("old admission");
-    await db.update(databaseClients).set({ status: "revoked" }).where(eq(databaseClients.id, clientId));
-    const operation = await enqueue({
-      kind: "pgbouncer.reload",
-      targetIds: [endpointId],
-      payload: { nonce: createId("n") },
-    });
-    operationIds.push(operation.id);
-    const result = await runOperation("pgbouncer.reload", operation).catch((error: unknown) => error);
-    expect(result).toBeInstanceOf(PgbouncerReloadError);
-    expect(await Bun.file(join(overrides.ARK_PGBOUNCER_DIR!, "expose")).text()).toBe("0\n");
-    expect(await Bun.file(join(overrides.ARK_PGBOUNCER_DIR!, "allowlist.status")).text()).toContain(
-      "exposed=false",
-    );
-    await expect(tcpReply(publicPort)).rejects.toMatchObject({ code: "ECONNREFUSED" });
-    expect(await tcpReply(backendPort)).toContain("old admission");
-  } finally {
-    ingress.kill();
-    await ingress.exited;
-    await new Promise<void>((done) => backend.close(() => done()));
-  }
+  operationIds.push(operation.id);
+  const result = await runOperation("pgbouncer.reload", operation).catch((error: unknown) => error);
+  expect(result).toBeInstanceOf(PgbouncerReloadError);
+  const edge = await poolerEdgeInput();
+  expect(edge.fence?.reason).toBe("no-admitted-client");
+  expect(edge.pooler).toBeNull();
+  // The retirement watchdog's fallback is the same durable edge fence.
+  const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  expect(settings!.poolerFencedAt).toBeInstanceOf(Date);
 }, 15_000);
-
-test("a stale closed acknowledgement cannot satisfy the route fence", async () => {
-  const { fenceDatabasePublicListener } = await import("./modules/providers.ts");
-  const dir = join(work, "stale-status");
-  await mkdir(dir);
-  await Bun.write(join(dir, "expose"), "1\n");
-  await Bun.write(join(dir, "allowlist.status"), "exposed=false\n");
-  await expect(fenceDatabasePublicListener(dir, 30)).rejects.toThrow(/did not acknowledge closure/);
-  expect(await Bun.file(join(dir, "expose")).text()).toBe("0\n");
-});
 
 test("startup installs ingress limits without reopening a revoked client or rewriting pooler files", async () => {
   const previousDir = process.env.ARK_PGBOUNCER_DIR;
   const dir = join(work, "startup-revoked");
   await mkdir(dir);
-  await Bun.write(join(dir, "expose"), "1\n");
   await Bun.write(join(dir, PGBOUNCER_FILES.config), "existing pooler configuration\n");
   process.env.ARK_PGBOUNCER_DIR = dir;
   const admin = spyOn(pooler, "reloadPgbouncerAdmin").mockImplementation(async () => {
@@ -425,9 +381,12 @@ test("startup installs ingress limits without reopening a revoked client or rewr
     });
     operationIds.push(operation.id);
     await runOperation("pgbouncer.reload", operation);
-    expect(await Bun.file(join(dir, "expose")).text()).toBe("0\n");
+    // No exposure toggle any more (FD-26): 5432 belongs to the edge, which renders be_pgbouncer.
+    expect(await Bun.file(join(dir, "expose")).exists()).toBe(false);
     expect(await Bun.file(join(dir, PGBOUNCER_FILES.config)).text()).toBe("existing pooler configuration\n");
     const rules = await Bun.file(join(dir, "allowlist.nft")).text();
+    // Limits only: no port-wide CIDR list that would also cut off Postgres routes on 5432.
+    expect(rules).toContain("# ark-db-ingress: allowlist=open");
     expect(rules).toContain("ct count over 128");
     expect(rules).toContain("limit rate over 30/second burst 60 packets");
     expect(admin).not.toHaveBeenCalled();

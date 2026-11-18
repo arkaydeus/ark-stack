@@ -1,9 +1,11 @@
-// Route lifecycle (docs/design/front-door.md §3.3, §3.8, §3.13, §3.14, FD-08, FD-14).
+// Route lifecycle (docs/design/front-door.md §3.3, §3.8, §3.13, §3.14, FD-08, FD-14, FD-26).
 //
 // Owners create, update, enable, disable and delete public routes to tailnet services: `http`
 // routes (Caddy behind the 443 SNI router), `tls` routes (TLS-TCP by SNI on 443 or an enabled shared
-// SNI port: passthrough, terminate or terminate_mtls) and `tcp` routes (raw TCP, `plain`, on a
-// dedicated port from 20000-20049). Every kind shares one lifecycle. A route
+// SNI port: passthrough, terminate or terminate_mtls), `tcp` routes (raw TCP, `plain`, on a
+// dedicated port from 20000-20049) and `postgres` routes (direct-TLS PostgreSQL by SNI on 5432,
+// passthrough for PG >= 17 or edge termination with ALPN postgresql, and an opt-in compatibility port
+// from the raw range for passthrough routes). Every kind shares one lifecycle. A route
 // moves through `draft -> awaiting_acl -> awaiting_dns -> issuing_certificate -> ready`:
 //
 // - draft: creation audit state; persisted atomically with endpoint, DNS and awaiting_acl.
@@ -18,8 +20,8 @@
 // `enable` is refused before `ready`. `edge.apply` renders enabled `ready` HTTP routes allowed by
 // the lease into Caddy (FD-09): `public` routes directly and `sso` routes (the default) behind the
 // login gate (FD-11) with their bypass paths and Origin exceptions. Tightening the gate records
-// a revocation in the same transaction (§3.9.3). `edge.l4_apply` renders `tls` and `tcp` routes
-// into HAProxy (FD-14, modules/l4-routes.ts, shared/src/edge-l4.ts).
+// a revocation in the same transaction (§3.9.3). `edge.l4_apply` renders `tls`, `tcp` and `postgres`
+// routes into HAProxy (FD-14, FD-26, modules/l4-routes.ts, shared/src/edge-l4.ts).
 //
 // L4 routes deny every source until their `sourceCidrs` list says otherwise (empty = deny all).
 // Enabling an L4 route with an empty list is refused; `allowInternet` opens it to every source only
@@ -75,7 +77,7 @@ import {
 } from "../schema.ts";
 import { currentRoute, routeVersion } from "./front-route-state.ts";
 import { EDGE_OBSERVE_TARGET, edgePolicy, loadEdgeSnapshot } from "./edge-observe.ts";
-import { enabledSniPorts, storedL4Settings } from "./l4-routes.ts";
+import { enabledSniPorts, isL4Kind, storedL4Settings } from "./l4-routes.ts";
 import * as pki from "./pki.ts";
 
 export type RouteEnqueue = (input: {
@@ -205,7 +207,7 @@ async function loadRoute(routeId: string) {
 }
 
 function requireManaged(route: RouteRow) {
-  if (route.kind !== "http" && route.kind !== "tls" && route.kind !== "tcp") {
+  if (route.kind !== "http" && !isL4Kind(route.kind)) {
     throw new FrontRouteError(422, `Route kind "${route.kind}" is not managed by this API yet.`);
   }
 }
@@ -221,7 +223,7 @@ function l4Check<T>(work: () => T): T {
   }
 }
 
-/** The stored L4 settings of a `tls`/`tcp` row, refusing a corrupt row instead of guessing. */
+/** The stored L4 settings of a `tls`/`tcp`/`postgres` row, refusing a corrupt row instead of guessing. */
 function currentL4(route: RouteRow): L4RouteSettings {
   const stored = storedL4Settings(route);
   if (!stored) throw new FrontRouteError(409, "The route's stored TLS/TCP settings are invalid.");
@@ -229,10 +231,11 @@ function currentL4(route: RouteRow): L4RouteSettings {
 }
 
 function l4Summary(route: RouteRow) {
-  if (route.kind !== "tls" && route.kind !== "tcp") return null;
+  if (!isL4Kind(route.kind)) return null;
   const stored = storedL4Settings(route);
   return {
     tlsMode: route.tlsMode,
+    compatPort: route.kind === "postgres" ? route.compatPort : null,
     sourceCidrs: route.sourceCidrs,
     allowInternet: route.allowInternet,
     internetConfirmedAt: route.internetConfirmedAt?.toISOString() ?? null,
@@ -242,6 +245,37 @@ function l4Summary(route: RouteRow) {
     // Empty = deny all; the route cannot be enabled until it admits someone.
     admits: route.allowInternet ? "internet" : route.sourceCidrs.length ? "allowlist" : "nobody",
   };
+}
+
+/**
+ * A dedicated raw port carries one listener: a `tcp` route's port or a `postgres` route's compatibility
+ * port. The unique indexes cover each kind separately; this check (under the raw-port lock in the
+ * mutation transaction) covers a port used by one kind and requested by the other.
+ */
+async function assertRawPortFree(executor: Pick<typeof db, "select">, port: number, except: string | null) {
+  const rows = await executor
+    .select({
+      id: frontRoutes.id,
+      kind: frontRoutes.kind,
+      listenPort: frontRoutes.listenPort,
+      compatPort: frontRoutes.compatPort,
+    })
+    .from(frontRoutes)
+    .where(
+      statement`(${frontRoutes.kind} = 'tcp' AND ${frontRoutes.listenPort} = ${port}) OR ${frontRoutes.compatPort} = ${port}`,
+    );
+  const taken = rows.find((row) => row.id !== except);
+  if (taken) {
+    throw new FrontRouteError(
+      409,
+      `Port ${port} already carries route ${taken.id} (${taken.kind === "tcp" ? "raw TCP" : "Postgres compatibility port"}).`,
+    );
+  }
+}
+
+/** Serialises raw-port allocation across tcp routes and Postgres compatibility ports. */
+async function lockRawPorts(tx: DbTransaction) {
+  await tx.execute(statement`SELECT pg_advisory_xact_lock(hashtext('ark:front:raw-ports'))`);
 }
 
 async function routeDrain(enqueue: RouteEnqueue, route: RouteRow, reason: string) {
@@ -376,6 +410,7 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
             allowPlaintext: input.allowPlaintext,
             protocolAuthConfirmed: input.protocolAuthConfirmed,
             limits: input.limits,
+            compatPort: input.compatPort,
           }),
         );
   // HTTP defaults to the login gate; L4 admission is governed by its own policy.
@@ -411,11 +446,7 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
   }
   if (kind === "tcp") {
     // A dedicated port carries exactly one route, whatever its hostname.
-    const [taken] = await db
-      .select({ id: frontRoutes.id })
-      .from(frontRoutes)
-      .where(and(eq(frontRoutes.kind, "tcp"), eq(frontRoutes.listenPort, listenPort)));
-    if (taken) throw new FrontRouteError(409, `Port ${listenPort} already carries route ${taken.id}.`);
+    await assertRawPortFree(db, listenPort, null);
   } else if (endpoint) {
     // HTTP and TLS-TCP routes share a listener by SNI: one route per hostname and port.
     const [existing] = await db
@@ -434,6 +465,7 @@ export async function prepareRouteCreate(input: FrontRouteCreateInput) {
         `${hostname} already has a route on port ${listenPort} (${existing.id}).`,
       );
   }
+  if (l4?.compatPort != null) await assertRawPortFree(db, l4.compatPort, null);
   const redirectTo =
     input.redirectTo == null ? null : normalizeRedirectTo(input.redirectTo, { hostname, zone: domain.name });
   const targetInput = input.target.trim();
@@ -552,6 +584,10 @@ export async function commitRouteCreate(
   try {
     await db.transaction(async (tx) => {
       await authorize?.(tx);
+      if (plan.kind === "tcp" || plan.l4?.compatPort != null) {
+        await lockRawPorts(tx);
+        await assertRawPortFree(tx, plan.kind === "tcp" ? plan.listenPort : plan.l4!.compatPort!, null);
+      }
       // terminate_mtls: the route's own client CA, created atomically with the route. Its CRL is
       // generated before the route is first rendered (`edge.l4_apply` refreshes missing CRLs).
       const clientCa =
@@ -594,6 +630,7 @@ export async function commitRouteCreate(
               protocolAuthConfirmed: plan.l4.protocolAuthConfirmed,
               tcpOptions: plan.l4.limits,
               clientCaId: clientCa?.id ?? null,
+              compatPort: plan.l4.compatPort,
             }
           : {}),
         targetInput: plan.targetInput,
@@ -656,8 +693,8 @@ export async function commitRouteCreate(
     if (isUniqueViolation(error)) {
       throw new FrontRouteError(
         409,
-        plan.kind === "tcp"
-          ? `Port ${plan.listenPort} or ${plan.hostname} is already taken; reload and retry.`
+        plan.kind === "tcp" || plan.l4?.compatPort != null
+          ? `Port ${plan.kind === "tcp" ? plan.listenPort : plan.l4!.compatPort} or ${plan.hostname} is already taken; reload and retry.`
           : `${plan.hostname} already has a route or endpoint; reload and retry.`,
       );
     }
@@ -679,7 +716,7 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
   l4Check(() => assertFieldsForKind(route.kind as SupportedRouteKind, input));
   if (input.accessMode !== undefined) assertSupportedAccessMode(input.accessMode, "update");
   let l4: { current: L4RouteSettings; next: L4RouteSettings } | null = null;
-  if (route.kind === "tls" || route.kind === "tcp") {
+  if (isL4Kind(route.kind)) {
     const current = currentL4(route);
     const next = l4Check(() =>
       checkL4RouteSettings({
@@ -695,8 +732,11 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
             ? (input.protocolAuthConfirmed ?? current.protocolAuthConfirmed)
             : input.protocolAuthConfirmed,
         limits: { ...current.limits, ...input.limits },
+        compatPort: input.compatPort === undefined ? current.compatPort : input.compatPort,
       }),
     );
+    if (next.compatPort !== null && next.compatPort !== current.compatPort)
+      await assertRawPortFree(db, next.compatPort, route.id);
     l4 = { current, next };
   }
   let redirectTo = redirectOf(route);
@@ -755,6 +795,7 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
       "allowInternet",
       "protocolAuthConfirmed",
       "limits",
+      "compatPort",
     ] as const) {
       if (JSON.stringify(before[key]) !== JSON.stringify(next[key]))
         changes[key] = { from: before[key], to: next[key] };
@@ -804,6 +845,10 @@ export async function commitRouteUpdate(
   else delete httpOptions.allowedOrigins;
   await db.transaction(async (tx) => {
     await authorize?.(tx);
+    if (l4?.compatPort != null && l4.compatPort !== route.compatPort) {
+      await lockRawPorts(tx);
+      await assertRawPortFree(tx, l4.compatPort, route.id);
+    }
     // Switching to terminate_mtls gives the route its own client CA (kept if it already has one).
     const clientCaId =
       l4?.tlsMode === "terminate_mtls" && !route.clientCaId
@@ -831,6 +876,7 @@ export async function commitRouteUpdate(
               protocolAuthConfirmed: l4.protocolAuthConfirmed,
               tcpOptions: l4.limits,
               clientCaId,
+              ...(route.kind === "postgres" ? { compatPort: l4.compatPort } : {}),
             }
           : {}),
         targetInput: plan.targetInput,
@@ -858,9 +904,14 @@ export async function commitRouteUpdate(
   const live = route.enabled && route.status === "ready";
   const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   // A changed L4 policy renames the route's HAProxy servers: the old ones are fenced and drained.
-  const policyChanged = ["tlsMode", "sourceCidrs", "allowInternet", "protocolAuthConfirmed", "limits"].some(
-    (key) => key in plan.changes,
-  );
+  const policyChanged = [
+    "tlsMode",
+    "sourceCidrs",
+    "allowInternet",
+    "protocolAuthConfirmed",
+    "limits",
+    "compatPort",
+  ].some((key) => key in plan.changes);
   if (live && (plan.pinned || policyChanged)) {
     // The old backend (or policy) stops serving now, not at the next observation.
     await routeDrain(enqueue, route, plan.pinned ? "route_updated" : "route_policy_changed");

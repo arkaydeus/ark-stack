@@ -22,22 +22,22 @@ const watchdog: string[] = [];
 // Remember only the job inserted by this probe, so cleanup never removes a pre-existing daily
 // operation and the scheduler cannot leave a global queue row behind its database fixture.
 const daily = await queueDailyRollover(new Date());
-// A separate peer emulates the host ingress controller, including policy-hash and exposure
-// matching. The coordinator must await this exchange; it cannot use the development bypass.
+const startedAt = new Date();
+// A separate peer emulates the host ingress reconciler, including policy-hash matching. The
+// coordinator must await this exchange; it cannot use the development bypass. (Since FD-26 there
+// is no exposure toggle: whether PgBouncer is reachable on 5432 is the edge's be_pgbouncer.)
 const watcher = setInterval(() => {
   if (watching) return;
   watching = true;
   void (async () => {
     const rules = await readFile(join(dir, "allowlist.nft"), "utf8").catch(() => "");
-    const exposed = (await readFile(join(dir, "expose"), "utf8").catch(() => "0")).trim() === "1";
-    const key = `${rules}:${exposed}`;
-    if (!rules || (previous === key && (await Bun.file(join(dir, "allowlist.status")).exists()))) return;
+    if (!rules || (previous === rules && (await Bun.file(join(dir, "allowlist.status")).exists()))) return;
     await Bun.sleep(150);
     await writeFile(
       join(dir, "allowlist.status"),
-      `policy_hash=${createHash("sha256").update(rules).digest("hex")}\napplied=true\nexposed=${exposed}\n`,
+      `policy_hash=${createHash("sha256").update(rules).digest("hex")}\napplied=true\n`,
     );
-    previous = key;
+    previous = rules;
     acknowledgements++;
   })().finally(() => {
     watching = false;
@@ -116,5 +116,7 @@ try {
     await Bun.sleep(5);
   }
   if (daily) await sql`DELETE FROM operations WHERE id = ${daily.id}`;
+  // pgbouncer.reload queues edge.l4_apply for the domain worker (FD-26); none runs here.
+  await sql`DELETE FROM operations WHERE kind = 'edge.l4_apply' AND status = 'queued' AND created_at >= ${startedAt}`;
   await sql.end({ timeout: 2 });
 }

@@ -50,7 +50,10 @@ for (const image of validated.images) {
 if (/^  edge-l4:/m.test(composeSource)) {
   const prefix = ["compose", "-f", compose, "-p", project];
   for (const args of [
-    [...prefix, "stop", "domain-worker", "edge", "edge-l4", "edge-watchdog"],
+    // database-ingress: before FD-26 its Bun relay listened on host 5432, which edge-ts now publishes for
+    // edge-l4's fe_pg5432. Stop it so the recreated edge-ts can bind the port; `up` restarts it as the
+    // nft-only reconciler.
+    [...prefix, "stop", "domain-worker", "edge", "edge-l4", "edge-watchdog", "database-ingress"],
     [
       ...prefix,
       "run",

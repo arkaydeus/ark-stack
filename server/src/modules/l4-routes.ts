@@ -1,14 +1,16 @@
-// TLS-TCP and raw-TCP routes (docs/design/front-door.md §3.8, FD-14): their stored admission policy,
-// its fingerprint in the lease (so a policy change or a client certificate revocation fences and
-// drains the route's old HAProxy servers in every worker), and the `edge.l4_apply` input built from
-// the routes the lease allows: the certificate for terminated routes, the route CA and its CRL.
+// TLS-TCP, raw-TCP and Postgres routes (docs/design/front-door.md §3.8, FD-14, FD-26): their stored
+// admission policy, its fingerprint in the lease (so a policy change or a client certificate revocation
+// fences and drains the route's old HAProxy servers in every worker), and the `edge.l4_apply` input
+// built from the routes the lease allows: the certificate for terminated routes, the route CA and its CRL.
 
 import {
+  POSTGRES_ROUTER_PORT,
   isTcpRoutePort,
   l4Limits,
   l4PolicyFingerprint,
   parseSniPorts,
   routeAllowlist,
+  type EdgeL4PostgresRoute,
   type EdgeL4TcpRoute,
   type EdgeL4TlsMode,
   type EdgeL4TlsRoute,
@@ -32,7 +34,7 @@ export function enabledSniPorts(env: Record<string, string | undefined> = proces
 }
 
 export type StoredL4Settings = {
-  kind: "tls" | "tcp";
+  kind: "tls" | "tcp" | "postgres";
   listenPort: number;
   tlsMode: EdgeL4TlsMode | "plain";
   sourceCidrs: string[];
@@ -40,9 +42,16 @@ export type StoredL4Settings = {
   protocolAuthConfirmed: boolean;
   limits: L4Limits;
   clientCaId: string | null;
+  /** Postgres passthrough routes: the opt-in compatibility port, or null. */
+  compatPort: number | null;
 };
 
-/** The stored L4 settings of a route row, or null for HTTP/Postgres rows and invalid stored values. */
+/** True for the route kinds HAProxy serves (FD-14, FD-26). */
+export function isL4Kind(kind: string): kind is "tls" | "tcp" | "postgres" {
+  return kind === "tls" || kind === "tcp" || kind === "postgres";
+}
+
+/** The stored L4 settings of a route row, or null for HTTP rows and invalid stored values. */
 export function storedL4Settings(
   row: Pick<
     RouteRow,
@@ -54,14 +63,17 @@ export function storedL4Settings(
     | "protocolAuthConfirmed"
     | "tcpOptions"
     | "clientCaId"
-  >,
+  > & { compatPort?: number | null },
 ): StoredL4Settings | null {
-  if (row.kind !== "tls" && row.kind !== "tcp") return null;
+  if (!isL4Kind(row.kind)) return null;
   try {
     const kind = row.kind;
     const tlsMode = row.tlsMode;
     if (!tlsMode || (kind === "tcp" ? tlsMode !== "plain" : tlsMode === "plain")) return null;
     if (kind === "tcp" && !isTcpRoutePort(row.listenPort)) return null;
+    if (kind === "postgres" && row.listenPort !== POSTGRES_ROUTER_PORT) return null;
+    const compatPort = kind === "postgres" ? (row.compatPort ?? null) : null;
+    if (compatPort !== null && (!isTcpRoutePort(compatPort) || tlsMode !== "passthrough")) return null;
     const sourceCidrs = Array.isArray(row.sourceCidrs) ? row.sourceCidrs.map(String) : [];
     routeAllowlist({ sourceCidrs, allowInternet: false });
     return {
@@ -73,6 +85,7 @@ export function storedL4Settings(
       protocolAuthConfirmed: row.protocolAuthConfirmed,
       limits: l4Limits(kind, row.tcpOptions as Partial<Record<keyof L4Limits, unknown>>),
       clientCaId: row.clientCaId,
+      compatPort,
     };
   } catch {
     return null;
@@ -106,7 +119,7 @@ export function l4RoutePolicy(settings: StoredL4Settings, revoked: Map<string, s
 export type OmittedL4Route = { id: string; hostname: string; reason: string };
 
 /**
- * The `tls` and `tcp` routes of an `edge.l4_apply` input: only routes in the lease policy, rendered
+ * The `tls`, `tcp` and `postgres` routes of an `edge.l4_apply` input: only routes in the lease policy, rendered
  * with exactly the policy fingerprint the lease names (a route whose stored policy moved on since
  * the lease was read waits for the next apply rather than rendering an unauthorised server).
  */
@@ -115,11 +128,12 @@ export async function edgeL4Routes(input: {
   certDir?: string;
   sniPorts?: number[];
 }) {
-  const l4 = input.policyRoutes.filter((route) => route.kind === "tls" || route.kind === "tcp");
+  const l4 = input.policyRoutes.filter((route) => isL4Kind(route.kind));
   const omitted: OmittedL4Route[] = [];
   const tlsRoutes: EdgeL4TlsRoute[] = [];
   const tcpRoutes: EdgeL4TcpRoute[] = [];
-  if (!l4.length) return { tlsRoutes, tcpRoutes, omitted };
+  const postgresRoutes: EdgeL4PostgresRoute[] = [];
+  if (!l4.length) return { tlsRoutes, tcpRoutes, postgresRoutes, omitted };
   const sniPorts = input.sniPorts ?? enabledSniPorts();
   // One MVCC snapshot: never pair a newly committed policy with an earlier CRL.
   const { rows, revoked, cas } = await db.transaction(
@@ -172,15 +186,14 @@ export async function edgeL4Routes(input: {
       tcpRoutes.push({ ...base, listenPort: settings.listenPort });
       continue;
     }
-    if (settings.listenPort !== 443 && !sniPorts.includes(settings.listenPort)) {
+    if (settings.kind === "tls" && settings.listenPort !== 443 && !sniPorts.includes(settings.listenPort)) {
       omit(`shared SNI port ${settings.listenPort} is not enabled on this host`);
       continue;
     }
-    const tls: EdgeL4TlsRoute = {
-      ...base,
-      listenPort: settings.listenPort,
-      tlsMode: settings.tlsMode as EdgeL4TlsMode,
-    };
+    const tls: EdgeL4TlsRoute & EdgeL4PostgresRoute =
+      settings.kind === "postgres"
+        ? { ...base, tlsMode: settings.tlsMode as EdgeL4TlsMode, compatPort: settings.compatPort }
+        : { ...base, listenPort: settings.listenPort, tlsMode: settings.tlsMode as EdgeL4TlsMode };
     if (settings.tlsMode !== "passthrough") {
       try {
         const directory = join(certDir, route.hostname);
@@ -213,7 +226,8 @@ export async function edgeL4Routes(input: {
       tls.clientCaPem = ca.certPem;
       tls.clientCrlPem = ca.crlPem;
     }
-    tlsRoutes.push(tls);
+    if (settings.kind === "postgres") postgresRoutes.push(tls);
+    else tlsRoutes.push(tls);
   }
-  return { tlsRoutes, tcpRoutes, omitted };
+  return { tlsRoutes, tcpRoutes, postgresRoutes, omitted };
 }

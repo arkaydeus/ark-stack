@@ -26,7 +26,15 @@ import {
   assertCidrs,
   canMutateQueue,
   classifyDiscovery,
-  clientAllowed,
+  checkPoolerPolicy,
+  poolerAdmission,
+  poolerPolicyInput,
+  poolerPolicyLoosens,
+  POOLER_POLICY_BOUNDARY,
+  POSTGRES_DRIVER_GUIDANCE,
+  POSTGRES_ROUTE_NOTES,
+  POSTGRES_ROUTER_PORT,
+  POSTGRES_TARGET_CHECKLIST,
   maintainInput,
   queueActionInput,
   deviceInput,
@@ -115,7 +123,9 @@ import {
   enqueue,
   finalizeAgentCompletion,
   heartbeatClaim,
+  queuePoolerEdgeApply,
 } from "./coordinator.ts";
+import { loadPoolerPolicy } from "./modules/pooler-policy.ts";
 import { db, sql } from "./db.ts";
 import { loadEnv } from "./env.ts";
 import { revealSecret } from "./coordinator.ts";
@@ -1097,6 +1107,9 @@ app.get("/api/state", async (c) => {
     settings,
     region: regionSummary(settings ?? null),
     dbIngress: dbIngressLimitsSummary(settings ?? null),
+    // One pooler-wide policy on public 5432 (FD-26, §3.8.3); requests name databases, so only owners
+    // and operators see them. Every role sees the boundary and the publication state.
+    poolerPolicy: await poolerPolicyView(access),
     domains: visibleDomains.map((domain) => ({
       ...redactDomain(domain, access),
       records: records.filter((record) => record.domainId === domain.id),
@@ -2112,6 +2125,20 @@ app.put("/api/databases/:id/cidrs", async (c) => {
   return c.json({ operationId: operation.id, cidrs });
 });
 
+/** The pooler policy for the inventory: full detail for owners and operators, the boundary for all. */
+async function poolerPolicyView(access: { role: string }) {
+  const evaluation = await loadPoolerPolicy();
+  if (access.role === "owner" || access.role === "operator") return evaluation;
+  return {
+    scope: evaluation.scope,
+    status: evaluation.status,
+    publishable: evaluation.publishable,
+    message: evaluation.message,
+    boundary: evaluation.boundary,
+    conflict: evaluation.conflict,
+  };
+}
+
 app.get("/api/databases/:id/admission", async (c) => {
   requireOperator(c.get("access"));
   await requireDatabaseAccess(c.get("access"), c.req.param("id"));
@@ -2120,7 +2147,113 @@ app.get("/api/databases/:id/admission", async (c) => {
     .from(managedDatabases)
     .where(eq(managedDatabases.id, c.req.param("id")));
   if (!database) throw new HTTPException(404, { message: "Database not found." });
-  return c.json(clientAllowed(database.sourceCidrs ?? [], String(c.req.query("ip") ?? "")));
+  // Classic SSLRequest carries no database name, so admission is the pooler-wide policy for every
+  // database. A source admitted for another database is admitted here too: never report this
+  // database's own CIDRs as isolating it (§3.8.3).
+  const evaluation = await loadPoolerPolicy();
+  return c.json({
+    databaseId: database.id,
+    requestedCidrs: database.sourceCidrs ?? [],
+    ...poolerAdmission(evaluation, String(c.req.query("ip") ?? "")),
+  });
+});
+
+// The pooler-wide source policy for public 5432 (front door §3.8.3, FD-26). Owners and operators read
+// the requests, conflicts and publication state. Saving is owner-only with MFA and a single-use
+// `exposure.public` grant bound to the body: it is the explicit review that publication needs when
+// databases request different sources, so the body echoes the requests fingerprint it reviewed.
+app.get("/api/databases/pooler-policy", async (c) => {
+  requireOperator(c.get("access"));
+  return c.json(await loadPoolerPolicy());
+});
+
+app.put("/api/databases/pooler-policy", async (c) => {
+  const access = c.get("access");
+  requireOwner(access);
+  requireMfa(c.get("session"));
+  const request = await c.req.json();
+  const input = poolerPolicyInput.parse(request);
+  let checked: ReturnType<typeof checkPoolerPolicy>;
+  try {
+    checked = checkPoolerPolicy(input);
+  } catch (error) {
+    throw new HTTPException(422, { message: (error as Error).message });
+  }
+  const current = await loadPoolerPolicy();
+  if (input.reviewedRequests !== current.requestsFingerprint) {
+    throw new HTTPException(409, {
+      message:
+        "The databases' requests changed since they were reviewed. Reload, review them again and save.",
+    });
+  }
+  // Validate before consuming the single-use grant, so a stale review does not burn a step-up.
+  await requirePrivileged(
+    access,
+    c.get("session"),
+    "exposure.public",
+    privilegedRequestHash("exposure.public", request),
+  );
+  const [previous] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const now = new Date();
+  const keepConfirmation =
+    checked.allowInternet && previous?.poolerAllowInternet && previous.poolerInternetConfirmedAt;
+  const values = {
+    poolerSourceCidrs: checked.allowInternet ? [] : checked.sourceCidrs,
+    poolerAllowInternet: checked.allowInternet,
+    poolerInternetConfirmedBy: checked.allowInternet
+      ? keepConfirmation
+        ? previous!.poolerInternetConfirmedBy
+        : access.userId
+      : null,
+    poolerInternetConfirmedAt: checked.allowInternet
+      ? keepConfirmation
+        ? previous!.poolerInternetConfirmedAt
+        : now
+      : null,
+    poolerPolicyReviewedBy: access.userId,
+    poolerPolicyReviewedAt: now,
+    poolerPolicyReviewedRequests: current.requestsFingerprint,
+    updatedAt: now,
+  };
+  await db
+    .insert(platformSettings)
+    .values({ id: "default", ...values })
+    .onConflictDoUpdate({ target: platformSettings.id, set: values });
+  const loosened = poolerPolicyLoosens(
+    {
+      sourceCidrs: Array.isArray(previous?.poolerSourceCidrs) ? previous.poolerSourceCidrs : [],
+      allowInternet: Boolean(previous?.poolerAllowInternet),
+    },
+    checked,
+  );
+  // The edge re-renders be_pgbouncer at once (tightening must not wait for PgBouncer); the reload
+  // then updates each public database's status against the new policy.
+  await queuePoolerEdgeApply();
+  const operation = await enqueue({
+    kind: "pgbouncer.reload",
+    actorId: access.userId,
+    targetIds: ["platform"],
+    payload: { poolerPolicy: { ...checked, reviewedRequests: current.requestsFingerprint } },
+  });
+  await audit(
+    access.userId,
+    "pooler_policy.update",
+    "platform",
+    "platform",
+    {
+      ...checked,
+      loosened,
+      reviewedRequests: current.requestsFingerprint,
+      distinctRequests: current.distinctRequests,
+      conflicts: current.conflicts.map((conflict) => conflict.reason),
+      previous: previous
+        ? { sourceCidrs: previous.poolerSourceCidrs, allowInternet: previous.poolerAllowInternet }
+        : null,
+    },
+    operation.id,
+    access.role,
+  );
+  return c.json({ ...(await loadPoolerPolicy()), operationId: operation.id });
 });
 
 // ---- Database clients (front door §3.10.3, §3.12, FD-17) ----------------------------------------
@@ -3352,6 +3485,15 @@ app.get("/api/front/listeners", async (c) => {
     reservedPorts: RESERVED_ROUTE_PORTS,
     tlsModes: ["passthrough", "terminate", "terminate_mtls"],
     guidance: PROTOCOL_GUIDANCE,
+    // Postgres routes on the 5432 router (FD-26, §3.8.3): target hardening and driver guidance.
+    postgres: {
+      port: POSTGRES_ROUTER_PORT,
+      compatPorts: TCP_ROUTE_PORTS,
+      checklist: POSTGRES_TARGET_CHECKLIST,
+      drivers: POSTGRES_DRIVER_GUIDANCE,
+      notes: POSTGRES_ROUTE_NOTES,
+      poolerBoundary: POOLER_POLICY_BOUNDARY,
+    },
   });
 });
 

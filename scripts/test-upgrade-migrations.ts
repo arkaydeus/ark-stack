@@ -80,7 +80,6 @@ try { await processQueued(1, "pgbouncer."); } finally { await sql.end(); }
     const bundle = await Bun.build({ entrypoints: [entry], outdir: bundleDir, target: "bun" });
     if (!bundle.success) throw new Error(`Cannot bundle upgrade runtime: ${bundle.logs.join(" ")}`);
   }
-  await writeFile(join(policyState, "pgbouncer", "expose"), "0\n");
   // Both processes use the installer's Linux ownership. Avoid macOS bind-mount inode
   // replacement semantics when the worker atomically publishes its next policy.
   await docker(["volume", "create", ingressVolume]);
@@ -322,14 +321,34 @@ table inet ark_db_ingress {
       "A session insert that omits origin must fail.",
     );
     const [frontDoorSettings] = await verified`
-      SELECT pooler_source_cidrs, pooler_allow_internet, gate_login_mode
+      SELECT pooler_source_cidrs, pooler_allow_internet, gate_login_mode,
+        pooler_internet_confirmed_at IS NOT NULL AS confirmed, pooler_policy_reviewed_at
       FROM platform_settings WHERE id = 'default'
     `;
+    // 0013 defaults the pooler closed. FD-26's 0030 then adopts the single pre-existing database
+    // ingress policy, so the Vercel -> PgBouncer path keeps working across the cutover: the legacy
+    // public database has no CIDRs, which admitted any mTLS client before, so the explicit
+    // pooler-wide policy is allow-internet (audited, no review needed for a single request).
     assert.deepEqual(
       frontDoorSettings,
-      { pooler_source_cidrs: [], pooler_allow_internet: false, gate_login_mode: "disabled" },
-      "Front-door exposure must default closed on upgrade.",
+      {
+        pooler_source_cidrs: [],
+        pooler_allow_internet: true,
+        gate_login_mode: "disabled",
+        confirmed: true,
+        pooler_policy_reviewed_at: null,
+      },
+      "FD-26 must adopt the single pre-existing database ingress policy as the pooler-wide policy.",
     );
+    const [migratedAudit] = await verified`
+      SELECT detail FROM audit_events WHERE action = 'pooler_policy.migrated'
+    `;
+    assert.equal(migratedAudit?.detail?.allowInternet, true, "The adopted pooler policy must be audited.");
+    const [enforcedColumn] = await verified`
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'managed_databases' AND column_name = 'allowlist_enforced'
+    `;
+    assert.equal(enforcedColumn, undefined, "No per-database enforcement claim may survive FD-26.");
     // 0014_region.sql (FD-03) must follow 0013 and default the existing install to us-east.
     assert.equal(
       order.indexOf("0014_region.sql"),
@@ -456,11 +475,22 @@ table inet ark_db_ingress {
       ]) {
         assert.ok(installed.includes(expected), `Startup must install ${expected} in the kernel.`);
       }
+      // FD-26: 5432 belongs to the edge. Without an admitted mTLS client the pooler is fenced there
+      // (durably, for the domain worker's edge.l4_apply), and no relay exposure toggle exists.
       assert.equal(
-        await ingressFile("pgbouncer/expose"),
-        "0\n",
+        await ingressFile("pgbouncer/expose").catch(() => "missing"),
+        "missing",
+        "Startup must not write the retired relay exposure toggle.",
+      );
+      const [fence] = await verified`SELECT pooler_fence_reason FROM platform_settings WHERE id = 'default'`;
+      assert.equal(
+        fence?.pooler_fence_reason,
+        "no-admitted-client",
         "Startup installs rate limits but cannot expose a database without an admitted mTLS client.",
       );
+      const [edgeApply] =
+        await verified`SELECT id FROM operations WHERE kind = 'edge.l4_apply' AND status = 'queued'`;
+      assert.ok(edgeApply, "Startup must queue the edge's pooler re-render.");
       assert.equal(
         await ingressFile("pgbouncer/pgbouncer.ini").catch(() => "missing"),
         "missing",
