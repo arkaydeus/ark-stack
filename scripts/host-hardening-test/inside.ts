@@ -12,7 +12,6 @@ import {
   jmapCall,
   rebootRequiredMetrics,
   renderEdgeL4Generation,
-  renderHostFirewall,
   sha256Hex,
 } from "@ark-stack/shared";
 import { frontIngressRules } from "../../server/src/modules/front-ingress.ts";
@@ -25,7 +24,7 @@ const front = "/work/tmp/edge-l4/front-ingress";
 const sni = [8883];
 const raw = [20001, 20007];
 
-async function makePolicy(mailEnabled: boolean) {
+async function makePolicy() {
   await mkdir(front, { recursive: true });
   const target = {
     hostname: "route.example.test",
@@ -49,7 +48,6 @@ async function makePolicy(mailEnabled: boolean) {
   await rename(join(front, "policy.nft.tmp"), join(front, "policy.nft"));
   await writeFile(join(front, "policy.request.tmp"), JSON.stringify({ id, hash: sha256Hex(rules) }));
   await rename(join(front, "policy.request.tmp"), join(front, "policy.request"));
-  await writeFile("/tmp/ark-host.nft", renderHostFirewall({ mailEnabled, sniPorts: sni }));
   console.log(id);
 }
 
@@ -235,7 +233,7 @@ function configureMail() {
 const [mode, value] = process.argv.slice(2);
 switch (mode) {
   case "policy":
-    await makePolicy(value === "on");
+    await makePolicy();
     break;
   case "listen":
     listen(value ? [Number(value)] : [80, 443, ...sni, ...raw], !value);

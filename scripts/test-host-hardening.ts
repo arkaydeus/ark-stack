@@ -43,9 +43,7 @@ async function ready<T>(check: () => Promise<T>, label: string, timeout = 30_000
 }
 
 async function applyPolicy(mode: "on" | "off") {
-  const id = await host("bun", fixture, "policy", mode);
-  await host("nft", "-c", "-f", "/tmp/ark-host.nft");
-  await host("nft", "-f", "/tmp/ark-host.nft");
+  const id = await host("bun", fixture, "policy");
   await docker(
     "exec",
     "-e",
@@ -131,7 +129,7 @@ case "$*" in
     exit 0 ;;
 esac
 if [ "\${1:-}" = compose ] && [ "\${4:-}" = build ]; then
-  bun ${fixture} policy off >/tmp/upgrade-request
+  bun ${fixture} policy >/tmp/upgrade-request
   sleep 2
   echo "Injected build failure after publishing a fresh front request." >&2
   exit 42
