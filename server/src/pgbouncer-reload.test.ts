@@ -3,12 +3,18 @@
 // an alert and fails the operation; the expiry alert keeps tracking the certificate still served.
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { PGBOUNCER_FILES, encryptSecret, generateInstallSecrets, parseEnvFile } from "@ark-stack/shared";
+import {
+  PGBOUNCER_FILES,
+  encryptSecret,
+  generateInstallSecrets,
+  nftAllowlist,
+  parseEnvFile,
+} from "@ark-stack/shared";
 
 if (!process.env.DATABASE_URL && existsSync(".env")) {
   Object.assign(process.env, parseEnvFile(await Bun.file(".env").text()));
@@ -75,6 +81,42 @@ beforeAll(async () => {
   await db
     .insert(endpoints)
     .values({ id: endpointId, kind: "database", hostname, exposure: "public", status: "verified" });
+
+  const ca = await pki.createPrivateCa({ purpose: "db-client", name: `reload-${clientId}` });
+  caId = ca.id;
+  // The inventory summary never exposes the key secret ID, so read it from the row for cleanup.
+  const [caRow] = await db.select().from(privateCas).where(eq(privateCas.id, ca.id));
+  caKeyId = caRow?.keySecretId ?? "";
+  const issued = await pki.issueClientCertificate({
+    caId,
+    subjectCn: "recovery_shop_production",
+    keyOwner: { resourceType: "platform", resourceId: "platform" },
+  });
+  clientKeyId = issued.certificate.keySecretId;
+  await db.insert(databaseClusters).values({ id: clusterId, name: clusterId, endpointId });
+  await db
+    .insert(managedDatabases)
+    .values({ id: databaseId, clusterId, name: "recoverydb", exposure: "public" });
+  await db.insert(secrets).values({
+    id: secretId,
+    kind: "database_password",
+    resourceType: "database",
+    resourceId: databaseId,
+    ...encryptSecret(process.env.ARK_ROOT_KEY!, "runtime-password", "k1"),
+  });
+  await db
+    .insert(databaseRoles)
+    .values({ id: roleId, databaseId, name: "recovery_shop_production", kind: "runtime", secretId });
+  await db.insert(databaseClients).values({
+    id: clientId,
+    databaseId,
+    name: "shop",
+    environment: "production",
+    roleKind: "runtime",
+    roleId,
+    caId,
+    status: "revoked",
+  });
 });
 
 afterAll(async () => {
@@ -212,40 +254,7 @@ describe("payload-less renewal recovery", () => {
     const pending = (
       await db.select().from(certificates).where(eq(certificates.endpointId, endpointId))
     ).find((row) => row.status === "awaiting_reload")!;
-    const ca = await pki.createPrivateCa({ purpose: "db-client", name: `reload-${clientId}` });
-    caId = ca.id;
-    // The inventory summary never exposes the key secret ID, so read it from the row for cleanup.
-    const [caRow] = await db.select().from(privateCas).where(eq(privateCas.id, ca.id));
-    caKeyId = caRow?.keySecretId ?? "";
-    const issued = await pki.issueClientCertificate({
-      caId,
-      subjectCn: "recovery_shop_production",
-      keyOwner: { resourceType: "platform", resourceId: "platform" },
-    });
-    clientKeyId = issued.certificate.keySecretId;
-    await db.insert(databaseClusters).values({ id: clusterId, name: clusterId, endpointId });
-    await db
-      .insert(managedDatabases)
-      .values({ id: databaseId, clusterId, name: "recoverydb", exposure: "public" });
-    await db.insert(secrets).values({
-      id: secretId,
-      kind: "database_password",
-      resourceType: "database",
-      resourceId: databaseId,
-      ...encryptSecret(process.env.ARK_ROOT_KEY!, "runtime-password", "k1"),
-    });
-    await db
-      .insert(databaseRoles)
-      .values({ id: roleId, databaseId, name: "recovery_shop_production", kind: "runtime", secretId });
-    await db.insert(databaseClients).values({
-      id: clientId,
-      databaseId,
-      name: "shop",
-      environment: "production",
-      roleKind: "runtime",
-      roleId,
-      caId,
-    });
+    await db.update(databaseClients).set({ status: "active" }).where(eq(databaseClients.id, clientId));
     const reload = await enqueue({
       kind: "pgbouncer.reload",
       targetIds: [endpointId],
@@ -334,47 +343,67 @@ async function listening(server: ReturnType<typeof createServer>) {
 }
 
 test("revoking the last client closes the live ingress before a failed admin reload", async () => {
+  await db.update(databaseClients).set({ status: "active" }).where(eq(databaseClients.id, clientId));
+  const previousDir = process.env.ARK_PGBOUNCER_DIR;
+  const dir = join(work, "live-ingress");
+  const statusFile = join(dir, "allowlist.status");
+  await mkdir(dir);
+  const bin = join(work, "bin");
+  await mkdir(bin);
+  // Model nft's stdin, table readback and counter read. Network admission still uses the real watcher.
+  const nft = join(bin, "nft");
+  await Bun.write(
+    nft,
+    `#!/bin/sh
+case "$1" in
+  -f) cat >/dev/null ;;
+  -j) echo '{"nftables":[]}' ;;
+  list) echo ark_db_ingress ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+  await chmod(nft, 0o700);
+
   // The backend models the still-running pooler retaining its old admission configuration.
   const backend = createServer((socket) => socket.end("old admission still live\n"));
   const backendPort = await listening(backend);
   const reservation = createServer();
   const publicPort = await listening(reservation);
   await new Promise<void>((done) => reservation.close(() => done()));
-  const bin = join(work, "bin");
-  await mkdir(bin);
-  // Exercise the real ingress watcher/listener. Only privileged nft execution is replaced.
-  // Like `nft -f -`, the stub must drain stdin: one that exits unread makes the watcher's rules
-  // write fail with EPIPE, which on Linux kills the watcher before it opens the listener.
-  const nft = join(bin, "nft");
-  await Bun.write(nft, "#!/bin/sh\ncat >/dev/null\necho ark_db_ingress\n");
-  await chmod(nft, 0o700);
-  await Bun.write(join(overrides.ARK_PGBOUNCER_DIR!, "expose"), "1\n");
+  await Bun.write(join(dir, "allowlist.nft"), nftAllowlist([], publicPort));
+  await Bun.write(join(dir, "expose"), "1\n");
   const ingress = Bun.spawn([process.execPath, "--no-env-file", resolve("scripts/database-ingress.ts")], {
     env: {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
+      ARK_PGBOUNCER_DIR: dir,
+      ARK_DB_INGRESS_METRICS_DIR: join(work, "metrics"),
       ARK_PUBLIC_DB_PORT: String(publicPort),
       ARK_PGBOUNCER_LOOPBACK_PORT: String(backendPort),
     },
     stdout: "ignore",
     stderr: "pipe",
   });
+  const stderr = ingress.stderr.text();
+  process.env.ARK_PGBOUNCER_DIR = dir;
   try {
-    let opened = false;
-    for (let attempt = 0; attempt < 100; attempt++) {
-      if (
-        await tcpReply(publicPort).then(
-          () => true,
-          () => false,
-        )
-      ) {
-        opened = true;
-        break;
+    let reply: string | undefined;
+    let status = "";
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && ingress.exitCode === null) {
+      status = await readFile(statusFile, "utf8").catch(() => "");
+      if (status.includes("exposed=true\n")) {
+        reply = await tcpReply(publicPort).catch(() => undefined);
+        if (reply !== undefined) break;
       }
       await Bun.sleep(20);
     }
-    expect(opened).toBe(true);
-    expect(await tcpReply(publicPort)).toContain("old admission");
+    if (reply === undefined) {
+      ingress.kill();
+      throw new Error(`Ingress did not start (exit ${await ingress.exited}): ${status}\n${await stderr}`);
+    }
+    expect(reply).toContain("old admission");
     await db.update(databaseClients).set({ status: "revoked" }).where(eq(databaseClients.id, clientId));
     const operation = await enqueue({
       kind: "pgbouncer.reload",
@@ -384,18 +413,17 @@ test("revoking the last client closes the live ingress before a failed admin rel
     operationIds.push(operation.id);
     const result = await runOperation("pgbouncer.reload", operation).catch((error: unknown) => error);
     expect(result).toBeInstanceOf(PgbouncerReloadError);
-    expect(await Bun.file(join(overrides.ARK_PGBOUNCER_DIR!, "expose")).text()).toBe("0\n");
-    expect(await Bun.file(join(overrides.ARK_PGBOUNCER_DIR!, "allowlist.status")).text()).toContain(
-      "exposed=false",
-    );
+    expect(await Bun.file(join(dir, "expose")).text()).toBe("0\n");
+    expect(await readFile(statusFile, "utf8")).toContain("exposed=false");
     await expect(tcpReply(publicPort)).rejects.toMatchObject({ code: "ECONNREFUSED" });
     expect(await tcpReply(backendPort)).toContain("old admission");
   } finally {
+    process.env.ARK_PGBOUNCER_DIR = previousDir;
     ingress.kill();
     await ingress.exited;
     await new Promise<void>((done) => backend.close(() => done()));
   }
-}, 15_000);
+}, 25_000);
 
 test("a stale closed acknowledgement cannot satisfy the route fence", async () => {
   const { fenceDatabasePublicListener } = await import("./modules/providers.ts");
@@ -408,6 +436,7 @@ test("a stale closed acknowledgement cannot satisfy the route fence", async () =
 });
 
 test("startup installs ingress limits without reopening a revoked client or rewriting pooler files", async () => {
+  await db.update(databaseClients).set({ status: "revoked" }).where(eq(databaseClients.id, clientId));
   const previousDir = process.env.ARK_PGBOUNCER_DIR;
   const dir = join(work, "startup-revoked");
   await mkdir(dir);

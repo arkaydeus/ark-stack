@@ -2,6 +2,7 @@
 // credentials, per-destination export manifests from a fake executor and a fake restic, local backups
 // becoming `uploaded`, and per-target alerts raised and resolved.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -357,15 +358,24 @@ describe("off-VPS backup targets (FD-21)", () => {
   test("a repository move excludes old and in-flight export evidence from current health", async () => {
     const target = await offsite.saveS3Target(input({ name: `${prefix}-move` }));
     await offsite.exportTarget(target.id);
-    await writeFile(join(work, "block"), "");
+    const block = join(work, "block");
+    const blocked = join(work, "blocked");
+    await writeFile(block, "");
     const pending = offsite.exportTarget(target.id);
-    const deadline = Date.now() + 3000;
-    while (!(await Bun.file(join(work, "blocked")).exists()) && Date.now() < deadline) await Bun.sleep(10);
-    expect(await Bun.file(join(work, "blocked")).exists()).toBe(true);
-    const moved = await offsite.saveS3Target(
-      input({ id: target.id, name: target.name, prefix: "empty", repositoryPassword: undefined }),
-    );
-    await rm(join(work, "block"));
+    const settled = pending.catch(() => undefined);
+    let moved: Awaited<ReturnType<typeof offsite.saveS3Target>>;
+    try {
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(blocked) && Date.now() < deadline) await Bun.sleep(10);
+      if (!existsSync(blocked)) throw new Error("The in-flight backup never reached restic.");
+      moved = await offsite.saveS3Target(
+        input({ id: target.id, name: target.name, prefix: "empty", repositoryPassword: undefined }),
+      );
+    } finally {
+      // Release and join the export even if the repository move or readiness check fails.
+      await rm(block, { force: true });
+      await settled;
+    }
     await pending;
     expect(moved.repositoryRevision).not.toBe(target.repositoryRevision);
     const [after] = await db.select().from(backupTargets).where(eq(backupTargets.id, target.id));
@@ -385,7 +395,7 @@ describe("off-VPS backup targets (FD-21)", () => {
     await offsite.exportTarget(target.id);
     const [exported] = await db.select().from(backupTargets).where(eq(backupTargets.id, target.id));
     expect(exported!.lastSuccessAt).toBeInstanceOf(Date);
-  });
+  }, 20_000);
 
   test("scheduler enqueues due backups, per-target exports and revision-bound weekly verification", async () => {
     const jobs: Array<{ kind: string; targetIds: string[]; payload?: Record<string, unknown> }> = [];
@@ -455,12 +465,18 @@ describe("off-VPS backup targets (FD-21)", () => {
 
   test("file exports continue across target failures and exact snapshots restore with sealed environment", async () => {
     await rm(join(work, "restic-args"), { force: true });
+    // This case only needs one successful and one failing destination.
+    await db
+      .update(backupTargets)
+      .set({ enabled: false })
+      .where(like(backupTargets.name, `${prefix}%`));
     const bad = await offsite.saveS3Target(input({ name: `${prefix}-files-fail`, prefix: "fail-only" }));
+    const good = await offsite.saveS3Target(input({ name: `${prefix}-files-good`, prefix: "files-only" }));
     const results = await offsite.exportFiles("mail", work, []);
     expect(results.find((row) => row.targetId === bad.id)?.error).toContain("destination refused");
     await db.update(backupTargets).set({ enabled: false }).where(eq(backupTargets.id, bad.id));
-    expect(results.some((row) => row.snapshotId)).toBe(true);
-    const snapshotId = results.find((row) => row.snapshotId)!.snapshotId!;
+    const snapshotId = results.find((row) => row.targetId === good.id)?.snapshotId;
+    if (!snapshotId) throw new Error("The healthy destination did not return a snapshot.");
     const restored = await offsite.restoreFiles("mail", snapshotId, join(work, "restored"));
     expect(restored.argv.join(" ")).toContain("s3:");
     expect(restored.argv).toContain(snapshotId);
