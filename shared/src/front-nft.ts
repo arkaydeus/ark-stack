@@ -47,22 +47,38 @@ function frontPortMarker(port: number, policy: "closed" | "deny-all" | "allowlis
   return `# ark-front: port=${port} policy=${policy}`;
 }
 
-function meterSets(key: string) {
+function meterKeys(key: string, limits: DbIngressLimits, defaults: DbIngressLimits) {
+  const { maxConnectionsPerSource: conn, newConnectionsPerSecond: rate, newConnectionBurst: burst } = limits;
+  return {
+    conn: conn === defaults.maxConnectionsPerSource ? key : `${key}_${conn}`,
+    rate:
+      rate === defaults.newConnectionsPerSecond && burst === defaults.newConnectionBurst
+        ? key
+        : `${key}_${rate}_${burst}`,
+  };
+}
+
+function meterSets(keys: { conn: string; rate: string }) {
   return [
-    `  set conn4_${key} { type ipv4_addr; size 65535; flags dynamic; }`,
-    `  set conn6_${key} { type ipv6_addr; size 65535; flags dynamic; }`,
-    `  set rate4_${key} { type ipv4_addr; size 65535; flags dynamic; timeout 2m; }`,
-    `  set rate6_${key} { type ipv6_addr; size 65535; flags dynamic; timeout 2m; }`,
+    `  set conn4_${keys.conn} { type ipv4_addr; size 65535; flags dynamic; }`,
+    `  set conn6_${keys.conn} { type ipv6_addr; size 65535; flags dynamic; }`,
+    `  set rate4_${keys.rate} { type ipv4_addr; size 65535; flags dynamic; timeout 2m; }`,
+    `  set rate6_${keys.rate} { type ipv6_addr; size 65535; flags dynamic; timeout 2m; }`,
   ];
 }
 
-function meterRules(key: string, conn: number, rate: string, burst: number) {
-  const drop = key === "shared" ? "drop" : "drop_dedicated";
+function meterRules(
+  keys: { conn: string; rate: string },
+  conn: number,
+  rate: string,
+  burst: number,
+  drop: string,
+) {
   return [
-    `    ct state new add @conn4_${key} { ip saddr ct count over ${conn} } counter name "${drop}_conn4" drop`,
-    `    ct state new add @conn6_${key} { ip6 saddr and ${V6_PREFIX_MASK} ct count over ${conn} } counter name "${drop}_conn6" drop`,
-    `    ct state new update @rate4_${key} { ip saddr limit rate over ${rate} burst ${burst} packets } counter name "${drop}_rate4" drop`,
-    `    ct state new update @rate6_${key} { ip6 saddr and ${V6_PREFIX_MASK} limit rate over ${rate} burst ${burst} packets } counter name "${drop}_rate6" drop`,
+    `    ct state new add @conn4_${keys.conn} { ip saddr ct count over ${conn} } counter name "${drop}_conn4" drop`,
+    `    ct state new add @conn6_${keys.conn} { ip6 saddr and ${V6_PREFIX_MASK} ct count over ${conn} } counter name "${drop}_conn6" drop`,
+    `    ct state new update @rate4_${keys.rate} { ip saddr limit rate over ${rate} burst ${burst} packets } counter name "${drop}_rate4" drop`,
+    `    ct state new update @rate6_${keys.rate} { ip6 saddr and ${V6_PREFIX_MASK} limit rate over ${rate} burst ${burst} packets } counter name "${drop}_rate6" drop`,
   ];
 }
 
@@ -89,8 +105,12 @@ export function renderFrontIngress(
     byPort.set(route.listenPort, route);
   }
   const markers: string[] = [];
-  const sets = meterSets("shared");
+  // Dynamic elements remember their original limits. Keep their names when the settings
+  // are unchanged and use fresh sets for new thresholds.
+  const sharedKeys = meterKeys("shared", limits, FRONT_SHARED_LIMIT_DEFAULTS);
+  const sets = meterSets(sharedKeys);
   const rules: string[] = [];
+  const defaultPortLimits = l4Limits("tcp");
   for (let port = TCP_ROUTE_PORTS.start; port <= TCP_ROUTE_PORTS.end; port++) {
     const route = byPort.get(port);
     if (!route) {
@@ -104,7 +124,20 @@ export function renderFrontIngress(
     const v4 = cidrs.filter((cidr) => parseCidr(cidr).version === 4);
     const v6 = cidrs.filter((cidr) => parseCidr(cidr).version === 6);
     const chain = `port_${port}`;
-    sets.push(...meterSets(String(port)));
+    const keys = meterKeys(
+      String(port),
+      {
+        maxConnectionsPerSource: portLimits.perSourceConn,
+        newConnectionsPerSecond: portLimits.perSourceRate,
+        newConnectionBurst: portLimits.perSourceRate,
+      },
+      {
+        maxConnectionsPerSource: defaultPortLimits.perSourceConn,
+        newConnectionsPerSecond: defaultPortLimits.perSourceRate,
+        newConnectionBurst: defaultPortLimits.perSourceRate,
+      },
+    );
+    sets.push(...meterSets(keys));
     // HAProxy counts the rate per 10 s; the kernel bucket allows the same per minute (x6).
     const perMinute = portLimits.perSourceRate * 6;
     rules.push(
@@ -121,7 +154,13 @@ export function renderFrontIngress(
       ...(open ? [`    goto ${chain}_limits`] : []),
       "  }",
       `  chain ${chain}_limits {`,
-      ...meterRules(String(port), portLimits.perSourceConn, `${perMinute}/minute`, portLimits.perSourceRate),
+      ...meterRules(
+        keys,
+        portLimits.perSourceConn,
+        `${perMinute}/minute`,
+        portLimits.perSourceRate,
+        "drop_dedicated",
+      ),
       // Admitted: end this table's evaluation before the dedicated-range fallback drop.
       "    accept",
       "  }",
@@ -144,7 +183,8 @@ ${markers.join("\n")}
 table inet ark_front_raw
 delete table inet ark_front_raw
 table inet ${FRONT_TABLE}
-delete table inet ${FRONT_TABLE}
+# Replace dispatch and policy rules while retaining unchanged meters and named counters.
+flush table inet ${FRONT_TABLE}
 table inet ${FRONT_TABLE} {
 ${Object.keys(FRONT_COUNTERS)
   .map((name) => `  counter ${name} {}`)
@@ -159,7 +199,7 @@ ${dispatch("")}
 ${dispatch("ct direction original ct status dnat ")}
   }
   chain ${FRONT_SHARED_CHAIN} {
-${meterRules("shared", conn, `${rate}/second`, burst).join("\n")}
+${meterRules(sharedKeys, conn, `${rate}/second`, burst, "drop").join("\n")}
   }
   chain ${FRONT_DEDICATED_CHAIN} {
 ${vmap}    counter name "drop_closed" drop

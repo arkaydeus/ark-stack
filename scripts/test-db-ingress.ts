@@ -80,6 +80,24 @@ function check(condition: boolean, claim: string, observed: string) {
   console.log(`  ${condition ? "ok  " : "FAIL"}  ${claim} [${observed}]`);
 }
 
+const dedicated = (firstCap: number, secondCap: number, firstRate: number, secondRate: number) =>
+  renderFrontIngress([
+    {
+      id: "rt_t001",
+      listenPort: 20001,
+      sourceCidrs: [],
+      allowInternet: true,
+      limits: { perSourceConn: firstCap, perSourceRate: firstRate },
+    },
+    {
+      id: "rt_t003",
+      listenPort: 20003,
+      sourceCidrs: [],
+      allowInternet: true,
+      limits: { perSourceConn: secondCap, perSourceRate: secondRate },
+    },
+  ]);
+
 function section(title: string) {
   console.log(`\n== ${title}`);
 }
@@ -119,10 +137,14 @@ table inet ark_db_ingress {
     "rate.nft": renderDbIngress(limits(1000, TEST_RATE, TEST_BURST)),
     "front-example.nft": `${example}\n`,
     "front-defaults.nft": front,
-    "front-limits.nft": renderFrontIngress([], [8883], limits(2, TEST_RATE, TEST_BURST)),
+    "front-limits.nft": renderFrontIngress([], [8883], limits(2, 1000, 1000)),
     "front-rate.nft": renderFrontIngress([], [8883], limits(1000, TEST_RATE, TEST_BURST)),
-
+    "front-dedicated-conn.nft": dedicated(2, 4, 20, 30),
+    "front-dedicated-rate.nft": dedicated(20, 30, 2, 4),
+    "db-authority-first.nft": renderDbIngress(limits(3, 500, 500)),
+    "db-authority-next.nft": renderDbIngress(limits(4, 600, 600)),
     "combined.nft": renderDbIngress() + "\n" + front,
+    "combined-low.nft": renderDbIngress() + "\n" + renderFrontIngress([], [8883], limits(2, 1000, 1000)),
   };
   for (const [name, content] of Object.entries(files)) await writeFile(join(rules, name), content);
   console.log(

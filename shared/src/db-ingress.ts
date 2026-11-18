@@ -110,6 +110,37 @@ export function dbIngressLimitsSummary(settings: Parameters<typeof platformDbIng
 /** IPv6 sources are grouped by /64 for both limits (§3.11). */
 const V6_PREFIX_MASK = "ffff:ffff:ffff:ffff::";
 
+function connectionSets(rules: string) {
+  return new Set([...rules.matchAll(/^[\t ]+set (conn[46](?:_[0-9]+)?) \{/gm)].map((match) => match[1]!));
+}
+
+function declareConnectionSet(name: string) {
+  const type = name.startsWith("conn4") ? "ipv4_addr" : "ipv6_addr";
+  return [name, name.replace("conn", "active")].map(
+    (set) => `  set ${set} { type ${type}; size 65535; flags dynamic; }`,
+  );
+}
+
+function drainConnectionSet(name: string) {
+  const active = name.replace("conn", "active");
+  return name.startsWith("conn4")
+    ? `    ct state new ip saddr @${active} counter name "drop_conn4" drop`
+    : `    ct state new ip6 saddr and ${V6_PREFIX_MASK} @${active} counter name "drop_conn6" drop`;
+}
+
+/** Retain generations installed by the other publisher, even across a reconciler restart. */
+export function preserveDbIngressGenerations(rules: string, installed: string) {
+  const desired = connectionSets(rules);
+  const live = [...connectionSets(installed)].filter((name) => !desired.has(name));
+  if (!desired.size || !live.length) return rules;
+  return rules
+    .replace(/^  set conn[46].*$/m, (line) => [...live.flatMap(declareConnectionSet), line].join("\n"))
+    .replace(
+      `  chain ${DB_INGRESS_LIMITS_CHAIN} {\n`,
+      (line) => line + live.map(drainConnectionSet).join("\n") + "\n",
+    );
+}
+
 export function renderDbIngress(limits: DbIngressLimits = DB_INGRESS_LIMIT_DEFAULTS, previousRules = "") {
   const parsed = dbIngressLimitsInput.safeParse(limits);
   if (!parsed.success) {
@@ -127,28 +158,15 @@ export function renderDbIngress(limits: DbIngressLimits = DB_INGRESS_LIMIT_DEFAU
   // generation per configured value. Retain older conncount sets and deny their sources
   // until they drain (the kernel garbage-collects empty conncount elements). This keeps
   // idle established connections accounted for without terminating them on a cap change.
-  const connectionSets = new Set(
-    [...previousRules.matchAll(/^  set (conn[46](?:_[0-9]+)?) \{/gm)].map((match) => match[1]!),
-  );
+  const generations = connectionSets(previousRules);
   const conn4 = `conn4_${conn}`;
   const conn6 = `conn6_${conn}`;
-  connectionSets.add(conn4);
-  connectionSets.add(conn6);
-  const setDeclarations = [...connectionSets]
-    .flatMap((name) => {
-      const type = name.startsWith("conn4") ? "ipv4_addr" : "ipv6_addr";
-      return [name, name.replace("conn", "active")].map(
-        (set) => `  set ${set} { type ${type}; size 65535; flags dynamic; }`,
-      );
-    })
-    .join("\n");
-  const drainingRules = [...connectionSets]
+  generations.add(conn4);
+  generations.add(conn6);
+  const setDeclarations = [...generations].flatMap(declareConnectionSet).join("\n");
+  const drainingRules = [...generations]
     .filter((name) => name !== conn4 && name !== conn6)
-    .map((name) =>
-      name.startsWith("conn4")
-        ? `    ct state new ip saddr @${name.replace("conn", "active")} counter name "drop_conn4" drop`
-        : `    ct state new ip6 saddr and ${V6_PREFIX_MASK} @${name.replace("conn", "active")} counter name "drop_conn6" drop`,
-    )
+    .map(drainConnectionSet)
     .join("\n");
   const rate4 = `rate4_${rate}_${burst}`;
   const rate6 = `rate6_${rate}_${burst}`;

@@ -14,7 +14,8 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync } from "node:fs";
-import { mkdir, rename } from "node:fs/promises";
+import { mkdir, rename, rm } from "node:fs/promises";
+import { once } from "node:events";
 import { connect, createServer, type Socket } from "node:net";
 import { createInterface } from "node:readline";
 
@@ -499,57 +500,162 @@ async function sharedLimitsCase(client: Client, hook: "input" | "forward") {
   );
 }
 
+async function dedicatedLimitsCase(client: Client) {
+  apply("front-dedicated-conn.nft");
+  const previous = counters("ark_front").values;
+  for (const [port, cap] of [
+    [20001, 2],
+    [20003, 4],
+  ] as const) {
+    const admitted = await client.open(A4, V4_DST, cap, { port });
+    const over = await client.open(A4, V4_DST, 1, { port, timeoutMs: 700 });
+    check(
+      admitted.ok === cap && !over.ok,
+      `tcp/${port} enforces its own cap of ${cap}`,
+      JSON.stringify({ admitted, over }),
+    );
+  }
+  await client.closeAll();
+  apply("front-dedicated-rate.nft");
+  for (const [port, burst] of [
+    [20001, 2],
+    [20003, 4],
+  ] as const) {
+    const result = await client.open(A6, V6_DST, 12, { port, hold: false, timeoutMs: 700 });
+    check(result.ok === burst, `tcp/${port} enforces its own burst of ${burst}`, JSON.stringify(result));
+  }
+  const values = counters("ark_front").values;
+  check(
+    values.drop_dedicated_conn4 >= previous.drop_dedicated_conn4 + 2 &&
+      values.drop_dedicated_rate6 > previous.drop_dedicated_rate6,
+    "dedicated connection and rate drops increment their named counters",
+    JSON.stringify(values),
+  );
+}
+
+async function until<T>(read: () => Promise<T>, accept: (value: T) => boolean, description: string) {
+  for (let i = 0; i < 60; i++) {
+    const value = await read();
+    if (accept(value)) return value;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Timed out waiting for ${description}.`);
+}
+
+const hashOf = (rules: string) => createHash("sha256").update(rules).digest("hex");
+const read = (file: string) =>
+  Bun.file(file)
+    .text()
+    .catch(() => "");
+async function write(file: string, content: string) {
+  await Bun.write(`${file}.tmp`, content);
+  await rename(`${file}.tmp`, file);
+}
+
+type Sample = { observedAt?: string; counters?: { name: string; packets: number }[] };
+type Snapshot = Sample & { front?: Sample };
+
+const packets = (value: Snapshot) =>
+  value.front?.counters?.find((item) => item.name === "drop_closed")?.packets ?? 0;
+
 async function reconcilerCase(client: Client) {
   const dir = "/tmp/front-reconciler";
-  await mkdir(`${dir}/front`, { recursive: true });
-  const child = spawn("bun", ["/bundle/database-ingress.js"], {
-    stdio: "inherit",
-    env: {
-      ...process.env,
-      ARK_FRONT_INGRESS_DIR: `${dir}/front`,
-      ARK_EDGE_SNI_PORTS: "8883",
-      ARK_PGBOUNCER_DIR: `${dir}/pgbouncer`,
-      ARK_DB_INGRESS_METRICS_DIR: `${dir}/metrics`,
-    },
-  });
-  children.push(child);
-  async function request(rules: string) {
+  const front = `${dir}/front`;
+  const db = `${dir}/pgbouncer`;
+  const dbFile = `${db}/allowlist.nft`;
+  await mkdir(front, { recursive: true });
+  await mkdir(db, { recursive: true });
+  const start = () => {
+    const child = spawn("bun", ["/bundle/database-ingress.js"], {
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        ARK_FRONT_INGRESS_DIR: front,
+        ARK_EDGE_SNI_PORTS: "8883",
+        ARK_PGBOUNCER_DIR: db,
+        ARK_DB_INGRESS_METRICS_DIR: `${dir}/metrics`,
+        ARK_DB_INGRESS_COUNTER_INTERVAL_MS: "250",
+      },
+    });
+    children.push(child);
+    return child;
+  };
+  const fixture = (name: string) => Bun.file(`${rulesDir}/${name}.nft`).text();
+  async function publishFront(rules: string) {
     const id = crypto.randomUUID();
-    const hash = createHash("sha256").update(rules).digest("hex");
-    await Bun.write(`${dir}/front/policy.nft.tmp`, rules);
-    await rename(`${dir}/front/policy.nft.tmp`, `${dir}/front/policy.nft`);
-    await Bun.write(`${dir}/front/policy.request.tmp`, JSON.stringify({ id, hash }));
-    await rename(`${dir}/front/policy.request.tmp`, `${dir}/front/policy.request`);
-    for (let i = 0; i < 60; i++) {
-      const status = await Bun.file(`${dir}/front/policy.status`)
-        .text()
-        .catch(() => "");
-      if (
-        status.includes(`request_id=${id}
-`) &&
-        status.includes(`policy_hash=${hash}
-`)
-      ) {
-        return status.replaceAll("\n", " ").trim();
-      }
-      await Bun.sleep(100);
-    }
-    throw new Error("Reconciler did not acknowledge the requested nft policy.");
+    const hash = hashOf(rules);
+    await write(`${front}/policy.nft`, rules);
+    await write(`${front}/policy.request`, JSON.stringify({ id, hash }));
+    return { id, hash };
   }
+  async function waitForFront({ id, hash }: { id: string; hash: string }, error = "") {
+    const status = await until(
+      () => read(`${front}/policy.status`),
+      (value) =>
+        value.includes(`request_id=${id}\n`) &&
+        value.includes(`policy_hash=${hash}\n`) &&
+        (!error || value.includes(error)),
+      "the front policy acknowledgement",
+    );
+    return status.replaceAll("\n", " ").trim();
+  }
+  const request = async (rules: string) => waitForFront(await publishFront(rules));
+  const waitForDb = (applied: boolean, hash?: string) =>
+    until(
+      () => read(`${db}/allowlist.status`),
+      (value) =>
+        value.startsWith(`applied=${applied}\n`) &&
+        (hash === undefined || value.includes(`policy_hash=${hash}\n`)),
+      `database readiness ${applied}`,
+    );
+  const tables = () => sh("nft", "list", "tables", "inet");
 
-  // Simulate a kernel with an FD-26 table still active. Its drop must disappear with the upgrade.
-  await Bun.write(
-    "/tmp/legacy-front.nft",
-    `table inet ark_front_raw {
+  // Seed the old kernel table, matching FD-26 combined request and persisted success before startup.
+  sh("nft", "delete", "table", "inet", "ark_front");
+  const legacyRaw = `#!/usr/sbin/nft -f
+# ark-front-raw: port=20001 policy=closed
+# ark-front-raw: port=20003 policy=internet
+table inet ark_front_raw {
+  chain input {
+    type filter hook input priority -1; policy accept;
+    tcp dport 20001 drop
+  }
   chain forward {
     type filter hook forward priority -1; policy accept;
     ct status dnat tcp dport 20001 drop
   }
 }
-`,
-  );
+`;
+  const legacy = (await fixture("defaults")) + "\n" + legacyRaw;
+  await Bun.write("/tmp/legacy-front.nft", legacy);
   sh("nft", "-f", "/tmp/legacy-front.nft");
-  const good = await Bun.file(`${rulesDir}/combined.nft`).text();
+  const persisted = await publishFront(legacy);
+  await write(
+    `${front}/policy.status`,
+    `applied=true\npolicy_hash=${persisted.hash}\nrequest_id=${persisted.id}\nerror=\n`,
+  );
+  let child = start();
+  await waitForFront(persisted, "Awaiting a front policy");
+  for (const port of [80, 443, 5432, 20003]) {
+    const input = await client.probe("198.51.100.2", "198.51.100.1", port);
+    const forward = await client.probe("198.51.100.2", V4_DST, port);
+    check(
+      input.banner === "input" && forward.banner === "forward",
+      `tcp/${port} stays reachable during the FD-26 handoff`,
+      `input=${input.banner} forward=${forward.banner}`,
+    );
+  }
+  check(
+    (await client.probe("198.51.100.2", V4_DST, 20001)).banner === null,
+    "legacy policy still drops closed dedicated ports before replacement",
+    "",
+  );
+  check(
+    tables().includes("ark_front_raw") && !tables().includes("ark_front_guard"),
+    "startup leaves the FD-26 table in place without a new guard",
+    tables().trim(),
+  );
+  const good = await fixture("combined");
   let status = await request(good);
   check(
     status.startsWith("applied=true "),
@@ -606,6 +712,153 @@ async function reconcilerCase(client: Client) {
     "successful readback releases the drop guard",
     JSON.stringify(recovered),
   );
+
+  status = await request(good + "flush chain inet ark_front input\n");
+  check(
+    status.startsWith("applied=false ") && status.includes("readback"),
+    "a successful transaction with missing effective rules fails readback",
+    status,
+  );
+  await waitForDb(false);
+  check(
+    (await client.probe("198.51.100.2", V4_DST, 80)).banner === null && tables().includes("ark_front_guard"),
+    "readback failure guards active front listeners",
+    tables().trim(),
+  );
+  check((await request(good)).startsWith("applied=true "), "valid policy recovers from failed readback", "");
+  sh("nft", "flush", "chain", "inet", "ark_front", "dedicated_ports");
+  check(
+    (await request(good)).startsWith("applied=true ") &&
+      (await client.probe(A4, V4_DST, 20049)).banner === null,
+    "a fresh ID with identical bytes restores drifted live rules",
+    tables().trim(),
+  );
+
+  const lowFront = await fixture("combined-low");
+  check((await request(lowFront)).startsWith("applied=true "), "installs low shared cap", "");
+  const source = "198.51.100.2";
+  const saturated = await client.open(source, V4_DST, 2, { port: 80 });
+  const sharedDrops = counters("ark_front").values.drop_conn4;
+  check(
+    saturated.ok === 2 && (await client.probe(source, V4_DST, 443)).banner === null,
+    "shared budget is saturated before a database-only update",
+    JSON.stringify(saturated),
+  );
+
+  const firstDb = await fixture("db-authority-first");
+  const nextDb = await fixture("db-authority-next");
+  await write(dbFile, firstDb);
+  await waitForDb(true, hashOf(firstDb));
+  const intermediate = await client.open("10.10.0.4", V4_DST, 1);
+  check(
+    intermediate.ok === 1,
+    "holds a 5432 connection in the intermediate cap generation",
+    JSON.stringify(intermediate),
+  );
+  await write(dbFile, nextDb);
+  await waitForDb(true, hashOf(nextDb));
+
+  const exited = once(child, "exit");
+  child.kill();
+  await exited;
+  await rm(`${front}/policy.status`);
+  const stale = JSON.parse(await read(`${front}/policy.request`)) as { id: string; hash: string };
+  child = start();
+  status = await waitForFront(stale);
+  const liveDb = sh("nft", "-s", "-t", "list", "table", "inet", "ark_db_ingress");
+  check(
+    status.startsWith("applied=true ") &&
+      liveDb.includes("ct count over 4") &&
+      liveDb.includes("limit rate over 600/second"),
+    "restart retains the acknowledged database cap and rate",
+    status,
+  );
+  await waitForDb(true, hashOf(nextDb));
+  check(
+    (await client.probe("10.10.0.4", V4_DST)).banner === null && liveDb.includes("@active4_3 counter"),
+    "older live 5432 generation continues to drain after replay",
+    "",
+  );
+  check(
+    (await client.probe(source, V4_DST, 443)).banner === null &&
+      counters("ark_front").values.drop_conn4 >= sharedDrops + 2,
+    "shared sessions and counters survive the 5432 update and front reapply",
+    "",
+  );
+
+  await write(dbFile, nextDb + "add chain inet ark_db_ingress invalid chain syntax\n");
+  await waitForDb(false);
+  check(
+    (await request(good)).startsWith("applied=false ") &&
+      (await client.probe(B4, V4_DST, 80)).banner === "forward" &&
+      (await client.probe(B4, V4_DST)).banner === null,
+    "front cannot clear an authoritative database failure, which guards only 5432",
+    tables().trim(),
+  );
+  await rm(dbFile);
+  check(
+    (await waitForFront(await publishFront(good), "applied=true\n")).startsWith("applied=true "),
+    "front fallback recovers after database file removal",
+    "",
+  );
+  await waitForDb(true);
+  check(
+    !tables().includes("ark_db_ingress_guard") &&
+      (await client.probe(B4, V4_DST)).banner === "forward" &&
+      (await client.probe("10.10.0.4", V4_DST)).banner === null,
+    "fallback clears the database guard and preserves the live drain generation",
+    tables().trim(),
+  );
+
+  await write(dbFile, nextDb);
+  await waitForDb(true, hashOf(nextDb));
+  await rm(dbFile);
+  await mkdir(dbFile);
+  const readError = await waitForDb(false);
+  check(
+    readError.includes("EISDIR") && (await client.probe(B4, V4_DST)).banner === null,
+    "non-ENOENT database read error fails status and closes 5432",
+    readError.trim(),
+  );
+  await rm(dbFile, { recursive: true });
+  await write(dbFile, nextDb);
+  await waitForDb(true, hashOf(nextDb));
+  check((await client.probe(B4, V4_DST)).banner === "forward", "database file recovery reopens 5432", "");
+  await client.closeAll();
+
+  const sample = () =>
+    Bun.file(`${dir}/metrics/counters.json`)
+      .json()
+      .then((data) => data as Snapshot)
+      .catch((): Snapshot => ({}));
+  const beforeFailure = await until(
+    sample,
+    (value) => Boolean(value.observedAt && value.front?.observedAt),
+    "both counter timestamps",
+  );
+  sh("nft", "delete", "table", "inet", "ark_db_ingress");
+  const baseline = await until(
+    sample,
+    (value) => value.front?.observedAt !== beforeFailure.front?.observedAt,
+    "front counters after database table removal",
+  );
+  await client.probe(A4, V4_DST, 20049);
+  const updated = await until(
+    sample,
+    (value) => value.front?.observedAt !== baseline.front?.observedAt && packets(value) > packets(baseline),
+    "a fresh front counter sample while the database scrape fails",
+  );
+  check(
+    updated.observedAt === baseline.observedAt,
+    "a failed database scrape retains only its own timestamp",
+    JSON.stringify({ db: updated.observedAt, front: updated.front?.observedAt }),
+  );
+  check(
+    (await request(good)).startsWith("applied=true "),
+    "verified front apply restores the database table",
+    "",
+  );
+  child.kill();
 }
 async function main() {
   console.log("nft -c (check only) on every rendered ruleset");
@@ -664,6 +917,7 @@ async function main() {
   apply("front-defaults.nft");
   await frontProbes(client, "forward", true);
   await sharedLimitsCase(client, "forward");
+  await dedicatedLimitsCase(client);
   await reconcilerCase(client);
 
   for (const child of children) child.kill();

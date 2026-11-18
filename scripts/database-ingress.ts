@@ -5,14 +5,18 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+  DB_INGRESS_LIMITS_CHAIN,
   DB_INGRESS_TABLE,
+  FRONT_DEDICATED_CHAIN,
   FRONT_RAW_RANGE,
+  FRONT_SHARED_CHAIN,
   FRONT_TABLE,
   POSTGRES_ROUTER_PORT,
   SHARED_SNI_PORTS,
   frontSharedPorts,
   parseNftCounters,
   parseSniPorts,
+  preserveDbIngressGenerations,
   sha256Hex,
   type IngressCounterSnapshot,
 } from "@ark-stack/shared";
@@ -68,35 +72,87 @@ async function publish(file: string, content: string) {
   await rename(temporary, file);
 }
 
-async function readPolicyTable(table: string) {
-  const listed = await nft(["list", "table", "inet", table]);
+function declaresTable(rules: string, table: string) {
+  return `\n${rules}`.includes(`\ntable inet ${table} {`);
+}
+
+const legacyDbReset = /^delete table inet ark_db_ingress$/m;
+const legacyDbFlush = `flush table inet ${DB_INGRESS_TABLE}`;
+
+function chainRules(rules: string) {
+  return new Map(
+    [...rules.matchAll(/^[\t ]+chain (\w+) \{\n([\s\S]*?)^[\t ]+}\s*$/gm)].map(([, name, body]) => [
+      name!,
+      body!
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#")),
+    ]),
+  );
+}
+
+function listPolicyTable(table: string) {
+  return nft(["-s", "-t", "-y", "list", "table", "inet", table]);
+}
+
+async function installedPolicyTable(table: string) {
+  const tables = await nft(["list", "tables", "inet"]);
+  return tables.split("\n").includes(`table inet ${table}`) ? listPolicyTable(table) : "";
+}
+
+// nft canonicalizes addresses, operators and port lists. Check the installed chain
+// structure, dispatch and verdicts in order, without comparing a textual ruleset dump.
+function ruleActions(rule: string) {
+  return rule
+    .replaceAll('"', "")
+    .match(
+      /(?:(?:\d+\s*:\s*)?\b(?:jump|goto) \w+|@\w+|\b(?:counter name \w+|drop|accept|return)\b|ct count over \d+|limit rate over \d+\/\w+)/g,
+    )
+    ?.join(" ");
+}
+
+async function verifyPolicyTable(table: string, rules: string, priority: number) {
+  const installed = chainRules(await listPolicyTable(table));
+  const desired = chainRules(rules);
   for (const hook of ["input", "forward"]) {
-    if (!listed.includes(`hook ${hook} `))
+    if (installed.get(hook)?.[0] !== `type filter hook ${hook} priority ${priority}; policy accept;`) {
       throw new Error(`nft readback did not show the ${hook} hook in ${table}`);
+    }
+  }
+  const required = ["input", "forward"];
+  // Pre-FD-18 files have no meter chain. Startup applies their existing policy until
+  // the database worker publishes the configured limits.
+  if (table === DB_INGRESS_TABLE && !rules.split("\n").includes(legacyDbFlush)) {
+    required.push(DB_INGRESS_LIMITS_CHAIN);
+  }
+  if (table === FRONT_TABLE) required.push(FRONT_SHARED_CHAIN, FRONT_DEDICATED_CHAIN);
+  for (const chain of new Set([...required, ...desired.keys()])) {
+    const expected = desired.get(chain);
+    const actual = installed.get(chain);
+    const minimum = chain === "input" || chain === "forward" ? 2 : 1;
+    if (
+      !expected ||
+      !actual ||
+      expected.length < minimum ||
+      expected.length !== actual.length ||
+      expected.some((rule, index) => ruleActions(rule) !== ruleActions(actual[index]!))
+    ) {
+      throw new Error(`nft readback did not show the requested ${table}/${chain} policy`);
+    }
   }
 }
 
-// A failed nft transaction normally leaves the previous table in the kernel. Install a drop
-// guard independently of the failed bytes, and keep it through retries until readback succeeds.
-async function applyPolicy(rules: string | null, tables: string[], guard: { table: string; ports: string }) {
-  const clearGuard = `table inet ${guard.table}\ndelete table inet ${guard.table}\n`;
+type Guard = typeof dbGuard;
+
+function clearGuard(guard: Guard) {
+  return `table inet ${guard.table}\ndelete table inet ${guard.table}\n`;
+}
+
+// A rejected nft transaction normally leaves the previous policy in the kernel.
+// Keep an independent drop guard until a replacement has passed readback.
+async function guardFailure(guard: Guard, error: unknown) {
   try {
-    if (rules !== null) {
-      for (const table of tables) {
-        if (!`\n${rules}`.includes(`\ntable inet ${table} {`)) {
-          throw new Error(`Policy does not declare ${table}`);
-        }
-      }
-      await nft(["-f", "-"], rules);
-    }
-    for (const table of tables) await readPolicyTable(table);
-    await nft(["-f", "-"], clearGuard);
-    return "";
-  } catch (error) {
-    try {
-      await nft(
-        ["-f", "-"],
-        `${clearGuard}table inet ${guard.table} {
+    const rules = `table inet ${guard.table} {
   chain input {
     type filter hook input priority -2; policy accept;
     tcp dport ${guard.ports} drop
@@ -106,14 +162,44 @@ async function applyPolicy(rules: string | null, tables: string[], guard: { tabl
     ct direction original ct status dnat tcp dport ${guard.ports} drop
   }
 }
-`,
-      );
-      await readPolicyTable(guard.table);
-      return String(error);
-    } catch (guardError) {
-      return `${String(error)}. Failed to install the drop guard: ${String(guardError)}`;
-    }
+`;
+    await nft(["-f", "-"], clearGuard(guard) + rules);
+    await verifyPolicyTable(guard.table, rules, -2);
+    return String(error);
+  } catch (guardError) {
+    return `${String(error)}. Failed to install the drop guard: ${String(guardError)}`;
   }
+}
+
+async function applyPolicies(policies: [string, string][], guards: Guard[]) {
+  for (const [table, rules] of policies) {
+    if (!declaresTable(rules, table)) throw new Error(`Policy does not declare ${table}`);
+  }
+  await nft(["-f", "-"], policies.map(([, rules]) => rules).join("\n"));
+  for (const [table, rules] of policies) await verifyPolicyTable(table, rules, -1);
+  await nft(["-f", "-"], guards.map(clearGuard).join(""));
+}
+
+async function databasePolicy(rules: string) {
+  return preserveDbIngressGenerations(
+    rules.replace(legacyDbReset, legacyDbFlush),
+    await installedPolicyTable(DB_INGRESS_TABLE),
+  );
+}
+
+async function frontPolicy(rules: string) {
+  // Existing FD-15 requests used a table reset. Upgrade the transaction in place as well.
+  const policy = rules.replace(/^delete table inet ark_front$/m, `flush table inet ${FRONT_TABLE}`);
+  // After the rule flush, obsolete dedicated chains and meter sets are unreferenced.
+  const installed = await installedPolicyTable(FRONT_TABLE);
+  const obsolete = [
+    ...installed.matchAll(
+      /^[\t ]+(chain|set) (port_\d+(?:_limits)?|(?:conn|rate)[46]_(?:shared|\d+)(?:_\d+)*) \{/gm,
+    ),
+  ]
+    .filter(([, kind, name]) => !policy.includes(`  ${kind} ${name} {`))
+    .map(([, kind, name]) => `delete ${kind} inet ${FRONT_TABLE} ${name}\n`);
+  return policy + "\n" + obsolete.join("");
 }
 
 function statusError(error: string) {
@@ -121,27 +207,43 @@ function statusError(error: string) {
 }
 
 let dbApplied: string | null = null;
-let frontApplied: string | null = null;
+let dbHash = "";
+let dbError = "";
 let frontAcknowledged: string | null = null;
+let frontGuardError = "";
 let lastDbStatus: string | null = null;
 
-async function reconcileDatabase() {
-  const rules = await readOptional(nftFile);
-  if (rules === dbApplied && lastDbStatus !== null) return false;
-  const error = rules === null ? "" : await applyPolicy(rules, [DB_INGRESS_TABLE], dbGuard);
-  const status = `applied=${!error}\nenforced=false\npolicy_hash=${rules === null ? "" : sha256Hex(rules)}\nerror=${statusError(error)}\n`;
+async function publishDatabaseStatus() {
+  const error = dbError || frontGuardError;
+  const status = `applied=${!error}\nenforced=false\npolicy_hash=${dbHash}\nerror=${statusError(error)}\n`;
   if (status !== lastDbStatus) {
     await publish(join(dir, "allowlist.status"), status);
     lastDbStatus = status;
   }
-  dbApplied = error ? null : rules;
-  // On a fresh front request, install the combined policy again if the database worker has
-  // changed 5432 in the meantime. An already acknowledged front request must not roll that back.
-  if (rules !== null) frontApplied = null;
-  return rules !== null && !error;
 }
 
-async function reconcileFront() {
+async function reconcileDatabase() {
+  try {
+    const rules = await readOptional(nftFile);
+    if (rules === null) {
+      dbApplied = null;
+      // Keep a prior failure visible until a verified fallback supersedes it.
+      return { rules, error: "", changed: false };
+    }
+    dbHash = sha256Hex(rules);
+    if (rules === dbApplied) return { rules, error: "", changed: false };
+    await applyPolicies([[DB_INGRESS_TABLE, await databasePolicy(rules)]], [dbGuard]);
+    dbApplied = rules;
+    dbError = "";
+    return { rules, error: "", changed: true };
+  } catch (error) {
+    dbApplied = null;
+    dbError = await guardFailure(dbGuard, error);
+    return { rules: null, error: dbError, changed: false };
+  }
+}
+
+async function reconcileFront(database: Awaited<ReturnType<typeof reconcileDatabase>>) {
   if (!frontDir) return false;
   const requestText = await readOptional(join(frontDir, "policy.request"));
   if (!requestText) return false;
@@ -151,38 +253,73 @@ async function reconcileFront() {
     return false;
   if (request.id === frontAcknowledged) return false;
 
-  const error = await applyPolicy(
-    rules === frontApplied ? null : rules,
-    [DB_INGRESS_TABLE, FRONT_TABLE],
-    frontGuard,
-  );
-  frontApplied = error ? null : rules;
-  await publish(
-    join(frontDir, "policy.status"),
-    `applied=${!error}\npolicy_hash=${request.hash}\nrequest_id=${request.id}\nerror=${statusError(error)}\n`,
-  );
-  if (!error) frontAcknowledged = request.id;
+  const statusFile = join(frontDir, "policy.status");
+  const requestStatus = `policy_hash=${request.hash}\nrequest_id=${request.id}\n`;
+  const legacy = !declaresTable(rules, FRONT_TABLE) && declaresTable(rules, "ark_front_raw");
+  let error = database.error;
+  if (legacy) {
+    // The installer preserves these files and starts us before the new domain worker.
+    error = "Awaiting a front policy from the upgraded domain worker.";
+  } else if (!error) {
+    try {
+      const boundary = rules.indexOf("\n#!", 1);
+      if (boundary === -1) throw new Error("Front request is missing its combined policy sections");
+      const desiredDb = database.rules ?? rules.slice(0, boundary);
+      const front = await frontPolicy(rules.slice(boundary + 1));
+      // Reapply every fresh request, including identical bytes, to repair external drift.
+      // A present database file owns 5432 and cannot be overwritten by a front replay.
+      await applyPolicies(
+        [
+          [DB_INGRESS_TABLE, await databasePolicy(desiredDb)],
+          [FRONT_TABLE, front],
+        ],
+        [frontGuard, dbGuard],
+      );
+      frontGuardError = "";
+      dbError = "";
+      dbHash = sha256Hex(desiredDb);
+    } catch (failure) {
+      frontAcknowledged = null;
+      frontGuardError = await guardFailure(frontGuard, failure);
+      error = frontGuardError;
+    }
+  }
+  await publish(statusFile, `applied=${!error}\n${requestStatus}error=${statusError(error)}\n`);
+  if (legacy || !error) frontAcknowledged = request.id;
   return !error;
 }
 
+let dbCounters: IngressCounterSnapshot | undefined;
 let frontCounters: IngressCounterSnapshot | undefined;
-async function exportCounters() {
-  if (dbApplied === null && frontAcknowledged === null) return;
+let exporting = false;
+
+async function scrapeCounters(table: IngressCounterSnapshot["table"]) {
   try {
-    const json = await nft(["-j", "list", "counters", "table", "inet", DB_INGRESS_TABLE]);
-    const dbCounters = parseNftCounters(json);
-    if (frontAcknowledged !== null) {
-      try {
-        const front = await nft(["-j", "list", "counters", "table", "inet", FRONT_TABLE]);
-        frontCounters = parseNftCounters(front, new Date(), FRONT_TABLE);
-      } catch (error) {
-        console.error(`Front ingress counter export failed: ${String(error)}`);
-      }
-    }
-    await publish(countersFile, `${JSON.stringify({ ...dbCounters, front: frontCounters })}\n`);
+    const json = await nft(["-j", "list", "counters", "table", "inet", table]);
+    return parseNftCounters(json, new Date(), table);
   } catch (error) {
-    // Leave the last snapshot, whose age the metrics endpoint reports.
-    console.error(`nft counter export failed: ${String(error)}`);
+    console.error(`nft counter export for ${table} failed: ${String(error)}`);
+    return undefined;
+  }
+}
+
+async function exportCounters() {
+  if (exporting) return;
+  exporting = true;
+  try {
+    const [dbSample, frontSample] = await Promise.all([
+      scrapeCounters(DB_INGRESS_TABLE),
+      frontDir ? scrapeCounters(FRONT_TABLE) : undefined,
+    ]);
+    dbCounters = dbSample ?? dbCounters;
+    frontCounters = frontSample ?? frontCounters;
+    if (dbSample || frontSample) {
+      await publish(countersFile, `${JSON.stringify({ ...dbCounters, front: frontCounters })}\n`);
+    }
+  } catch (error) {
+    console.error(`nft counter snapshot publication failed: ${String(error)}`);
+  } finally {
+    exporting = false;
   }
 }
 
@@ -198,9 +335,10 @@ async function reconcile() {
   if (reconciling) return;
   reconciling = true;
   try {
-    const dbChanged = await reconcileDatabase().catch(reportRefreshError("Database ingress"));
-    const frontChanged = await reconcileFront().catch(reportRefreshError("Front ingress"));
-    if (dbChanged || frontChanged) await exportCounters();
+    const database = await reconcileDatabase();
+    const frontChanged = await reconcileFront(database).catch(reportRefreshError("Front ingress"));
+    await publishDatabaseStatus().catch(reportRefreshError("Database ingress status"));
+    if (database.changed || frontChanged) await exportCounters();
   } finally {
     reconciling = false;
   }
@@ -208,7 +346,25 @@ async function reconcile() {
 
 await mkdir(dir, { recursive: true, mode: 0o700 });
 await mkdir(metricsDir, { recursive: true, mode: 0o755 });
+if (frontDir && (await installedPolicyTable(frontGuard.table))) {
+  frontGuardError = "The public front policy is still guarded pending successful readback.";
+}
+if (await installedPolicyTable(dbGuard.table)) {
+  dbError = "The database policy is still guarded pending successful readback.";
+}
+// Keep each last-good sample even when the process restarts during a one-table scrape failure.
+try {
+  const previous = await readOptional(countersFile);
+  if (previous) {
+    const snapshot = JSON.parse(previous) as IngressCounterSnapshot & { front?: IngressCounterSnapshot };
+    if (snapshot.table === DB_INGRESS_TABLE) dbCounters = snapshot;
+    if (snapshot.front?.table === FRONT_TABLE) frontCounters = snapshot.front;
+  }
+} catch (error) {
+  console.error(`Could not load the previous nft counter snapshot: ${String(error)}`);
+}
 await reconcile();
+await exportCounters();
 // Poll for atomically published files. Bind mount notifications can be lost during an upgrade.
 setInterval(() => void reconcile(), 250);
 setInterval(() => void exportCounters(), counterIntervalMs);
