@@ -2,10 +2,21 @@ import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-import { bundleDigest, maintenanceArgv, verifyMaintenanceRelease } from "@ark-stack/shared";
+import {
+  bundleDigest,
+  mailEnabled,
+  maintenanceArgv,
+  parseEnvFile,
+  verifyMaintenanceRelease,
+} from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
+import { lockHostDeployment } from "./host-deployment-lock.ts";
+import { hostCommand } from "./install-host-hardening.ts";
 
+const root = join(import.meta.dir, "..");
+const execute = process.env.ARK_MAINTENANCE_EXECUTE === "1";
+if (execute) await lockHostDeployment(root);
 const token = process.env.ARK_MAINTENANCE_TOKEN ?? "";
 if (!token) {
   console.error("ARK_MAINTENANCE_TOKEN is required for the platform maintenance runner.");
@@ -24,6 +35,16 @@ const composeSource = await Bun.file(compose).text();
 const validated = verifyMaintenanceRelease(bundle, composeSource, publicKey.replaceAll("\\n", "\n"));
 const project = "ark-platform";
 const argv = maintenanceArgv(project, compose);
+const prefix = ["compose", "-f", compose, "-p", project];
+const envFile = Bun.file(join(root, ".env"));
+const installedMail = (await envFile.exists())
+  ? parseEnvFile(await envFile.text()).ARK_MAIL_ENABLED
+  : undefined;
+const enableMail = mailEnabled(installedMail ?? process.env.ARK_MAIL_ENABLED);
+// The installed setting wins even if the maintenance process started before a mail-off install ended.
+process.env.ARK_MAIL_ENABLED = enableMail ? "1" : "0";
+const omitMail = !enableMail && validated.serviceNames.includes("mail-worker");
+if (omitMail) argv.push("--scale", "mail-worker=0");
 const journal = join(process.env.ARK_MAINTENANCE_JOURNAL ?? "tmp/maintenance.jsonl");
 
 await appendFile(
@@ -31,10 +52,12 @@ await appendFile(
   `${JSON.stringify({ at: new Date().toISOString(), digest: bundleDigest(validated.images), composeDigest: bundle.composeDigest, images: validated.images })}\n`,
 );
 
-if (process.env.ARK_MAINTENANCE_EXECUTE !== "1") {
+if (!execute) {
   console.log(JSON.stringify({ planned: argv, images: validated.images, executed: false }, null, 2));
   process.exit(0);
 }
+
+if (omitMail) await hostCommand("docker", [...prefix, "stop", "mail-worker"]);
 
 for (const image of validated.images) {
   await new Promise<void>((resolve, reject) => {
@@ -47,8 +70,7 @@ for (const image of validated.images) {
 
 // Stop writers and the old public listener before converting persisted Caddy files. The approved
 // domain-worker image contains the initializer; only this one-shot process gets ownership capabilities.
-if (/^  edge-l4:/m.test(composeSource)) {
-  const prefix = ["compose", "-f", compose, "-p", project];
+if (validated.serviceNames.includes("edge-l4")) {
   for (const args of [
     // database-ingress: before FD-26 its Bun relay listened on host 5432, which edge-ts now publishes for
     // edge-l4's fe_pg5432. Stop it so the recreated edge-ts can bind the port; `up` restarts it as the

@@ -3,18 +3,50 @@ import { chmod, chown, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-import { applyEdgeSniPorts, generateInstallSecrets, mergeInstallEnv } from "@ark-stack/shared";
+import {
+  SHARED_SNI_PORTS,
+  applyEdgeSniPorts,
+  generateInstallSecrets,
+  mailEnabled,
+  mergeInstallEnv,
+  parseEnvFile,
+} from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
+import { lockHostDeployment } from "./host-deployment-lock.ts";
 import { configureEdgeAuthKey } from "./install-edge-auth.ts";
 import { chownEdgeL4, composeImages, seedEdgeL4, verifyImageIds } from "./install-edge-l4.ts";
+import { appliedHostConfig } from "./host-inventory.ts";
+import {
+  enrollVps,
+  hostFirewallPath,
+  hostMetricsPath,
+  installHostHardening,
+} from "./install-host-hardening.ts";
+import { startLocalMail } from "./install-mail-submission.ts";
 import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 
 const root = join(import.meta.dir, "..");
+const flags = process.argv.slice(2);
+if (flags.length === 1 && flags[0] === "--enroll-vps") {
+  await enrollVps();
+  process.exit(0);
+}
+if (flags.length && (flags.length !== 1 || flags[0] !== "--harden-vps")) {
+  throw new Error("Usage: host:install [--enroll-vps | --harden-vps]");
+}
+const useDocker = process.env.ARK_INSTALL_SKIP_DOCKER !== "1";
+if (useDocker) await lockHostDeployment(root);
+const hardened =
+  flags[0] === "--harden-vps" ||
+  (process.platform === "linux" &&
+    existsSync(hostFirewallPath) &&
+    process.env.ARK_INSTALL_SKIP_DOCKER !== "1");
 
 function run(command: string, args: string[]) {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, { cwd: root, stdio: "inherit" });
+    const child = spawn(command, args, { cwd: root, stdio: "inherit", env: process.env });
+    child.on("error", reject);
     child.on("exit", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${command} ${args.join(" ")} exited ${code}`));
@@ -35,8 +67,49 @@ const edgeAuthKey = await configureEdgeAuthKey(envPath);
 // Shared SNI ports for tls routes (FD-14): ARK_EDGE_SNI_PORTS from the environment, else from .env.
 // Each enabled port is published on edge-ts; the API and domain worker accept tls routes only there.
 const sni = applyEdgeSniPorts(await Bun.file(envPath).text(), process.env.ARK_EDGE_SNI_PORTS);
-await Bun.write(envPath, sni.env);
+const values = parseEnvFile(sni.env);
+const enableMail = mailEnabled(process.env.ARK_MAIL_ENABLED ?? values.ARK_MAIL_ENABLED);
+const compose = ["compose", "-f", "infra/platform/docker-compose.yml"];
+async function stopDisabledMail() {
+  if (!useDocker || enableMail) return;
+  // Stop the old firewall writer before changing the baseline and remove its old container
+  // configuration so that Docker cannot restart it with mail enabled after an interrupted install.
+  if (hardened) await run("docker", [...compose, "rm", "--stop", "--force", "database-ingress"]);
+  await run("docker", ["compose", "-f", "infra/mail/docker-compose.yml", "stop", "stalwart"]);
+  // Until the API is recreated with the new setting it can still accept mail mutations.
+  await run("docker", [...compose, "stop", "mail-worker", "api"]);
+}
+values.ARK_MAIL_ENABLED = enableMail ? "1" : "0";
+values.ARK_HOST_HARDENING = hardened ? "1" : "0";
+values.ARK_HOST_METRICS_SOURCE = hardened ? hostMetricsPath : "../../tmp/host-metrics";
+if (hardened) {
+  await installHostHardening(async () => {
+    await stopDisabledMail();
+    return appliedHostConfig(root, values).catch((error) => {
+      console.warn(
+        `Could not reuse the previous front policy. Dedicated ports stay closed until reconciliation. ${String(error)}`,
+      );
+      return { mailEnabled: enableMail, sniPorts: sni.ports };
+    });
+  });
+} else await stopDisabledMail();
+await Bun.write(
+  envPath,
+  Object.entries(values)
+    .map(([key, value]) => `${key}=${value}\n`)
+    .join(""),
+);
 await chmod(envPath, 0o600);
+for (const key of [
+  "ARK_MAIL_ENABLED",
+  "ARK_HOST_HARDENING",
+  "ARK_HOST_METRICS_SOURCE",
+  "ARK_EDGE_SNI_PORTS",
+  ...SHARED_SNI_PORTS.map((port) => `ARK_EDGE_SNI_PORT_${port}`),
+]) {
+  if (values[key] === undefined) delete process.env[key];
+  else process.env[key] = values[key];
+}
 console.log(`Shared SNI ports: ${sni.ports.length ? sni.ports.join(", ") : "none (443 only)"}`);
 for (const path of [
   "certs",
@@ -48,6 +121,7 @@ for (const path of [
   "edge",
   "edge-l4",
   "mail-state",
+  "host-metrics",
 ]) {
   await mkdir(join(root, "tmp", path), { recursive: true });
 }
@@ -126,7 +200,7 @@ if (process.platform === "linux" && process.getuid?.() === 0) {
   await chownEdgeL4(join(root, "tmp", "edge-l4"), containerUid);
 }
 
-if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
+if (useDocker) {
   // Numeric IDs, not names: HAProxy must be uid 99 and GID 4400 must be free in the pinned images.
   await verifyImageIds(
     composeImages(
@@ -139,14 +213,13 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
       run("docker", ["network", "create", network]),
     );
   }
-  const compose = ["compose", "-f", "infra/platform/docker-compose.yml"];
   await run("docker", [
     ...compose,
     "build",
     "api",
     "migrate",
     "database-worker",
-    "mail-worker",
+    ...(enableMail ? ["mail-worker"] : []),
     "domain-worker",
     "edge-watchdog",
     "haproxy-validator",
@@ -155,16 +228,12 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "database-ingress",
   ]);
   await run("docker", [...compose, "up", "-d", "postgres", "app-postgres"]);
-  await run("docker", [
-    "compose",
-    "-f",
-    "infra/mail/docker-compose.yml",
-    "up",
-    "-d",
-    "--wait",
-    "--wait-timeout",
-    "120",
-  ]);
+  if (enableMail) {
+    await startLocalMail(root, {
+      user: process.env.STALWART_ADMIN_ADDRESS ?? parsed.STALWART_ADMIN_ADDRESS,
+      password: process.env.STALWART_ADMIN_PASSWORD ?? parsed.STALWART_ADMIN_PASSWORD,
+    });
+  }
   await run("docker", [
     ...compose,
     "exec",
@@ -176,7 +245,13 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
   await run("docker", [...compose, "run", "--rm", "migrate"]);
   // Recreate the host-namespace reconciler first: before FD-26 its relay listened on host 5432, which
   // edge-ts now publishes for edge-l4's PostgreSQL router.
-  await run("docker", [...compose, "up", "-d", "database-ingress"]);
+  await run("docker", [
+    ...compose,
+    "up",
+    "-d",
+    ...(hardened ? ["--force-recreate"] : []),
+    "database-ingress",
+  ]);
   await run("docker", [
     ...compose,
     "up",
@@ -186,7 +261,7 @@ if (process.env.ARK_INSTALL_SKIP_DOCKER !== "1") {
     "120",
     "api",
     "database-worker",
-    "mail-worker",
+    ...(enableMail ? ["mail-worker"] : []),
     "domain-worker",
     "backup-worker",
     "agent",

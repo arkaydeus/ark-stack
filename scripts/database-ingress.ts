@@ -11,12 +11,17 @@ import {
   FRONT_RAW_RANGE,
   FRONT_SHARED_CHAIN,
   FRONT_TABLE,
+  HOST_FIREWALL_TABLE,
   POSTGRES_ROUTER_PORT,
   SHARED_SNI_PORTS,
+  assertHostFirewall,
   frontSharedPorts,
+  hostRoutesFromFront,
+  mailEnabled,
   parseNftCounters,
   parseSniPorts,
   preserveDbIngressGenerations,
+  renderHostFirewall,
   sha256Hex,
   type IngressCounterSnapshot,
 } from "@ark-stack/shared";
@@ -24,6 +29,13 @@ import {
 const dir = process.env.ARK_PGBOUNCER_DIR ?? join(process.cwd(), "tmp", "pgbouncer");
 const nftFile = join(dir, "allowlist.nft");
 const frontDir = process.env.ARK_FRONT_INGRESS_DIR;
+const hostConfig =
+  process.env.ARK_HOST_HARDENING === "1"
+    ? {
+        mailEnabled: mailEnabled(process.env.ARK_MAIL_ENABLED),
+        sniPorts: parseSniPorts(process.env.ARK_EDGE_SNI_PORTS),
+      }
+    : undefined;
 // The API mounts only the metrics directory, without policies or PgBouncer credentials.
 const metricsDir = process.env.ARK_DB_INGRESS_METRICS_DIR ?? join(process.cwd(), "tmp", "db-ingress");
 const countersFile = join(metricsDir, "counters.json");
@@ -171,12 +183,19 @@ async function guardFailure(guard: Guard, error: unknown) {
   }
 }
 
-async function applyPolicies(policies: [string, string][], guards: Guard[]) {
+async function applyPolicies(
+  policies: [string, string][],
+  guards: Guard[],
+  host?: Parameters<typeof renderHostFirewall>[0],
+) {
   for (const [table, rules] of policies) {
     if (!declaresTable(rules, table)) throw new Error(`Policy does not declare ${table}`);
   }
-  await nft(["-f", "-"], policies.map(([, rules]) => rules).join("\n"));
+  const transaction = policies.map(([, rules]) => rules);
+  if (host) transaction.push(renderHostFirewall(host));
+  await nft(["-f", "-"], transaction.join("\n"));
   for (const [table, rules] of policies) await verifyPolicyTable(table, rules, -1);
+  if (host) assertHostFirewall(await nft(["-s", "-y", "list", "table", "inet", HOST_FIREWALL_TABLE]), host);
   await nft(["-f", "-"], guards.map(clearGuard).join(""));
 }
 
@@ -274,6 +293,7 @@ async function reconcileFront(database: Awaited<ReturnType<typeof reconcileDatab
           [FRONT_TABLE, front],
         ],
         [frontGuard, dbGuard],
+        hostConfig ? { ...hostConfig, routes: hostRoutesFromFront(rules) } : undefined,
       );
       frontGuardError = "";
       dbError = "";

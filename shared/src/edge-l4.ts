@@ -679,6 +679,15 @@ function renderPostgresRoute(route: PostgresRoute) {
  * is rejected. Without a published database there is no PgBouncer rule, so classic clients are rejected.
  */
 function renderPg5432Frontend(pooler: Pooler | null, routes: PostgresRoute[]) {
+  if (!pooler && !routes.length) {
+    // Keep the published port probeable through Docker even on the initial and closed generations.
+    return [
+      "frontend fe_pg5432",
+      `    bind :${POSTGRES_ROUTER_PORT}`,
+      "    tcp-request content reject",
+      "",
+    ].join("\n");
+  }
   const poolerRules = pooler
     ? [
         "    # Ark databases via PgBouncer: classic negotiation, or direct TLS for the DB hostname / no SNI.",
@@ -753,15 +762,14 @@ function renderSniFrontend(port: number, routes: TlsRoute[]) {
 function renderConfig(input: {
   httpHostnames: string[];
   httpRoutes?: EdgeL4HttpRoute[];
+  sniPorts: number[];
   routes: TlsRoute[];
   tcpRoutes: TcpRoute[];
   postgresRoutes: PostgresRoute[];
   pooler: Pooler | null;
 }) {
   const on443 = input.routes.filter((route) => route.listenPort === SNI_ROUTER_PORT);
-  const sharedPorts = [...new Set(input.routes.map((route) => route.listenPort))]
-    .filter((port) => port !== SNI_ROUTER_PORT)
-    .toSorted((a, b) => a - b);
+  const sharedPorts = input.sniPorts;
   const routeRules = on443.map(
     (route) => `    use_backend ${route.backend} if { req.ssl_sni -i ${route.hostname} }`,
   );
@@ -794,9 +802,8 @@ function renderConfig(input: {
     ),
   );
   const backends = input.routes.map(renderTlsRoute);
-  const pg5432 = Boolean(input.pooler || input.postgresRoutes.length);
   const reject =
-    scoped || sharedPorts.length || pg5432
+    scoped || sharedPorts.length || input.pooler || input.postgresRoutes.length
       ? ["backend be_reject", "    tcp-request content reject", ""].join("\n")
       : "";
   // PgBouncer is the only backend addressed by name: Docker's DNS on the pgbouncer-ingress network.
@@ -808,13 +815,11 @@ resolvers docker
     hold valid 10s
 `
     : "";
-  const postgres = pg5432
-    ? [
-        renderPg5432Frontend(input.pooler, input.postgresRoutes),
-        ...(input.pooler ? [renderPoolerBackend(input.pooler)] : []),
-        ...input.postgresRoutes.map(renderPostgresRoute),
-      ]
-    : [];
+  const postgres = [
+    renderPg5432Frontend(input.pooler, input.postgresRoutes),
+    ...(input.pooler ? [renderPoolerBackend(input.pooler)] : []),
+    ...input.postgresRoutes.map(renderPostgresRoute),
+  ];
   return `# Ark edge-l4 generation, rendered by edge.l4_apply (docs/design/front-door.md §3.8.5).
 # Immutable: edge.l4_apply writes a new generation, has it validated and swaps \`current\`.
 global
@@ -999,13 +1004,22 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
     pooler: pooler ? { hostname: pooler.hostname, server: pooler.server, admits: pooler.admits } : null,
   };
   const files: Record<string, string> = {
-    "haproxy.cfg": renderConfig({ httpHostnames, httpRoutes, routes, tcpRoutes, postgresRoutes, pooler }),
+    "haproxy.cfg": renderConfig({
+      httpHostnames,
+      httpRoutes,
+      sniPorts,
+      routes,
+      tcpRoutes,
+      postgresRoutes,
+      pooler,
+    }),
     // PgBouncer is not a tailnet backend: the closed configuration keeps serving it without a lease.
     "haproxy.closed.cfg": renderConfig({
       httpHostnames,
       // HTTP admission is also guarded at Caddy. Keep SNI routing available when this variant is
       // selected for an L4 lease denial so it cannot drop unrelated HTTP routes on reload.
       httpRoutes,
+      sniPorts,
       routes: [],
       tcpRoutes: [],
       postgresRoutes: [],

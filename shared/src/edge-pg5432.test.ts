@@ -119,8 +119,12 @@ describe("fe_pg5432 (§3.8.5)", () => {
     expect(routesOnly.files["haproxy.cfg"]).not.toContain("resolvers docker");
     expect(routesOnly.files[POOLER_ALLOWLIST_FILE]).toBeUndefined();
     expect(routesOnly.manifest.pooler).toBeNull();
-    // Without a pooler or a postgres route there is no 5432 listener at all.
-    expect(renderEdgeL4Generation({ httpHostnames: [] }).files["haproxy.cfg"]).not.toContain("fe_pg5432");
+    const empty = renderEdgeL4Generation({ httpHostnames: [] });
+    for (const withoutBackend of [empty.files["haproxy.cfg"]!, routesOnly.files["haproxy.closed.cfg"]!]) {
+      expect(section(withoutBackend, "frontend fe_pg5432").trimEnd()).toBe(
+        "frontend fe_pg5432\n    bind :5432\n    tcp-request content reject",
+      );
+    }
   });
 
   test("pooler allowlists: empty denies all, only allowInternet opens, near-open lists are refused", () => {

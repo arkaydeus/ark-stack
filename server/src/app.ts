@@ -1,6 +1,7 @@
 import { repositoryProtectionPolicy } from "@ark-stack/shared";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import {
   assertAliasGraph,
@@ -62,6 +63,8 @@ import {
   regionSettingsInput,
   regionSummary,
   ingressCounterMetrics,
+  mailEnabled,
+  rebootRequiredMetrics,
   dbIngressLimitsInput,
   dbIngressLimitsSummary,
   platformDbIngressLimits,
@@ -859,7 +862,8 @@ app.get("/api/metrics/prometheus", async (c) => {
   if (!secureEqual(c.req.header("authorization") ?? "", `Bearer ${env.metricsToken}`)) {
     throw new HTTPException(401, { message: "Invalid metrics credential." });
   }
-  const [opRows, backupRows, certRows, heartbeatRows, openAlerts] = await Promise.all([
+  const hostMetricsDir = process.env.ARK_HOST_METRICS_DIR;
+  const [opRows, backupRows, certRows, heartbeatRows, openAlerts, rebootMarker] = await Promise.all([
     db.select().from(operations),
     db.select().from(backups),
     db.select().from(certificates),
@@ -868,6 +872,7 @@ app.get("/api/metrics/prometheus", async (c) => {
       .select({ dedupKey: alerts.dedupKey, severity: alerts.severity })
       .from(alerts)
       .where(isNull(alerts.resolvedAt)),
+    hostMetricsDir ? readFile(join(hostMetricsDir, "reboot-required"), "utf8").catch(() => null) : null,
   ]);
   const rolloverAlerts = openAlerts.filter((item) => item.dedupKey.startsWith(ROLLOVER_ALERT_PREFIX));
   const lines = [
@@ -881,7 +886,13 @@ app.get("/api/metrics/prometheus", async (c) => {
     "# TYPE ark_certificates_expiring gauge",
     `ark_certificates_expiring ${certRows.filter((item) => item.expiresAt && item.expiresAt.getTime() < Date.now() + 14 * 86_400_000).length}`,
     "# TYPE ark_worker_heartbeat_stale gauge",
-    ...["agent", "database", "domains", "mail", "backup"].map((identity) => {
+    ...[
+      "agent",
+      "database",
+      "domains",
+      ...(mailEnabled(process.env.ARK_MAIL_ENABLED) ? ["mail"] : []),
+      "backup",
+    ].map((identity) => {
       const item = heartbeatRows.find((row) => row.identity === identity);
       return `ark_worker_heartbeat_stale{identity="${identity}"} ${!item || Date.now() - item.lastSeenAt.getTime() > 90_000 ? 1 : 0}`;
     }),
@@ -898,6 +909,7 @@ app.get("/api/metrics/prometheus", async (c) => {
     // nft drop counters for the public edge ports (§3.11), written by the
     // host-namespace database-ingress reconciler. A missing or unreadable snapshot reports 0.
     ...ingressCounterMetrics(await readDbIngressCounters()),
+    ...rebootRequiredMetrics(rebootMarker),
     // Off-VPS backup targets (front door §3.19, FD-21): last success age, append-only verdict and the
     // age of the newest off-VPS recovery point per source.
     ...(await backupTargetMetrics()),
@@ -1267,6 +1279,7 @@ app.post("/api/wizard", async (c) => {
     });
   }
   const input = wizardInput.parse(await c.req.json());
+  if (input.includeMail) requireMailEnabled();
   const ownershipToken = `ark-own-${createToken(16)}`;
   const plan = buildDomainPlan({
     baseDomain: input.baseDomain,
@@ -1656,10 +1669,17 @@ app.post("/api/databases", async (c) => {
   return c.json({ id, operationId: operation.id });
 });
 
+function requireMailEnabled() {
+  if (!mailEnabled(process.env.ARK_MAIL_ENABLED)) {
+    throw new HTTPException(503, { message: "Mail is disabled on this installation." });
+  }
+}
+
 app.post("/api/mailboxes", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const input = mailboxInput.parse(await c.req.json());
   requireDomain(access, input.domainId, "manage");
   const id = createId("mbx");
@@ -1679,6 +1699,7 @@ app.post("/api/aliases", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const input = aliasInput.parse(await c.req.json());
   requireDomain(access, input.domainId, "manage");
   const existing = await db.select().from(aliases);
@@ -1721,6 +1742,7 @@ app.patch("/api/aliases/:id", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const body = z
     .object({
       description: z.string().max(200).optional(),
@@ -1768,6 +1790,7 @@ app.patch("/api/aliases/:id", async (c) => {
 app.delete("/api/aliases/:id", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMailEnabled();
   const [alias] = await db
     .select()
     .from(aliases)
@@ -2741,6 +2764,7 @@ app.delete(vercelIntegrationPath, async (c) => {
 app.get("/api/mail/queue", async (c) => {
   const access = c.get("access");
   requireOperator(access);
+  requireMailEnabled();
   // Queue entries carry sender and recipient addresses for every tenant. Scope reads to the
   // domains the caller may view, matching the domain scoping the mutation route already does.
   const domainRows = await db.select().from(domainClaims);
@@ -2761,6 +2785,7 @@ app.post("/api/mail/queue", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const input = queueActionInput.parse(await c.req.json());
   const native = (await listMailQueue()).find((item) => item.id === input.item.id);
   if (!native) throw new HTTPException(404, { message: "Queue item not found." });
@@ -2794,6 +2819,7 @@ app.post("/api/mailboxes/:id/devices", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const input = deviceInput.parse(await c.req.json());
   const [mailbox] = await db
     .select()
@@ -2856,6 +2882,7 @@ app.post("/api/devices/:id/revoke", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const [device] = await db
     .select()
     .from(mailboxDevices)
@@ -3351,6 +3378,7 @@ app.post("/api/mail/reconcile", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const body = z.object({ mailboxId: z.string() }).parse(await c.req.json());
   const [mailbox] = await db.select().from(mailboxes).where(eq(mailboxes.id, body.mailboxId));
   if (!mailbox) throw new HTTPException(404, { message: "Mailbox not found." });
@@ -3367,6 +3395,7 @@ app.post("/api/ses/reconcile", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const body = z.object({ domainId: z.string() }).parse(await c.req.json());
   requireDomain(access, body.domainId, "manage");
   const operation = await enqueue({
@@ -3381,6 +3410,7 @@ app.post("/api/mailboxes/:id/lifecycle", async (c) => {
   const access = c.get("access");
   requireOperator(access);
   requireMfa(c.get("session"));
+  requireMailEnabled();
   const body = z
     .object({ lifecycle: z.enum(["active", "suspended", "retained", "purged"]) })
     .parse(await c.req.json());

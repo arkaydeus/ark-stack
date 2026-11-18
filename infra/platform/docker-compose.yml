@@ -134,11 +134,15 @@ services:
       # (docs/design/front-door.md §3.11, FD-18). Its own directory, so the API never sees the
       # PgBouncer userlist or TLS key.
       ARK_DB_INGRESS_METRICS_DIR: /var/lib/ark/db-ingress
+      ARK_HOST_METRICS_DIR: /var/lib/ark/host-metrics
+      ARK_MAIL_ENABLED: ${ARK_MAIL_ENABLED:-1}
       # Authenticates the edge watchdog's read-only lease reads (docs/design/front-door.md §3.2).
       # Without it the watchdog keeps every tailnet route withdrawn.
       ARK_EDGE_WATCHDOG_TOKEN: ${ARK_EDGE_WATCHDOG_TOKEN:-}
     # Never mount ark_edge_ts_socket here: the API has no access to tailscaled (front door §3.6).
-    volumes: [../../tmp/db-ingress:/var/lib/ark/db-ingress:ro]
+    volumes:
+      - ../../tmp/db-ingress:/var/lib/ark/db-ingress:ro
+      - ${ARK_HOST_METRICS_SOURCE:-../../tmp/host-metrics}:/var/lib/ark/host-metrics:ro
     expose: ["3000"]
     # Bootstrap and host-local recovery only; never bind the raw API publicly.
     ports: ["127.0.0.1:3000:3000"]
@@ -414,6 +418,8 @@ services:
       ARK_DB_INGRESS_METRICS_DIR: /var/lib/ark/db-ingress
       ARK_FRONT_INGRESS_DIR: /var/lib/ark/front-ingress
       ARK_EDGE_SNI_PORTS: ${ARK_EDGE_SNI_PORTS:-}
+      ARK_HOST_HARDENING: ${ARK_HOST_HARDENING:-0}
+      ARK_MAIL_ENABLED: ${ARK_MAIL_ENABLED:-1}
     volumes:
       - ../../tmp/pgbouncer:/var/lib/ark/pgbouncer
       - ../../tmp/db-ingress:/var/lib/ark/db-ingress

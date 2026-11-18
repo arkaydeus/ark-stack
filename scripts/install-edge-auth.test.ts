@@ -43,6 +43,10 @@ async function fixture() {
     "install.ts",
     "install-edge-auth.ts",
     "install-edge-l4.ts",
+    "install-host-hardening.ts",
+    "install-mail-submission.ts",
+    "host-inventory.ts",
+    "host-deployment-lock.ts",
     "edge-namespace.ts",
     "pgbouncer-bootstrap.ts",
   ]) {
@@ -67,8 +71,18 @@ async function fixture() {
     join(directory, "bin/docker"),
     `#!${process.execPath}
 import { appendFileSync } from "node:fs";
+if (process.argv.includes("ps") && process.argv.includes("stalwart")) console.log("stalwart-id");
+if (process.argv.includes("{{json .NetworkSettings.Networks}}")) console.log(JSON.stringify({
+  "mail-public": { IPAddress: "172.16.0.3", GlobalIPv6Address: "" },
+}));
+if (process.argv.includes("--config")) console.log(JSON.stringify({
+  methodResponses: [["x:NetworkListener/get", {
+    list: [{ protocol: "smtp", bind: { "[::]:587": true }, useTls: true, tlsImplicit: false }],
+  }, "op"]],
+}));
 if (process.argv.some((arg) => arg.includes("id -u"))) console.log(process.argv.some((arg) => arg.startsWith("haproxy:")) ? "99\\n---" : "1000\\n---");
 appendFileSync(process.env.INSTALL_CALLS, JSON.stringify({args:process.argv.slice(2), key:process.env.TS_EDGE_AUTHKEY}) + "\\n");
+if (process.env.INSTALL_FAIL_BUILD === "1" && process.argv.includes("build")) process.exit(42);
 `,
   );
   await chmod(join(directory, "bin/docker"), 0o700);
@@ -148,6 +162,48 @@ test("prompt selection writes a normalized key without echoing it", async () => 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test.each([false, true])(
+  "mail-off install stops prior mail services before build, build fails=%s",
+  async (fail) => {
+    const directory = await fixture();
+    try {
+      const envPath = join(directory, ".env");
+      await Bun.write(envPath, `TS_EDGE_AUTHKEY=${installedKey}\nARK_MAIL_ENABLED=1\n`);
+      const child = Bun.spawn([process.execPath, "scripts/install.ts"], {
+        cwd: directory,
+        env: {
+          ...process.env,
+          PATH: `${directory}/bin:${process.env.PATH}`,
+          ARK_MAIL_ENABLED: "0",
+          ARK_INSTALL_SKIP_DOCKER: "0",
+          INSTALL_CALLS: join(directory, "calls"),
+          INSTALL_FAIL_BUILD: fail ? "1" : "0",
+        },
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      expect(code, stderr).toBe(fail ? 1 : 0);
+      const calls = (await Bun.file(join(directory, "calls")).text())
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line).args as string[]);
+      const build = calls.findIndex((args) => args.includes("build"));
+      for (const service of ["stalwart", "mail-worker", "api"]) {
+        const stop = calls.findIndex((args) => args.includes("stop") && args.includes(service));
+        expect(stop).toBeGreaterThanOrEqual(0);
+        expect(stop).toBeLessThan(build);
+      }
+      expect(calls.filter((args) => args.includes("up") || args.includes("build")).flat()).not.toContain(
+        "mail-worker",
+      );
+      expect(await Bun.file(envPath).text()).toMatch(/^ARK_MAIL_ENABLED=0$/m);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test("invalid inherited key aborts the installer after secret merge and before any Docker command", async () => {
   const directory = await fixture();

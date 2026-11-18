@@ -41,6 +41,7 @@ Useful commands:
 | `mise run recover -- status`         | local lockout / bootstrap inspection        |
 | `mise run recover:mfa -- …`          | token- and confirmation-gated MFA reset     |
 | `mise run host:install`              | build and start the complete host topology  |
+| `mise run host:audit`                | check the VPS firewall and public ports     |
 | `mise run images:publish`            | build and push all images to GHCR           |
 | `mise run import -- file`            | read-only Orkmail/PgStack inventory compare |
 | `mise run recover-host`              | host-loss checklist                         |

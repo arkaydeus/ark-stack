@@ -24,6 +24,7 @@ import {
   firstComposeImage,
   generatePassword,
   isInFlight,
+  mailEnabled,
   nextBackupStatus,
   observedDnsValue,
   parseImageRef,
@@ -392,7 +393,8 @@ export async function claimQueued(
   );
   const prefixes = input.kindPrefixes ?? (input.kindPrefix ? [input.kindPrefix] : []);
   const patterns = prefixes.map((item) => `${item}%`);
-  const unlike = input.excludePrefix ? `${input.excludePrefix}%` : null;
+  const excluded = input.excludePrefix ? [`${input.excludePrefix}%`] : [];
+  if (!mailEnabled(process.env.ARK_MAIL_ENABLED)) excluded.push("mail.%", "mailbox.%", "ses.%");
   const agentOwned = input.agentOwned ?? false;
   const leaseSeconds = Math.max(30, Math.floor((input.leaseMs ?? 90_000) / 1000));
   await sql`
@@ -421,7 +423,7 @@ export async function claimQueued(
           SELECT id FROM operations
           WHERE status = 'queued'
             AND (${patterns.length === 0}::boolean OR kind LIKE ANY(${patterns}::text[]))
-            AND (${unlike}::text IS NULL OR kind NOT LIKE ${unlike})
+            AND NOT (kind LIKE ANY(${excluded}::text[]))
             AND (
               ${agentOwned}::boolean IS NOT TRUE
               OR (kind = 'service.deploy' AND payload ?& ARRAY['compose', 'composeHash', 'project'])
@@ -1050,7 +1052,7 @@ async function verifyDomain(operation: OperationRow) {
   const mailEndpointReady = endpointRows.some(
     (item) => item.kind === "mail" && verifiedEndpointIds.has(item.id),
   );
-  if (mailEndpointReady) {
+  if (mailEndpointReady && mailEnabled(process.env.ARK_MAIL_ENABLED)) {
     for (const mailbox of await db.select().from(mailboxes).where(eq(mailboxes.domainId, domainId))) {
       if (!mailbox.nativeId) {
         await enqueue({
