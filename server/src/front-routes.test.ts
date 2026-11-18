@@ -1730,6 +1730,12 @@ describe("FD-19 reviewed DNS", () => {
       expect(restored[0]).toMatchObject({ id: tombstone?.id, required: true, withdrawal_reason: null });
       expect(restored[1]).toMatchObject({ required: true, withdrawal_reason: null });
       expect((await call(actors.owner, "GET", fixture.path + "/dns")).body.ipv6Status).toBe("eligible");
+      // An additional IPv6 answer must still surface as pending with a desired AAAA present.
+      fixture.publicDns.aaaa.push("2001:db8::bad");
+      await fixture.verify();
+      const mixedAnswer = (await call(actors.owner, "GET", fixture.path + "/dns")).body;
+      expect(mixedAnswer.ipv6Status).toBe("withdrawal_pending");
+      expect(mixedAnswer.lastError).toMatch(/Unexpected AAAA/);
     } finally {
       await fixture.dispose();
     }

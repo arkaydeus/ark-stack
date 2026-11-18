@@ -459,7 +459,8 @@ export async function domainDnsReview(domainId: string, includeCloudflare = true
     ipv6Status:
       providerOnly.length ||
       visible.some((record) => record.type === "AAAA" && pendingWithdrawal(record)) ||
-      domain.proxyAaaaHosts.length
+      domain.proxyAaaaHosts.length ||
+      domain.lastError?.startsWith("Unexpected AAAA")
         ? "withdrawal_pending"
         : effectiveAaaa(domain, settings)
           ? "eligible"
