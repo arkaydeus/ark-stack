@@ -158,11 +158,11 @@
 #### Empty allowlist generates a self-deleting nft script that the host scripts then reject
 
 - File: shared/src/cidr.ts:106
-- Symbol: nftAllowlist / scripts/database-ingress.ts applyNft
+- Historical symbols: `nftAllowlist` and `applyNft`. FD-15 uses `renderDbIngress` and `applyPolicy` in `scripts/database-ingress.ts`.
 - Description: With no CIDRs the generated file creates then deletes the table. Both host-side scripts run `nft list table inet ark_db_ingress` afterwards, which fails, so they record `applied=false` and stop the listener. The documented "any authenticated client" mode can never expose the port through the ingress container.
 - Evidence: `table inet ark_db_ingress\ndelete table inet ark_db_ingress` (`cidr.ts:107`); `if (!listed.includes("ark_db")) throw new Error("nft readback did not show ark_db_ingress")` (`scripts/database-ingress.ts:44`); the server-side `applyDatabaseAllowlist` special-cases `!cidrs.length` but the scripts do not.
 - Suggestion: Emit a real table with an accept-only chain for the empty case, or have both scripts treat "table absent" as the expected state when the file carries an open-mode marker.
-- Verification: Write `nftAllowlist([])` to the watched dir and confirm status reports `applied=true` with the listener up.
+- Verification now covered by `mise run test:db-ingress`, which checks the 5432 policy acknowledgement and both network paths. HAProxy owns the public listener.
 
 ### 11. [P1][conf:85][correctness]
 

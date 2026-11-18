@@ -19,7 +19,7 @@ import {
   type EdgeL4TlsRoute,
 } from "./edge-l4.ts";
 import { routeIdentityKey } from "./edge-withdrawal.ts";
-import { frontRawPortPolicies, renderFrontRawPorts } from "./front-raw-nft.ts";
+import { frontPortPolicies, renderFrontIngress } from "./front-nft.ts";
 import {
   assertFieldsForKind,
   assertL4Enableable,
@@ -273,15 +273,13 @@ describe("policy fingerprints in server names (§3.8.6 revocation)", () => {
     const old = { ...mqtt, policy: "1111111111111111" };
     const next = { ...mqtt, policy: "2222222222222222" };
     const index = allowedServerIndex(new Set([routeIdentityKey(next)]));
-    const targetOld = { server: haproxyServerName(old), key: "100.88.1.20:1883" };
-    const loopOld = { server: haproxyLoopServerName(old), key: null };
+    const targetOld = { backend: "be_mqtt_inner", server: haproxyServerName(old), key: "100.88.1.20:1883" };
+    const loopOld = { backend: "be_mqtt", server: haproxyLoopServerName(old), key: null };
     expect(haproxyServerDenied(targetOld, index)).toBe(true);
     expect(haproxyServerDenied(loopOld, index)).toBe(true);
-    expect(haproxyServerDenied({ server: haproxyServerName(next), key: "100.88.1.20:1883" }, index)).toBe(
-      false,
-    );
-    expect(haproxyServerDenied({ server: haproxyLoopServerName(next), key: null }, index)).toBe(false);
-    expect(haproxyServerDenied({ server: "caddy", key: null }, index)).toBe(false);
+    expect(haproxyServerDenied({ ...targetOld, server: haproxyServerName(next) }, index)).toBe(false);
+    expect(haproxyServerDenied({ ...loopOld, server: haproxyLoopServerName(next) }, index)).toBe(false);
+    expect(haproxyServerDenied({ backend: "be_caddy", server: "caddy", key: null }, index)).toBe(false);
     // HTTP identities are unchanged by the optional fifth element.
     const http = { id: "rt_web1", hostname: "www.example.com", stableId: "n1", ip: "100.88.1.21", port: 80 };
     expect(JSON.parse(decodeURIComponent(routeIdentityKey(http)))).toHaveLength(4);
@@ -307,20 +305,21 @@ describe("policy fingerprints in server names (§3.8.6 revocation)", () => {
   });
 });
 
-describe("raw-port nftables (FD-14, the ark_db_ingress style)", () => {
+describe("dedicated ports in ark_front (§3.11)", () => {
   test("every range port is covered: closed, deny-all, allowlist or explicit internet", () => {
-    const rules = renderFrontRawPorts([
+    const rules = renderFrontIngress([
       { id: "rt_t001", listenPort: 20001, sourceCidrs: ["198.51.100.7/32", "2001:db8::/48"] },
       { id: "rt_t002", listenPort: 20002, sourceCidrs: [] },
       { id: "rt_t003", listenPort: 20003, sourceCidrs: [], allowInternet: true },
     ]);
-    const policies = frontRawPortPolicies(rules);
+    const policies = frontPortPolicies(rules);
     expect(policies.size).toBe(50);
     expect(policies.get(20000)).toBe("closed");
     expect(policies.get(20001)).toBe("allowlist");
     expect(policies.get(20002)).toBe("deny-all");
     expect(policies.get(20003)).toBe("internet");
-    expect(rules).toContain('tcp dport 20000-20049 counter name "drop_closed" drop');
+    expect(rules).toContain("tcp dport 20000-20049 jump dedicated_ports");
+    expect(rules).toContain('counter name "drop_closed" drop');
     expect(rules).toContain("ip saddr 198.51.100.7/32 goto port_20001_limits");
     expect(rules).toContain("ip6 saddr 2001:db8::/48 goto port_20001_limits");
     const chain = (name: string) =>
@@ -332,19 +331,21 @@ describe("raw-port nftables (FD-14, the ark_db_ingress style)", () => {
     expect(chain("port_20003")).toContain("goto port_20003_limits");
     expect(chain("port_20003")).not.toContain("drop_allowlist");
     expect(chain("port_20001_limits")).toEndWith("    accept");
-    expect(rules).toContain("ct direction original ct status dnat tcp dport vmap {");
+    expect(rules).toContain(
+      "ct direction original ct status dnat tcp dport 20000-20049 jump dedicated_ports",
+    );
   });
 
   test("bad ports, duplicates and open prefixes are refused", () => {
-    expect(() => renderFrontRawPorts([{ id: "rt_a", listenPort: 22, sourceCidrs: [] }])).toThrow();
+    expect(() => renderFrontIngress([{ id: "rt_a", listenPort: 22, sourceCidrs: [] }])).toThrow();
     expect(() =>
-      renderFrontRawPorts([
+      renderFrontIngress([
         { id: "rt_a", listenPort: 20001, sourceCidrs: [] },
         { id: "rt_b", listenPort: 20001, sourceCidrs: [] },
       ]),
     ).toThrow();
     expect(() =>
-      renderFrontRawPorts([{ id: "rt_a", listenPort: 20001, sourceCidrs: ["0.0.0.0/0"] }]),
+      renderFrontIngress([{ id: "rt_a", listenPort: 20001, sourceCidrs: ["0.0.0.0/0"] }]),
     ).toThrow();
   });
 });

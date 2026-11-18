@@ -3,11 +3,14 @@
 // the domain worker's user, groups and mounts.
 import {
   HaproxyMaster,
+  haproxyHttpServerName,
   haproxyServerName,
   type EdgePolicyRoute,
   HaproxyWithdrawalAdapter,
   installEdgeL4Generation,
   renderEdgeL4Generation,
+  SERVER_FORCED_MAINT,
+  type EdgeL4HttpRoute,
   type EdgeL4Input,
 } from "@ark-stack/shared";
 
@@ -58,12 +61,22 @@ export async function writeEdgeL4(input: EdgeL4Input, env: Record<string, string
     throw new Error("ARK_HAPROXY_MASTER_SOCKET is required to reload edge-l4 in production.");
   }
   const generation = renderEdgeL4Generation(input);
+  const adapter = settings.masterSocket ? new HaproxyWithdrawalAdapter(settings.masterSocket) : null;
+  // A withdrawal changes runtime state even if the desired generation hash stayed the same.
+  const force = Boolean(
+    adapter && input.httpRoutes?.length && (await missingHttpRoutes(input.httpRoutes, adapter.master)).length,
+  );
   const result = await installEdgeL4Generation({
     root: settings.root,
     generation,
     validatorSocket: settings.validatorSocket,
-    master: settings.masterSocket ? new HaproxyMaster(settings.masterSocket) : undefined,
+    master: adapter?.master,
+    force,
   });
+  if (adapter && input.httpRoutes !== undefined) {
+    const retired = await adapter.retireLegacyHttp();
+    if (retired.error) throw new Error(`Legacy HTTP session withdrawal failed: ${retired.error}`);
+  }
   return {
     applied: true as const,
     ...result,
@@ -81,18 +94,26 @@ export async function writeEdgeL4(input: EdgeL4Input, env: Record<string, string
 
 /** Desired-versus-running recovery examines accepting workers, never a leaving worker's copy. */
 export async function missingL4Routes(routes: EdgePolicyRoute[], master: HaproxyMaster) {
-  const servers = (
-    await Promise.all(
-      (await master.workers())
-        .filter((worker) => worker.section === "current")
-        .map((worker) => master.servers(worker.pid)),
-    )
-  ).flat();
+  const servers = await acceptingServers(master);
   return routes
     .filter(
       (route) =>
         (route.kind === "tls" || route.kind === "tcp" || route.kind === "postgres") &&
-        !servers.some((server) => server.server === haproxyServerName(route) && !(server.adminState & 1)),
+        !servers.has(haproxyServerName(route)),
     )
     .map((route) => route.id);
+}
+
+export async function missingHttpRoutes(routes: EdgeL4HttpRoute[], master: HaproxyMaster) {
+  if (!routes.length) return [];
+  const servers = await acceptingServers(master);
+  return routes.filter((route) => !servers.has(haproxyHttpServerName(route))).map((route) => route.id);
+}
+
+async function acceptingServers(master: HaproxyMaster) {
+  const workers = (await master.workers()).filter((worker) => worker.section === "current");
+  const servers = (await Promise.all(workers.map((worker) => master.servers(worker.pid)))).flat();
+  return new Set(
+    servers.filter((server) => !(server.adminState & SERVER_FORCED_MAINT)).map((server) => server.server),
+  );
 }

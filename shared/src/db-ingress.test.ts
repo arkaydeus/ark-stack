@@ -5,15 +5,13 @@ import { describe, expect, test } from "bun:test";
 
 import {
   DB_INGRESS_LIMIT_DEFAULTS,
-  dbIngressAllowlistEnforced,
-  dbIngressCounterMetrics,
   dbIngressLimits,
   dbIngressLimitsInput,
   dbIngressLimitsSummary,
-  nftAllowlist,
-  parseNftCounters,
+  renderDbIngress,
   platformDbIngressLimits,
 } from "./db-ingress.ts";
+import { ingressCounterMetrics, parseNftCounters } from "./ingress-counters.ts";
 
 const design = await Bun.file(new URL("../../docs/design/front-door.md", import.meta.url)).text();
 
@@ -37,19 +35,17 @@ function chain(rules: string, name: string) {
 
 describe("rendered ark_db_ingress ruleset", () => {
   test("matches TCP 5432 on both the input and forward hooks, ahead of Docker at priority -1", () => {
-    for (const rules of [nftAllowlist([]), nftAllowlist(["10.0.0.0/8"])]) {
-      const input = chain(rules, "input");
-      expect(input).toContain("type filter hook input priority -1; policy accept;");
-      expect(input).toContain("tcp dport 5432 jump ark_db_limits");
-      const forward = chain(rules, "forward");
-      expect(forward).toContain("type filter hook forward priority -1; policy accept;");
-      // forward only sees DNATed traffic (Docker published port, FD-26 router).
-      expect(forward).toContain("ct status dnat tcp dport 5432 jump ark_db_limits");
-    }
+    const rules = renderDbIngress();
+    const input = chain(rules, "input");
+    expect(input).toContain("type filter hook input priority -1; policy accept;");
+    expect(input).toContain("tcp dport 5432 jump ark_db_limits");
+    const forward = chain(rules, "forward");
+    expect(forward).toContain("type filter hook forward priority -1; policy accept;");
+    expect(forward).toContain("ct direction original ct status dnat tcp dport 5432 jump ark_db_limits");
   });
 
   test("at the defaults, the §3.11 example is rendered with generation-qualified set names", () => {
-    const rendered = nftAllowlist([]);
+    const rendered = renderDbIngress();
     for (const line of designRules()) {
       if (line.startsWith("table ") || line === "}") continue;
       // Ark names counters for metrics and qualifies dynamic sets by the configured limits.
@@ -67,7 +63,7 @@ describe("rendered ark_db_ingress ruleset", () => {
   });
 
   test("groups IPv6 sources by /64 for both limits and IPv4 per address", () => {
-    const limits = chain(nftAllowlist([]), "ark_db_limits");
+    const limits = chain(renderDbIngress(), "ark_db_limits");
     expect(limits).toContain("add @conn4_128 { ip saddr ct count over 128 }");
     expect(limits).toContain("add @conn6_128 { ip6 saddr and ffff:ffff:ffff:ffff:: ct count over 128 }");
     expect(limits).toContain("update @rate4_30_60 { ip saddr limit rate over 30/second burst 60 packets }");
@@ -75,29 +71,25 @@ describe("rendered ark_db_ingress ruleset", () => {
       "update @rate6_30_60 { ip6 saddr and ffff:ffff:ffff:ffff:: limit rate over 30/second burst 60 packets }",
     );
     // ct count sets must not carry a timeout (nftables meters page); rate sets expire.
-    expect(nftAllowlist([])).toContain("set conn6_128 { type ipv6_addr; size 65535; flags dynamic; }");
-    expect(nftAllowlist([])).toContain(
+    expect(renderDbIngress()).toContain("set conn6_128 { type ipv6_addr; size 65535; flags dynamic; }");
+    expect(renderDbIngress()).toContain(
       "set rate6_30_60 { type ipv6_addr; size 65535; flags dynamic; timeout 2m; }",
     );
   });
 
   test("reapplies retain state and cap changes guard previous source generations until drained", () => {
-    const original = nftAllowlist([], 5432, {
+    const original = renderDbIngress({
       maxConnectionsPerSource: 5,
       newConnectionsPerSecond: 2,
       newConnectionBurst: 5,
     });
     expect(
-      nftAllowlist(
-        [],
-        5432,
+      renderDbIngress(
         { maxConnectionsPerSource: 5, newConnectionsPerSecond: 2, newConnectionBurst: 5 },
         original,
       ),
     ).toBe(original);
-    const lower = nftAllowlist(
-      [],
-      5432,
+    const lower = renderDbIngress(
       { maxConnectionsPerSource: 4, newConnectionsPerSecond: 3, newConnectionBurst: 6 },
       original,
     );
@@ -111,13 +103,13 @@ describe("rendered ark_db_ingress ruleset", () => {
     expect(lower).toContain("add @conn4_4 { ip saddr ct count over 4 }");
     expect(lower).toContain("update @rate4_3_6 { ip saddr limit rate over 3/second burst 6 packets }");
     const legacy = original.replaceAll("conn4_5", "conn4").replaceAll("conn6_5", "conn6");
-    const upgraded = nftAllowlist([], 5432, DB_INGRESS_LIMIT_DEFAULTS, legacy);
+    const upgraded = renderDbIngress(DB_INGRESS_LIMIT_DEFAULTS, legacy);
     expect(upgraded).toContain('ip saddr @active4 counter name "drop_conn4" drop');
     expect(upgraded).toContain("set conn6 { type ipv6_addr; size 65535; flags dynamic; }");
   });
 
   test("renders the configured limits and every drop with a named counter", () => {
-    const rules = nftAllowlist([], 5432, {
+    const rules = renderDbIngress({
       maxConnectionsPerSource: 7,
       newConnectionsPerSecond: 3,
       newConnectionBurst: 9,
@@ -129,38 +121,21 @@ describe("rendered ark_db_ingress ruleset", () => {
     for (const name of ["drop_conn4", "drop_conn6", "drop_rate4", "drop_rate6"]) {
       expect(rules).toContain(`  counter ${name} {}`);
     }
-    expect(rules).not.toContain("drop_allowlist");
+    expect(rules).not.toContain('counter name "drop_allowlist"');
     // No anonymous drop counters: every drop is attributable in the metrics.
     expect(rules).not.toMatch(/ counter drop$/m);
   });
 
-  test("an allowlist runs before the limits and only it carries the enforced marker", () => {
-    const rules = nftAllowlist(["10.0.0.0/8", "2001:db8::/32", "not-a-cidr"]);
-    const input = chain(rules, "input");
-    expect(input.indexOf("jump ark_db_allow")).toBeLessThan(input.indexOf("jump ark_db_limits"));
-    const forward = chain(rules, "forward");
-    expect(forward).toContain("ct status dnat tcp dport 5432 jump ark_db_allow");
-    const allow = chain(rules, "ark_db_allow");
-    expect(allow).toContain("ip saddr 10.0.0.0/8 return");
-    expect(allow).toContain("ip6 saddr 2001:db8::/32 return");
-    expect(allow).toContain('counter name "drop_allowlist" drop');
-    expect(allow).not.toContain("not-a-cidr");
-    expect(dbIngressAllowlistEnforced(rules)).toBe(true);
-    expect(dbIngressAllowlistEnforced(nftAllowlist([]))).toBe(false);
-    expect(dbIngressAllowlistEnforced(nftAllowlist(["not-a-cidr"]))).toBe(false);
-  });
-
-  test("refuses limits or ports nft would reject or that would disable the cap", () => {
-    expect(() => nftAllowlist([], 0)).toThrow("Invalid database port");
+  test("refuses limits nft would reject or that would disable the cap", () => {
     expect(() =>
-      nftAllowlist([], 5432, {
+      renderDbIngress({
         maxConnectionsPerSource: 0,
         newConnectionsPerSecond: 30,
         newConnectionBurst: 60,
       }),
     ).toThrow("Invalid database ingress limits");
     expect(() =>
-      nftAllowlist([], 5432, {
+      renderDbIngress({
         maxConnectionsPerSource: 1.5,
         newConnectionsPerSecond: 30,
         newConnectionBurst: 60,
@@ -249,7 +224,7 @@ describe("nft counters as Prometheus metrics", () => {
 
   test("exports drops by table, chain, reason and family, plus snapshot presence and age", () => {
     const snapshot = parseNftCounters(kernel, new Date("2026-11-16T00:00:00Z"));
-    const lines = dbIngressCounterMetrics(snapshot, new Date("2026-11-16T00:00:30Z"));
+    const lines = ingressCounterMetrics(snapshot, new Date("2026-11-16T00:00:30Z"));
     expect(lines).toContain('ark_nft_counters_present{table="ark_db_ingress"} 1');
     expect(lines).toContain('ark_nft_counters_age_seconds{table="ark_db_ingress"} 30');
     expect(lines).toContain("# TYPE ark_nft_drop_packets_total counter");
@@ -262,13 +237,26 @@ describe("nft counters as Prometheus metrics", () => {
     expect(lines.join("\n")).not.toContain("rogue");
   });
 
+  test("exports both tables from the same snapshot with a single definition per metric", () => {
+    const instant = new Date("2026-11-16T00:00:00Z");
+    const db = parseNftCounters(kernel, instant);
+    const front = parseNftCounters(kernel, instant, "ark_front");
+    const lines = ingressCounterMetrics({ ...db, front }, instant);
+    expect(lines).toContain('ark_nft_counters_present{table="ark_front"} 1');
+    expect(lines).toContain('ark_nft_counters_present{table="ark_db_ingress"} 1');
+    expect(lines).toContain(
+      'ark_nft_drop_packets_total{table="ark_front",chain="shared_limits",reason="concurrent",family="ipv4"} 99',
+    );
+    expect(lines.filter((line) => line === "# TYPE ark_nft_drop_packets_total counter")).toHaveLength(1);
+  });
+
   test("a missing or malformed snapshot reports absent and never invents counter values", () => {
     for (const value of [null, {}, { table: "ark_db_ingress", counters: [] }, "garbage"]) {
-      const lines = dbIngressCounterMetrics(value);
+      const lines = ingressCounterMetrics(value);
       expect(lines).toContain('ark_nft_counters_present{table="ark_db_ingress"} 0');
       expect(lines.some((line) => line.startsWith("ark_nft_drop_packets_total"))).toBe(false);
     }
-    const tampered = dbIngressCounterMetrics({
+    const tampered = ingressCounterMetrics({
       table: "ark_db_ingress",
       observedAt: new Date().toISOString(),
       counters: [

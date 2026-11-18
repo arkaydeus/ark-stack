@@ -6,7 +6,7 @@
 //    read-only mount, while `PATCH /localapi/v0/prefs`, `POST /localapi/v0/prefs` and the other
 //    state-changing endpoints are refused. A root control proves the same mount accepts writes from a
 //    privileged caller, so the refusals come from tailscaled's uid check.
-// 2. Withdrawal runtime tests. The shipped edge-ts and edge services (Caddy behind the launch guard),
+// 2. Withdrawal runtime tests. The shipped edge-ts, HAProxy and Caddy services with their guards,
 //    the edge watchdog (bundled production code, as uid 1000 with no capabilities), the API's lease
 //    endpoint and `edge.observe` against a mocked LocalAPI. A Docker network inside 100.64.0.0/10
 //    connected to edge-ts stands in for the tailnet peer, so Caddy really proxies (and holds a
@@ -22,8 +22,9 @@
 //    Listener closure is measured on Caddy's 127.0.0.1:8443 listener itself, by a prober in the edge
 //    namespace (scripts/edge-test/listener.ts), so HAProxy's connect handling on 443 is not counted;
 //    the end-to-end outcome through 443 is checked separately against the same bounds.
-// HAProxy withdrawal is covered by scripts/test-edge-l4.ts (FD-25). It needs a local PostgreSQL (DATABASE_URL), like
-// `mise run test`; it creates and drops its own database.
+// Multiple HAProxy worker generations are covered by scripts/test-edge-l4.ts. This suite needs a local
+// PostgreSQL (DATABASE_URL) and creates and drops its own database.
+// `ARK_EDGE_OBSERVER_ONLY=<text>` runs matching cases after setup.
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp } from "node:fs/promises";
@@ -38,7 +39,7 @@ import postgres from "postgres";
 
 import { watchListener } from "./edge-test/listener.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
-import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
+import { type EdgeStack, httpRouterArgs, startEdgeStack } from "./edge-test/stack.ts";
 
 const root = resolve(import.meta.dir, "..");
 if (!process.env.DATABASE_URL && existsSync(join(root, ".env"))) {
@@ -249,6 +250,7 @@ async function startContainers() {
     acmeDir,
     certDir,
     edgeDir,
+    validator: true,
     ports: ["127.0.0.1::80", "127.0.0.1::443", "127.0.0.1::41642/udp"],
     // The pinned image's tailscaled, started directly in kernel mode on the shipped socket path:
     // containerboot would give up after 60 s without a login and restart edge-ts, stranding edge.
@@ -296,6 +298,8 @@ async function startWatchdog(adminUrl: string) {
     watchdogName,
     "--user",
     "1000:1000",
+    "--group-add",
+    "4400",
     "--read-only",
     "--tmpfs",
     "/tmp",
@@ -317,6 +321,7 @@ async function startWatchdog(adminUrl: string) {
     "ARK_EDGE_DIR=/var/lib/ark/edge",
     "--volume",
     `${edgeDir}:/var/lib/ark/edge`,
+    ...httpRouterArgs(stack),
     "--volume",
     `${watchdogBundle}:/watchdog:ro`,
     "--workdir",
@@ -352,6 +357,8 @@ async function edgeApply() {
     stack.networks.edgeControl,
     "--user",
     "1000:1000",
+    "--group-add",
+    "4400",
     "--env",
     "HOME=/tmp",
     "--env",
@@ -364,21 +371,21 @@ async function edgeApply() {
     `${writeEdgeBundle}:/harness:ro`,
     "--volume",
     `${edgeDir}:/edge`,
+    ...httpRouterArgs(stack, true),
     "--workdir",
     "/tmp",
     bunImage,
     "bun",
     "/harness/write-edge.js",
-    "write",
+    "write-routed",
     JSON.stringify(plan),
   );
   return JSON.parse(output) as { applied: boolean; httpRoutes: string[] };
 }
 
 /**
- * Tailnet backends in Caddy's active config, read through the admin API from edge-control. A
- * withdrawal of a delayed handler stops Caddy conservatively (FD-09:
- * stream_close_delay), so this waits for the launch guard's restart instead of racing it.
+ * Tailnet backends in Caddy's active config, read through the admin API from edge-control.
+ * Waits for the admin API because the fail-closed fault cases deliberately stop Caddy.
  */
 async function activeBackends() {
   return waitFor("Caddy admin API", () => readActiveBackends(), 30_000);
@@ -756,7 +763,7 @@ async function restoreRoute(report: Report) {
   const stopObserving = keepObserving();
   try {
     // Setup, not an assertion: the launch guard or watchdog can still restart Caddy between the admin
-    // check and the apply (the preceding case's stop-and-restart), and writeEdge then refuses to /load
+    // check and the apply (the preceding case's guard restart), and writeEdge then refuses to /load
     // over an unreadable config. The domain worker retries edge.apply; so does this setup, up to 3 times.
     for (let attempt = 1; ; attempt++) {
       await waitFor("Caddy admin API after re-confirmation", async () => {
@@ -1114,20 +1121,11 @@ async function sharedBackendTest(report: Report) {
       "revoking one hostname closes its handler and session on a shared backend",
       `withdrawn +${gone - revokedAt} ms; closed +${closed - revokedAt} ms`,
     );
-    // The revoked route held a WebSocket, which a reload cannot close before stream_close_delay
-    // (5 min, FD-09), so the watchdog stopped Caddy. The launch guard restarts it from the closed
-    // file (it still names the revoked route) and the watchdog restores its lease-checked config,
-    // without any edge.apply being processed.
-    const restoredAt = await waitFor(
-      "the other hostname after the withdrawal restart",
-      async () => ((await outcome(sharedHost)) === "upstream" ? Date.now() : undefined),
-      20_000,
-    );
     expect(
       report,
       (await outcome(sharedHost)) === "upstream" && (await outcome()) !== "upstream",
-      "the other hostname reaches the same backend again without an edge.apply; the revoked one does not",
-      `restored +${restoredAt - revokedAt} ms; revoked: ${await outcome()}`,
+      "the other hostname keeps reaching the same upstream without an edge.apply",
+      `sibling: ${await outcome(sharedHost)}; revoked: ${await outcome()}`,
     );
     await docker("restart", stack.edge);
     await refreshPorts();
@@ -1153,6 +1151,8 @@ async function sharedBackendTest(report: Report) {
 // ---- Runner --------------------------------------------------------------------------------------------
 
 async function run(name: string, test: (report: Report) => Promise<unknown>) {
+  const only = process.env.ARK_EDGE_OBSERVER_ONLY;
+  if (only && !name.includes(only)) return true;
   const report: Report = { name, lines: [] };
   const started = Date.now();
   try {

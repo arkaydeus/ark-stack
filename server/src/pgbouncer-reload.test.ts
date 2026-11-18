@@ -438,7 +438,7 @@ test("startup installs ingress limits without reopening a revoked client or rewr
     expect(await Bun.file(join(dir, PGBOUNCER_FILES.config)).text()).toBe("existing pooler configuration\n");
     const rules = await Bun.file(join(dir, "allowlist.nft")).text();
     // Limits only: no port-wide CIDR list that would also cut off Postgres routes on 5432.
-    expect(rules).toContain("# ark-db-ingress: allowlist=open");
+    expect(rules).toContain("# Generated public database limits");
     expect(rules).toContain("ct count over 128");
     expect(rules).toContain("limit rate over 30/second burst 60 packets");
     expect(admin).not.toHaveBeenCalled();

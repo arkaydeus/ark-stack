@@ -435,7 +435,7 @@ describe("postgres routes (§3.8.3)", () => {
     const { DB_INGRESS_LIMIT_DEFAULTS } = await import("@ark-stack/shared");
     const firewall = frontIngressRules(edgeL4Input({ certificates: [] }, l4), DB_INGRESS_LIMIT_DEFAULTS);
     expect(firewall).toContain("chain ark_db_limits");
-    expect(firewall).toContain("# ark-front-raw: port=20017 policy=allowlist");
+    expect(firewall).toContain("# ark-front: port=20017 policy=allowlist");
     expect(firewall).toContain("ip saddr 198.51.100.0/24 goto port_20017_limits");
     // Without a published pooler, classic connections have no backend on the same port.
     expect(config).not.toContain("be_pgbouncer");

@@ -59,6 +59,28 @@ export type EdgeStack = {
   hostPort: (port: number, protocol?: "tcp" | "udp") => Promise<number>;
 };
 
+/** Socket mounts for the production watchdog or the fixture worker. */
+export function httpRouterArgs(stack: EdgeStack, write = false) {
+  return [
+    "--env",
+    "ARK_EDGE_L4_DIR=/usr/local/etc/haproxy",
+    "--env",
+    "ARK_HAPROXY_MASTER_SOCKET=/var/run/haproxy/master.sock",
+    "--volume",
+    `${stack.volumes.haproxyRun}:/var/run/haproxy`,
+    "--volume",
+    `${stack.volumes.edgeL4}:/usr/local/etc/haproxy${write ? "" : ":ro"}`,
+    ...(write
+      ? [
+          "--env",
+          "ARK_HAPROXY_VALIDATOR_SOCKET=/var/run/haproxy-validator/validate.sock",
+          "--volume",
+          `${stack.volumes.validatorRun}:/var/run/haproxy-validator`,
+        ]
+      : []),
+  ];
+}
+
 function yamlString(value: string) {
   return JSON.stringify(value);
 }

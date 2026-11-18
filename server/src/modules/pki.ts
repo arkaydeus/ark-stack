@@ -18,6 +18,7 @@
 // Every certificate carries subjectKeyIdentifier and authorityKeyIdentifier: Python 3.13+
 // (`VERIFY_X509_STRICT` by default) rejects a chain whose certificates lack an AKI.
 
+import { isUtf8 } from "node:buffer";
 import {
   createPrivateKey,
   createPublicKey,
@@ -335,6 +336,7 @@ function assertRequestedExtensions(extensions: x509.ParsedExtension[]) {
         break;
       }
       case x509.OID.subjectKeyIdentifier:
+        x509.decodeSubjectKeyIdentifier(item.value);
         break; // Ark computes its own.
       default:
         throw new PkiPolicyError(
@@ -346,11 +348,41 @@ function assertRequestedExtensions(extensions: x509.ParsedExtension[]) {
 
 /** Named curves a CSR key may use, by OID, matching `assertClientKeyPolicy`. */
 const CSR_CURVES = new Set(["1.2.840.10045.3.1.7", "1.3.132.0.34"]);
-/** Directory string tags accepted in a CSR subject (which Ark checks but never copies). */
-const NAME_STRING_TAGS = new Set([0x0c, 0x13, 0x14, 0x16, 0x1c, 0x1e]);
 const MAX_NAME_RDNS = 16;
 const MAX_RDN_ATTRIBUTES = 8;
 const MAX_CSR_ATTRIBUTES = 4;
+
+/** Check the string encoding even though the issued certificate uses a server-assigned subject. */
+function assertCsrSubjectString({ tag, content }: x509.Node) {
+  const malformed = "Malformed CSR subject string.";
+  switch (tag) {
+    case 0x0c: // UTF8String
+      if (!isUtf8(content)) throw new x509.DerError(malformed);
+      return;
+    case 0x13: // PrintableString
+      x509.printableString(content.toString("latin1"));
+      return;
+    case 0x14: // TeletexString
+      return;
+    case 0x16: // IA5String
+      if (content.some((byte) => byte > 0x7f)) throw new x509.DerError(malformed);
+      return;
+    case 0x1c: // UniversalString (UCS-4)
+    case 0x1e: {
+      // BMPString (UCS-2)
+      const width = tag === 0x1c ? 4 : 2;
+      if (content.length % width) throw new x509.DerError(malformed);
+      for (let offset = 0; offset < content.length; offset += width) {
+        const codePoint = content.readUIntBE(offset, width);
+        if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff))
+          throw new x509.DerError(malformed);
+      }
+      return;
+    }
+    default:
+      throw new x509.DerError("Unsupported subject string type.");
+  }
+}
 
 function assertCsrName(node: x509.Node | undefined) {
   const rdns = x509.children(x509.expectTag(node, 0x30, "a subject Name"));
@@ -363,7 +395,7 @@ function assertCsrName(node: x509.Node | undefined) {
       const parts = x509.children(x509.expectTag(attribute, 0x30, "an AttributeTypeAndValue"));
       if (parts.length !== 2) throw new x509.DerError("Malformed AttributeTypeAndValue.");
       x509.decodeOid(parts[0]);
-      if (!NAME_STRING_TAGS.has(parts[1]!.tag)) throw new x509.DerError("Unsupported subject string type.");
+      assertCsrSubjectString(parts[1]!);
     }
   }
 }
@@ -471,7 +503,7 @@ export function validateCsr(csrPem: string): KeyObject {
       if ((extensionRequests += 1) > 1) throw new PkiPolicyError("The CSR repeats its extension request.");
       const requested = x509.children(x509.expectTag(values, 0x31, "an attribute value SET"));
       if (requested.length !== 1) throw new PkiPolicyError("The CSR must carry one extension request.");
-      assertRequestedExtensions(x509.parseExtensions(requested[0]!));
+      assertRequestedExtensions(x509.parseExtensions(requested[0]));
     }
     return publicKey;
   } catch (error) {

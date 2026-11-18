@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import {
   allowedBackends,
   routeIdentityKey,
+  routeIdentityHostname,
   type EdgeL4Input,
   type EdgeL4Pooler,
   CaddyWithdrawalAdapter,
@@ -31,6 +32,7 @@ import {
   PGBOUNCER_SOCKET_DIR,
   planEdge,
   servedHttpHostnames,
+  servedHttpRoutes,
   planHash,
   platformDbIngressLimits,
   redactLogLine,
@@ -63,6 +65,7 @@ import {
   edgeL4Configured,
   edgeL4Settings,
   haproxyAdapter,
+  missingHttpRoutes,
   missingL4Routes,
   writeEdgeL4,
 } from "./modules/edge-l4.ts";
@@ -70,6 +73,7 @@ import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import { edgeL4Routes, enabledSniPorts, type OmittedL4Route } from "./modules/l4-routes.ts";
 import { refreshRouteCrls, routeCrlsDue } from "./modules/route-pki.ts";
 import {
+  edgeLeaseDocument,
   ensureGateRevocationDrain,
   markGateRevocationsApplied,
   pendingGateRevocations,
@@ -168,7 +172,7 @@ import { mutateMailQueue } from "./modules/queue.ts";
 import { currentMailStatus, reconcileMailEngine } from "./modules/mail.ts";
 import { poolerEdgeInput } from "./modules/pooler-policy.ts";
 import {
-  applyDatabaseAllowlist,
+  applyDatabaseIngress,
   applyStalwartDevice,
   reconcileSes,
   resolveImageDigest,
@@ -1785,6 +1789,10 @@ async function restoreBackup(operation: OperationRow) {
 }
 
 async function changeMode(operation: OperationRow) {
+  return withEdgeLock(() => changeModeLocked(operation));
+}
+
+async function changeModeLocked(operation: OperationRow) {
   const adminMode = String(operation.payload.adminMode ?? "public") === "tailnet" ? "tailnet" : "public";
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const destinationOrigin =
@@ -1818,6 +1826,7 @@ async function changeMode(operation: OperationRow) {
     .update(platformSettings)
     .set({ adminMode, authOrigin: destinationOrigin, updatedAt: new Date() })
     .where(eq(platformSettings.id, "default"));
+  if (edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
   await db.delete(session);
   await addStep(operation.id, "mode-change", { adminMode, sessionsRevoked: true, ...edge });
 }
@@ -1936,7 +1945,7 @@ export async function reconcileDatabaseIngressOnStartup() {
 async function applyCurrentDatabaseIngress(dir: string) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const limits = platformDbIngressLimits(settings);
-  const allowlist = await applyDatabaseAllowlist(dir, [], 5432, { limits });
+  const allowlist = await applyDatabaseIngress(dir, limits);
   return { limits, allowlist };
 }
 
@@ -2774,8 +2783,11 @@ export function startRolloverScheduler(
 // have no upstream yet, so they are rendered as unrouted (a fixed 503 naming no internal host).
 // Front-door HTTP routes are read from `front_routes` and rendered only while the lease allows them
 // (front door §3.2, FD-06): `public` routes directly, `sso` routes behind the login gate (FD-11).
-export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: string | null | undefined) {
-  const policy = await edgePolicy();
+export async function edgePlan(
+  adminMode: "public" | "tailnet",
+  adminHostname: string | null | undefined,
+  policyRoutes?: Awaited<ReturnType<typeof edgePolicy>>["routes"],
+) {
   const [settings] = await db
     .select({ mode: platformSettings.gateLoginMode, hostname: platformSettings.gateLoginHostname })
     .from(platformSettings)
@@ -2787,20 +2799,26 @@ export async function edgePlan(adminMode: "public" | "tailnet", adminHostname: s
     gateHostname: settings?.mode === "public" ? settings.hostname : null,
     endpoints: await db.select().from(endpoints),
     certificates: await db.select().from(certificates),
-    httpRoutes: await edgeHttpRoutes(policy.routes),
+    httpRoutes: await edgeHttpRoutes(policyRoutes ?? (await edgePolicy()).routes),
   });
 }
 
 async function applyEdge(operation: OperationRow) {
-  // Every edge.apply forces a Caddy /load (`Cache-Control: must-revalidate`), so it also applies the
-  // gate revocations that committed before it began (FD-11, §3.9.3). Snapshot them first: a
-  // revocation that commits during this apply waits for the next forced reload.
+  return withEdgeLock(() => applyEdgeLocked(operation));
+}
+
+async function applyEdgeLocked(operation: OperationRow) {
+  // The forced Caddy load and HAProxy drain apply the revocations in this snapshot. A
+  // revocation that commits during this apply waits for the next drain.
   const revocations = await pendingGateRevocations();
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
     settings?.adminHostname,
   );
+  // Queue the SNI generation before marking revocations applied. It takes this same lock before
+  // reading policy, so the reload can re-admit a drained route once its new handler is active.
+  if (edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
   const written = await writeEdge({
     ...plan,
     revokedRouteIds: [...new Set(revocations.map((item) => item.routeId))],
@@ -2821,8 +2839,6 @@ async function applyEdge(operation: OperationRow) {
     omitted: plan.omitted,
     gateRevocationsApplied: applied,
   });
-  // The SNI router names every hostname Caddy serves; a queued edge.l4_apply is reused.
-  if (edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
 }
 
 /**
@@ -2836,13 +2852,14 @@ export async function withEdgeLock<T>(work: () => Promise<T>) {
   })) as T;
 }
 
-// HAProxy SNI router on 443 (front door §3.8.5, FD-25): HTTP, admin and login hostnames go to Caddy
-// over PROXY v2; unknown SNI goes to Caddy too; non-TLS is rejected after 5 s. The HTTP hostnames are
+// HAProxy SNI router on 443 (front door §3.8.5). HTTP routes each get a backend to Caddy over
+// PROXY v2. Unmatched SNI is refused. The HTTP hostnames are
 // exactly the ones the same plan gives Caddy a site for (FD-09): servable routes with an issued
 // certificate, never an omitted or unservable route. TLS-TCP routes (on 443 or an enabled shared SNI
 // port) and raw-TCP routes (dedicated ports) are the lease-allowed `tls`/`tcp` routes (FD-14).
 export function edgeL4Input(
-  plan: Pick<Awaited<ReturnType<typeof edgePlan>>, "certificates">,
+  plan: Pick<Awaited<ReturnType<typeof edgePlan>>, "certificates"> &
+    Partial<Pick<Awaited<ReturnType<typeof edgePlan>>, "httpRoutes">>,
   l4: Partial<
     Pick<Awaited<ReturnType<typeof edgeL4Routes>>, "tlsRoutes" | "tcpRoutes" | "postgresRoutes">
   > = {},
@@ -2851,6 +2868,7 @@ export function edgeL4Input(
 ): EdgeL4Input {
   return {
     httpHostnames: servedHttpHostnames(plan),
+    httpRoutes: servedHttpRoutes(plan),
     tlsRoutes: l4.tlsRoutes ?? [],
     tcpRoutes: l4.tcpRoutes ?? [],
     postgresRoutes: l4.postgresRoutes ?? [],
@@ -2867,17 +2885,37 @@ async function applyEdgeL4(operation: OperationRow) {
 
 async function applyEdgeL4Locked(operation: OperationRow) {
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const policy = await edgeLeaseDocument();
+  const pending = new Set(policy.revocations?.map((item) => item.routeId));
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
     settings?.adminHostname,
+    // Even a recent pending revocation may already have fenced admission before a failed load.
+    policy.routes.filter((route) => !pending.has(route.id)),
   );
   // Route CAs must carry a current CRL: OpenSSL refuses every client certificate once it expires.
   const crls = await refreshRouteCrls();
   const sniPorts = enabledSniPorts();
-  const l4 = await edgeL4Routes({ policyRoutes: (await edgePolicy()).routes, sniPorts });
+  const l4 = await edgeL4Routes({ policyRoutes: policy.routes, sniPorts });
   // PgBouncer on 5432 (FD-26): only while the pooler-wide policy is publishable and not fenced.
   const pooler = await poolerEdgeInput();
   const input = edgeL4Input(plan, l4, sniPorts, pooler.pooler);
+  const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
+  if (adminUrl && input.httpRoutes?.length) {
+    // HAProxy must never admit a new identity while Caddy still serves that hostname's old pin.
+    const identities = await new CaddyWithdrawalAdapter(adminUrl).activeRoutes();
+    const active = new Set(identities);
+    const proxyHosts = new Set(identities.map(routeIdentityHostname));
+    const inactive = new Set(
+      servedHttpRoutes(plan)
+        .filter((route) =>
+          route.redirectTo ? proxyHosts.has(route.hostname) : !active.has(routeIdentityKey(route)),
+        )
+        .map((route) => route.hostname),
+    );
+    input.httpHostnames = input.httpHostnames.filter((hostname) => !inactive.has(hostname));
+    input.httpRoutes = input.httpRoutes.filter((route) => !inactive.has(route.hostname));
+  }
   if (edgeL4Configured() && !edgeL4Settings().validatorSocket)
     throw new Error("ARK_HAPROXY_VALIDATOR_SOCKET is required to apply edge-l4.");
   const firewall = edgeL4Configured()
@@ -2948,19 +2986,19 @@ async function reconcileServedRoutes() {
   const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
   if (!adminUrl) return { checked: false };
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  const policy = await edgeLeaseDocument();
+  const pending = new Set(policy.revocations?.map((item) => item.routeId));
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
     settings?.adminHostname,
+    policy.routes.filter((route) => !pending.has(route.id)),
   );
-  const issued = new Set(
-    plan.certificates
-      .filter((certificate) => certificate.status === "issued")
-      .map((certificate) => certificate.hostname),
-  );
+  const routed = servedHttpRoutes(plan);
   // Redirect-only routes dial no backend, so they carry no identity to look for.
-  const allowed = plan.httpRoutes.filter((route) => issued.has(route.hostname) && !route.redirectTo);
-  if (!allowed.length) return { checked: true, missing: [] };
+  const allowed = routed.filter((route) => !route.redirectTo);
+  if (!routed.length) return { checked: true, missing: [] };
   let active: string[];
+  let missingHttp: string[] = [];
   try {
     active = await new CaddyWithdrawalAdapter(
       adminUrl,
@@ -2968,12 +3006,19 @@ async function reconcileServedRoutes() {
       3_000,
       caddyState(process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform")),
     ).activeRoutes();
+    const control = haproxyAdapter();
+    if (control && edgeL4Configured()) {
+      missingHttp = await missingHttpRoutes(routed, control.master);
+    }
   } catch (error) {
     return { checked: false, error: (error as Error).message };
   }
-  const missing = allowed
-    .filter((route) => !active.includes(routeIdentityKey(route)))
-    .map((route) => route.id);
+  const missing = [
+    ...new Set([
+      ...allowed.filter((route) => !active.includes(routeIdentityKey(route))).map((route) => route.id),
+      ...missingHttp,
+    ]),
+  ];
   if (missing.length) await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   return { checked: true, missing };
 }
@@ -2984,30 +3029,38 @@ export const EDGE_WITHDRAWAL_ALERT = "edge-withdrawal";
 // Caddy is enforced through its admin API and HAProxy through its master CLI (every current and
 // leaving worker, admission first), here and by the edge-local watchdog every second.
 async function drainEdge(operation: OperationRow) {
-  // Gate revocations (FD-11, §3.9.3): the drain is a forced reload of the current configuration, even
-  // when its text is unchanged; applyEdge marks the revocations applied only once it succeeded. A
-  // failure leaves them pending: the watchdog withdraws the route after 5 s and the work is retried.
+  // The gate drain fences affected HAProxy backends around the forced Caddy load.
   if (operation.payload.reason === "gate_revocation") return applyEdge(operation);
+  return withEdgeLock(() => drainEdgeLocked(operation));
+}
+
+async function drainEdgeLocked(operation: OperationRow) {
   const adminUrl = process.env.ARK_EDGE_RELOAD_URL;
   const backends = Array.isArray(operation.payload.backends) ? operation.payload.backends : [];
+  const allowed = allowedBackends(await edgeLeaseDocument());
+  const control = haproxyAdapter();
+  // Even if HAProxy cannot be verified, Caddy may need to stop to close streams
+  // accepted through a legacy shared worker.
+  const haproxy = await drainHaproxyLocked(allowed, control, raiseAlert).then(
+    (result) => ({ result }),
+    (error: unknown) => ({ error }),
+  );
   if (!adminUrl) {
     if (process.env.NODE_ENV === "production") {
       throw new Error("ARK_EDGE_RELOAD_URL is required to drain edge routes in production.");
     }
+    if ("error" in haproxy) throw haproxy.error;
     await addStep(operation.id, "edge-drain", {
       backends,
       caddy: "not configured",
-      haproxy: await drainHaproxy(allowedBackends(await edgePolicy())),
+      haproxy: haproxy.result,
     });
     return;
   }
-  const allowed = allowedBackends(await edgePolicy());
-  const adapter = new CaddyWithdrawalAdapter(
-    adminUrl,
-    fetch,
-    3_000,
-    caddyState(process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform")),
-  );
+  const adapter = new CaddyWithdrawalAdapter(adminUrl, fetch, 3_000, {
+    ...caddyState(process.env.ARK_EDGE_DIR ?? join(process.cwd(), "infra", "platform")),
+    scopedHttp: control ? () => control.ensureHttpControl() : undefined,
+  });
   const result = await adapter.enforce(allowed);
   if (result.error) {
     let outcome = "Caddy was stopped";
@@ -3023,14 +3076,13 @@ async function drainEdge(operation: OperationRow) {
     });
     throw new Error(`Caddy withdrawal failed; ${outcome}: ${result.error}`);
   }
-  // An unreachable result without an error is an expected, bounded restart. HAProxy still drains.
-  const haproxy = await drainHaproxy(allowed);
+  if ("error" in haproxy) throw haproxy.error;
   await addStep(operation.id, "edge-drain", {
     reason: operation.payload.reason ?? null,
     routeIds: operation.payload.routeIds ?? [],
     backends,
     caddy: { active: result.active, withdrawn: result.withdrawn, restarting: !!result.unreachable },
-    haproxy,
+    haproxy: haproxy.result,
   });
 }
 
@@ -3040,26 +3092,31 @@ export async function drainHaproxy(
   adapter: EdgeWithdrawalAdapter | null = haproxyAdapter(),
   alert: (input: Parameters<typeof raiseAlert>[0]) => Promise<unknown> = raiseAlert,
 ) {
+  return withEdgeLock(() => drainHaproxyLocked(allowed, adapter, alert));
+}
+
+async function drainHaproxyLocked(
+  allowed: ReadonlySet<string>,
+  adapter: EdgeWithdrawalAdapter | null,
+  alert: (input: Parameters<typeof raiseAlert>[0]) => Promise<unknown>,
+) {
   if (!adapter) return "not configured";
-  // Keep the fallback under the same lock: an apply must not race a failing drain's stop.
-  return withEdgeLock(async () => {
-    const result = await adapter.enforce(allowed);
-    if (result.error) {
-      let outcome = "HAProxy tailnet backends were fenced";
-      try {
-        await adapter.stop();
-      } catch (error) {
-        outcome = `HAProxy stop failed: ${(error as Error).message}`;
-      }
-      await alert({
-        severity: "critical",
-        title: `Edge route withdrawal failed; ${outcome} (${result.error})`,
-        dedupKey: EDGE_WITHDRAWAL_ALERT,
-      });
-      throw new Error(`HAProxy withdrawal failed; ${outcome}: ${result.error}`);
+  const result = await adapter.enforce(allowed);
+  if (result.error) {
+    let outcome = "HAProxy tailnet backends were fenced";
+    try {
+      await adapter.stop();
+    } catch (error) {
+      outcome = `HAProxy stop failed: ${(error as Error).message}`;
     }
-    return { active: result.active, withdrawn: result.withdrawn };
-  });
+    await alert({
+      severity: "critical",
+      title: `Edge route withdrawal failed; ${outcome} (${result.error})`,
+      dedupKey: EDGE_WITHDRAWAL_ALERT,
+    });
+    throw new Error(`HAProxy withdrawal failed; ${outcome}: ${result.error}`);
+  }
+  return { active: result.active, withdrawn: result.withdrawn };
 }
 
 /** Schedules `edge.observe` every five minutes where the edge node's socket is mounted (§3.4). */

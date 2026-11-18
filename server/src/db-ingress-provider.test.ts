@@ -3,27 +3,26 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { dbIngressAllowlistEnforced, sha256Hex } from "@ark-stack/shared";
+import { sha256Hex } from "@ark-stack/shared";
 
-import { applyDatabaseAllowlist } from "./modules/providers.ts";
+import { applyDatabaseIngress } from "./modules/providers.ts";
 
-test("provider enforcement matches the written marker, including all-invalid and mixed CIDRs", async () => {
+test("provider writes rate limits without a CIDR allowlist and retains prior connection sets", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ark-ingress-provider-"));
   const saved = { ARK_ALLOWLIST_HELPER: process.env.ARK_ALLOWLIST_HELPER };
   process.env.ARK_ALLOWLIST_HELPER = "/usr/bin/true";
   try {
-    for (const cidrs of [["not-a-cidr"], [], ["not-a-cidr", "192.0.2.0/24"]]) {
-      const result = await applyDatabaseAllowlist(dir, cidrs);
-      const rules = await readFile(result.file, "utf8");
-      expect(result.applied).toBe(true);
-      expect(result.enforced).toBe(dbIngressAllowlistEnforced(rules));
-      expect(result.enforced).toBe(cidrs.includes("192.0.2.0/24"));
-    }
-    await applyDatabaseAllowlist(dir, [], 5432, {
-      limits: { maxConnectionsPerSource: 5, newConnectionsPerSecond: 2, newConnectionBurst: 5 },
+    const first = await applyDatabaseIngress(dir, {
+      maxConnectionsPerSource: 5,
+      newConnectionsPerSecond: 2,
+      newConnectionBurst: 5,
     });
-    const lower = await applyDatabaseAllowlist(dir, [], 5432, {
-      limits: { maxConnectionsPerSource: 4, newConnectionsPerSecond: 2, newConnectionBurst: 5 },
+    expect(first).toMatchObject({ applied: true, enforced: false });
+    expect(await readFile(first.file, "utf8")).not.toContain("jump ark_db_allow");
+    const lower = await applyDatabaseIngress(dir, {
+      maxConnectionsPerSource: 4,
+      newConnectionsPerSecond: 2,
+      newConnectionBurst: 5,
     });
     expect(await readFile(lower.file, "utf8")).toContain(
       'ip saddr @active4_5 counter name "drop_conn4" drop',
@@ -48,7 +47,7 @@ test("external worker waits for a host acknowledgement of the exact policy", asy
   try {
     await writeFile(join(dir, "allowlist.status"), "applied=true\npolicy_hash=old-policy\n");
     let complete = false;
-    const pending = applyDatabaseAllowlist(dir, ["192.0.2.0/24"]).then((result) => {
+    const pending = applyDatabaseIngress(dir).then((result) => {
       complete = true;
       return result;
     });
@@ -69,7 +68,7 @@ test("external worker waits for a host acknowledgement of the exact policy", asy
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(complete).toBe(false);
     await writeFile(join(dir, "allowlist.status"), `applied=true\npolicy_hash=${sha256Hex(rules)}\n`);
-    expect(await pending).toMatchObject({ applied: true, enforced: true });
+    expect(await pending).toMatchObject({ applied: true, enforced: false });
     // There is no exposure toggle any more: 5432 belongs to the edge (FD-26).
     expect(await Bun.file(join(dir, "expose")).exists()).toBe(false);
   } finally {

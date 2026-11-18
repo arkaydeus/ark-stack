@@ -61,7 +61,7 @@ import {
   settingsInput,
   regionSettingsInput,
   regionSummary,
-  dbIngressCounterMetrics,
+  ingressCounterMetrics,
   dbIngressLimitsInput,
   dbIngressLimitsSummary,
   platformDbIngressLimits,
@@ -895,9 +895,9 @@ app.get("/api/metrics/prometheus", async (c) => {
     ),
     "# TYPE ark_db_client_retirement_failures gauge",
     `ark_db_client_retirement_failures ${openAlerts.filter((item) => item.dedupKey.startsWith(RETIREMENT_ALERT_PREFIX)).length}`,
-    // nft drop counters for the public database port (front door §3.11, FD-18), written by the
+    // nft drop counters for the public edge ports (§3.11), written by the
     // host-namespace database-ingress reconciler. A missing or unreadable snapshot reports 0.
-    ...dbIngressCounterMetrics(await readDbIngressCounters()),
+    ...ingressCounterMetrics(await readDbIngressCounters()),
     // Off-VPS backup targets (front door §3.19, FD-21): last success age, append-only verdict and the
     // age of the newest off-VPS recovery point per source.
     ...(await backupTargetMetrics()),
