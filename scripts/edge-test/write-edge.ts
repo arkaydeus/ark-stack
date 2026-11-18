@@ -6,13 +6,24 @@
 // Caddy's admin API only accepts Host `edge-admin:2019`, which is why this cannot run on the host.
 //
 //   bun write-edge.js write '<writeEdge input JSON>'
+//   bun write-edge.js write-routed '<writeEdge input JSON>' (also apply the HTTP SNI generation)
 //   bun write-edge.js load-without-revalidate   (control: /adapt + /load without Cache-Control)
+import { servedHttpHostnames, servedHttpRoutes } from "@ark-stack/shared";
+import { writeEdgeL4 } from "../../server/src/modules/edge-l4.ts";
 import { writeEdge } from "../../server/src/modules/providers.ts";
 
 const [mode, input] = process.argv.slice(2);
 
-if (mode === "write") {
-  console.log(JSON.stringify(await writeEdge(JSON.parse(input ?? "{}"))));
+if (mode === "write" || mode === "write-routed") {
+  const plan = JSON.parse(input ?? "{}");
+  const written = await writeEdge(plan);
+  if (mode === "write-routed") {
+    await writeEdgeL4({
+      httpHostnames: servedHttpHostnames(plan),
+      httpRoutes: servedHttpRoutes(plan),
+    });
+  }
+  console.log(JSON.stringify(written));
 } else if (mode === "load-without-revalidate") {
   const base = process.env.ARK_EDGE_RELOAD_URL ?? "";
   const caddyfile = await Bun.file(`${process.env.ARK_EDGE_DIR}/Caddyfile`).text();

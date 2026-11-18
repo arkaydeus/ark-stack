@@ -248,6 +248,13 @@ export function servedHttpHostnames(plan: { certificates: Array<{ hostname: stri
   return plan.certificates.filter((item) => item.status === "issued").map((item) => item.hostname);
 }
 
+export function servedHttpRoutes(
+  plan: Parameters<typeof servedHttpHostnames>[0] & { httpRoutes?: EdgeHttpRoute[] },
+) {
+  const hosts = new Set(servedHttpHostnames(plan));
+  return (plan.httpRoutes ?? []).filter((route) => hosts.has(route.hostname));
+}
+
 /**
  * Renders the public edge Caddyfile. Every HTTPS site loads the certificate Ark issued with
  * `tls <fullchain> <privkey>`; a hostname without an `issued` certificate is not rendered as a

@@ -37,6 +37,7 @@
 import { randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import { connect as http2Connect } from "node:http2";
 import { connect as netConnect } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -50,6 +51,7 @@ import {
   planEdge,
   routeIdentityKey,
   servedHttpHostnames,
+  servedHttpRoutes,
   type EdgeHttpRoute,
   type EdgeLeaseDocument,
   type EdgePolicyRoute,
@@ -147,12 +149,12 @@ const fd09Policy: EdgePolicyRoute[] = fd09Routes
   .map(({ id, hostname, stableId, ip, port }) => ({ id, kind: "http", hostname, stableId, ip, port }));
 
 /** `edge.apply`'s plan: the production planner over fixture endpoint, certificate and route rows. */
-function fixturePlan() {
+function fixturePlan(routes = fd09Routes) {
   const at = new Date();
   const rows = [
     { hostname: adminHost, kind: "admin" },
     { hostname: appHost, kind: "http" },
-    ...fd09Routes.map((route) => ({ hostname: route.hostname, kind: "route" })),
+    ...routes.map((route) => ({ hostname: route.hostname, kind: "route" })),
     { hostname: loginHost, kind: "gate" },
   ];
   return planEdge({
@@ -166,11 +168,15 @@ function fixturePlan() {
       status: "issued",
       lastDeployedAt: at,
     })),
-    httpRoutes: fd09Routes,
+    httpRoutes: routes,
   });
 }
 /** `edge.l4_apply`'s HTTP hostnames, derived from the same plan as the coordinator does. */
 const httpHosts = servedHttpHostnames(fixturePlan());
+const scopedHttp = {
+  httpHostnames: [...httpHosts, wsHost],
+  httpRoutes: servedHttpRoutes(fixturePlan()),
+};
 
 type Report = { name: string; lines: string[] };
 
@@ -507,8 +513,7 @@ async function edgeTsAddress(networkName: string) {
 }
 
 /** `edge.apply` as the domain worker runs it: the production planner, renderer and writeEdge on edge-control. */
-async function edgeApply() {
-  const plan = fixturePlan();
+async function edgeApply(plan = fixturePlan()) {
   const output = await docker(
     "run",
     "--rm",
@@ -516,6 +521,8 @@ async function edgeApply() {
     stack.networks.edgeControl,
     "--user",
     "1000:1000",
+    "--group-add",
+    "4400",
     "--env",
     "HOME=/tmp",
     "--env",
@@ -524,6 +531,10 @@ async function edgeApply() {
     "ARK_EDGE_RELOAD_URL=http://edge-admin:2019",
     "--env",
     "ARK_ACME_WEBROOT=/var/lib/ark/acme",
+    "--env",
+    "ARK_HAPROXY_MASTER_SOCKET=/var/run/haproxy/master.sock",
+    "--volume",
+    `${stack.volumes.haproxyRun}:/var/run/haproxy`,
     "--volume",
     `${bundles.writeEdge}:/harness:ro`,
     "--volume",
@@ -762,7 +773,7 @@ async function websocket(servername: string) {
       const masked = Buffer.from(payload.map((byte, index) => byte ^ mask[index % 4]!));
       socket.write(Buffer.concat([Buffer.from([0x81, 0x80 | payload.length]), mask, masked]));
     });
-  return { echo, closed: () => closeAt !== null, end: () => socket.destroy() };
+  return { echo, closed: () => closeAt !== null, closedAt: () => closeAt, end: () => socket.destroy() };
 }
 
 // ---- Tests -------------------------------------------------------------------------------------------------
@@ -850,7 +861,7 @@ async function permissionsTest(report: Report) {
     generation: string;
     reloadLog?: string;
     error?: string;
-  }>(["apply", JSON.stringify({ httpHostnames: httpHosts })]);
+  }>(["apply", JSON.stringify(scopedHttp)]);
   expect(
     report,
     applied.applied && applied.reloaded && /^[a-f0-9]{64}$/.test(applied.generation),
@@ -862,10 +873,10 @@ async function permissionsTest(report: Report) {
   expect(
     report,
     stat.some((row) => row.pxname === "fe_tls443" && row.svname === "FRONTEND" && row.status === "OPEN") &&
-      stat.some((row) => row.pxname === "be_caddy" && row.svname === "caddy"),
+      stat.some((row) => row.pxname === "be_caddy" && row.svname === "caddy_platform"),
     "the worker reads `show stat` through the admin socket",
     stat
-      .filter((row) => ["FRONTEND", "caddy"].includes(row.svname))
+      .filter((row) => ["FRONTEND", "caddy_platform"].includes(row.svname))
       .map((row) => `${row.pxname}/${row.svname} ${row.status}`)
       .join(", "),
   );
@@ -1038,13 +1049,39 @@ async function proxyTrustTest(report: Report) {
 }
 
 async function sniHostTest(report: Report) {
-  const mismatch = await secureGet(appHost, adminHost, "/");
+  await installScopedHttp();
+  const mismatch = await secureGet(wwwHost, tailnetHost);
   expect(
     report,
     mismatch.status === 421,
     "an SNI/Host mismatch between two Ark sites returns 421",
-    `SNI ${appHost}, Host ${adminHost} -> ${mismatch.status}`,
+    `SNI ${wwwHost}, Host ${tailnetHost} -> ${mismatch.status}`,
   );
+  const session = http2Connect(`https://127.0.0.1:${ports.https}`, {
+    servername: wwwHost,
+    rejectUnauthorized: false,
+  });
+  try {
+    const status = (authority: string) =>
+      new Promise<number>((resolveStatus, reject) => {
+        const stream = session.request({ ":authority": authority, ":path": "/" });
+        stream.on("response", (headers) => resolveStatus(Number(headers[":status"])));
+        stream.on("error", reject);
+        stream.setTimeout(5_000, () => stream.destroy(new Error("HTTP/2 request timed out")));
+        stream.resume();
+        stream.end();
+      });
+    const own = await status(wwwHost);
+    const other = await status(tailnetHost);
+    expect(
+      report,
+      own === 200 && other === 421,
+      "an HTTP/2 connection cannot coalesce across routes",
+      `${own}, then ${other}`,
+    );
+  } finally {
+    session.destroy();
+  }
   const unknown = await secureGet("unknown.example.net", "unknown.example.net").then(
     (reply) => `HTTP ${reply.status}`,
     (error: Error) => `refused (${error.message})`,
@@ -1052,7 +1089,7 @@ async function sniHostTest(report: Report) {
   expect(
     report,
     unknown.startsWith("refused"),
-    "unknown SNI goes to Caddy, which fails the handshake (no certificate)",
+    "unknown SNI is refused by the scoped router before it reaches Caddy",
     unknown,
   );
   const replies = await Promise.all([
@@ -1255,7 +1292,8 @@ function failedHandshake(servername: string) {
 /** HAProxy tcplog lines for connections to Caddy that failed to connect (termination state SC). */
 async function caddyConnectFailures() {
   // %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq
-  const pattern = /be_caddy\/caddy (-?\d+)\/(-?\d+)\/\+?(\d+) \d+ SC \d+\/\d+\/\d+\/\d+\/\+?(\d+)/;
+  const pattern =
+    /be_caddy\/caddy(?:_platform)? (-?\d+)\/(-?\d+)\/\+?(\d+) \d+ SC \d+\/\d+\/\d+\/\d+\/\+?(\d+)/;
   return (await logsOf(stack.edgeL4))
     .split("\n")
     .map((line) => ({ line, match: pattern.exec(line) }))
@@ -1269,7 +1307,7 @@ async function caddyConnectFailures() {
 }
 
 /**
- * Caddy's 8443 listener closed (watchdog stop, withdrawal failure, the FD-09 restart): HAProxy still
+ * Caddy's 8443 listener closed (whole-edge fail-closed stop): HAProxy still
  * accepts on 443, but must fail the loopback connect at once rather than retrying it for about 3 s.
  * Caddy keeps running here (an HTTP-only config through the admin API), so its listener stays closed
  * for the whole measurement and no restart races it.
@@ -1377,7 +1415,7 @@ async function guardMode() {
  * not cover a slow host; waiting for the guard's confirmed switch does.
  */
 async function allowAllTailnetRoutes() {
-  lease.routes = [webRoute, mqttRoute];
+  lease.routes = [webRoute, mqttRoute, ...fd09Policy];
   lease.validUntil = Number.POSITIVE_INFINITY;
   await Bun.sleep(1_500);
   await waitFor(
@@ -1391,7 +1429,7 @@ async function allowAllTailnetRoutes() {
 async function sessionsAcrossWorkers() {
   const applied = await probe<{ reloaded: boolean; error?: string }>([
     "apply",
-    JSON.stringify({ httpHostnames: httpHosts, tlsRoutes: [mqttL4] }),
+    JSON.stringify({ ...scopedHttp, tlsRoutes: [mqttL4] }),
     "force",
   ]);
   if (applied.error) throw new Error(applied.error);
@@ -1515,33 +1553,20 @@ async function leaseExpiryTest(report: Report) {
     "lease expiry withdraws the HAProxy-routed backend across current and leaving workers by expiry + 5 s",
     `${workers.length} workers; closed ${closedAt.map((at) => (at === null ? "never" : `${at - expiresAt} ms after expiry`)).join(", ")}`,
   );
-  // The adapters now enforce independently. HAProxy may close its sessions while Caddy is still
-  // inside /load; wait for Caddy's verified withdrawal before asserting its post-withdrawal reply.
-  const caddyWithdrawal = await waitFor(
+  await waitFor(
     "Caddy to verify its independent lease withdrawal",
     async () =>
       events.slice(eventsBefore).find((event) => event.event === "withdrawn" && event.proxy === "caddy"),
     5_000,
     50,
   );
-  // The withdrawn tailnet HTTP route renders stream_close_delay (FD-09), so the watchdog stops Caddy
-  // and the launch guard restarts it. HAProxy no longer retries the loopback hop, so a request inside
-  // that restart is reset at once instead of waiting for Caddy; wait for the restart to finish.
-  const stoppedCaddy = /stopped caddy/.test(caddyWithdrawal.detail);
-  const withdrawnAt = Date.now();
-  const servingAgain = await waitFor(
-    "unrelated HTTP routes after the lease-expiry withdrawal",
-    async () => ((await secureGet(adminHost)).status === 200 ? Date.now() : undefined),
-    stoppedCaddy ? 20_000 : 2_000,
-    100,
-  );
   const fresh = await tlsOutcome();
   const admin = await secureGet(adminHost);
   expect(
     report,
     fresh.startsWith("refused") && admin.status === 200,
-    "unrelated HTTP routes keep serving (after Caddy's stream-close restart) while tailnet backends are withdrawn",
-    `${mqttHost}: ${fresh}; ${adminHost}: ${admin.status}${stoppedCaddy ? `, serving again +${servingAgain - withdrawnAt} ms after the Caddy stop was reported` : ""}`,
+    "platform HTTPS keeps serving while tailnet backends are withdrawn",
+    `${mqttHost}: ${fresh}; ${adminHost}: ${admin.status}`,
   );
 }
 
@@ -1624,7 +1649,7 @@ async function launchGuardTest(report: Report) {
     if (phase === 900) {
       const applied = await probe<{ error?: string }>([
         "apply",
-        JSON.stringify({ httpHostnames: httpHosts, tlsRoutes: [] }),
+        JSON.stringify({ ...scopedHttp, tlsRoutes: [] }),
       ]);
       if (applied.error) throw new Error(applied.error);
       // The lease still allows the removed route, so the watchdog leaves these old sessions alone.
@@ -1831,7 +1856,7 @@ async function fd09AbsentTest(report: Report) {
   );
   const applied = await probe<{ httpHostnames?: string[]; error?: string }>([
     "apply",
-    JSON.stringify({ httpHostnames: httpHosts, tlsRoutes: [] }),
+    JSON.stringify({ ...scopedHttp, tlsRoutes: [] }),
   ]);
   const mapped = applied.httpHostnames ?? [];
   expect(
@@ -2015,6 +2040,7 @@ async function fd09RedirectTest(report: Report) {
 const websocketIdleMs = 630_000;
 
 async function fd09WebsocketTest(report: Report) {
+  await installScopedHttp();
   const ws = await websocket(wwwHost);
   const opened = await ws.echo("hello");
   const started = Date.now();
@@ -2038,56 +2064,125 @@ async function fd09WebsocketTest(report: Report) {
   ws.end();
 }
 
-/**
- * stream_close_delay keeps a withdrawn handler's WebSockets open after a reload, so the watchdog stops
- * Caddy when a withdrawn route holds one; the guard restarts it and the watchdog restores the rest.
- */
-async function fd09WithdrawalTest(report: Report) {
-  const ws = await websocket(wwwHost);
-  const opened = await ws.echo("before-withdrawal");
-  const closedAt = new Promise<number>((resolveClosed) => {
-    const timer = setInterval(() => {
-      if (ws.closed()) {
-        clearInterval(timer);
-        resolveClosed(Date.now());
-      }
-    }, 50);
-  });
-  const revokedAt = Date.now();
-  lease.routes = lease.routes.filter((route) => route.id !== wwwRoute.id);
-  const closed = await Promise.race([closedAt, Bun.sleep(10_000).then(() => 0)]);
-  // Detection (watchdog pass, at most 1 s plus the 300 ms lease read) + 5 s.
+async function installScopedHttp(tlsRoutes = [] as (typeof mqttL4)[]) {
+  const applied = await probe<{ error?: string }>(["apply", JSON.stringify({ ...scopedHttp, tlsRoutes })]);
+  if (applied.error) throw new Error(applied.error);
+}
+
+async function caddyPid() {
+  const processes = await docker("top", stack.edge, "-eo", "pid,comm");
+  const pid = /^\s*(\d+)\s+caddy\s*$/m.exec(processes)?.[1];
+  if (!pid) throw new Error(`Caddy process missing: ${processes}`);
+  return pid;
+}
+
+async function targetedHttpWithdrawalTest(
+  report: Report,
+  trigger: "identity" | "expiry" | "apply" | "drain",
+) {
+  await allowAllTailnetRoutes();
+  await installScopedHttp();
+  await edgeApply();
+  const initialPid = await caddyPid();
+  const target = await websocket(wwwHost);
+  const sibling = await websocket(tailnetHost);
+  const reload = await probe<{ reload: { success: boolean } }>(["reload"]);
+  const current = await websocket(wwwHost);
   expect(
     report,
-    opened === "before-withdrawal" && closed > 0 && closed - revokedAt <= 6_500,
-    "withdrawing a route closes its open WebSocket despite stream_close_delay 5m",
-    closed ? `closed +${closed - revokedAt} ms` : "still open after 10 s",
+    reload.reload.success &&
+      (await target.echo("leaving")) === "leaving" &&
+      (await current.echo("current")) === "current" &&
+      (await sibling.echo("held")) === "held",
+    "the target has open WebSockets in both workers and a sibling is open",
+    "all three connections echoed",
   );
-  const restored = await waitFor(
-    "the other routes after the withdrawal restart",
-    async () => ((await secureGet(tailnetHost)).body === "ok" ? Date.now() : undefined),
-    30_000,
-    250,
-  );
-  const www = await secureGet(wwwHost).then(
-    (reply) => `${reply.status}`,
-    (error: Error) => `refused (${error.message})`,
-  );
+  const trafficHost = trigger === "expiry" ? adminHost : tailnetHost;
+  const traffic = { running: true, requests: 0, errors: [] as string[] };
+  const requests = (async () => {
+    while (traffic.running) {
+      const reply = await secureGet(trafficHost).catch((error: Error) => ({
+        status: 0,
+        body: error.message,
+      }));
+      traffic.requests++;
+      if (reply.status !== 200) traffic.errors.push(`${reply.status} ${reply.body.slice(0, 80)}`);
+      await Bun.sleep(50);
+    }
+  })();
+  try {
+    await waitFor("requests before withdrawal", async () => (traffic.requests > 0 ? true : undefined));
+    const at = Date.now();
+    const deadlineStart = trigger === "expiry" ? at + 2_000 : at;
+    const remaining = lease.routes.filter((route) => route.id !== wwwRoute.id);
+    if (trigger === "expiry") lease.validUntil = deadlineStart;
+    else if (trigger === "identity")
+      lease.routes = [...remaining, { ...wwwRoute, kind: "http", stableId: "nREPLACED" }];
+    else if (trigger === "apply")
+      await edgeApply(fixturePlan(fd09Routes.filter((route) => route.id !== wwwRoute.id)));
+    else {
+      const result = await probe<{ withdrawn: string[]; error?: string }>([
+        "withdraw",
+        JSON.stringify(remaining.map(routeIdentityKey)),
+      ]);
+      expect(
+        report,
+        !result.error && result.withdrawn.includes(wwwHost),
+        "edge.drain targets the route",
+        JSON.stringify(result),
+      );
+    }
+    const closedAt = await waitFor(
+      "both target sockets to close",
+      async () => {
+        const times = [target.closedAt(), current.closedAt()];
+        return times.every((time) => time !== null) ? Math.max(...(times as number[])) : undefined;
+      },
+      7_000,
+      50,
+    );
+    expect(
+      report,
+      closedAt - deadlineStart >= 0 && closedAt - deadlineStart <= 5_000,
+      "both target WebSockets close within five seconds",
+      `${closedAt - deadlineStart} ms`,
+    );
+    if (trigger !== "expiry")
+      expect(
+        report,
+        (await sibling.echo("uninterrupted")) === "uninterrupted",
+        "the sibling WebSocket stays connected",
+        tailnetHost,
+      );
+    const denied = await secureGet(wwwHost).then(
+      (reply) => reply.status !== 200,
+      () => true,
+    );
+    expect(report, denied, "the withdrawn route refuses new requests", wwwHost);
+    expect(report, (await caddyPid()) === initialPid, "Caddy keeps the same process", initialPid);
+    const after = traffic.requests;
+    await waitFor("requests after withdrawal", async () => (traffic.requests > after ? true : undefined));
+  } finally {
+    traffic.running = false;
+    await requests;
+    target.end();
+    current.end();
+    sibling.end();
+  }
   expect(
     report,
-    www !== "200",
-    "the other routes serve again without an edge.apply; the withdrawn one does not",
-    `${tailnetHost} restored +${restored - revokedAt} ms; ${wwwHost} -> ${www}`,
+    traffic.requests >= 2 && !traffic.errors.length,
+    "unrelated HTTP requests succeed throughout",
+    `${traffic.requests} requests; ${traffic.errors.join(", ") || "zero errors"}`,
   );
-  lease.routes = [webRoute, mqttRoute, ...fd09Policy];
-  await Bun.sleep(1_500);
-  const applied = await edgeApply();
-  const back = await waitFor(
-    "the route after it is allowed again",
+  await allowAllTailnetRoutes();
+  await installScopedHttp();
+  await edgeApply();
+  await waitFor(
+    "the HTTP route to serve again",
     async () => ((await secureGet(wwwHost)).status === 200 ? true : undefined),
     15_000,
   );
-  expect(report, applied.applied && back, "allowed again, edge.apply serves it again", wwwHost);
 }
 
 // ---- FD-10: the login origin through the SNI router (§3.5, §3.9.1) -------------------------------------------
@@ -2270,7 +2365,10 @@ try {
   await run("FD-09: static 502 through 443", fd09ErrorTest);
   await run("FD-09: apex redirect and the :80 list", fd09RedirectTest);
   await run("FD-09: WebSocket idle over 10 minutes, then one edge.apply", fd09WebsocketTest);
-  await run("FD-09: withdrawal closes a route's WebSockets despite stream_close_delay", fd09WithdrawalTest);
+  for (const trigger of ["identity", "expiry", "apply", "drain"] as const)
+    await run(`HTTP targeted withdrawal: ${trigger}`, (report) =>
+      targetedHttpWithdrawalTest(report, trigger),
+    );
   await run(
     "FD-10: login-origin path allowlist, edge token and client address through 443",
     fd10AllowlistTest,

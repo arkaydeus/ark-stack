@@ -32,6 +32,7 @@ import {
   allowedServerIndex,
   GENERATION_ID,
   generationId,
+  haproxyHttpHostname,
   haproxyServerDenied,
   haproxyServerProtected,
   loopTargetServer,
@@ -40,6 +41,7 @@ import {
   parseShowProc,
   parseShowSess,
   parseShowStat,
+  type SessionInfo,
   SERVER_FORCED_MAINT,
   type EdgeL4Generation,
   type HaproxyProcess,
@@ -94,7 +96,19 @@ export class HaproxyMaster {
 
   /** Current and leaving workers (the master and external programs excluded). */
   async workers(): Promise<HaproxyProcess[]> {
-    const text = await this.command("show proc");
+    // The Unix listener can refuse a connect briefly while the master re-execs on reload.
+    // Retry within the watchdog pass without treating a failed inspection as verified.
+    let text: string;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        text = await this.command("show proc");
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (attempt >= 3 || (code !== "ECONNREFUSED" && code !== "ENOENT")) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+    }
     if (!/<PID>|master/.test(text)) throw new Error(`unexpected show proc answer: ${text.slice(0, 120)}`);
     const workers = parseShowProc(text).filter((process) => process.type === "worker");
     if (!workers.length) throw new Error("show proc returned no inspectable worker");
@@ -158,6 +172,14 @@ export class HaproxyMaster {
 /** Verification passes per enforcement; a racing reload or a slow session close gets this many tries. */
 const ENFORCE_PASSES = 20;
 
+function legacyCaddyServer(server: Pick<ServerState, "backend" | "server">) {
+  return server.backend === "be_caddy" && server.server === "caddy";
+}
+
+function sessionName(session: SessionInfo) {
+  return `${session.backend}/${session.server}`;
+}
+
 export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
   readonly proxy = "haproxy";
   readonly master: HaproxyMaster;
@@ -181,6 +203,54 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
 
   async enforce(allowed: ReadonlySet<string>): Promise<WithdrawalResult> {
     const index = allowedServerIndex(allowed);
+    return this.enforceServers((server) => haproxyServerDenied(server, index));
+  }
+
+  /** Fences removed or revoked HTTP identities without touching L4 or platform HTTPS. */
+  async enforceHttp(allowed: ReadonlySet<string>) {
+    const index = allowedServerIndex(allowed);
+    return this.enforceServers(
+      (server) => haproxyHttpHostname(server) !== null && haproxyServerDenied(server, index),
+    );
+  }
+
+  /** The first scoped generation retires sockets accepted by the old shared HTTP backend. */
+  async retireLegacyHttp() {
+    return this.enforceServers(legacyCaddyServer);
+  }
+
+  /** Confirms scoped control or fences the shared backend during the initial rollout. */
+  async ensureHttpControl() {
+    if (await this.hasLegacyHttp()) {
+      const retired = await this.retireLegacyHttp();
+      if (retired.error) throw new Error(retired.error);
+    }
+    return true;
+  }
+
+  /** A legacy backend can hold connections whose route cannot be determined at layer 4. */
+  async hasLegacyHttp() {
+    const workers = await this.master.workers();
+    const hasCurrent = workers.some((worker) => worker.section === "current");
+    const legacy = await Promise.all(
+      workers.map(async (worker) => {
+        try {
+          if (!(await this.master.servers(worker.pid)).some(legacyCaddyServer)) return false;
+          return (
+            !hasCurrent ||
+            worker.section === "current" ||
+            (await this.master.sessions(worker.pid)).some((session) => session.backend === "be_caddy")
+          );
+        } catch (error) {
+          if (error instanceof WorkerGoneError) return false;
+          throw error;
+        }
+      }),
+    );
+    return legacy.some(Boolean);
+  }
+
+  private async enforceServers(denies: (server: ServerState) => boolean): Promise<WithdrawalResult> {
     const active = new Set<string>();
     const withdrawn = new Set<string>();
     let workers: HaproxyProcess[];
@@ -204,7 +274,7 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
         workers.map(async (worker) => {
           this.inspected.add(worker.pid);
           try {
-            const outcome = await this.enforceWorker(worker.pid, index, active, withdrawn);
+            const outcome = await this.enforceWorker(worker.pid, denies, active, withdrawn);
             if (!outcome.clean) {
               clean = false;
               problem = outcome.problem;
@@ -248,21 +318,23 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
    */
   private async enforceWorker(
     pid: number,
-    index: ReadonlyMap<string, string>,
+    denies: (server: ServerState) => boolean,
     active: Set<string>,
     withdrawn: Set<string>,
   ) {
     const servers = await this.master.servers(pid);
-    // Tailnet target servers and terminated routes' loop servers (FD-14), which are fenced with
-    // their target so no new connection is even terminated for a revoked route.
-    const denied = servers.filter((server) => haproxyServerDenied(server, index));
-    for (const server of servers) if (server.key) active.add(server.key);
+    const denied = servers.filter(denies);
+    for (const server of servers) {
+      const key = server.key ?? haproxyHttpHostname(server);
+      if (key) active.add(key);
+    }
     if (!denied.length) return { clean: true, problem: "" };
-    // A loop server has no tailnet address; report it under its target's backend key.
+    // A loop server has no tailnet address. Report it under its target's backend key.
     const keyFor = (server: ServerState) =>
       server.key ??
+      haproxyHttpHostname(server) ??
       servers.find((item) => item.server === loopTargetServer(server.server) && item.key)?.key ??
-      `loop:${server.server}`;
+      server.backend;
     let leaving = false;
     // 1. Admission: disable every denied server in an accepting worker before touching sessions.
     for (const server of denied) {
@@ -276,20 +348,28 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
     }
     // 2. Sessions: per server where the proxy runs, per session where it is stopping.
     const deniedNames = new Set(denied.map((server) => `${server.backend}/${server.server}`));
-    const sessions = (await this.master.sessions(pid)).filter((session) =>
-      deniedNames.has(`${session.backend}/${session.server}`),
+    // Each HTTP backend has one server. Include connections assigned to the backend that are
+    // still waiting for its server, as well as connections already attached to that server.
+    const httpByBackend = new Map(
+      denied
+        .filter((server) => haproxyHttpHostname(server) !== null || legacyCaddyServer(server))
+        .map((server) => [server.backend, keyFor(server)]),
     );
+    const matches = (session: SessionInfo) =>
+      deniedNames.has(sessionName(session)) || httpByBackend.has(session.backend);
+    const sessions = (await this.master.sessions(pid)).filter(matches);
     const keyOf = new Map(denied.map((server) => [`${server.backend}/${server.server}`, keyFor(server)]));
-    for (const name of new Set(sessions.map((session) => `${session.backend}/${session.server}`))) {
-      withdrawn.add(keyOf.get(name)!);
-      if (!leaving) {
+    for (const name of new Set(sessions.map(sessionName))) {
+      const matching = sessions.filter((session) => sessionName(session) === name);
+      withdrawn.add(keyOf.get(name) ?? httpByBackend.get(matching[0]!.backend)!);
+      if (!leaving && deniedNames.has(name)) {
         const answer = (await this.master.worker(pid, `shutdown sessions server ${name}`)).trim();
         if (!answer) continue;
         if (!PROXY_STOPPED.test(answer)) throw new Error(`shutdown sessions server ${name}: ${answer}`);
         leaving = true;
       }
       // A leaving worker's proxies are stopped and refuse server commands; end each session instead.
-      for (const session of sessions.filter((item) => `${item.backend}/${item.server}` === name)) {
+      for (const session of matching) {
         const answer = (await this.master.worker(pid, `shutdown session ${session.id}`)).trim();
         if (answer && !/not found|no such|unknown session/i.test(answer)) {
           throw new Error(`shutdown session: ${answer}`);
@@ -308,9 +388,7 @@ export class HaproxyWithdrawalAdapter implements EdgeWithdrawalAdapter {
         problem: `worker ${pid}: ${unfenced.length} denied server(s) still admit connections`,
       };
     }
-    const remaining = (await this.master.sessions(pid)).filter((session) =>
-      deniedNames.has(`${session.backend}/${session.server}`),
-    );
+    const remaining = (await this.master.sessions(pid)).filter(matches);
     if (remaining.length) {
       return {
         clean: false,

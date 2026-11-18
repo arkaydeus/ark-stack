@@ -7,6 +7,7 @@ import {
   allowedServerIndex,
   generationId,
   haproxyConfigServers,
+  haproxyHttpServerName,
   haproxyLaunchDecision,
   haproxyLoopServerName,
   haproxyServerName,
@@ -73,7 +74,7 @@ describe("edge-l4 rendering (§3.8.5 fe_tls443)", () => {
       const caddy = section(text, "be_caddy");
       expect(caddy).toContain("\n    retries 0\n");
       expect(caddy).toContain("\n    timeout connect 1s\n");
-      expect(caddy).toEndWith("    server caddy 127.0.0.1:8443 send-proxy-v2");
+      expect(caddy.trimEnd()).toEndWith("    server caddy 127.0.0.1:8443 send-proxy-v2");
       // A single server: redispatch would have nowhere else to go and must not be enabled anywhere.
       expect(text).not.toMatch(/^\s+option redispatch/m);
       // The fast-fail settings are scoped to Caddy; defaults keep the 5 s connect timeout.
@@ -83,6 +84,29 @@ describe("edge-l4 rendering (§3.8.5 fe_tls443)", () => {
       );
     }
     expect(section(withRoute.files["haproxy.cfg"]!, "be_rt_p7q2_tls")).not.toContain("retries");
+  });
+
+  test("HTTP route hostnames have independent fail-fast backends in both configurations", () => {
+    const a = { ...route, id: "rt_web1", hostname: "a.example.com", port: 3000 };
+    const b = { ...a, id: "rt_web2", hostname: "b.example.com" };
+    const scoped = renderEdgeL4Generation({
+      httpHostnames: [a.hostname, b.hostname, "login.example.com"],
+      httpRoutes: [b, a],
+      tlsRoutes: [route],
+    });
+    expect(haproxyHttpServerName(a)).not.toBe(haproxyHttpServerName(b));
+    for (const path of ["haproxy.cfg", "haproxy.closed.cfg"]) {
+      const text = scoped.files[path]!;
+      for (const host of [a, b]) {
+        const backend = `be_http_${host.hostname}`;
+        expect(text).toContain(`use_backend ${backend} if { req.ssl_sni -i ${host.hostname} }`);
+        const stanza = section(text, backend);
+        expect(stanza).toContain("    retries 0\n    timeout connect 1s\n");
+        expect(stanza).toContain(`server ${haproxyHttpServerName(host)} 127.0.0.1:8443 send-proxy-v2`);
+      }
+      expect(text).toContain("acl ark_http_sni req.ssl_sni -i login.example.com\n");
+      expect(text).toContain("default_backend be_reject\n");
+    }
   });
 
   test("the global section shares the admin socket with group 4400 and bounds old workers", () => {
@@ -373,6 +397,33 @@ describe("HaproxyWithdrawalAdapter", () => {
     expect(again.error).toBeUndefined();
   });
 
+  test("withdraws old HTTP identities and pending connections without fencing the same hostname's replacement", async () => {
+    const old = { ...route, hostname: "www.example.com" };
+    const replacement = { ...old, stableId: "nNEW" };
+    const backend = "be_http_www.example.com";
+    const serverFor = (input: typeof old) => ({
+      backend,
+      server: haproxyHttpServerName(input),
+      addr: "127.0.0.1",
+      port: 8443,
+      admin: 0,
+    });
+    const state = workers();
+    state[0]!.servers.push(serverFor(replacement));
+    state[0]!.sessions.push({ id: "0xb", backend, server: serverFor(replacement).server });
+    state[1]!.servers.push(serverFor(old));
+    state[1]!.sessions.push(
+      { id: "0xa", backend, server: serverFor(old).server },
+      { id: "0xc", backend, server: "<none>" },
+    );
+    const adapter = new HaproxyWithdrawalAdapter("/fake", fakeMaster(state));
+    const result = await adapter.enforceHttp(new Set([routeIdentityKey(replacement)]));
+    expect(result.error).toBeUndefined();
+    expect(result.withdrawn).toEqual([old.hostname]);
+    expect(state[0]!.sessions.some((session) => session.id === "0xb")).toBe(true);
+    expect(state[1]!.sessions.map((session) => session.id)).toEqual(["0x9"]);
+  });
+
   test("an empty allowlist (expired lease) withdraws every tailnet server but never Caddy", async () => {
     const state = workers();
     const result = await new HaproxyWithdrawalAdapter("/fake", fakeMaster(state)).enforce(new Set());
@@ -399,6 +450,22 @@ describe("HaproxyWithdrawalAdapter", () => {
       throw new Error("ENOENT");
     }).enforce(new Set());
     expect(result).toMatchObject({ unreachable: true });
+  });
+
+  test("a brief master socket refusal during reload is retried before the watchdog reports failure", async () => {
+    const cli = fakeMaster(workers());
+    let refused = false;
+    const reexec: HaproxyCli = async (socket, command, timeout) => {
+      if (command === "show proc" && !refused) {
+        refused = true;
+        throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+      }
+      return cli(socket, command, timeout);
+    };
+    const result = await new HaproxyWithdrawalAdapter("/fake", reexec).enforce(new Set());
+    expect(refused).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(result.withdrawn).toEqual(["100.88.1.20:1883", "100.88.1.30:1883"]);
   });
 
   test("stop fences tailnet servers and sessions without shutting down public HTTP", async () => {
