@@ -11,7 +11,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
+
+import { prepareEdgeImage } from "../../scripts/edge-test/edge-image.ts";
 
 import { GATE_EDGE_API_PATHS, createId, privilegedRequestHash, renderCaddyfile } from "@ark-stack/shared";
 import { createAuthEndpoint } from "better-auth/api";
@@ -623,9 +625,13 @@ describe("trusted client address and sign-in rate limit", () => {
           .replaceAll("api:3000", `host.docker.internal:${relay.port}`)
           .concat("\n:8081 {\n  reverse_proxy 127.0.0.1:8080\n}\n");
         await Bun.write(join(directory, "Caddyfile"), mode === "public" ? publicConfig : tailnetConfig);
-        const compose = Bun.YAML.parse(
-          await Bun.file(join(import.meta.dir, "../../infra/platform/docker-compose.yml")).text(),
-        ) as { services: { edge: { image: string } } };
+        const root = resolvePath(import.meta.dir, "../..");
+        const source = await Bun.file(join(root, "infra/platform/docker-compose.yml")).text();
+        const compose = Bun.YAML.parse(source) as { services: { "tailnet-gateway": { image: string } } };
+        const image =
+          mode === "public"
+            ? await prepareEdgeImage(proxyDocker, { root, compose: source })
+            : { image: compose.services["tailnet-gateway"].image, platformArgs: [] };
         await proxyDocker("network", "create", network);
         proxyNetworks.push(network);
         const proxy = `${network}-caddy`;
@@ -645,7 +651,8 @@ describe("trusted client address and sign-in rate limit", () => {
           `ARK_EDGE_GATE_TOKEN=${edgeToken}`,
           "-v",
           `${directory}/Caddyfile:/etc/caddy/Caddyfile:ro`,
-          compose.services.edge.image,
+          ...image.platformArgs,
+          image.image,
         );
         for (const label of ["a", "b"]) {
           const name = `${network}-${label}`;

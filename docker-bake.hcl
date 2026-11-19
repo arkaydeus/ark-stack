@@ -26,7 +26,7 @@ function "refs" {
 }
 
 group "default" {
-  targets = ["app", "database-worker", "database-ingress", "domain-worker", "edge-watchdog", "haproxy-validator", "mail-worker", "backup-worker", "postgres", "app-postgres", "agent"]
+  targets = ["app", "database-worker", "database-ingress", "domain-worker", "edge-caddy", "edge-watchdog", "haproxy-validator", "mail-worker", "backup-worker", "postgres", "app-postgres", "agent"]
 }
 
 target "_common" {
@@ -70,6 +70,14 @@ target "domain-worker" {
   inherits = ["_app"]
   target   = "domain-worker"
   tags     = refs("ark-domain-worker")
+}
+
+# Caddy 2.11.9 with the pinned caddy-ratelimit plugin, for the `edge` service (docs/design/front-door.md
+# FD-23). Compose builds it locally; a published digest can be pinned with `mise run images:pin-edge-caddy`.
+target "edge-caddy" {
+  inherits = ["_app"]
+  target   = "edge-caddy"
+  tags     = refs("ark-edge-caddy")
 }
 
 target "edge-watchdog" {

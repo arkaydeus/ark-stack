@@ -9,21 +9,47 @@
 //   bun write-edge.js write-routed '<writeEdge input JSON>' (also apply the HTTP SNI generation)
 //   bun write-edge.js coordinator '{"kind":"edge.drain","enqueue":true}' (disposable database)
 //   bun write-edge.js load-without-revalidate   (control: /adapt + /load without Cache-Control)
-import { servedHttpHostnames, servedHttpRoutes } from "@ark-stack/shared";
+import { join } from "node:path";
+
+import { servedHttpHostnames, servedHttpRoutes, sha256Hex } from "@ark-stack/shared";
 import { writeEdgeL4 } from "../../server/src/modules/edge-l4.ts";
 import { writeEdge } from "../../server/src/modules/providers.ts";
 
 const [mode, input] = process.argv.slice(2);
 
 if (mode === "coordinator") {
-  const { kind, enqueue: create, failCensus } = JSON.parse(input ?? "{}");
-  if (kind !== "edge.drain" && kind !== "edge.l4_apply") throw new Error("Unexpected edge operation");
+  const { kind, enqueue: create, failCensus, acknowledgeIngress } = JSON.parse(input ?? "{}");
+  if (kind !== "edge.drain" && kind !== "edge.l4_apply" && kind !== "edge.apply")
+    throw new Error("Unexpected edge operation");
   const { enqueue, processQueued } = await import("../../server/src/coordinator.ts");
   const { sql } = await import("../../server/src/db.ts");
   const fault = failCensus
     ? Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null, { status: 503 }) })
     : null;
   if (fault) process.env.ARK_EDGE_RELOAD_URL = fault.url.origin;
+  // This fixture has no host firewall reconciler. Acknowledge only the exact rendered request.
+  const ingress = process.env.ARK_FRONT_INGRESS_DIR;
+  let acknowledged = "";
+  const timer =
+    acknowledgeIngress && ingress
+      ? setInterval(async () => {
+          try {
+            const { id, hash } = await Bun.file(join(ingress, "policy.request")).json();
+            if (
+              id !== acknowledged &&
+              hash === sha256Hex(await Bun.file(join(ingress, "policy.nft")).text())
+            ) {
+              await Bun.write(
+                join(ingress, "policy.status"),
+                `request_id=${id}\npolicy_hash=${hash}\napplied=true\n`,
+              );
+              acknowledged = id;
+            }
+          } catch {
+            // The worker has not published the request yet.
+          }
+        }, 75)
+      : undefined;
   try {
     if (create) await enqueue({ kind, targetIds: ["platform"] });
     const [queued] = await sql`
@@ -35,6 +61,7 @@ if (mode === "coordinator") {
     const steps = await sql`SELECT evidence FROM operation_steps WHERE operation_id = ${queued.id}`;
     console.log(JSON.stringify({ ...finished, evidence: steps[0]?.evidence ?? null }));
   } finally {
+    clearInterval(timer);
     await fault?.stop(true);
     await sql.end();
   }

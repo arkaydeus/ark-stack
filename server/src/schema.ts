@@ -640,8 +640,9 @@ export const frontRoutes = pgTable(
     internetConfirmedBy: text("internet_confirmed_by").references(() => user.id),
     internetConfirmedAt: timestamp("internet_confirmed_at", { withTimezone: true }),
     protocolAuthConfirmed: boolean("protocol_auth_confirmed").notNull().default(false),
+    // terminate_mtls routes (FD-14), and HTTP routes that require client certificates (FD-23).
     clientCaId: text("client_ca_id").references(() => privateCas.id),
-    rateLimit: jsonb("rate_limit").$type<Record<string, unknown>>(), // reserved; not rendered in v1
+    rateLimit: jsonb("rate_limit").$type<Record<string, unknown>>(), // HTTP routes: { requests, window } (FD-23)
     enabled: boolean("enabled").notNull().default(false),
     status: text("status").$type<(typeof frontRouteStatuses)[number]>().notNull().default("draft"),
     lastError: text("last_error"),

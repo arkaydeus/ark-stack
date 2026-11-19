@@ -888,7 +888,15 @@ export async function generateCaCrl(
     const thisUpdate = wholeSeconds(input.now ?? new Date());
     const nextUpdate = new Date(thisUpdate.getTime() + Math.round(days * DAY_MS));
     // A CRL number from the clock, kept strictly above the stored CRL's, needs no extra column.
-    const previous = ca.crlPem ? x509.parseCrl(x509.fromPem(ca.crlPem, ["X509 CRL"])).crlNumber : null;
+    let previous: bigint | null = null;
+    if (ca.crlPem) {
+      try {
+        previous = x509.parseCrl(x509.fromPem(ca.crlPem, ["X509 CRL"])).crlNumber;
+      } catch (error) {
+        // HTTP admission closes on an unreadable CRL. Rebuild it from committed revocations.
+        if (ca.purpose !== "http-client") throw error;
+      }
+    }
     const fromClock = BigInt(Math.floor(thisUpdate.getTime() / 1000));
     const crlNumber = previous !== null && previous >= fromClock ? previous + 1n : fromClock;
     const crl = buildCrl({

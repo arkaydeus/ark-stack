@@ -4,6 +4,7 @@ import {
   HTTP_ROUTE_SNIPPETS,
   checkedHttpRoute,
   httpRouteSiteBody,
+  httpRouteTlsOptions,
   type EdgeHttpRoute,
 } from "./edge-http.ts";
 import { ValidationError } from "./errors.ts";
@@ -303,7 +304,7 @@ export function renderCaddyfile(input: {
     if (certificate.status === "issued") issued.set(hostname, certificate);
   }
   const served: string[] = [];
-  const site = (hostname: string, body: string, marker = "") => {
+  const site = (hostname: string, body: string, marker = "", tlsOptions = "") => {
     hostname = checkedHostname(hostname);
     const certificate = issued.get(hostname);
     if (!certificate) return "";
@@ -313,7 +314,7 @@ export function renderCaddyfile(input: {
     // HTTPS sites listen on loopback only, behind the HAProxy SNI router on 443 (§3.5, §3.8).
     return `${marker}${hostname} {
   bind 127.0.0.1
-  ${tlsLine(certificate)}
+  ${tlsLine(certificate)}${tlsOptions}
 ${body}}
 `;
   };
@@ -377,11 +378,13 @@ ${body}}
         httpRouteSiteBody(route, checkedUpstream(input.apiUpstream)),
         // Redirect-only routes dial nothing, so they carry no tailnet marker.
         route.redirectTo
-          ? `# ${route.id} ${route.hostname}: canonical redirect to ${route.redirectTo}
+          ? `# ${route.id} ${route.hostname}: canonical redirect to ${route.redirectTo}${route.clientAuth ? " (client certificate required)" : ""}
 `
-          : `# ${route.id} ${route.hostname}: ${route.access === "sso" ? "SSO" : "public access"}
+          : `# ${route.id} ${route.hostname}: ${route.access === "sso" ? "SSO" : "public access"}${route.clientAuth ? " with a client certificate" : ""}
 ${TAILNET_ROUTE_MARKER} ${route.id} ${route.upstream}
 `,
+        // HTTP mTLS (FD-23): the client certificate is checked in the TLS handshake, before HTTP.
+        httpRouteTlsOptions(route),
       ),
     )
     .filter(Boolean)

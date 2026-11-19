@@ -3935,14 +3935,20 @@ app.patch("/api/front/routes/:id", async (c) => {
           tx,
         )
     : undefined;
-  const { status } = await commitRouteUpdate(
-    plan,
-    { userId: access.userId, role: access.role },
-    enqueue,
-    authorize,
-  );
-  const [route] = await listFrontRoutes(routeId);
-  return c.json({ route, status, loosening: plan.loosening });
+  try {
+    const { status } = await commitRouteUpdate(
+      plan,
+      { userId: access.userId, role: access.role },
+      enqueue,
+      authorize,
+    );
+    const [route] = await listFrontRoutes(routeId);
+    return c.json({ route, status, loosening: plan.loosening });
+  } catch (error) {
+    if (error instanceof HTTPException && error.status === 403)
+      return c.json({ error: error.message, code: "exposure_step_up_required" }, 403);
+    throw error;
+  }
 });
 
 app.post("/api/front/routes/:id/enable", async (c) => {
@@ -3974,9 +3980,10 @@ app.post("/api/front/routes/:id/disable", async (c) => {
   return c.json({ route });
 });
 
-// Client certificates of a terminate_mtls route (front door §3.8.4, FD-14). Owner-only. Issuing
-// grants access, so it needs a `credential.rotate` grant bound to the route and exact body;
-// revoking tightens (the CRL is regenerated and the route's sessions drained) and needs none.
+// Client certificates of a terminate_mtls route (front door §3.8.4, FD-14) or an HTTP mTLS route
+// (FD-23). Owner-only. Issuing grants access, so it needs a `credential.rotate` grant bound to the
+// route and exact body; revoking tightens (the CRL is regenerated and the route's sessions drained)
+// and needs none.
 const routeClientCertificateInput = z
   .object({
     name: z
@@ -4005,17 +4012,20 @@ app.post("/api/front/routes/:id/client-certificates", async (c) => {
   const request = (await c.req.json()) as Record<string, unknown>;
   const input = routeClientCertificateInput.parse(request);
   if (input.csrPem !== undefined) validateCsr(input.csrPem);
-  await listRouteClientCertificates(routeId);
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "credential.rotate",
-    privilegedRequestHash("credential.rotate", { routeId, ...request }),
+  const issued = await issueRouteClientCertificate(
+    routeId,
+    input,
+    { userId: access.userId, role: access.role },
+    enqueue,
+    (tx) =>
+      requirePrivileged(
+        access,
+        c.get("session"),
+        "credential.rotate",
+        privilegedRequestHash("credential.rotate", { routeId, ...request }),
+        tx,
+      ),
   );
-  const issued = await issueRouteClientCertificate(routeId, input, {
-    userId: access.userId,
-    role: access.role,
-  });
   c.header("cache-control", "no-store");
   return c.json(issued, 201);
 });

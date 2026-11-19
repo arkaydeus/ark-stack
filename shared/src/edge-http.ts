@@ -12,7 +12,11 @@
 //   `Domain=` removed (cookies become host-only on the public name), no buffering for WebSockets,
 //   `stream_close_delay` across reloads, and dial/response-header timeouts;
 // - the Location policy below;
-// - or, for an apex route with `redirectTo`, a 308 to the canonical hostname and nothing else.
+// - or, for an apex route with `redirectTo`, a 308 to the canonical hostname and nothing else;
+// - optionally (FD-23), a per-client `rate_limit` zone (the pinned caddy-ratelimit plugin) ahead of
+//   every handler, and HTTP mTLS in the site's `tls` block: a certificate from the route's own CA,
+//   then a `leaf` allowlist of exactly the certificates it admits (`httpRouteTlsOptions`). Routes
+//   without either render exactly as before.
 //
 // `public` routes render no gate. `sso` routes (FD-11) render `forward_auth` to the API; their
 // `stream_close_delay` is capped at 5 minutes for routine reloads. Gate revocations drain
@@ -63,8 +67,11 @@ import {
   checkBypassPaths,
 } from "./gate.ts";
 import { normalizeHostname } from "./hostnames.ts";
+import { HTTP_RATE_LIMIT_BOUNDS } from "./http-rate-limit.ts";
 import { checkTailnetAddress, parseIpLiteral } from "./tailnet.ts";
 import { backendKey } from "./tailnet-observe.ts";
+
+export { HTTP_RATE_LIMIT_BOUNDS } from "./http-rate-limit.ts";
 
 /** Where the `edge` container mounts the static error pages (infra/platform/edge-errors). */
 export const EDGE_ERRORS_DIR = "/etc/caddy/errors";
@@ -96,6 +103,30 @@ export const HTTP_ROUTE_DEFAULTS: HttpRouteOptions = {
 };
 
 /**
+ * Per-route request rate limit (`front_routes.rate_limit`, FD-23): at most `requests` requests per
+ * sliding `window` from one client address (the PROXY v2 source), rendered with the pinned
+ * `caddy-ratelimit` plugin. Requests over the limit get 429 with `Retry-After`, before the login
+ * gate's `forward_auth` and before the upstream.
+ */
+export type HttpRateLimit = { requests: number; window: string };
+
+/**
+ * HTTP client-certificate authentication (FD-23): the route's own CA (`front_routes.client_ca_id`)
+ * and the client certificates it currently admits. Caddy verifies the chain against the CA and then
+ * accepts only these exact leaf certificates, so a certificate that is revoked (in the route CA's CRL
+ * or marked revoked) or expired is refused during the TLS handshake. An empty list admits nobody.
+ */
+export type HttpClientAuth = {
+  /** The route CA certificate, base64 DER. */
+  caCertificate: string;
+  /** Every admitted client certificate, base64 DER. */
+  certificates: string[];
+};
+
+/** At most this many admitted client certificates per route are rendered. */
+export const HTTP_CLIENT_CERTIFICATE_LIMIT = 500;
+
+/**
  * A servable front-door HTTP route (front door §3.2, §3.5). Only routes that are enabled, `ready`
  * and allowed by a fresh lease reach the renderer. The pinned IP is the only address dialed; route
  * and stable-ID metadata authorise that exact pin.
@@ -117,9 +148,15 @@ export type EdgeHttpRoute = {
   internalNames?: string[];
   /** Further tailnet addresses of the target node (its other address family). */
   internalIps?: string[];
+  /** Per-client request rate limit (FD-23); none by default. */
+  rateLimit?: HttpRateLimit | null;
+  /** Required client certificates (HTTP mTLS, FD-23); none by default. */
+  clientAuth?: HttpClientAuth | null;
 };
 
 const ROUTE_ID = /^rt_[a-z0-9]+$/;
+/** Canonical base64 of one DER certificate; anything else is refused, never escaped. */
+const BASE64_DER = /^[A-Za-z0-9+/]{64,24000}={0,2}$/;
 /** Tailscale StableNodeIDs are alphanumeric (`nAbC123CNTRL`); anything else is refused, not escaped. */
 const STABLE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const BYPASS_PATH = /^\/[A-Za-z0-9._~\-/]*\*?$/;
@@ -170,6 +207,65 @@ export function httpRouteOptions(value: Record<string, unknown> | null | undefin
   if (input.streamTimeout !== undefined && input.streamTimeout !== null)
     options.streamTimeout = durationMs(input.streamTimeout, "streamTimeout", 1_000);
   return options;
+}
+
+/**
+ * Parses `front_routes.rate_limit`: null or absent means no limit; anything present must be exactly
+ * `{ requests, window }` within `HTTP_RATE_LIMIT_BOUNDS`. Invalid values are refused, never defaulted.
+ */
+export function httpRateLimit(value: unknown): HttpRateLimit | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" || Array.isArray(value))
+    throw new ValidationError("rateLimit must be an object with requests and window, or null.");
+  const input = value as Record<string, unknown>;
+  const unknown = Object.keys(input).filter((key) => key !== "requests" && key !== "window");
+  if (unknown.length) throw new ValidationError(`rateLimit has unknown fields: ${unknown.join(", ")}.`);
+  const { requests, window } = input;
+  const bounds = HTTP_RATE_LIMIT_BOUNDS;
+  if (
+    typeof requests !== "number" ||
+    !Number.isInteger(requests) ||
+    requests < bounds.requests.min ||
+    requests > bounds.requests.max
+  ) {
+    throw new ValidationError(
+      `rateLimit.requests ${JSON.stringify(requests)} must be an integer ${bounds.requests.min}-${bounds.requests.max}.`,
+    );
+  }
+  const match = typeof window === "string" ? DURATION.exec(window) : null;
+  const ms = match ? Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS] : Number.NaN;
+  if (!match || match[2] === "ms" || ms < bounds.windowMs.min || ms > bounds.windowMs.max) {
+    throw new ValidationError(
+      `rateLimit.window ${JSON.stringify(window)} must be a duration from 1s to 1h, such as 10s or 1m.`,
+    );
+  }
+  return { requests, window: window as string };
+}
+
+/** The duration of an already validated rate limit window. */
+export function rateLimitWindowMs(limit: HttpRateLimit) {
+  const match = DURATION.exec(limit.window)!;
+  return Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS];
+}
+
+function checkedClientAuth(value: HttpClientAuth, routeId: string) {
+  const der = (item: unknown, what: string) => {
+    if (
+      typeof item !== "string" ||
+      !BASE64_DER.test(item) ||
+      Buffer.from(item, "base64").toString("base64") !== item
+    )
+      throw new ValidationError(`Route ${routeId}: ${what} is not a base64 DER certificate.`);
+    return item;
+  };
+  if (!value || typeof value !== "object" || !Array.isArray(value.certificates))
+    throw new ValidationError(`Route ${routeId}: client authentication needs a CA and a certificate list.`);
+  const certificates = [...new Set(value.certificates.map((item) => der(item, "a client certificate")))];
+  if (certificates.length > HTTP_CLIENT_CERTIFICATE_LIMIT)
+    throw new ValidationError(
+      `Route ${routeId} admits ${certificates.length} client certificates; at most ${HTTP_CLIENT_CERTIFICATE_LIMIT} are supported.`,
+    );
+  return { caCertificate: der(value.caCertificate, "the client CA"), certificates: certificates.toSorted() };
 }
 
 function checkedName(hostname: string, what: string) {
@@ -241,6 +337,12 @@ export function checkedHttpRoute(route: EdgeHttpRoute) {
     // Names that cannot form a valid authority never pass the supported-forms check; skip them.
     if (value && NAME.test(value) && !parseIpLiteral(value)) names.add(value);
   }
+  const rateLimit = httpRateLimit(route.rateLimit);
+  // Fail closed: a route that names client authentication but carries no usable CA is never served.
+  const clientAuth =
+    route.clientAuth === undefined || route.clientAuth === null
+      ? null
+      : checkedClientAuth(route.clientAuth, route.id);
   return {
     id: route.id,
     hostname,
@@ -254,6 +356,8 @@ export function checkedHttpRoute(route: EdgeHttpRoute) {
     options,
     internalIps: [...ips.values()],
     internalNames: [...names].toSorted(),
+    rateLimit,
+    clientAuth,
   };
 }
 
@@ -410,6 +514,60 @@ export const HTTP_ROUTE_SNIPPETS = (errorsDir: string) => `(ark_route_base) {
 
 const API_UPSTREAM = /^[A-Za-z0-9.-]+:\d{1,5}$/;
 
+function pemCertificate(der: string) {
+  return `-----BEGIN CERTIFICATE-----\n${der.match(/.{1,64}/g)!.join("\n")}\n-----END CERTIFICATE-----`;
+}
+
+/**
+ * The options block of a route site's `tls` directive (FD-23). Empty for routes without client
+ * authentication, so their `tls` line is unchanged. For HTTP mTLS routes: a client certificate is
+ * required and verified against the route CA only (the inline trust pool), and the `leaf` verifier
+ * then admits exactly the route's unrevoked, unexpired certificates. Caddy runs the verifier from
+ * `VerifyConnection` and turns session tickets off for client-auth policies, so neither a resumed
+ * session nor a ticket from another hostname skips it. Every value is validated base64 DER.
+ */
+export function httpRouteTlsOptions(route: CheckedHttpRoute) {
+  if (!route.clientAuth) return "";
+  const leaves = route.clientAuth.certificates
+    .map((der) => `        pem "${pemCertificate(der)}"\n`)
+    .join("");
+  return ` {
+    client_auth {
+      mode require_and_verify
+      trust_pool inline {
+        trust_der ${route.clientAuth.caCertificate}
+      }
+      # The route's unrevoked, unexpired client certificates (FD-23); an empty list admits nobody.
+      verifier leaf {
+${leaves}      }
+    }
+  }`;
+}
+
+/** The route's `rate_limit` handler (FD-23), keyed by the PROXY v2 client address. */
+function rateLimitBlock(route: CheckedHttpRoute, indent: string) {
+  if (!route.rateLimit) return "";
+  return [
+    "rate_limit {",
+    // Zone names are global to the Caddy process, so each route has its own.
+    `  zone ark_${route.id} {`,
+    "    key {remote_host}",
+    `    events ${route.rateLimit.requests}`,
+    `    window ${route.rateLimit.window}`,
+    "  }",
+    "}",
+  ]
+    .map((line) => `${indent}${line}\n`)
+    .join("");
+}
+
+/** A static 429 for requests over the route's limit; Retry-After comes from the plugin. */
+const RATE_LIMITED = `  handle_errors 429 {
+    header -Server
+    respond "Too many requests." 429
+  }
+`;
+
 /** The edge token as a runtime placeholder: it never appears in the rendered file. */
 const EDGE_TOKEN = "{env.ARK_EDGE_GATE_TOKEN}";
 
@@ -421,6 +579,13 @@ export function httpRouteSiteBody(route: CheckedHttpRoute, apiUpstream = "api:30
   const { options } = route;
   const hsts = options.hsts ? '  header Strict-Transport-Security "max-age=31536000"\n' : "";
   if (route.redirectTo) {
+    // `redir` sorts before `rate_limit`, so a limited redirect runs both in an explicit order.
+    if (route.rateLimit)
+      return `  import ark_route_base
+${hsts}  route {
+${rateLimitBlock(route, "    ")}    redir https://${route.redirectTo}{uri} 308
+  }
+${RATE_LIMITED}`;
     return `  import ark_route_base
 ${hsts}  redir https://${route.redirectTo}{uri} 308
 `;
@@ -462,11 +627,17 @@ ${policy.rewrite ? `          header Location ${token(`(?i)${policy.rewrite.patt
     }
 `;
   const identity = `    vars ark_tailnet_route ${routeIdentityKey(route)}\n`;
+  // The plugin orders `rate_limit` before `basic_auth`: ahead of `forward_auth`, every `handle`
+  // (the gate's own handlers included) and the upstream.
+  const limited = route.rateLimit
+    ? `  # Rate limit (FD-23): ${route.rateLimit.requests} requests per ${route.rateLimit.window} per client address.
+${rateLimitBlock(route, "  ")}${RATE_LIMITED}`
+    : "";
   const head = `  import ark_route_base
 ${hsts}  request_body {
     max_size ${options.maxBodyMb}MB
   }
-`;
+${limited}`;
   if (route.access !== "sso") {
     return `${head}  # Reserved for the login gate (FD-11): public routes answer every /.ark/gate/* path with 404.
   handle /.ark/gate/* {

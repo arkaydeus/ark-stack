@@ -7,6 +7,9 @@
 // API is reachable only from edge-control, and a restarted or replaced `edge-ts` is recovered by the
 // same rejoin step `mise run maintain` runs. No tailnet is needed; `mise run test:edge-tailnet` covers
 // the checks that need one.
+// The `edge` service runs the custom Caddy build (FD-23: the official image's binary rebuilt with the
+// pinned caddy-ratelimit plugin), so validation and behaviour tests run on that image; the official
+// pin remains the tailnet-gateway image and the base of the custom build.
 // The bump procedure for the pinned images is in docs/operating.md ("Third-party image pins").
 import { X509Certificate, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp } from "node:fs/promises";
@@ -25,11 +28,15 @@ import {
 } from "@ark-stack/shared";
 
 import { rejoinNamespaceDependents } from "./edge-namespace.ts";
+import { checkEdgeCaddyBase, composeEdgeImage, prepareEdgeImage } from "./edge-test/edge-image.ts";
 import { checkReleasePins } from "./edge-test/pins.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
 
 const caddyImage = "caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c";
+/** The shipped edge image (FD-23), set by `checkPins`: built from the edge-caddy stage or pinned. */
+let edgeImage = "";
+let edgePlatformArgs: string[] = [];
 // The edge node (edge-ts) and the admin node (tailscale) share this pin.
 const tailscaleImage =
   "tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2";
@@ -87,11 +94,13 @@ function fixture(name: string) {
 async function checkPins() {
   const compose = await Bun.file(join(root, "infra/platform/docker-compose.yml")).text();
   const caddyPins = [...compose.matchAll(/^\s*image:\s*(caddy:\S+)\s*$/gm)].map((match) => match[1]);
-  if (caddyPins.length !== 2 || caddyPins.some((pin) => pin !== caddyImage)) {
+  if (caddyPins.length !== 1 || caddyPins.some((pin) => pin !== caddyImage)) {
     throw new Error(
-      `infra/platform/docker-compose.yml must pin edge and tailnet-gateway to the tested ${caddyImage}; found ${JSON.stringify(caddyPins)}.`,
+      `infra/platform/docker-compose.yml must pin tailnet-gateway to the tested ${caddyImage}; found ${JSON.stringify(caddyPins)}.`,
     );
   }
+  composeEdgeImage(compose);
+  checkEdgeCaddyBase(await Bun.file(join(root, "Dockerfile")).text(), caddyImage);
   const tailscalePins = [...compose.matchAll(/^\s*image:\s*(tailscale\/tailscale:\S+)\s*$/gm)].map(
     (match) => match[1],
   );
@@ -121,6 +130,12 @@ async function checkPins() {
   if (!version.startsWith("v2.11.9 ")) throw new Error(`${caddyImage} reports ${version}, expected v2.11.9.`);
   console.log(
     `Compose and release.json pin the tested image ${caddyImage} (${version.split(" ")[0]}); release bundle digest matches.`,
+  );
+  const edge = await prepareEdgeImage(docker, { root, compose });
+  edgeImage = edge.image;
+  edgePlatformArgs = edge.platformArgs;
+  console.log(
+    `Compose ${edge.kind === "build" ? "builds" : "pins"} the edge image ${edgeImage} (${edge.version}, with http.handlers.rate_limit) on ${caddyImage.split("@")[0]}.`,
   );
   console.log(`Compose pins edge-ts, tailscale and backup-ts to the tested ${tailscaleImage}.`);
 }
@@ -189,7 +204,7 @@ function fixturePlan() {
 
 // ---- Static validation -----------------------------------------------------------------------------------
 
-async function validate(name: string, source: string) {
+async function validate(name: string, source: string, image = edgeImage) {
   const file = join(directory, `validate-${name}.Caddyfile`);
   await Bun.write(file, source);
   await docker(
@@ -201,7 +216,8 @@ async function validate(name: string, source: string) {
     `${file}:/etc/caddy/Caddyfile:ro`,
     "--volume",
     `${fixtureCerts.served}:${EDGE_CERT_DIR}:ro`,
-    caddyImage,
+    ...(image === edgeImage ? edgePlatformArgs : []),
+    image,
     "caddy",
     "adapt",
     "--config",
@@ -212,7 +228,7 @@ async function validate(name: string, source: string) {
   ).catch((error: Error) => {
     throw new Error(`${name} Caddy validation failed: ${error.message}`);
   });
-  console.log(`  ok  ${name} adapts and validates on ${caddyImage.split("@")[0]}`);
+  console.log(`  ok  ${name} adapts and validates on ${image.split("@")[0]}`);
 }
 
 async function validateConfigurations() {
@@ -302,6 +318,58 @@ async function validateConfigurations() {
   if (!routeConfig.includes(`${GATE_LOGIN_SITE_COMMENT}\nlogin.example.com {`)) {
     throw new Error("The rendered §3.5 example must include the login-origin site block (FD-10).");
   }
+  // FD-23: a rate-limited SSO route with client certificates, a rate-limited redirect and an mTLS route
+  // that admits nobody, with fixture certificates standing in for the route CA and its leaves.
+  const der = async (hostname: string) =>
+    new X509Certificate(
+      await Bun.file(join(fixtureCerts.served, hostname, "fullchain.pem")).text(),
+    ).raw.toString("base64");
+  const caCertificate = await der("admin.example.com");
+  const controlsPlan = planEdge({
+    adminMode: "tailnet",
+    endpoints: issuedHostnames.map((hostname) => ({
+      id: `end_${hostname}`,
+      kind: "route",
+      hostname,
+      exposure: "public",
+    })),
+    certificates: issuedHostnames.map((hostname) => ({
+      endpointId: `end_${hostname}`,
+      status: "issued",
+      lastDeployedAt: new Date(),
+    })),
+    httpRoutes: [
+      {
+        ...route,
+        id: "rt_k3x9",
+        hostname: "www.example.com",
+        access: "sso",
+        bypassPaths: ["/webhooks/*"],
+        rateLimit: { requests: 100, window: "1m" },
+        clientAuth: { caCertificate, certificates: [await der("www.example.com"), await der("example.com")] },
+      },
+      {
+        ...route,
+        id: "rt_a1b2",
+        hostname: "example.com",
+        redirectTo: "www.example.com",
+        rateLimit: { requests: 5, window: "10s" },
+      },
+      {
+        ...route,
+        id: "rt_m0n0",
+        hostname: "admin.example.com",
+        clientAuth: { caCertificate, certificates: [] },
+      },
+    ],
+  });
+  if (controlsPlan.omitted.length)
+    throw new Error(`FD-23 routes were omitted: ${JSON.stringify(controlsPlan.omitted)}`);
+  const controlsConfig = renderCaddyfile({
+    ...controlsPlan,
+    challengeDir: "/var/lib/ark/acme",
+    apiUpstream: "api:3000",
+  });
   console.log("Validating rendered and static Caddyfiles (tls files from fixture certificates):");
   await validate("generated-public-with-http-routes", routeConfig);
   await validate("generated-public", publicConfig);
@@ -310,8 +378,14 @@ async function validateConfigurations() {
     renderCaddyfile({ adminMode: "tailnet", challengeDir: "/var/lib/ark/acme", apiUpstream: "api:3000" }),
   );
   await validate("generated-public-with-app-routes", appConfig);
+  await validate("generated-rate-limit-and-mtls", controlsConfig);
   await validate("bootstrap-edge", await Bun.file(join(root, "infra/platform/Caddyfile")).text());
-  await validate("tailnet-gateway", await Bun.file(join(root, "infra/platform/TailnetCaddyfile")).text());
+  // tailnet-gateway runs the official image.
+  await validate(
+    "tailnet-gateway",
+    await Bun.file(join(root, "infra/platform/TailnetCaddyfile")).text(),
+    caddyImage,
+  );
   console.log("Generated and static Caddy configurations validate with deny-first route ordering.");
 }
 
@@ -371,7 +445,8 @@ async function startCaddy(label: string, caddyfile: string, ports: number[], vol
     "--volume",
     `${file}:/etc/caddy/Caddyfile:ro`,
     ...volumes.flatMap((volume) => ["--volume", volume]),
-    caddyImage,
+    ...edgePlatformArgs,
+    edgeImage,
   );
   const mapped = new Map<number, number>();
   for (const port of ports) mapped.set(port, await publishedPort(name, port));
@@ -1379,7 +1454,7 @@ try {
   await checkPins();
   await generateFixtureCertificates();
   await validateConfigurations();
-  console.log(`\nEdge behaviour tests on ${caddyImage} (the idle test takes ${idleSeconds} s):`);
+  console.log(`\nEdge behaviour tests on ${edgeImage} (the idle test takes ${idleSeconds} s):`);
   await startUpstream();
   const results = await Promise.all([
     run("websocket idle", websocketIdleTest),
