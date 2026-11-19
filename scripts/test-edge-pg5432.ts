@@ -36,7 +36,7 @@
 // `ARK_EDGE_PG5432_ONLY=<text>` runs only the named tests whose name contains <text> (setup always runs).
 import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { createConnection } from "node:net";
+import { createConnection, isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -53,6 +53,7 @@ import {
   type EdgeL4PostgresRoute,
   type EdgeLeaseDocument,
   type EdgePolicyRoute,
+  type ServerState,
   type WatchdogEvent,
 } from "@ark-stack/shared";
 
@@ -1479,12 +1480,24 @@ async function publicationTest(report: Report) {
     "no port_20007 allow chain",
   );
   await call("open-pooler");
-  expect(
-    report,
-    okPooler(await psql(sourceIp.A, pooledConn("sslmode=require"))),
-    "control: managed edge publishes the saved pooler policy",
-    "PgBouncer accepts classic negotiation",
-  );
+  // A successful reload starts the worker before Docker DNS necessarily resolves PgBouncer.
+  // Also let a concurrent guard reopen finish so the client reaches the accepting generation.
+  await waitFor("the full HAProxy variant to resolve PgBouncer", async () => {
+    if ((await guardMode()) !== "full") return undefined;
+    const workers = await probe<Record<string, { section: string; servers: ServerState[] }>>(["servers"]);
+    return Object.values(workers).some(
+      ({ section, servers }) =>
+        section === "current" &&
+        servers.some(
+          ({ backend, server, addr, adminState }) =>
+            backend === "be_pgbouncer" && server === "pgbouncer" && isIP(addr) && adminState === 0,
+        ),
+    )
+      ? true
+      : undefined;
+  });
+  const pooled = await psql(sourceIp.A, pooledConn("sslmode=require"));
+  expect(report, okPooler(pooled), "control: managed edge publishes the saved pooler policy", brief(pooled));
   await call("fence");
   expect(
     report,
