@@ -72,7 +72,7 @@ The dev override `infra/platform/docker-compose.dev.yml` binds the control-plane
 | `docs:build` | `bun scripts/docs-site/build.ts build` | Writes the static site to `dist/docs`, or `--out dir`                     |
 | `docs:serve` | `bun scripts/docs-site/build.ts serve` | Serves on `http://127.0.0.1:4321/` (or `--port n`) and rebuilds on change |
 
-What the docs check verifies is described in [Testing](../development/testing.md).
+`docs:build` requires an empty output directory or one that holds a docs build manifest from an earlier build. If you have an older unmarked `dist/docs`, move it aside or choose a fresh directory with `--out`. What the docs check verifies is described in [Testing](../development/testing.md).
 
 ## Tests
 
@@ -170,7 +170,7 @@ The first two tasks are for a locally reachable development database. For produc
 | `images:pin-edge-caddy` | `scripts/pin-edge-caddy.ts`           | Docker; a published `ark-edge-caddy` digest                             |
 | `agent:build`           | `go build -o ark-agent .` in `agent/` | Go                                                                      |
 
-`images:publish` builds the twelve targets of the default Bake group in `docker-bake.hcl` and pushes them to GHCR. Useful arguments are `--dry-run`, `--tag <tag>`, `--no-latest`, `--platform <list>` and `--allow-dirty`. `ARK_IMAGE_REGISTRY` must be a lowercase `ghcr.io/<namespace>` prefix and `ARK_IMAGE_PLATFORMS` sets the default platforms. `images:pin-edge-caddy` takes the `edge-caddy` reference the publisher prints (`ghcr.io/<namespace>/ark-edge-caddy[:<tag>]@sha256:<digest>`) and an optional `--no-verify`. Both are covered in [Publishing images](../../README.md#publishing-images) and [Third-party image pins](../operating.md#third-party-image-pins).
+`images:publish` builds the twelve targets of the default Bake group in `docker-bake.hcl` and pushes them to GHCR. Useful arguments are `--dry-run`, `--tag <tag>`, `--no-latest`, `--platform <list>` and `--allow-dirty`. `ARK_IMAGE_REGISTRY` must be a lowercase `ghcr.io/<namespace>` prefix and `ARK_IMAGE_PLATFORMS` sets the default platforms. `images:pin-edge-caddy` takes the `edge-caddy` reference the publisher prints (`ghcr.io/<namespace>/ark-edge-caddy[:<tag>]@sha256:<digest>`) and an optional `--no-verify`. Both are covered in [Publishing first-party images](../operations/maintenance-and-upgrades.md#publishing-first-party-images) and [Third-party image pins](../operating.md#third-party-image-pins).
 
 ## Standalone scripts
 

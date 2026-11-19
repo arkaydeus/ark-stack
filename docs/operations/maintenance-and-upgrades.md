@@ -169,7 +169,7 @@ Migrations are plain SQL files in `server/drizzle/`, applied in file-name order 
 
 ### Publishing first-party images
 
-`mise run images:publish` (`scripts/publish-images.ts`) builds all twelve Bake targets of the default group (`imageTargets` in `scripts/check-image-plan.ts`), tags them with the first 12 characters of `HEAD` and `latest`, pushes them and prints immutable digest references.
+`mise run images:publish` (`scripts/publish-images.ts`) builds all twelve Bake targets of the default group (`imageTargets` in `scripts/check-image-plan.ts`) for `linux/amd64` by default, tags them with the first 12 characters of `HEAD` and `latest`, pushes them and prints immutable digest references after pushing. Compose builds the `edge` Caddy (`edge-caddy`: Caddy 2.11.9 with the pinned rate-limit plugin) locally until its published digest is pinned with `mise run images:pin-edge-caddy` (see [Third-party image pins](#third-party-image-pins)).
 
 ```sh
 mise run images:publish -- --dry-run
@@ -177,14 +177,26 @@ mise run images:publish -- --tag v0.1.0 --no-latest
 mise run images:publish -- --platform linux/amd64,linux/arm64
 ```
 
-| Setting                   | Effect                                                                                                           |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `ARK_IMAGE_REGISTRY`      | Registry prefix, default `ghcr.io/arkaydeus`. Only lowercase `ghcr.io/<namespace>` prefixes are accepted.        |
-| `ARK_IMAGE_PLATFORMS`     | Default platforms (default `linux/amd64`); `--platform` overrides it.                                            |
-| `GHCR_TOKEN`, `GHCR_USER` | Use an explicit token. Without both, the publisher uses the `gh` CLI login, which needs `write:packages`.        |
-| `--allow-dirty`           | Allow a dirty tree. Tags and the revision label get `-dirty`, `latest` is omitted and `--tag latest` is refused. |
+| Setting                   | Effect                                                                                                                                                    |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ARK_IMAGE_REGISTRY`      | Registry prefix, default `ghcr.io/arkaydeus`. Only lowercase `ghcr.io/<namespace>` prefixes are accepted; other registry hosts are rejected before login. |
+| `ARK_IMAGE_PLATFORMS`     | Default platforms (default `linux/amd64`); `--platform` overrides it.                                                                                     |
+| `GHCR_TOKEN`, `GHCR_USER` | Use an explicit token. Without both, the publisher uses the `gh` CLI login, which needs `write:packages`.                                                 |
+| `--allow-dirty`           | Allow a dirty tree. Tags and the revision label get `-dirty`, `latest` is omitted and `--tag latest` is refused.                                          |
 
-Login and push use a temporary Docker configuration, removed afterwards. Before publishing, `bun scripts/check-image-plan.ts` confirms the Bake plan has exactly the expected targets, each with the source label, annotation and minimal provenance. CI runs it and a `--no-cache` build of every target. The manually dispatched **GHCR publish check** workflow (`.github/workflows/ghcr-publish-check.yml`) pushes and deletes a small smoke image to prove registry permissions, annotations and provenance. Full details are in the README's "Publishing images" section.
+**Credentials.** Set both `GHCR_TOKEN` and `GHCR_USER` to use an explicit token without a GitHub CLI login. Otherwise, log in with `gh` and grant its token package access:
+
+```sh
+gh auth refresh -h github.com -s write:packages
+```
+
+Login and push use a temporary Docker configuration, removed on success or failure. The existing Docker context and Buildx builder are preserved.
+
+**Clean trees and dry runs.** Publishing requires a clean tree unless `--allow-dirty` is supplied. Dirty builds append `-dirty` to both automatic and explicit tags and to the revision label, omit `latest`, and reject `--tag latest`. Dry runs allow dirty trees and print the same tags and labels without accessing credentials.
+
+**Checks.** Before publishing, `bun scripts/check-image-plan.ts` confirms the Bake plan has exactly the expected targets, each with the source label, annotation and minimal provenance. CI runs it, checking the resolved Bake plan for repository source annotations and minimal provenance on every target, and builds every target with `--no-cache` to exercise the filtered build context. The publisher's command tests (`scripts/publish-images.test.ts`) and its dedicated TypeScript check (`scripts/tsconfig.publish.json`) run in CI and in the normal local `mise run test` and `mise run typecheck` tasks.
+
+**GHCR publish check.** The manually dispatched **GHCR publish check** workflow (`.github/workflows/ghcr-publish-check.yml`) uses the repository's Actions token to push a tiny image that inherits Bake's common settings. It verifies the pushed index annotation, SLSA provenance and GitHub package repository linkage, then deletes its uniquely named smoke package and its temporary Docker configuration. Run it in `arkaydeus/ark-stack`, whose source URL is configured in Bake; it needs permission to create and delete packages. It does not publish release tags.
 
 ### Third-party image pins
 

@@ -277,7 +277,7 @@ Off-VPS targets, their credentials and restic passwords are configured in the UI
 | `ARK_IMAGE_PLATFORMS`     | `linux/amd64`           | `mise run images:publish` | Default build platforms; `--platform` overrides.                                                       |
 | `GHCR_TOKEN`, `GHCR_USER` | unset                   | `mise run images:publish` | Explicit registry credentials instead of a GitHub CLI login.                                           |
 
-See [Maintenance and upgrades](../operations/maintenance-and-upgrades.md) and the [README](../../README.md#publishing-images).
+See [Publishing first-party images](../operations/maintenance-and-upgrades.md#publishing-first-party-images).
 
 ## Probe machines and tests
 

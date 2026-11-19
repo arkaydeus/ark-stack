@@ -64,7 +64,7 @@ What the directories cover:
 
 ## Database-backed tests on a throwaway PostgreSQL
 
-`mise run test:db` (`scripts/test-db.ts`) gives the DB-backed tests a clean, private database:
+`mise run test:db` (`scripts/test-db.ts`) gives the DB-backed tests a clean, private database. It needs only Docker: no `.env` and no `mise run db:up`.
 
 - It starts a uniquely named `postgres:17.6` container (pinned by digest, data on tmpfs, labelled `ark-stack.test-db`) on a loopback port Docker picks.
 - It applies the migrations as the owner role `ark_migration`, as production migrations do, because test cleanup deletes `audit_events` rows that the runtime role may not.
@@ -86,7 +86,7 @@ ark_test_db server/src/coordinator.test.ts
 mise run test:db:down <container>      # the exact command is printed by test:db:up
 ```
 
-The `ark_test_db` helper runs `bun --no-env-file test` from the repository root under `env -i`, so follow-up tests are isolated from your shell's provider settings as well.
+The `ark_test_db` helper runs `bun --no-env-file test` from the repository root under `env -i`, so follow-up tests are isolated from your shell's provider settings as well. `test:db:down` removes only a container carrying the harness label, and fails if the named container is absent.
 
 `scripts/test-db.test.ts` tests the harness itself. Its two Docker cases (two concurrent real databases with distinct ports and data, and that inherited providers or native tools cannot leak into alert and backup tests) run only with `ARK_TEST_DB_DOCKER=1`, as CI does.
 
@@ -153,6 +153,8 @@ mise run test:db:down <container>
 
 > [!NOTE]
 > On Linux CI runners, the edge harnesses need the legacy IPv6 netfilter tables loaded on the host (`sudo modprobe -a ip6_tables ip6table_filter ip6table_nat ip6table_mangle`), because `tailscaled` in `edge-ts` uses the image's legacy `ip6tables` and a container cannot load kernel modules. Docker Desktop needs no extra step.
+
+`test:pgbouncer` picks an ephemeral loopback port for the public listener unless `ARK_PGBOUNCER_SMOKE_PORT` sets one. It uses the same migrated platform test database as the unit suite, so run it after the unit run rather than at the same time. The PgBouncer runtime probes it bundles (`scripts/pgbouncer-*-probe.ts`) have their own TypeScript project, `scripts/tsconfig.pgbouncer.json`, which `mise run typecheck` and CI check.
 
 The edge test helpers live in `scripts/edge-test/` (Compose stack, runtime cleanup, TLS and TCP echo servers, a fake gate API and upstream, image pins) and the backup helpers in `scripts/backup-test/` (MinIO, restic wrappers, the tailnet Compose fixture). The image pins every harness uses are checked by `scripts/edge-test/pins.test.ts`; the bump procedure is in [Third-party image pins](../operating.md#third-party-image-pins).
 
