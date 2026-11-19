@@ -6,7 +6,7 @@ import { app } from "./app.ts";
 import { startOffhostHeartbeat } from "./modules/offhost-heartbeat.ts";
 
 const env = loadEnv();
-assertNoPlaceholderSecrets(process.env);
+assertNoPlaceholderSecrets(process.env, { embeddedWorkers: env.embeddedWorkers });
 if (process.env.ARK_BACKUP_REQUIRED === "1" && process.env.ARK_BACKUP_EXECUTE !== "1") {
   throw new Error("ARK_BACKUP_EXECUTE must be 1 when backup execution is required.");
 }

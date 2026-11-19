@@ -125,4 +125,22 @@ describe("startup gate token guard", () => {
     expect(() => assertNoPlaceholderSecrets(env)).not.toThrow();
     expect(() => assertNoPlaceholderSecrets({ ...env, ARK_EDGE_GATE_TOKEN: "" })).not.toThrow();
   });
+
+  test("external-worker API deployments omit service secrets but still reject supplied placeholders", () => {
+    const env: Record<string, string | undefined> = generateInstallSecrets();
+    delete env.ARK_PLATFORM_PG_EXECUTOR_TOKEN;
+    delete env.ARK_CONTROL_DB_PASSWORD;
+    delete env.STALWART_ADMIN_PASSWORD;
+    expect(() => assertNoPlaceholderSecrets(env, { embeddedWorkers: false })).not.toThrow();
+    expect(() => assertNoPlaceholderSecrets(env)).toThrow(/ARK_PLATFORM_PG_EXECUTOR_TOKEN/);
+    expect(() =>
+      assertNoPlaceholderSecrets(
+        { ...env, STALWART_ADMIN_PASSWORD: "change-me-now" },
+        { embeddedWorkers: false },
+      ),
+    ).toThrow(/STALWART_ADMIN_PASSWORD/);
+    expect(() =>
+      assertNoPlaceholderSecrets({ ...env, ARK_SETUP_TOKEN: undefined }, { embeddedWorkers: false }),
+    ).toThrow(/ARK_SETUP_TOKEN/);
+  });
 });

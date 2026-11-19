@@ -1,7 +1,19 @@
 import { describe, expect, test } from "bun:test";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
-import { anchors, checkDocs, checkMarkdown, context, routeKey, routeMatches, slug } from "./check-docs.ts";
+import {
+  anchors,
+  checkDocs,
+  checkMarkdown,
+  context,
+  checkFile,
+  fullFiles,
+  routeKey,
+  routeMatches,
+  slug,
+} from "./check-docs.ts";
 
 const root = join(import.meta.dir, "..");
 
@@ -94,6 +106,35 @@ describe("documentation check", () => {
         ({ kind, detail }) => `${kind}: ${detail}`,
       ),
     ).toEqual([diagnostic]);
+  });
+
+  test("checks published pages under guides and deeper folders in full", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "ark-docs-drift-"));
+    try {
+      const pages = ["docs/guides/fixture.md", "docs/features/deep/nested/fixture.md"];
+      for (const file of pages) {
+        mkdirSync(dirname(join(fixture, file)), { recursive: true });
+        writeFileSync(join(fixture, file), "Call `POST /api/unknown-fixture`.");
+      }
+      writeFileSync(
+        join(fixture, "docs/nav.json"),
+        JSON.stringify({
+          title: "Fixture",
+          repository: "https://example.com/docs",
+          sections: [{ title: "Guides", pages: pages.map((file) => ({ file })) }],
+        }),
+      );
+      const fixtureContext = { ...ctx, root: fixture, tracked: new Set(pages) };
+      expect(fullFiles(fixtureContext)).toEqual(pages.toSorted());
+      expect(
+        fullFiles(fixtureContext)
+          .flatMap((file) => checkFile(fixtureContext, file, "full"))
+          .map(({ file, kind }) => ({ file, kind })),
+      ).toEqual(pages.toSorted().map((file) => ({ file, kind: "endpoint" })));
+      expect(fullFiles(ctx)).toContain("docs/fix1-verification.md");
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   });
 
   test("the operator docs, guides and design links have no drift", () => {

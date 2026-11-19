@@ -1,0 +1,107 @@
+{
+  "title": "Ark Stack",
+  "repository": "https://github.com/arkaydeus/ark-stack",
+  "branch": "main",
+  "sections": [
+    {
+      "title": "Introduction",
+      "pages": [
+        { "file": "docs/index.md", "title": "Home" },
+        { "file": "docs/introduction/overview.md", "title": "Overview" },
+        { "file": "docs/introduction/concepts.md", "title": "Core concepts" },
+        { "file": "docs/introduction/components.md", "title": "System components" },
+        { "file": "docs/architecture.md", "title": "Architecture notes" }
+      ]
+    },
+    {
+      "title": "Getting started",
+      "pages": [
+        { "file": "docs/getting-started/local-development.md", "title": "Local development" },
+        { "file": "docs/getting-started/production-install.md", "title": "Production install" },
+        { "file": "docs/getting-started/first-run.md", "title": "First run and domain wizard" },
+        { "file": "docs/getting-started/configuration.md", "title": "Configuration" }
+      ]
+    },
+    {
+      "title": "Administration",
+      "pages": [
+        { "file": "docs/features/admin-ui.md", "title": "Admin UI tour" },
+        { "file": "docs/features/accounts-and-access.md", "title": "Accounts, MFA and access" },
+        { "file": "docs/features/admin-access-modes.md", "title": "Admin access modes" }
+      ]
+    },
+    {
+      "title": "Domains and mail",
+      "pages": [
+        { "file": "docs/features/domains-and-dns.md", "title": "Domains and DNS" },
+        { "file": "docs/features/certificates.md", "title": "Certificates" },
+        { "file": "docs/features/mail.md", "title": "Mail" }
+      ]
+    },
+    {
+      "title": "Databases and services",
+      "pages": [
+        { "file": "docs/features/databases.md", "title": "Application databases" },
+        { "file": "docs/features/sql-workspace.md", "title": "SQL workspace" },
+        { "file": "docs/features/public-database-access.md", "title": "Public database access" },
+        { "file": "docs/guides/vercel-database.md", "title": "Guide: database access from Vercel" },
+        { "file": "docs/features/services.md", "title": "Services and the Docker agent" }
+      ]
+    },
+    {
+      "title": "Front door",
+      "pages": [{ "file": "docs/guides/front-door.md", "title": "Guide: public routes" }]
+    },
+    {
+      "title": "Backups",
+      "pages": [
+        { "file": "docs/features/backups.md", "title": "Backup system" },
+        { "file": "docs/guides/backups.md", "title": "Guide: off-VPS backups" }
+      ]
+    },
+    {
+      "title": "Operations",
+      "pages": [
+        { "file": "docs/features/monitoring.md", "title": "Monitoring and alerts" },
+        { "file": "docs/operations/operations-and-workers.md", "title": "Operations and workers" },
+        { "file": "docs/operations/maintenance-and-upgrades.md", "title": "Maintenance and upgrades" },
+        { "file": "docs/operations/recovery.md", "title": "Recovery" },
+        { "file": "docs/operations/troubleshooting.md", "title": "Troubleshooting" },
+        { "file": "docs/operating.md", "title": "Operator runbooks" }
+      ]
+    },
+    {
+      "title": "Security",
+      "pages": [
+        { "file": "docs/security/security-model.md", "title": "Security model" },
+        { "file": "docs/security-review.md", "title": "Security review checklist" }
+      ]
+    },
+    {
+      "title": "Development",
+      "pages": [
+        { "file": "docs/development/repository.md", "title": "Repository and conventions" },
+        { "file": "docs/development/testing.md", "title": "Testing" },
+        { "file": "README.md", "title": "Project README" }
+      ]
+    },
+    {
+      "title": "Reference",
+      "pages": [
+        { "file": "docs/reference/api.md", "title": "HTTP API" },
+        { "file": "docs/reference/commands.md", "title": "Commands and scripts" },
+        { "file": "docs/reference/ports-and-networks.md", "title": "Ports and networks" }
+      ]
+    },
+    {
+      "title": "Design history",
+      "pages": [
+        { "file": "docs/implementation-plan.md", "title": "Implementation plan" },
+        { "file": "docs/design/front-door.md", "title": "Front-door design" },
+        { "file": "docs/fix1-verification.md", "title": "Fix 1 verification" },
+        { "file": "docs/reviews/fable-review-1.md", "title": "Review 1" },
+        { "file": "docs/reviews/fd25-follow-up-verification.md", "title": "FD-25 follow-up verification" }
+      ]
+    }
+  ]
+}

@@ -1,5 +1,11 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": { "types": ["bun"] },
-  "include": ["check-docs.ts", "check-docs.test.ts"]
+  "include": [
+    "check-docs.ts",
+    "check-docs.test.ts",
+    "docs-site/build.ts",
+    "docs-site/build.test.ts",
+    "../e2e/docs-site.spec.ts"
+  ]
 }

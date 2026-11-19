@@ -9,9 +9,11 @@
 //   - inline and fenced HTTP `METHOD /api/...` requests are registered in server/src/app.ts;
 //   - backticked Ark environment variables (ARK_*, TS_*, BETTER_AUTH_*, …) occur in tracked source;
 //   - ports named as `TCP n`, `UDP n`, `port n` or a backticked `:n` occur in tracked source.
-// The front-door design document is historical, so only its links, paths and tasks are checked.
+// Published pages are checked in full except for historical records, which get structural checks.
 import { readFileSync } from "node:fs";
 import { join, dirname, normalize, relative } from "node:path";
+
+import { loadNav } from "./docs-site/nav.ts";
 
 export type Problem = { file: string; line: number; kind: string; detail: string };
 
@@ -26,9 +28,24 @@ export function slug(heading: string) {
     .replace(/\s/g, "-");
 }
 
+/** Allocate GitHub-style heading IDs in document order, including collisions with natural suffixes. */
+export function headingIds() {
+  const used = new Set<string>();
+  const next = new Map<string, number>();
+  return (heading: string) => {
+    const base = slug(heading);
+    let suffix = next.get(base) ?? 0;
+    let id = suffix ? `${base}-${suffix}` : base;
+    while (used.has(id)) id = `${base}-${++suffix}`;
+    used.add(id);
+    next.set(base, suffix + 1);
+    return id;
+  };
+}
+
 /** Anchors of a Markdown document, with GitHub's `-1`, `-2` suffixes for repeated headings. */
 export function anchors(markdown: string) {
-  const seen = new Map<string, number>();
+  const nextId = headingIds();
   const result = new Set<string>();
   let fenced = false;
   for (const line of markdown.split("\n")) {
@@ -36,10 +53,7 @@ export function anchors(markdown: string) {
     if (fenced) continue;
     const match = /^#{1,6}\s+(.*?)\s*#*\s*$/.exec(line);
     if (!match) continue;
-    const base = slug(match[1]!);
-    const count = seen.get(base) ?? 0;
-    seen.set(base, count + 1);
-    result.add(count ? `${base}-${count}` : base);
+    result.add(nextId(match[1]!));
   }
   return result;
 }
@@ -191,6 +205,12 @@ export function checkMarkdown(ctx: Context, file: string, text: string, scope: "
       for (const match of line.matchAll(/\]\(([^)\s]+)\)/g)) {
         const target = match[1]!;
         if (/^(?:https?:|mailto:)/.test(target)) continue;
+        // The original implementation plan cites source material from separate repositories.
+        if (
+          file === "docs/implementation-plan.md" &&
+          /^\/Users\/arkaydeus\/project\/infra\/(?:orkmail-stack|pgstack1)\//.test(target)
+        )
+          continue;
         const [pathPart, anchor] = target.split("#") as [string, string | undefined];
         if (!pathPart) {
           if (anchor && !ownAnchors.has(anchor)) report(number, "anchor", `#${anchor}`);
@@ -222,6 +242,8 @@ export function checkMarkdown(ctx: Context, file: string, text: string, scope: "
           PATH_ROOTS.test(token.replace(LINE_CITATION, "")) &&
           !/\s/.test(token) &&
           !token.includes("…") &&
+          !(file === "docs/implementation-plan.md" && plannedLayout.has(token)) &&
+          !(file === "docs/reviews/fable-review-1.md" && token === "infra/platform/*.next") &&
           !pathExists(ctx, token)
         ) {
           report(number, "path", token);
@@ -260,21 +282,25 @@ export function checkMarkdown(ctx: Context, file: string, text: string, scope: "
   return problems;
 }
 
-export const FULL = [
-  "README.md",
-  "docs/architecture.md",
-  "docs/operating.md",
-  "docs/security-review.md",
-  "docs/guides/front-door.md",
-  "docs/guides/vercel-database.md",
-  "docs/guides/backups.md",
-];
-export const LINKS_ONLY = ["docs/design/front-door.md"];
+const LINKS_ONLY = ["docs/design/front-door.md", "docs/reviews/fable-review-1.md"];
+const plannedLayout = new Set([
+  "workers/database/",
+  "workers/mail/",
+  "workers/backup/",
+  "workers/domains/",
+  "tests/integration/",
+]);
+
+/** Every published page is checked in full unless explicitly scoped as historical. */
+export function fullFiles(ctx: Context) {
+  const published = loadNav(ctx.root).sections.flatMap((section) => section.pages.map((page) => page.file));
+  return [...new Set(published)].filter((file) => !LINKS_ONLY.includes(file)).toSorted();
+}
 
 export function checkDocs(root = join(import.meta.dir, "..")) {
   const ctx = context(root);
   return [
-    ...FULL.flatMap((file) => checkFile(ctx, file, "full")),
+    ...fullFiles(ctx).flatMap((file) => checkFile(ctx, file, "full")),
     ...LINKS_ONLY.flatMap((file) => checkFile(ctx, file, "links")),
   ];
 }
@@ -282,6 +308,7 @@ export function checkDocs(root = join(import.meta.dir, "..")) {
 if (import.meta.main) {
   const root = join(import.meta.dir, "..");
   const problems = checkDocs(root);
+  const checked = fullFiles(context(root)).length + LINKS_ONLY.length;
   for (const problem of problems)
     console.log(
       `${relative(root, join(root, problem.file))}:${problem.line}: ${problem.kind}: ${problem.detail}`,
@@ -289,7 +316,7 @@ if (import.meta.main) {
   console.log(
     problems.length
       ? `\n${problems.length} documentation problem(s).`
-      : `Documentation check passed: ${FULL.length + LINKS_ONLY.length} files.`,
+      : `Documentation check passed: ${checked} files.`,
   );
   process.exit(problems.length ? 1 : 0);
 }
