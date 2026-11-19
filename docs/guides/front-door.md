@@ -8,7 +8,7 @@ This guide describes the system as built. The design and its reasoning are in [`
 
 1. [What listens where](#1-what-listens-where)
 2. [Before you start](#2-before-you-start)
-3. [HTTP routes (public or Ark login)](#3-http-routes-public-or-ark-login)
+3. [HTTP routes (public or Ark login)](#3-http-routes-public-or-ark-login), with [rate limits and client certificates](#34-rate-limits-and-client-certificates-fd-23)
 4. [TLS-TCP routes by SNI](#4-tls-tcp-routes-by-sni)
 5. [Raw TCP routes on ports 20000–20049](#5-raw-tcp-routes-on-ports-2000020049)
 6. [PostgreSQL: the Ark pooler and Postgres routes](#6-postgresql-the-ark-pooler-and-postgres-routes)
@@ -18,7 +18,7 @@ This guide describes the system as built. The design and its reasoning are in [`
 
 ## 1. What listens where
 
-All public front-door ports are published by the kernel-mode Tailscale container `edge-ts` (`tag:ark-edge`). HAProxy (`edge-l4`, 3.2 LTS) and Caddy (`edge`, 2.11.9) share its network namespace.
+All public front-door ports are published by the kernel-mode Tailscale container `edge-ts` (`tag:ark-edge`). HAProxy (`edge-l4`, 3.2 LTS) and Caddy (`edge`, 2.11.9) share its network namespace. The `edge` image is the official Caddy 2.11.9 image with its binary rebuilt to include the pinned `caddy-ratelimit` plugin, for HTTP route rate limits (§3.4).
 
 | Port                               | Owner                          | Routed by                                                                                                                                                                                                                                                           |
 | ---------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -108,6 +108,43 @@ Both loosen exposure and need `exposure.public`. The full contract is in [Login 
 - Limits: a 25 MB body, a 5 s dial timeout and a 60 s response-header timeout.
 
 Response bodies and other URL-bearing headers pass through unchanged. **Set the application's public URL to the route hostname, and check what the application emits before enabling the route.** Route targets must still authenticate anything sensitive: the gate is a perimeter, not a substitute.
+
+### 3.4 Rate limits and client certificates (FD-23)
+
+Two optional controls apply to any HTTP route, `public` or `sso`. A route that uses neither is rendered exactly as before.
+
+**Rate limit.** `rateLimit` admits at most `requests` requests per sliding `window` from one client address. The address is the real source that HAProxy passes to Caddy with PROXY v2.
+
+```http
+PATCH /api/front/routes/:id
+{ "rateLimit": { "requests": 60, "window": "1m" } }      // null removes the limit
+```
+
+- `requests` is an integer from 1 to 1000. `window` is a duration from `1s` to `1h`, such as `10s`, `1m` or `1h`.
+- Requests over the limit get `429` with `Retry-After` and a static body that has no `Server` header. Caddy counts and refuses them before the login gate's `forward_auth`, before the gate's own handlers and before the upstream, so a refused request never reaches the API or the target.
+- Each route has its own quota for a client address. When its limiter capacity or the shared process capacity is full, new client addresses get 429 until expired entries are swept. Existing entries retain their quotas.
+- Counters live in the running Caddy process. A restart or a changed rate policy starts that history again. IPv6 clients are counted per address, not per /64. The kernel per-source limits in front of 443 (`inet ark_front`) still apply, per /64.
+- Adding a limit or replacing it with a stricter policy needs no step-up. Removing a limit or allowing more requests in any window of the old duration requires `exposure.public` bound to `{ routeId, ...body }`. Stored limits outside the supported bounds close the route. Explicitly replacing or clearing one also requires the grant.
+
+**Client certificates (HTTP mTLS).** `"mtls": true` (on create or update) gives the route its own client CA (`client_ca_id`, purpose `http-client`) and requires a certificate from it in the TLS handshake:
+
+```http
+PATCH /api/front/routes/:id
+{ "mtls": true }
+POST /api/front/routes/:id/client-certificates      (step-up: credential.rotate, bound to { routeId, ...body })
+{ "name": "laptop-alice" }                          // or with "csrPem" for your own key
+POST /api/front/routes/:id/client-certificates/:certificateId/revoke
+```
+
+- Without a certificate, or with one that the route CA did not issue, the handshake fails with a TLS alert (`certificate required`, `unknown ca` or `bad certificate`). No HTTP response is sent at all.
+- Caddy has no CRL support. The edge therefore admits exactly the route CA's certificates that are unrevoked, unexpired and absent from its CRL. Issuing a certificate re-renders the edge, so a new certificate works within seconds.
+- Revoking regenerates the CRL and goes through the gate revocation journal. The forced reload drops the certificate, and the route's HAProxy sessions, WebSockets included, are drained around it. If that has not happened within 5 s, the watchdog withdraws the route until it has. Other certificates of the route keep working once the reload completes.
+- Generated keys are revealed once with `POST /api/secrets/:id/reveal` (`secret.reveal`). Certificates last 90 days. Reissue, then revoke the old one.
+- `mtls` combines with either access mode. With `sso`, a request needs both a certificate and a gate session: the certificate is checked first, in the handshake, and then `forward_auth` applies. The login origin itself never asks for a certificate, so sign-in works from any browser that holds one. Bypass paths skip only the session check, never the certificate.
+- `strict_sni_host` still applies: a connection opened for another hostname cannot reach the mTLS route by `Host`, and gets `421`. Caddy turns TLS session tickets off for client-certificate sites and re-checks the certificate on every resumed session.
+- Switching `mtls` on is a tightening: connections admitted without a certificate are drained. Switching it off loosens exposure and needs `exposure.public`. It also retires the route CA, so every certificate it issued stops working, including if `mtls` is switched on again later.
+
+The **Controls** and **Certificates** buttons on the Front door routes page do the same with the step-ups.
 
 ## 4. TLS-TCP routes by SNI
 
@@ -334,6 +371,6 @@ The external probe is `scripts/ipv6-preflight-probe.ts`. It runs either as a man
 
 ## 9. Withdrawal, revocation and what to audit
 
-Disabling, deleting or re-targeting a route, a failed identity check or an expired observation lease all withdraw the route. HAProxy fences its dedicated backend and closes its sessions, including in workers that are still draining after a reload. Caddy answers `503` for it. Unrelated routes keep serving. The watchdog checks the lease every second by default. The withdrawal budget is five seconds, including closure of existing sessions. The watchdog stops Caddy as a fallback when it cannot verify scoped control. Revoking a gate user's access drains the affected route within 5 s, or the watchdog withdraws it.
+Disabling, deleting or re-targeting a route, a failed identity check or an expired observation lease all withdraw the route. Revoking an HTTP route's client certificate drains that route's sessions in the same way (§3.4). HAProxy fences its dedicated backend and closes its sessions, including in workers that are still draining after a reload. Caddy answers `503` for it. Unrelated routes keep serving. The watchdog checks the lease every second by default. The withdrawal budget is five seconds, including closure of existing sessions. The watchdog stops Caddy as a fallback when it cannot verify scoped control. Revoking a gate user's access drains the affected route within 5 s, or the watchdog withdraws it.
 
 Runbooks for revoking routes, gate users and database clients are in [Revocation](../operating.md#revocation). The security boundaries and the tests that cover them are in [`docs/security-review.md`](../security-review.md).

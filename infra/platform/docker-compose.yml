@@ -531,7 +531,15 @@ services:
     restart: unless-stopped
 
   edge:
-    image: caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
+    # Caddy 2.11.9 plus the pinned caddy-ratelimit plugin (docs/design/front-door.md FD-23), built from
+    # the `edge-caddy` Dockerfile stage (also a Bake target) on the same official caddy:2.11.9 digest
+    # as tailnet-gateway; every build input is pinned. After `mise run images:publish`, replace this
+    # with the published digest: `mise run images:pin-edge-caddy -- <ref>@sha256:<digest>`.
+    image: ark-edge-caddy:${ARK_VERSION:-local}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: edge-caddy
     # Ark writes the Caddyfile and every certificate key as uid 1000 with mode 0600 (the installer
     # chowns tmp/edge and tmp/certs to it). As root with every capability dropped, Caddy could not
     # read them and would exit at startup. The image's /data/caddy and /config/caddy are 1777.

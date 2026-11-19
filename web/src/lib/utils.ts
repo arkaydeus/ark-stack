@@ -20,14 +20,24 @@ export function parseCidrList(value: string) {
     .filter(Boolean);
 }
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message);
+  }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: "include",
     headers: { "content-type": "application/json", ...init?.headers },
     ...init,
   });
-  const body = (await response.json().catch(() => ({}))) as { error?: string } & T;
-  if (!response.ok) throw new Error(body.error ?? "Request failed.");
+  const body = (await response.json().catch(() => ({}))) as { error?: string; code?: string } & T;
+  if (!response.ok) throw new ApiError(body.error ?? "Request failed.", response.status, body.code);
   return body;
 }
 

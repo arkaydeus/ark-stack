@@ -79,7 +79,7 @@ import {
 } from "./modules/edge-l4.ts";
 import { edgeHttpRoutes } from "./modules/edge-routes.ts";
 import { edgeL4Routes, enabledSniPorts, type OmittedL4Route } from "./modules/l4-routes.ts";
-import { refreshRouteCrls, routeCrlsDue } from "./modules/route-pki.ts";
+import { refreshHttpRouteCrls, refreshRouteCrls, routeCrlsDue } from "./modules/route-pki.ts";
 import {
   edgeLeaseDocument,
   ensureGateRevocationDrain,
@@ -342,8 +342,10 @@ type EnqueueInput = {
   idempotencyKey?: string;
 };
 
-export function enqueue(input: EnqueueInput) {
-  return db.transaction((tx) => enqueueInTransaction(tx, input));
+export function enqueue(input: EnqueueInput, executor?: DbTransaction) {
+  return executor
+    ? enqueueInTransaction(executor, input)
+    : db.transaction((tx) => enqueueInTransaction(tx, input));
 }
 
 async function enqueueInTransaction(tx: DbTransaction, input: EnqueueInput) {
@@ -357,10 +359,22 @@ async function enqueueInTransaction(tx: DbTransaction, input: EnqueueInput) {
     .orderBy(desc(operations.createdAt));
   // A running edge apply may already have captured an older desired state. Reuse only queued
   // successors: every mutation during a running apply must leave durable work behind it.
-  const inflight = related.find((row) =>
-    input.kind === "edge.l4_apply" ? row.status === "queued" : isInFlight(row.status),
-  );
-  if (inflight) return inflight;
+  if (input.kind === "edge.apply" || input.kind === "edge.l4_apply") {
+    const queued = related.find((row) => row.status === "queued");
+    if (queued) {
+      // Hold the queued row until the desired state commits. A concurrent claim either skips
+      // this row or wins first, in which case the status predicate requires a new successor.
+      const [successor] = await tx
+        .select()
+        .from(operations)
+        .where(and(eq(operations.id, queued.id), eq(operations.status, "queued")))
+        .for("update");
+      if (successor) return successor;
+    }
+  } else {
+    const inflight = related.find((row) => isInFlight(row.status));
+    if (inflight) return inflight;
+  }
   const idempotencyKey = related.length ? `${base}:${createId("idem")}` : base;
   const [row] = await tx
     .insert(operations)
@@ -3010,7 +3024,16 @@ async function observeEdge(operation: OperationRow) {
   // Weekly route CRL refresh (FD-14): edge.l4_apply regenerates due CRLs before rendering.
   const crlsDue = (await routeCrlsDue()).length;
   if (crlsDue && edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
-  await addStep(operation.id, "edge-observe", { ...result, reconcile, l4Recovery, routeCrlsDue: crlsDue });
+  const httpCrls = await refreshHttpRouteCrls((tx) =>
+    enqueue({ kind: "edge.apply", targetIds: ["platform"] }, tx),
+  );
+  await addStep(operation.id, "edge-observe", {
+    ...result,
+    reconcile,
+    l4Recovery,
+    routeCrlsDue: crlsDue,
+    httpCrls,
+  });
   return { ...result, reconcile };
 }
 

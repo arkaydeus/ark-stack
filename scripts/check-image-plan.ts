@@ -9,6 +9,7 @@ export const imageTargets = [
   "database-ingress",
   "database-worker",
   "domain-worker",
+  "edge-caddy",
   "edge-watchdog",
   "haproxy-validator",
   "mail-worker",
@@ -63,5 +64,7 @@ if (import.meta.main) {
   const [code, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
   assert.equal(code, 0, "Bake --print failed");
   checkImagePlan(JSON.parse(output));
-  console.log("All nine Bake targets retain index source annotations and minimal provenance.");
+  console.log(
+    `All ${imageTargets.length} Bake targets retain index source annotations and minimal provenance.`,
+  );
 }

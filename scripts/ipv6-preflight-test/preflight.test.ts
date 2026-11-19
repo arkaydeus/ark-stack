@@ -52,6 +52,7 @@ import {
   signClientCertificate,
 } from "../../server/src/modules/pki.ts";
 import { planPgbouncer, renderPgbouncerFiles } from "../../server/src/modules/pgbouncer.ts";
+import { prepareEdgeImage } from "../edge-test/edge-image.ts";
 import { EdgeTestRuntime } from "../edge-test/runtime.ts";
 import type { Subprocess } from "bun";
 import type { ProbeCredential } from "../ipv6-preflight-probe.ts";
@@ -66,7 +67,8 @@ const dnsImage =
   "ghcr.io/letsencrypt/pebble-challtestsrv:2.10.3@sha256:0152c8cb506e2ecba2900ed47d23932e27e3e6575a7d2c8ef93c7719ee3dea4c";
 const legoImage =
   "goacme/lego:v4.26.0@sha256:39e65153badce8c67fa16caed2f89ebb15db5747ffbbd502603ce0bbaf2ed218";
-const platform = Bun.YAML.parse(await Bun.file(join(root, "infra/platform/docker-compose.yml")).text()) as {
+const platformCompose = await Bun.file(join(root, "infra/platform/docker-compose.yml")).text();
+const platform = Bun.YAML.parse(platformCompose) as {
   services: Record<string, { image: string }>;
   networks: { admin: { enable_ipv6: boolean } };
 };
@@ -493,10 +495,11 @@ test("native IPv6, separate PostgreSQL probes, AAAA withdrawal and Pebble HTTP-0
     }
 
     await host("sh", "-ec", "systemctl unmask docker.service docker.socket; systemctl start docker");
+    const edgeImage = await prepareEdgeImage(docker, { root, compose: platformCompose });
     const images = [
       bunImage,
       pgImage,
-      platform.services.edge!.image,
+      edgeImage.image,
       platform.services["edge-l4"]!.image,
       platform.services["pgbouncer-public"]!.image,
     ];
@@ -644,6 +647,7 @@ ${appHost} {
         "container:edge-ts",
         "-v",
         "/work:/work:ro",
+        ...edgeImage.platformArgs,
         caddy,
         "caddy",
         "run",

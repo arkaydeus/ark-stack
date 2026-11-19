@@ -217,6 +217,11 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
   const edgeL4 = `${project}-edge-l4-1`;
   runtime.containers.push(edgeTs, edge, edgeL4);
   const services = ["edge-ts", "edge", "edge-l4"];
+  // `edge` is the custom Caddy build (FD-23). Rebuild it like the validator, unless Compose pins a
+  // published digest instead (then `up` pulls exactly that).
+  const composeServices = (Bun.YAML.parse(source) as { services?: Record<string, { build?: unknown }> })
+    .services;
+  if (composeServices?.edge?.build) await compose("build", "edge");
   if (options.validator) {
     // Always rebuild: a stale local image with the same tag would otherwise be reused.
     await compose("build", "haproxy-validator");

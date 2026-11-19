@@ -243,6 +243,8 @@ if (useDocker) {
     "database-worker",
     ...(enableMail ? ["mail-worker"] : []),
     "domain-worker",
+    // Custom Caddy with the pinned rate-limit plugin (FD-23); skipped once pinned to a published digest.
+    "edge",
     "edge-watchdog",
     "haproxy-validator",
     "backup-worker",

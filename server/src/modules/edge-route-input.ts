@@ -1,17 +1,31 @@
-import type { EdgeHttpRoute, EdgePolicyRoute } from "@ark-stack/shared";
+import type { EdgeHttpRoute, EdgePolicyRoute, HttpClientAuth, HttpRateLimit } from "@ark-stack/shared";
 import type { frontRoutes, tailnetNodes } from "../schema.ts";
 
 export type RouteRow = Pick<
   typeof frontRoutes.$inferSelect,
   "id" | "kind" | "accessMode" | "bypassPaths" | "httpOptions" | "targetInput" | "targetNodeStableId"
->;
+> &
+  Partial<Pick<typeof frontRoutes.$inferSelect, "rateLimit" | "clientCaId">>;
 export type NodeRow = Pick<
   typeof tailnetNodes.$inferSelect,
   "stableId" | "dnsName" | "hostName" | "ipv4" | "ipv6"
 >;
 
-/** Pure join of the policy, the route rows and the observed nodes (unit-testable without a database). */
-export function httpRoutesFor(policyRoutes: EdgePolicyRoute[], rows: RouteRow[], nodes: NodeRow[]) {
+/** A client CA that cannot be rendered: `checkedHttpRoute` refuses it, so the route is omitted. */
+const UNUSABLE_CLIENT_AUTH: HttpClientAuth = { caCertificate: "", certificates: [] };
+
+/**
+ * Pure join of the policy, the route rows and the observed nodes (unit-testable without a database).
+ * `clientAuth` holds each HTTP mTLS route CA's certificate and admitted client certificates (FD-23);
+ * a route whose CA is missing from it is passed on unusable and omitted by the planner (fail closed).
+ * The stored rate limit is passed through unchanged; the renderer validates it.
+ */
+export function httpRoutesFor(
+  policyRoutes: EdgePolicyRoute[],
+  rows: RouteRow[],
+  nodes: NodeRow[],
+  clientAuth: ReadonlyMap<string, HttpClientAuth> = new Map(),
+) {
   const byId = new Map(rows.map((row) => [row.id, row]));
   const byStableId = new Map(nodes.map((node) => [node.stableId, node]));
   const routes: EdgeHttpRoute[] = [];
@@ -40,6 +54,8 @@ export function httpRoutesFor(policyRoutes: EdgePolicyRoute[], rows: RouteRow[],
       internalIps: [node?.ipv4, node?.ipv6].filter(
         (ip): ip is string => typeof ip === "string" && ip.length > 0 && ip !== allowed.ip,
       ),
+      ...(row.rateLimit != null ? { rateLimit: row.rateLimit as HttpRateLimit } : {}),
+      ...(row.clientCaId ? { clientAuth: clientAuth.get(row.clientCaId) ?? UNUSABLE_CLIENT_AUTH } : {}),
     });
   }
   return routes;

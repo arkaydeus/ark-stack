@@ -45,6 +45,7 @@ Useful commands:
 | `mise run host:install`              | build and start the complete host topology  |
 | `mise run host:audit`                | check the VPS firewall and public ports     |
 | `mise run images:publish`            | build and push all images to GHCR           |
+| `mise run images:pin-edge-caddy`     | pin the published edge Caddy digest         |
 | `mise run import -- file`            | read-only Orkmail/PgStack inventory compare |
 | `mise run recover-host`              | host-loss checklist                         |
 | `mise run db:studio`                 | Drizzle Studio                              |
@@ -55,7 +56,7 @@ PgBouncer runtime probes also have a dedicated TypeScript check in CI and `mise 
 
 ## Publishing images
 
-`mise run images:publish` builds all eleven Bake targets of the default group (`imageTargets` in `scripts/check-image-plan.ts`) for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing.
+`mise run images:publish` builds all twelve Bake targets of the default group (`imageTargets` in `scripts/check-image-plan.ts`) for `linux/amd64`, tags them with the first 12 characters of HEAD and `latest`, and prints immutable digest references after pushing. Compose builds the `edge` Caddy (`edge-caddy`: Caddy 2.11.9 with the pinned rate-limit plugin) locally until its published digest is pinned with `mise run images:pin-edge-caddy` ([Third-party image pins](docs/operating.md#third-party-image-pins)).
 
 Set both `GHCR_TOKEN` and `GHCR_USER` to use an explicit token without a GitHub CLI login. Otherwise, log in with `gh` and grant its token package access using `gh auth refresh -h github.com -s write:packages`. Login and push use a temporary Docker configuration, removed on success or failure; the existing Docker context and Buildx builder are preserved.
 

@@ -61,3 +61,24 @@ test("internalIps excludes empty and pinned addresses, retaining the other obser
     node.ipv4!,
   ]);
 });
+
+test("FD-23: rate limits pass through, and mTLS routes get their CA's admitted certificates", () => {
+  const clientAuth = { caCertificate: "Q0E=", certificates: ["TEVBRg=="] };
+  const [route] = httpRoutesFor(
+    [allowed],
+    [{ ...row, rateLimit: { requests: 5, window: "1s" }, clientCaId: "pca_1" }],
+    [node],
+    new Map([["pca_1", clientAuth]]),
+  );
+  expect(route).toMatchObject({ rateLimit: { requests: 5, window: "1s" }, clientAuth });
+  // Routes without either control carry neither key, so their rendering is unchanged.
+  expect(httpRoutesFor([allowed], [row], [node])[0]).not.toHaveProperty("rateLimit");
+  expect(
+    httpRoutesFor([allowed], [{ ...row, rateLimit: null, clientCaId: null }], [node])[0],
+  ).not.toHaveProperty("clientAuth");
+});
+
+test("FD-23: an mTLS route whose CA could not be loaded is passed on unusable (the planner omits it)", () => {
+  const [route] = httpRoutesFor([allowed], [{ ...row, clientCaId: "pca_missing" }], [node]);
+  expect(route?.clientAuth).toEqual({ caCertificate: "", certificates: [] });
+});
