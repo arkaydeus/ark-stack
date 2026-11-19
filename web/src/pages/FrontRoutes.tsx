@@ -8,12 +8,14 @@
 
 import { type FormEvent, Fragment, useEffect, useState } from "react";
 
+import { HTTP_RATE_LIMIT_BOUNDS } from "@ark-stack/shared/http-rate-limit";
+
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, Input, Label } from "@/components/ui/input";
 import type { FrontListeners, FrontRouteSummary, PlatformState, RouteClientCertificates } from "@/lib/types";
-import { api, parseCidrList } from "@/lib/utils";
+import { ApiError, api, parseCidrList } from "@/lib/utils";
 
 import { InlineError } from "./Auth";
 import { DnsReviewPanel } from "./DnsReview";
@@ -81,7 +83,7 @@ export function FrontRoutesView({ state }: { state: PlatformState }) {
           <CardDescription>
             Public hostnames relayed to tailnet services. TLS-TCP and raw-TCP routes deny every source until
             their CIDR list admits one; only an owner-confirmed “allow internet” opens a route to everyone.
-            Route changes are owner-only and need a step-up.
+            Only owners can change routes. Changes that widen access require password verification.
           </CardDescription>
         </CardHeader>
         <CardContent className="p-0">
@@ -296,25 +298,28 @@ const WINDOW_SECONDS = { s: 1, m: 60, h: 3_600 } as const;
 
 /** Client-side check of a rate limit (FD-23); the API applies the same bounds. */
 function rateLimitError(requests: number, window: string) {
-  if (!Number.isInteger(requests) || requests < 1 || requests > 100_000)
-    return "Requests must be a whole number from 1 to 100000.";
+  if (!Number.isInteger(requests) || requests < 1 || requests > HTTP_RATE_LIMIT_BOUNDS.requests.max)
+    return `Requests must be a whole number from 1 to ${HTTP_RATE_LIMIT_BOUNDS.requests.max}.`;
   const match = RATE_WINDOW.exec(window);
   const seconds = match ? Number(match[1]) * WINDOW_SECONDS[match[2] as keyof typeof WINDOW_SECONDS] : 0;
   if (!match || seconds < 1 || seconds > 3_600) return "The window must be from 1s to 1h, such as 10s or 1m.";
   return "";
 }
 
-/**
- * Owner controls of an HTTP route (FD-23): a per-client rate limit and required client certificates.
- * Removing or raising the limit, or turning certificates off, loosens exposure and consumes the
- * exposure.public step-up; tightening needs none, so an unused grant simply expires.
- */
+/** Owner controls of an HTTP route (FD-23). The API decides when a change needs step-up. */
 function HttpControlsPanel({ route, onChanged }: { route: FrontRouteSummary; onChanged: () => void }) {
+  const [baseline, setBaseline] = useState(route);
   const [limited, setLimited] = useState(Boolean(route.rateLimit));
   const [mtls, setMtls] = useState(route.mtls === true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState("");
+  const [needsPassword, setNeedsPassword] = useState(false);
+
+  function clearStepUp() {
+    setNeedsPassword(false);
+    setSaved("");
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -328,28 +333,50 @@ function HttpControlsPanel({ route, onChanged }: { route: FrontRouteSummary; onC
       setError(invalid);
       return;
     }
-    const body = { rateLimit: limited ? { requests, window: period } : null, mtls };
+    const limitChanged =
+      limited !== Boolean(baseline.rateLimit) ||
+      (limited && (requests !== baseline.rateLimit?.requests || period !== baseline.rateLimit.window));
+    const mtlsChanged = mtls !== Boolean(baseline.mtls);
+    if (!limitChanged && !mtlsChanged) return;
+    const body = {
+      version: baseline.version,
+      ...(limitChanged ? { rateLimit: limited ? { requests, window: period } : null } : {}),
+      ...(mtlsChanged ? { mtls } : {}),
+    };
     if (
+      mtlsChanged &&
       mtls &&
-      !route.mtls &&
+      !needsPassword &&
       !window.confirm("Require a client certificate? Open connections without one are closed.")
     )
       return;
     setBusy(true);
     try {
-      await api("/api/step-up", {
-        method: "POST",
-        body: JSON.stringify({
-          password: form.get("password"),
-          action: "exposure.public",
-          request: { routeId: route.id, ...body },
-        }),
+      if (needsPassword) {
+        await api("/api/step-up", {
+          method: "POST",
+          body: JSON.stringify({
+            password: form.get("password"),
+            action: "exposure.public",
+            request: { routeId: route.id, ...body },
+          }),
+        });
+      }
+      const updated = await api<{ route: FrontRouteSummary }>(`/api/front/routes/${route.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(body),
       });
-      await api(`/api/front/routes/${route.id}`, { method: "PATCH", body: JSON.stringify(body) });
+      setBaseline(updated.route);
+      setNeedsPassword(false);
       setSaved("Saved. The edge applies the change within seconds.");
       onChanged();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not save the route controls.");
+      if (cause instanceof ApiError && cause.code === "exposure_step_up_required") {
+        setNeedsPassword(true);
+      } else {
+        if (cause instanceof ApiError && cause.status === 409) setNeedsPassword(false);
+        setError(cause instanceof Error ? cause.message : "Could not save the route controls.");
+      }
     } finally {
       setBusy(false);
     }
@@ -362,7 +389,11 @@ function HttpControlsPanel({ route, onChanged }: { route: FrontRouteSummary; onC
           type="checkbox"
           className="mt-1"
           checked={limited}
-          onChange={(event) => setLimited(event.target.checked)}
+          disabled={busy}
+          onChange={(event) => {
+            setLimited(event.target.checked);
+            clearStepUp();
+          }}
         />
         <span>
           Limit requests per client
@@ -379,14 +410,18 @@ function HttpControlsPanel({ route, onChanged }: { route: FrontRouteSummary; onC
             name="requests"
             type="number"
             min={1}
-            max={100000}
-            defaultValue={route.rateLimit?.requests ?? 60}
+            max={HTTP_RATE_LIMIT_BOUNDS.requests.max}
+            defaultValue={baseline.rateLimit?.requests ?? 60}
+            onChange={clearStepUp}
+            disabled={busy}
             required
           />
           <Field
             label="Per window (1s to 1h)"
             name="window"
-            defaultValue={route.rateLimit?.window ?? "1m"}
+            defaultValue={baseline.rateLimit?.window ?? "1m"}
+            onChange={clearStepUp}
+            disabled={busy}
             pattern="[1-9][0-9]*(s|m|h)"
             required
           />
@@ -397,7 +432,11 @@ function HttpControlsPanel({ route, onChanged }: { route: FrontRouteSummary; onC
           type="checkbox"
           className="mt-1"
           checked={mtls}
-          onChange={(event) => setMtls(event.target.checked)}
+          disabled={busy}
+          onChange={(event) => {
+            setMtls(event.target.checked);
+            clearStepUp();
+          }}
         />
         <span>
           Require a client certificate (mTLS)
@@ -408,13 +447,16 @@ function HttpControlsPanel({ route, onChanged }: { route: FrontRouteSummary; onC
           </span>
         </span>
       </label>
-      <Field
-        label="Current password"
-        name="password"
-        type="password"
-        autoComplete="current-password"
-        required
-      />
+      {needsPassword && (
+        <Field
+          label="Verify your password to widen access"
+          name="password"
+          type="password"
+          autoComplete="current-password"
+          disabled={busy}
+          required
+        />
+      )}
       {error && (
         <div className="md:col-span-2">
           <InlineError>{error}</InlineError>

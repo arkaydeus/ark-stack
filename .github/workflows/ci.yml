@@ -107,6 +107,7 @@ jobs:
           bun test scripts/install-docker-ipv6.test.ts
           bun --no-env-file scripts/test-db.ts scripts/ipv6-preflight-test/preflight.test.ts
       - run: bun scripts/test-edge-gate.ts
+      - run: bun scripts/test-edge-http-controls.ts
       # FD-11: Chromium through the containerised edge to the real API (Playwright installed above).
       - run: bun scripts/test-e2e-gate.ts
       - name: Off-VPS backups against MinIO (FD-21)

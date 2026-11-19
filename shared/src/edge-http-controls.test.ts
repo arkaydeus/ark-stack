@@ -10,7 +10,7 @@ import {
   httpRateLimit,
   httpRouteSiteBody,
   httpRouteTlsOptions,
-  rateLimitPerSecond,
+  rateLimitWindowMs,
   type EdgeHttpRoute,
 } from "./edge-http.ts";
 import { ValidationError } from "./errors.ts";
@@ -53,11 +53,11 @@ describe("rate limit values (front_routes.rate_limit)", () => {
     expect(httpRateLimit(null)).toBeNull();
     expect(httpRateLimit(undefined)).toBeNull();
     expect(httpRateLimit({ requests: 1, window: "1s" })).toEqual({ requests: 1, window: "1s" });
-    expect(httpRateLimit({ requests: 100_000, window: "1h" })).toEqual({ requests: 100_000, window: "1h" });
+    expect(httpRateLimit({ requests: 1_000, window: "1h" })).toEqual({ requests: 1_000, window: "1h" });
     expect(httpRateLimit({ requests: 30, window: "3600s" })).toEqual({ requests: 30, window: "3600s" });
     for (const bad of [
       { requests: 0, window: "1m" },
-      { requests: 100_001, window: "1m" },
+      { requests: 1_001, window: "1m" },
       { requests: 1.5, window: "1m" },
       { requests: "10", window: "1m" },
       { requests: 10, window: "500ms" },
@@ -74,10 +74,9 @@ describe("rate limit values (front_routes.rate_limit)", () => {
     }
   });
 
-  test("compares sustained rates for the loosening check", () => {
-    expect(rateLimitPerSecond({ requests: 60, window: "1m" })).toBe(1);
-    expect(rateLimitPerSecond({ requests: 10, window: "1s" })).toBe(10);
-    expect(rateLimitPerSecond(null)).toBe(Number.POSITIVE_INFINITY);
+  test("normalizes window durations for the loosening check", () => {
+    expect(rateLimitWindowMs({ requests: 60, window: "1m" })).toBe(60_000);
+    expect(rateLimitWindowMs({ requests: 10, window: "1s" })).toBe(1_000);
   });
 });
 

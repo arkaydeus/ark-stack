@@ -226,6 +226,7 @@ export type PlatformState = {
 /** `GET /api/front/routes` (FD-08, FD-14). */
 export type FrontRouteSummary = {
   id: string;
+  version: string;
   kind: "http" | "tls" | "tcp" | "postgres";
   hostname: string;
   listenPort: number;

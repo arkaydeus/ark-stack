@@ -117,7 +117,7 @@ The FD-10, FD-11 and FD-12 DB cases live in `server/src/gate-*.suite.ts`; their 
 - Header stripping (`X-Ark-*`, forged `X-Forwarded-*`, `Server`, `Via`).
 - `Location` rewriting.
 - Body and timeout limits.
-- Optional per-route rate limits (FD-23): a per-client-address `rate_limit` zone from the pinned `caddy-ratelimit` plugin (v0.1.0, module hash checked at build), ordered before `forward_auth` and the upstream, answering a static 429.
+- Optional per-route rate limits (FD-23): a per-client-address `rate_limit` zone from the pinned `caddy-ratelimit` plugin (v0.1.0, upstream hash checked at build, with limits on client entries and timestamps), ordered before `forward_auth` and the upstream, answering a static 429.
 - Optional HTTP mTLS (FD-23): `client_auth` `require_and_verify` against the route's own `http-client` CA only, then a `leaf` allowlist of its unrevoked, unexpired certificates that are not in its CRL. Caddy runs the check from `VerifyConnection` and disables session tickets for client-auth policies, so a resumed session cannot skip it. An unusable CA omits the route. Revocation goes through the gate revocation journal (forced reload and HAProxy session drain, with the 5 s watchdog deadline). It combines with Ark login, and `strict_sni_host` keeps one hostname's connection from reaching another.
 
 **Tests:**
@@ -133,14 +133,15 @@ The FD-10, FD-11 and FD-12 DB cases live in `server/src/gate-*.suite.ts`; their 
   - [U] `shared/src/edge-http-controls.test.ts`: limit bounds; the zone is site-level, before the gate handlers and `forward_auth`; the 429 hides `Server`; routes without controls render as before; the CA and leaf allowlist; an empty list admits nobody; an invalid limit or CA omits the route.
   - [U] `server/src/modules/route-crl.test.ts`: a CRL-listed, revoked, expired or not-yet-valid certificate is never admitted; a missing or unreadable CRL admits nobody.
   - [U] `shared/src/front-routes.test.ts`: removing or raising a limit, or switching mTLS off, needs a step-up; both fields are HTTP-only.
-  - [U] `scripts/edge-test/edge-image.test.ts`: the `edge` service builds the `edge-caddy` stage on the official Caddy digest, with the plugin version and hash pinned.
-  - [DB] `server/src/http-route-controls.test.ts`: validation, step-ups, the route CA and CRL, issuance re-rendering the edge, revocation journaling a gate revocation and leaving the allowlist, and switching mTLS on and off.
-  - [H: `test:edge`] `scripts/test-edge-http-controls.ts`: through HAProxy, 429 above the limit while another route is unaffected; a TLS alert, not an HTTP status, without a certificate, with a rogue-CA certificate, with an unadmitted certificate and with a revoked serial after the CRL update; the revoking apply closes that client's open connection; a valid certificate is served; 421 both ways; upper-case SNI; mTLS with Ark login.
+  - [U] `scripts/edge-test/edge-image.test.ts`: the local `edge-caddy` build and the published amd64 pin match the release bundle in their respective modes. The image build tests the limiter budget and its reclamation.
+  - [DB] `server/src/http-route-controls.test.ts`: isolated database coverage for step-up, stale edits, malformed limits, concurrent issuance, queue rollback, in-flight applies, CRL repair, and mTLS lifecycle.
+  - [B] `e2e/front-controls.spec.ts`: sparse PATCHes, a stale edit conflict, and a password prompt only for a loosening change.
+  - [H: `test:edge`, CI verify] `scripts/test-edge-http-controls.ts`: independent quotas for two clients and two routes through HAProxy, TLS refusals and valid clients, 421 and Ark login, real HTTP revocation with worker drain and watchdog withdrawal, malformed certificates, and CRL repair.
 
 **Gaps:**
 
 - Body-size and timeout limits are checked only as rendered text. No harness sends an oversized body or a slow request and expects 413 or 408.
-- **Design limit, untested.** HTTP rate-limit counters live in one Caddy process and can start again after a config reload, and IPv6 clients are counted per address rather than per /64. The kernel per-source limits on 443 still group IPv6 per /64.
+- **Design limit, untested.** HTTP rate-limit counters live in one Caddy process and reset when the process restarts or the rate policy changes, and IPv6 clients are counted per address rather than per /64. The kernel per-source limits on 443 still group IPv6 per /64.
 
 ### B5: Caddy ↔ Ark API (`forward_auth`, login origin)
 

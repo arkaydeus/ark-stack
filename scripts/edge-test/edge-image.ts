@@ -5,6 +5,7 @@
 
 /** The local tag Compose gives the built image when ARK_VERSION is unset. */
 export const LOCAL_EDGE_CADDY_IMAGE = "ark-edge-caddy:local";
+export const PINNED_EDGE_PLATFORM = "linux/amd64";
 export const EDGE_CADDY_TARGET = "edge-caddy";
 export const PINNED_EDGE_CADDY =
   /^ghcr\.io\/[a-z0-9][a-z0-9-]*\/ark-edge-caddy(?::[A-Za-z0-9._-]{1,128})?@sha256:[a-f0-9]{64}$/;
@@ -37,7 +38,7 @@ export function composeEdgeImage(compose: string) {
       `Compose edge image ${edge.image} is neither the ${EDGE_CADDY_TARGET} build nor a digest-pinned ghcr.io/<namespace>/ark-edge-caddy reference.`,
     );
   }
-  return { kind: "pinned" as const, image: edge.image };
+  return { kind: "pinned" as const, image: edge.image, platform: PINNED_EDGE_PLATFORM };
 }
 
 /** The Dockerfile's edge-caddy runtime stage must sit on the tested official Caddy digest. */
@@ -70,17 +71,31 @@ export async function prepareEdgeImage(
       input.root,
     );
   } else {
-    await docker("pull", edge.image);
+    await docker("pull", "--platform", edge.platform, edge.image);
   }
-  const version = await docker("run", "--rm", edge.image, "caddy", "version");
-  if (!version.startsWith("v2.11.9 ")) throw new Error(`${edge.image} reports ${version}, expected v2.11.9.`);
-  const modules = (await docker("run", "--rm", edge.image, "caddy", "list-modules")).split("\n");
-  if (!modules.some((line) => line.trim() === "http.handlers.rate_limit"))
-    throw new Error(`${edge.image} has no http.handlers.rate_limit module.`);
-  return { ...edge, version: version.split(" ")[0]! };
+  const platformArgs = edge.kind === "pinned" ? ["--platform", edge.platform] : [];
+  const version = await checkEdgeImage(docker, edge.image, platformArgs);
+  return { ...edge, platformArgs, version };
 }
 
-const COMPOSE_EDGE_HEAD = /^ {2}edge:\n(?: {4}#.*\n)* {4}image: .*\n(?: {4}build:\n(?: {6}.*\n)+)?/m;
+export async function checkEdgeImage(
+  docker: (...args: string[]) => Promise<string>,
+  image: string,
+  platformArgs: string[],
+) {
+  const version = await docker("run", "--rm", ...platformArgs, image, "caddy", "version");
+  if (!version.startsWith("v2.11.9 ")) throw new Error(`${image} reports ${version}, expected v2.11.9.`);
+  const modules = (await docker("run", "--rm", ...platformArgs, image, "caddy", "list-modules")).split("\n");
+  if (!modules.some((line) => line.trim() === "http.handlers.rate_limit"))
+    throw new Error(`${image} has no http.handlers.rate_limit module.`);
+  const build = await docker("run", "--rm", ...platformArgs, image, "caddy", "build-info");
+  if (!/^=>\s+\/build\/ark-bounded-ratelimit\s/m.test(build))
+    throw new Error(`${image} has no Ark rate-limit memory budget.`);
+  return version.split(" ")[0]!;
+}
+
+const COMPOSE_EDGE_HEAD =
+  /^ {2}edge:\n(?: {4}#.*\n)* {4}image: .*\n(?: {4}platform: .*\n)?(?: {4}build:\n(?: {6}.*\n)+)?/m;
 
 /**
  * Pins Compose's `edge` service to a published `ark-edge-caddy` digest (`mise run images:pin-edge-caddy`):
@@ -97,6 +112,7 @@ export function pinComposeEdge(compose: string, reference: string) {
     # \`edge-caddy\` image (Dockerfile stage and Bake target), pinned by digest with
     # \`mise run images:pin-edge-caddy\`. Its base is the same official caddy:2.11.9 digest as tailnet-gateway.
     image: ${reference}
+    platform: ${PINNED_EDGE_PLATFORM}
 `,
   );
   composeEdgeImage(pinned);

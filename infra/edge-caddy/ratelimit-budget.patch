@@ -1,0 +1,208 @@
+--- a/ratelimit.go
++++ b/ratelimit.go
+@@ -56,2 +56,2 @@
+-	if rl.MaxEvents < 0 {
+-		return fmt.Errorf("max_events must be at least zero")
++	if rl.MaxEvents < 1 || rl.MaxEvents > 1000 {
++		return fmt.Errorf("max_events must be between 1 and 1000")
+@@ -71,4 +71,9 @@
+-	// ensure rate limiter state endures across config changes
+-	rl.limitersMap = newRateLimiterMap()
+-	if val, loaded := rateLimits.LoadOrStore(name, rl.limitersMap); loaded {
+-		rl.limitersMap = val.(*rateLimitersMap)
++	// Keep quota history across reloads of an unchanged policy. Never resize
++	// active rings during provisioning of a different policy.
++	value, _, err := rateLimits.LoadOrNew(rl.poolKey(), func() (caddy.Destructor, error) {
++		zone := newRateLimiterMap()
++		zone.events, zone.window = rl.MaxEvents, time.Duration(rl.Window)
++		return zone, nil
++	})
++	if err != nil {
++		return err
+@@ -76 +81 @@
+-	rl.limitersMap.updateAll(rl.MaxEvents, time.Duration(rl.Window))
++	rl.limitersMap = value.(*rateLimitersMap)
+@@ -84,0 +90,26 @@
++type rateLimitPoolKey struct {
++	name   string
++	key    string
++	events int
++	window caddy.Duration
++}
++
++func (rl *RateLimit) poolKey() rateLimitPoolKey {
++	return rateLimitPoolKey{rl.zoneName, rl.Key, rl.MaxEvents, rl.Window}
++}
++
++const (
++	maxZoneKeys     = 1024
++	maxZoneSlots    = 128 * 1024
++	maxProcessKeys  = 16 * 1024
++	maxProcessSlots = 1024 * 1024 // 24 MiB of timestamps on 64-bit Go
++)
++
++// The shared budget also covers old and new configurations during a reload.
++// Lock order is always zone map, then budget.
++var limiterBudget struct {
++	sync.Mutex
++	keys  int
++	slots int
++}
++
+@@ -87,0 +119,2 @@
++	events     int
++	window     time.Duration
+@@ -91,3 +124 @@
+-	var rlm rateLimitersMap
+-	rlm.limiters = make(map[string]*ringBufferRateLimiter)
+-	return &rlm
++	return &rateLimitersMap{limiters: make(map[string]*ringBufferRateLimiter)}
+@@ -96,3 +127,4 @@
+-// getOrInsert returns an existing rate limiter from the map, or inserts a new
+-// one with the desired settings and returns it.
+-func (rlm *rateLimitersMap) getOrInsert(key string, maxEvents int, window time.Duration) *ringBufferRateLimiter {
++// withLimiter keeps a reservation in the map through the quota decision.
++// A new key is rejected when the zone or process cannot store it. Existing
++// keys keep their quotas and are never evicted to admit new keys.
++func (rlm *rateLimitersMap) withLimiter(key string, use func(*ringBufferRateLimiter)) bool {
+@@ -102,5 +134,2 @@
+-	rateLimiter, ok := rlm.limiters[key]
+-	if !ok {
+-		newRateLimiter := newRingBufferRateLimiter(maxEvents, window)
+-		rlm.limiters[key] = newRateLimiter
+-		return newRateLimiter
++	if rlm.limiters == nil {
++		return false
+@@ -108 +137,20 @@
+-	return rateLimiter
++	limiter := rlm.limiters[key]
++	if limiter == nil {
++		n := len(rlm.limiters) + 1
++		if n > maxZoneKeys || n*rlm.events > maxZoneSlots {
++			return false
++		}
++		limiterBudget.Lock()
++		if limiterBudget.keys >= maxProcessKeys || limiterBudget.slots+rlm.events > maxProcessSlots {
++			limiterBudget.Unlock()
++			return false
++		}
++		limiterBudget.keys++
++		limiterBudget.slots += rlm.events
++		limiterBudget.Unlock()
++
++		limiter = newRingBufferRateLimiter(rlm.events, rlm.window)
++		rlm.limiters[key] = limiter
++	}
++	use(limiter)
++	return true
+@@ -111,2 +159,9 @@
+-// updateAll updates existing rate limiters with new settings.
+-func (rlm *rateLimitersMap) updateAll(maxEvents int, window time.Duration) {
++func (rlm *rateLimitersMap) release(count int) {
++	limiterBudget.Lock()
++	limiterBudget.keys -= count
++	limiterBudget.slots -= count * rlm.events
++	limiterBudget.Unlock()
++}
++
++// Destruct is called when the last configuration releases this zone.
++func (rlm *rateLimitersMap) Destruct() error {
+@@ -115,5 +170,3 @@
+-
+-	for _, limiter := range rlm.limiters {
+-		limiter.SetMaxEvents(maxEvents)
+-		limiter.SetWindow(time.Duration(window))
+-	}
++	rlm.release(len(rlm.limiters))
++	rlm.limiters = nil
++	return nil
+@@ -127,25 +180,9 @@
+-	for key, rl := range rlm.limiters {
+-		func(rl *ringBufferRateLimiter) {
+-			rl.mu.Lock()
+-			defer rl.mu.Unlock()
+-
+-			// no point in keeping a ring buffer of size 0 around
+-			if len(rl.ring) == 0 {
+-				delete(rlm.limiters, key)
+-				return
+-			}
+-
+-			// get newest event in ring (should come right before oldest)
+-			cursorNewest := rl.cursor - 1
+-			if cursorNewest < 0 {
+-				cursorNewest = len(rl.ring) - 1
+-			}
+-			newest := rl.ring[cursorNewest]
+-			window := rl.window
+-
+-			// if newest event in memory is outside the window,
+-			// the entire ring has expired and can be forgotten
+-			if newest.Add(window).Before(now()) {
+-				delete(rlm.limiters, key)
+-			}
+-		}(rl)
++	expired := 0
++	threshold := now().Add(-rlm.window)
++	for key, limiter := range rlm.limiters {
++		// withLimiter holds this same map lock throughout any quota decision.
++		newest := (limiter.cursor + len(limiter.ring) - 1) % len(limiter.ring)
++		if limiter.ring[newest].Before(threshold) {
++			delete(rlm.limiters, key)
++			expired++
++		}
+@@ -152,0 +190 @@
++	rlm.release(expired)
+--- a/handler.go
++++ b/handler.go
+@@ -182,6 +182,7 @@
+-		limiter := rl.limitersMap.getOrInsert(key, rl.MaxEvents, time.Duration(rl.Window))
+-
+-		if h.Distributed == nil {
+-			// internal rate limiter only
+-			if dur := limiter.When(); dur > 0 {
+-				return h.rateLimitExceeded(w, r, repl, rl.zoneName, key, dur)
++		var wait time.Duration
++		var failure error
++		stored := rl.limitersMap.withLimiter(key, func(limiter *ringBufferRateLimiter) {
++			if h.Distributed == nil {
++				wait = limiter.When()
++			} else {
++				failure = h.distributedRateLimiting(w, r, repl, limiter, key, rl.zoneName)
+@@ -189,5 +190,6 @@
+-		} else {
+-			// distributed rate limiting; add last known state of other instances
+-			if err := h.distributedRateLimiting(w, r, repl, limiter, key, rl.zoneName); err != nil {
+-				return err
+-			}
++		})
++		if !stored {
++			// Capacity refusal has the normal 429 response without per-request
++			// logging or event emission. The periodic sweep may free state.
++			w.Header().Set("Retry-After", strconv.Itoa(max(1, int(time.Duration(h.SweepInterval).Seconds()))))
++			return caddyhttp.Error(http.StatusTooManyRequests, nil)
+@@ -194,0 +197,6 @@
++		if wait > 0 {
++			return h.rateLimitExceeded(w, r, repl, rl.zoneName, key, wait)
++		}
++		if failure != nil {
++			return failure
++		}
+@@ -247,2 +255,2 @@
+-	for name := range h.RateLimits {
+-		rateLimits.Delete(name)
++	for _, rl := range h.rateLimits {
++		rateLimits.Delete(rl.poolKey())
+@@ -267,4 +275,3 @@
+-			rateLimits.Range(func(key, value interface{}) bool {
+-				value.(*rateLimitersMap).sweep()
+-				return true
+-			})
++			for _, rl := range h.rateLimits {
++				rl.limitersMap.sweep()
++			}
+--- a/distributed.go
++++ b/distributed.go
+@@ -96 +96 @@
+-		zoneNameStr := zoneName.(string)
++		zoneNameStr := zoneName.(rateLimitPoolKey).name

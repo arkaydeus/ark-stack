@@ -120,11 +120,11 @@ PATCH /api/front/routes/:id
 { "rateLimit": { "requests": 60, "window": "1m" } }      // null removes the limit
 ```
 
-- `requests` is an integer from 1 to 100000. `window` is a duration from `1s` to `1h`, such as `10s`, `1m` or `1h`.
+- `requests` is an integer from 1 to 1000. `window` is a duration from `1s` to `1h`, such as `10s`, `1m` or `1h`.
 - Requests over the limit get `429` with `Retry-After` and a static body that has no `Server` header. Caddy counts and refuses them before the login gate's `forward_auth`, before the gate's own handlers and before the upstream, so a refused request never reaches the API or the target.
-- Each route has its own counters. Another route is unaffected, even from the same client.
-- Counters live in the running Caddy process. A restart, and some config reloads, start them again. IPv6 clients are counted per address, not per /64. The kernel per-source limits in front of 443 (`inet ark_front`) still apply, per /64.
-- Adding a limit or lowering it tightens exposure and needs no step-up. Removing a limit, raising `requests` or raising the rate loosens it, and needs `exposure.public` bound to `{ routeId, ...body }`.
+- Each route has its own quota for a client address. When its limiter capacity or the shared process capacity is full, new client addresses get 429 until expired entries are swept. Existing entries retain their quotas.
+- Counters live in the running Caddy process. A restart or a changed rate policy starts that history again. IPv6 clients are counted per address, not per /64. The kernel per-source limits in front of 443 (`inet ark_front`) still apply, per /64.
+- Adding a limit or replacing it with a stricter policy needs no step-up. Removing a limit or allowing more requests in any window of the old duration requires `exposure.public` bound to `{ routeId, ...body }`. Stored limits outside the supported bounds close the route. Explicitly replacing or clearing one also requires the grant.
 
 **Client certificates (HTTP mTLS).** `"mtls": true` (on create or update) gives the route its own client CA (`client_ca_id`, purpose `http-client`) and requires a certificate from it in the TLS handshake:
 

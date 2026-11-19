@@ -36,6 +36,7 @@ import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
 const caddyImage = "caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c";
 /** The shipped edge image (FD-23), set by `checkPins`: built from the edge-caddy stage or pinned. */
 let edgeImage = "";
+let edgePlatformArgs: string[] = [];
 // The edge node (edge-ts) and the admin node (tailscale) share this pin.
 const tailscaleImage =
   "tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2";
@@ -132,6 +133,7 @@ async function checkPins() {
   );
   const edge = await prepareEdgeImage(docker, { root, compose });
   edgeImage = edge.image;
+  edgePlatformArgs = edge.platformArgs;
   console.log(
     `Compose ${edge.kind === "build" ? "builds" : "pins"} the edge image ${edgeImage} (${edge.version}, with http.handlers.rate_limit) on ${caddyImage.split("@")[0]}.`,
   );
@@ -214,6 +216,7 @@ async function validate(name: string, source: string, image = edgeImage) {
     `${file}:/etc/caddy/Caddyfile:ro`,
     "--volume",
     `${fixtureCerts.served}:${EDGE_CERT_DIR}:ro`,
+    ...(image === edgeImage ? edgePlatformArgs : []),
     image,
     "caddy",
     "adapt",
@@ -442,6 +445,7 @@ async function startCaddy(label: string, caddyfile: string, ports: number[], vol
     "--volume",
     `${file}:/etc/caddy/Caddyfile:ro`,
     ...volumes.flatMap((volume) => ["--volume", volume]),
+    ...edgePlatformArgs,
     edgeImage,
   );
   const mapped = new Map<number, number>();

@@ -134,9 +134,9 @@ CMD []
 # replaced by an xcaddy build of the same Caddy release plus github.com/mholt/caddy-ratelimit (an
 # unofficial plugin) for HTTP route rate limits. The builder is the official 2.11.9 builder by digest.
 # The plugin is pinned to one tagged version; Go verifies every module against the checksum database,
-# and the build fails unless the binary records exactly the expected module hash, reports v2.11.9 and
-# carries the rate_limit handler. Everything else (filesystem, users, the file capability) is the
-# official image. The bump procedure is in docs/operating.md ("Third-party image pins").
+# and the build checks the expected upstream module hash before applying the local memory budget.
+# The binary reports v2.11.9 and carries the rate_limit handler. The filesystem, users and file
+# capability come from the official image. The bump procedure is in docs/operating.md ("Third-party image pins").
 FROM caddy:2.11.9-builder@sha256:f9beaa5ddbe7df6f26ebbcf9cbf44e05a1917b9bba464f0c3229038d7e2e6e13 AS edge-caddy-build
 ARG CADDY_VERSION=v2.11.9
 ARG CADDY_RATELIMIT_MODULE=github.com/mholt/caddy-ratelimit
@@ -144,10 +144,18 @@ ARG CADDY_RATELIMIT_VERSION=v0.1.0
 ARG CADDY_RATELIMIT_SUM=h1:73lOvdSLSoBGPT5l61nrTzh9liax+IDfXeQDtfzNcZ4=
 # The capability is set in the runtime stage, as the official image does.
 ENV XCADDY_SETCAP=0
+COPY infra/edge-caddy/ /build/ark-edge-caddy/
 RUN set -eu; \
-  xcaddy build "$CADDY_VERSION" --with "$CADDY_RATELIMIT_MODULE@$CADDY_RATELIMIT_VERSION" --output /out/caddy; \
-  go version -m /out/caddy | awk -v m="$CADDY_RATELIMIT_MODULE" -v v="$CADDY_RATELIMIT_VERSION" -v s="$CADDY_RATELIMIT_SUM" \
-    '$1 == "dep" && $2 == m && $3 == v && $4 == s { found = 1 } END { exit !found }'; \
+  module="$(go mod download -json "$CADDY_RATELIMIT_MODULE@$CADDY_RATELIMIT_VERSION")"; \
+  sum="$(echo "$module" | awk -F '"' '/"Sum":/ { print $4 }')"; \
+  test "$sum" = "$CADDY_RATELIMIT_SUM"; \
+  source="$(echo "$module" | awk -F '"' '/"Dir":/ { print $4 }')"; \
+  cp -R "$source" /build/ark-bounded-ratelimit; chmod -R u+w /build/ark-bounded-ratelimit; \
+  git -C /build/ark-bounded-ratelimit apply --unidiff-zero /build/ark-edge-caddy/ratelimit-budget.patch; \
+  cp /build/ark-edge-caddy/ratelimit-budget_test.go /build/ark-bounded-ratelimit/; \
+  (cd /build/ark-bounded-ratelimit; go mod edit -require "github.com/caddyserver/caddy/v2@$CADDY_VERSION"; \
+    go test -mod=mod -run "^TestArkRateLimitBudget$" .); \
+  xcaddy build "$CADDY_VERSION" --with "$CADDY_RATELIMIT_MODULE@$CADDY_RATELIMIT_VERSION=/build/ark-bounded-ratelimit" --output /out/caddy; \
   /out/caddy version | grep -q "^$CADDY_VERSION "; \
   /out/caddy list-modules | grep -qx http.handlers.rate_limit
 

@@ -235,6 +235,16 @@ describe("route request policy", () => {
     expect(
       looseningChanges({ ...current, rateLimit: null }, { rateLimit: { requests: 5, window: "1s" } }),
     ).toEqual([]);
+    for (const [before, after, looser] of [
+      [{ requests: 10, window: "10s" }, { requests: 6, window: "7s" }, true],
+      [{ requests: 10, window: "10s" }, { requests: 5, window: "7s" }, false],
+      [{ requests: 12, window: "1m" }, { requests: 4, window: "20s" }, false],
+      [{ requests: 12, window: "1m" }, { requests: 4, window: "19s" }, true],
+    ] as const) {
+      expect(looseningChanges({ ...current, rateLimit: before }, { rateLimit: after })).toEqual(
+        looser ? ["rateLimit"] : [],
+      );
+    }
     expect(looseningChanges(current, { mtls: false })).toEqual(["mtls"]);
     expect(looseningChanges({ ...current, mtls: false }, { mtls: true })).toEqual([]);
     expect(looseningChanges(current, { mtls: true, rateLimit: current.rateLimit })).toEqual([]);

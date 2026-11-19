@@ -67,8 +67,11 @@ import {
   checkBypassPaths,
 } from "./gate.ts";
 import { normalizeHostname } from "./hostnames.ts";
+import { HTTP_RATE_LIMIT_BOUNDS } from "./http-rate-limit.ts";
 import { checkTailnetAddress, parseIpLiteral } from "./tailnet.ts";
 import { backendKey } from "./tailnet-observe.ts";
+
+export { HTTP_RATE_LIMIT_BOUNDS } from "./http-rate-limit.ts";
 
 /** Where the `edge` container mounts the static error pages (infra/platform/edge-errors). */
 export const EDGE_ERRORS_DIR = "/etc/caddy/errors";
@@ -106,12 +109,6 @@ export const HTTP_ROUTE_DEFAULTS: HttpRouteOptions = {
  * gate's `forward_auth` and before the upstream.
  */
 export type HttpRateLimit = { requests: number; window: string };
-
-export const HTTP_RATE_LIMIT_BOUNDS = {
-  requests: { min: 1, max: 100_000 },
-  /** Window bounds in milliseconds: 1 s to 1 h. */
-  windowMs: { min: 1_000, max: 3_600_000 },
-} as const;
 
 /**
  * HTTP client-certificate authentication (FD-23): the route's own CA (`front_routes.client_ca_id`)
@@ -245,11 +242,10 @@ export function httpRateLimit(value: unknown): HttpRateLimit | null {
   return { requests, window: window as string };
 }
 
-/** Requests per second a rate limit admits; higher means looser. Null (no limit) is unbounded. */
-export function rateLimitPerSecond(limit: HttpRateLimit | null) {
-  if (!limit) return Number.POSITIVE_INFINITY;
+/** The duration of an already validated rate limit window. */
+export function rateLimitWindowMs(limit: HttpRateLimit) {
   const match = DURATION.exec(limit.window)!;
-  return limit.requests / ((Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS]) / 1_000);
+  return Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS];
 }
 
 function checkedClientAuth(value: HttpClientAuth, routeId: string) {

@@ -3935,14 +3935,20 @@ app.patch("/api/front/routes/:id", async (c) => {
           tx,
         )
     : undefined;
-  const { status } = await commitRouteUpdate(
-    plan,
-    { userId: access.userId, role: access.role },
-    enqueue,
-    authorize,
-  );
-  const [route] = await listFrontRoutes(routeId);
-  return c.json({ route, status, loosening: plan.loosening });
+  try {
+    const { status } = await commitRouteUpdate(
+      plan,
+      { userId: access.userId, role: access.role },
+      enqueue,
+      authorize,
+    );
+    const [route] = await listFrontRoutes(routeId);
+    return c.json({ route, status, loosening: plan.loosening });
+  } catch (error) {
+    if (error instanceof HTTPException && error.status === 403)
+      return c.json({ error: error.message, code: "exposure_step_up_required" }, 403);
+    throw error;
+  }
 });
 
 app.post("/api/front/routes/:id/enable", async (c) => {
@@ -4006,18 +4012,19 @@ app.post("/api/front/routes/:id/client-certificates", async (c) => {
   const request = (await c.req.json()) as Record<string, unknown>;
   const input = routeClientCertificateInput.parse(request);
   if (input.csrPem !== undefined) validateCsr(input.csrPem);
-  await listRouteClientCertificates(routeId);
-  await requirePrivileged(
-    access,
-    c.get("session"),
-    "credential.rotate",
-    privilegedRequestHash("credential.rotate", { routeId, ...request }),
-  );
   const issued = await issueRouteClientCertificate(
     routeId,
     input,
     { userId: access.userId, role: access.role },
     enqueue,
+    (tx) =>
+      requirePrivileged(
+        access,
+        c.get("session"),
+        "credential.rotate",
+        privilegedRequestHash("credential.rotate", { routeId, ...request }),
+        tx,
+      ),
   );
   c.header("cache-control", "no-store");
   return c.json(issued, 201);

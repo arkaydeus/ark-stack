@@ -11,7 +11,13 @@ import { join, resolve } from "node:path";
 
 import { bundleDigest } from "@ark-stack/shared";
 
-import { PINNED_EDGE_CADDY, pinComposeEdge, pinReleaseEdge } from "./edge-test/edge-image.ts";
+import {
+  PINNED_EDGE_CADDY,
+  PINNED_EDGE_PLATFORM,
+  checkEdgeImage,
+  pinComposeEdge,
+  pinReleaseEdge,
+} from "./edge-test/edge-image.ts";
 
 const root = resolve(import.meta.dir, "..");
 const args = process.argv.slice(2);
@@ -39,13 +45,10 @@ async function docker(...command: string[]) {
 if (verify) {
   const inspected = await docker("buildx", "imagetools", "inspect", reference);
   if (!/Platform:\s+linux\/amd64/.test(inspected)) throw new Error(`${reference} has no linux/amd64 image.`);
-  await docker("pull", reference);
-  const version = await docker("run", "--rm", reference, "caddy", "version");
-  if (!version.startsWith("v2.11.9 ")) throw new Error(`${reference} reports ${version}, expected v2.11.9.`);
-  const modules = (await docker("run", "--rm", reference, "caddy", "list-modules")).split("\n");
-  if (!modules.some((line) => line.trim() === "http.handlers.rate_limit"))
-    throw new Error(`${reference} has no http.handlers.rate_limit module.`);
-  console.log(`${reference}: ${version.split(" ")[0]} with http.handlers.rate_limit.`);
+  const platformArgs = ["--platform", PINNED_EDGE_PLATFORM];
+  await docker("pull", ...platformArgs, reference);
+  const version = await checkEdgeImage(docker, reference, platformArgs);
+  console.log(`${reference}: ${version} with http.handlers.rate_limit.`);
 }
 
 const composePath = join(root, "infra/platform/docker-compose.yml");

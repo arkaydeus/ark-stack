@@ -15,23 +15,21 @@
 //   upper-case SNI still requires the certificate;
 // - mTLS combined with Ark login: a certificate and a gate session are both required.
 //
-// Client certificates are issued with the production PKI functions (route CA, rogue CA, CRL) and
-// admitted with the production `admittedClientCertificates`. `ARK_EDGE_HTTP_CONTROLS_ONLY=<text>`
+// A disposable database holds real route CAs and certificates. The real API journals revocations,
+// the domain worker processes them, and the watchdog reads the production lease.
+// `ARK_EDGE_HTTP_CONTROLS_ONLY=<text>`
 // runs only matching groups (setup always runs).
-import { generateKeyPairSync, randomBytes, type KeyObject } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 
-import { planEdge, type EdgeHttpRoute } from "@ark-stack/shared";
+import { type EdgeHttpRoute } from "@ark-stack/shared";
 
 import { bunImage, cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from "./edge-test/gate-edge.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
-
-process.env.DATABASE_URL ??= "postgres://unused:unused@127.0.0.1:9/unused";
-const { buildCrl, createCaMaterial, signClientCertificate } = await import("../server/src/modules/pki.ts");
-const { admittedClientCertificates, caCertificateDer } = await import("../server/src/modules/route-crl.ts");
+import { startHttpControlsDb } from "./edge-test/http-controls-db.ts";
 
 const fixtures = join(import.meta.dir, "edge-test");
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
@@ -43,94 +41,34 @@ const gateToken = randomBytes(24).toString("base64url");
 
 const openHost = "open.example.com";
 const limitedHost = "limited.example.com";
+const alsoLimitedHost = "also-limited.example.com";
 const mtlsHost = "mtls.example.com";
 const closedHost = "closed.example.com";
 const bothHost = "both.example.com";
 const limit = { requests: 3, window: "1m" };
 
-// ---- Client PKI (production functions) ------------------------------------------------------------------
+type ControlsDb = Awaited<ReturnType<typeof startHttpControlsDb>>;
+type Client = Awaited<ReturnType<ControlsDb["issue"]>>;
+let database: ControlsDb | undefined;
+let good: Client;
+let doomed: Client;
+let overdueClient: Client;
+let goodBoth: Client;
+let rogue: Client;
+let caIds: Record<string, string>;
 
-type Client = { cert: string; key: string; serial: string };
-const now = new Date();
-const routeCa = createCaMaterial({
-  id: "pca_fd23_route",
-  purpose: "http-client",
-  name: "Route rt_mtls",
-  now,
-});
-const rogueCa = createCaMaterial({ id: "pca_fd23_rogue", purpose: "http-client", name: "Rogue", now });
-function client(ca: typeof routeCa, name: string): Client {
-  const pair = generateKeyPairSync("ec", { namedCurve: "P-256" });
-  const issued = signClientCertificate({ ca, subjectCn: name, publicKey: pair.publicKey as KeyObject, now });
-  return {
-    cert: issued.certPem,
-    key: pair.privateKey.export({ type: "pkcs8", format: "pem" }) as string,
-    serial: issued.serial,
-  };
-}
-const good = client(routeCa, "laptop");
-const doomed = client(routeCa, "phone");
-const rogue = client(rogueCa, "laptop");
-const crl = (revoked: Client[]) =>
-  buildCrl({
-    ca: routeCa,
-    revoked: revoked.map((item) => ({ serial: item.serial, revokedAt: now })),
-    thisUpdate: now,
-    nextUpdate: new Date(now.getTime() + 14 * 86_400_000),
-    crlNumber: BigInt(revoked.length + 1),
-  }).crlPem;
-const rows = (statuses: Record<string, string>) =>
-  [good, doomed].map((item) => ({
-    serial: item.serial,
-    status: statuses[item.serial] ?? "issued",
-    notBefore: now,
-    notAfter: new Date(now.getTime() + 90 * 86_400_000),
-    certPem: item.cert,
-  }));
-/** The route CA's admitted set, as `edge.apply` reads it: before and after revoking `doomed`. */
-const admitted = {
-  before: admittedClientCertificates({ crlPem: crl([]), certificates: rows({}) }),
-  after: admittedClientCertificates({
-    crlPem: crl([doomed]),
-    certificates: rows({ [doomed.serial]: "revoked" }),
-  }),
-};
-
-// ---- Routes ---------------------------------------------------------------------------------------------
-
+// Policy is seeded into the disposable database; a temporary lease permits edge setup.
 const gateSessionToken = randomBytes(32).toString("base64url");
-function fixtureRoutes(peerIp: string, phase: "before" | "after"): EdgeHttpRoute[] {
+function fixtureRoutes(peerIp: string): EdgeHttpRoute[] {
   const base = { stableId: "nHOMECTRL", ip: peerIp, port: 3000, access: "public" as const };
-  const clientAuth = { caCertificate: caCertificateDer(routeCa.certPem)!, certificates: admitted[phase] };
   return [
     { ...base, id: "rt_open", hostname: openHost },
     { ...base, id: "rt_lim", hostname: limitedHost, rateLimit: limit },
-    { ...base, id: "rt_mtls", hostname: mtlsHost, clientAuth },
-    // The route CA, but an empty admitted list: nobody gets in.
-    { ...base, id: "rt_closed", hostname: closedHost, clientAuth: { ...clientAuth, certificates: [] } },
-    { ...base, id: "rt_both", hostname: bothHost, access: "sso", clientAuth },
+    { ...base, id: "rt_limtwo", hostname: alsoLimitedHost, rateLimit: limit },
+    { ...base, id: "rt_mtls", hostname: mtlsHost },
+    { ...base, id: "rt_closed", hostname: closedHost },
+    { ...base, id: "rt_both", hostname: bothHost, access: "sso" },
   ];
-}
-
-function fixturePlan(peerIp: string, phase: "before" | "after") {
-  const routes = fixtureRoutes(peerIp, phase);
-  const plan = planEdge({
-    adminMode: "tailnet",
-    endpoints: routes.map((route) => ({
-      id: `end_${route.hostname}`,
-      kind: "route",
-      hostname: route.hostname,
-      exposure: "public",
-    })),
-    certificates: routes.map((route) => ({
-      endpointId: `end_${route.hostname}`,
-      status: "issued",
-      lastDeployedAt: now,
-    })),
-    httpRoutes: routes,
-  });
-  if (plan.omitted.length) throw new Error(`The planner omitted ${JSON.stringify(plan.omitted)}`);
-  return plan;
 }
 
 type Report = { name: string; lines: string[] };
@@ -144,7 +82,9 @@ let edge!: GateEdge;
 let httpsPort = 0;
 
 type Reply = { status: number; headers: Record<string, string[]>; body: string };
-type Outcome = { kind: "http"; reply: Reply } | { kind: "tls"; code: string; message: string; bytes: number };
+type Outcome =
+  | { kind: "http"; reply: Reply }
+  | { kind: "tls"; code: string; message: string; bytes: number; connected: boolean };
 
 /**
  * One HTTP/1.1 request through the published 443 with an optional client certificate. A failure
@@ -158,6 +98,7 @@ function attempt(
   return new Promise<Outcome>((resolveOutcome) => {
     const socket = tlsConnect({
       host: "127.0.0.1",
+      maxVersion: "TLSv1.2",
       port: httpsPort,
       servername,
       rejectUnauthorized: false,
@@ -166,6 +107,7 @@ function attempt(
     });
     let data = "";
     let settled = false;
+    let connected = false;
     const finish = (outcome: Outcome) => {
       if (settled) return;
       settled = true;
@@ -174,10 +116,12 @@ function attempt(
       resolveOutcome(outcome);
     };
     const timer = setTimeout(
-      () => finish({ kind: "tls", code: "TIMEOUT", message: "no answer in 8 s", bytes: data.length }),
+      () =>
+        finish({ kind: "tls", code: "TIMEOUT", message: "no answer in 8 s", bytes: data.length, connected }),
       8_000,
     );
     socket.on("secureConnect", () => {
+      connected = true;
       const headers = { Host: options.host ?? servername, Connection: "close", ...options.headers };
       socket.write(
         `GET ${path} HTTP/1.1\r\n${Object.entries(headers)
@@ -187,11 +131,12 @@ function attempt(
     });
     socket.on("data", (chunk) => (data += chunk.toString("utf8")));
     socket.on("error", (error: Error & { code?: string }) => {
-      if (!data) finish({ kind: "tls", code: error.code ?? "ERROR", message: error.message, bytes: 0 });
+      if (!data)
+        finish({ kind: "tls", code: error.code ?? "ERROR", message: error.message, bytes: 0, connected });
     });
     socket.on("close", () => {
       if (!data) {
-        finish({ kind: "tls", code: "CLOSED", message: "closed without a response", bytes: 0 });
+        finish({ kind: "tls", code: "CLOSED", message: "closed without a response", bytes: 0, connected });
         return;
       }
       const [head = "", ...rest] = data.split("\r\n\r\n");
@@ -213,11 +158,12 @@ function attempt(
 const describe = (outcome: Outcome) =>
   outcome.kind === "http" ? `HTTP ${outcome.reply.status}` : `TLS ${outcome.code}: ${outcome.message}`;
 
-/** A refusal in the handshake: an alert from the server, and no HTTP response byte. */
+/** TLS 1.2 authenticates the client before secureConnect. Some Bun versions report the alert as close. */
 const tlsRefused = (outcome: Outcome) =>
   outcome.kind === "tls" &&
   outcome.bytes === 0 &&
-  /alert|ERR_SSL/i.test(`${outcome.code} ${outcome.message}`);
+  !outcome.connected &&
+  (outcome.code === "CLOSED" || /alert|ERR_SSL/i.test(`${outcome.code} ${outcome.message}`));
 
 async function upstreamPaths() {
   return (await edge.seen(edge.peerName)) as string[];
@@ -276,6 +222,83 @@ async function rateLimitTest(report: Report) {
   );
 }
 
+/** Two ordinary clients on the edge's admin test network enter HAProxy directly on 443. */
+async function proxyClientQuota(container: string, hosts: string[]) {
+  return JSON.parse(
+    await runtime.docker(
+      "exec",
+      container,
+      "bun",
+      "-e",
+      String.raw`
+      import { lookup } from "node:dns/promises";
+      import { connect } from "node:tls";
+      const { address } = await lookup(process.argv[1]);
+      const result = [];
+      for (const host of JSON.parse(process.argv[2])) {
+        result.push(await new Promise((resolve, reject) => {
+          let response = "";
+          const socket = connect({ host: address, port: 443, servername: host, rejectUnauthorized: false },
+            () => socket.write("GET /headers HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n"));
+          socket.on("data", chunk => response += chunk);
+          socket.on("close", () => resolve(Number(response.split(" ")[1])));
+          socket.on("error", reject);
+          socket.setTimeout(5_000, () => socket.destroy(new Error("quota request timed out")));
+        }));
+      }
+      console.log(JSON.stringify(result));
+    `,
+      edge.stack.edgeTs,
+      JSON.stringify(hosts),
+    ),
+  ) as number[];
+}
+
+async function quotaIsolationTest(report: Report) {
+  const first = [...Array<string>(4).fill(limitedHost), alsoLimitedHost];
+  const second = [limitedHost, ...Array<string>(4).fill(alsoLimitedHost)];
+  const clients = [`${runName}-client-a`, `${runName}-client-b`];
+  for (const name of clients) {
+    runtime.containers.push(name);
+    await runtime.docker(
+      "run",
+      "-d",
+      "--name",
+      name,
+      "--network",
+      edge.stack.networks.admin,
+      bunImage,
+      "sleep",
+      "infinity",
+    );
+  }
+  const addresses = await Promise.all(
+    clients.map((name) =>
+      runtime.docker("inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name),
+    ),
+  );
+  expect(
+    report,
+    !!addresses[0] && !!addresses[1] && addresses[0] !== addresses[1],
+    "both clients have distinct source addresses at HAProxy",
+    addresses.join(", "),
+  );
+  const a = await proxyClientQuota(clients[0]!, first);
+  const b = await proxyClientQuota(clients[1]!, second);
+  expect(
+    report,
+    a.join() === "200,200,200,429,200",
+    "one client exhausts only its first route quota",
+    a.join(),
+  );
+  expect(
+    report,
+    b.join() === "200,200,200,200,429",
+    "a second client has independent quotas on both routes",
+    b.join(),
+  );
+}
+
 async function mtlsTest(report: Report) {
   const none = await attempt(mtlsHost);
   expect(
@@ -328,14 +351,14 @@ async function strictSniTest(report: Report) {
 
 async function combinedTest(report: Report) {
   const cookie = { Cookie: `__Host-ark_gate=${gateSessionToken}` };
-  const both = await attempt(bothHost, "/headers", { client: good, headers: cookie });
+  const both = await attempt(bothHost, "/headers", { client: goodBoth, headers: cookie });
   expect(
     report,
     both.kind === "http" && both.reply.status === 200,
     "a certificate and a gate session together are served",
     describe(both),
   );
-  const certOnly = await attempt(bothHost, "/headers", { client: good });
+  const certOnly = await attempt(bothHost, "/headers", { client: goodBoth });
   expect(
     report,
     certOnly.kind === "http" && certOnly.reply.status === 401,
@@ -351,9 +374,9 @@ async function combinedTest(report: Report) {
   );
 }
 
-/** Revoking a serial: CRL update, forced apply with the route revoked, open connection closed. */
-async function revocationTest(report: Report) {
-  const before = await attempt(mtlsHost, "/headers", { client: doomed });
+/** Revoke through the real API. Exercise both the worker drain and the watchdog fallback. */
+async function revocationTest(report: Report, client: Client, delayWorker: boolean) {
+  const before = await attempt(mtlsHost, "/headers", { client });
   expect(
     report,
     before.kind === "http" && before.reply.status === 200,
@@ -367,8 +390,8 @@ async function revocationTest(report: Report) {
     servername: mtlsHost,
     rejectUnauthorized: false,
     ALPNProtocols: ["http/1.1"],
-    cert: doomed.cert,
-    key: doomed.key,
+    cert: client.cert,
+    key: client.key,
   });
   let closedAt = 0;
   let firstReply = "";
@@ -393,27 +416,51 @@ async function revocationTest(report: Report) {
     "a keep-alive connection is open",
     firstReply.split("\r\n")[0]!,
   );
-  // The CRL lists the serial; `edge.apply` renders the CA's admitted set from it and, as the gate
-  // revocation journal makes it do, applies with the route revoked (forced reload, sessions drained).
-  const revokedAt = Date.now();
-  const applied = await edge.edgeApply({
-    ...fixturePlan(edge.peerIp, "after"),
-    revokedRouteIds: ["rt_mtls"],
-  });
-  if (!applied.applied) throw new Error(`[${report.name}] the revoking apply was not applied`);
-  await waitFor(
-    "the revoked client's connection to close",
-    async () => (closedAt ? true : undefined),
-    10_000,
-    50,
-  );
-  expect(
-    report,
-    closedAt - revokedAt < 10_000,
-    "the revoking apply closes the open connection admitted with that certificate",
-    `${closedAt - revokedAt} ms after the apply started`,
-  );
-  const after = await attempt(mtlsHost, "/headers", { client: doomed });
+  const db = database!;
+  try {
+    const revoked = await db.revoke("rt_mtls", client.id);
+    if (delayWorker) {
+      await waitFor(
+        "the real watchdog to fence the overdue route",
+        async () => closedAt || undefined,
+        10_000,
+        50,
+      );
+      const fenced = await attempt(mtlsHost, "/headers", { client: good });
+      expect(
+        report,
+        fenced.kind === "tls",
+        "after the journal deadline the whole route is fenced",
+        describe(fenced),
+      );
+      expect(
+        report,
+        closedAt - revoked.at >= 4_500 && closedAt - revoked.at < 10_000,
+        "the watchdog closes the open connection after the 5 s deadline",
+        `${closedAt - revoked.at} ms`,
+      );
+    }
+    const operationId = await db.run(edge, "edge.drain");
+    await waitFor("the revoked client's connection to close", async () => closedAt || undefined, 5_000, 50);
+    expect(
+      report,
+      await db.applied(revoked.id, operationId),
+      "the domain worker loaded the new policy and marked the API's journal row applied",
+      operationId,
+    );
+    if (!delayWorker) {
+      expect(
+        report,
+        closedAt - revoked.at < 5_000,
+        "the worker closes the open connection within the revocation deadline",
+        `${closedAt - revoked.at} ms`,
+      );
+    }
+    await db.run(edge, "edge.l4_apply");
+  } finally {
+    socket.destroy();
+  }
+  const after = await attempt(mtlsHost, "/headers", { client });
   expect(
     report,
     tlsRefused(after),
@@ -436,6 +483,61 @@ async function revocationTest(report: Report) {
   );
 }
 
+async function damagedPkiTest(report: Report) {
+  const db = database!;
+  for (const crl of [null, "unreadable"]) {
+    await db.corruptCrl(caIds.rt_mtls!, crl);
+    // HAProxy reconfigures independently while Caddy has to refuse this route's client certificates.
+    await db.run(edge, "edge.l4_apply", true);
+    await db.queueApply();
+    await db.run(edge, "edge.apply");
+    const refused = await attempt(mtlsHost, "/headers", { client: good });
+    expect(report, tlsRefused(refused), "a damaged or missing CRL admits no client", describe(refused));
+    const repaired = await db.recoverCrls();
+    expect(
+      report,
+      repaired.refreshed.includes(caIds.rt_mtls!) && !repaired.errors.length,
+      "CRL repair schedules a new Caddy apply",
+      JSON.stringify(repaired),
+    );
+    await db.run(edge, "edge.apply");
+    const restored = await attempt(mtlsHost, "/headers", { client: good });
+    expect(
+      report,
+      restored.kind === "http" && restored.reply.status === 200,
+      "a valid unrevoked certificate works after CRL repair",
+      describe(restored),
+    );
+  }
+
+  // Canonical PEM containing DER that is not a certificate. Caddy must still load unrelated routes.
+  const invalid = "-----BEGIN CERTIFICATE-----\nMAMCAQE=\n-----END CERTIFICATE-----";
+  await db.corruptCertificate(caIds.rt_closed!, goodBoth.id, invalid);
+  await db.queueApply();
+  await db.run(edge, "edge.apply");
+  const omitted = (await db.plan()).omitted;
+  expect(
+    report,
+    omitted.some(({ id }) => id === "rt_closed"),
+    "the malformed route CA omits only its route",
+    omitted.map(({ id }) => id).join(", "),
+  );
+  const leaf = await attempt(bothHost, "/headers", { client: goodBoth });
+  expect(
+    report,
+    tlsRefused(leaf),
+    "the malformed leaf is skipped without breaking the shared reload",
+    describe(leaf),
+  );
+  const plain = await attempt(openHost);
+  expect(
+    report,
+    plain.kind === "http" && plain.reply.status === 200,
+    "an unrelated route still serves",
+    describe(plain),
+  );
+}
+
 const reports: Report[] = [];
 async function run(name: string, test: (report: Report) => Promise<void>) {
   const only = process.env.ARK_EDGE_HTTP_CONTROLS_ONLY;
@@ -452,15 +554,30 @@ async function run(name: string, test: (report: Report) => Promise<void>) {
 
 let failed = false;
 try {
+  database = await startHttpControlsDb(runtime);
+  const db = database;
+  const [routeCa, closedCa, bothCa, rogueCa] = await Promise.all(
+    ["Route rt_mtls", "Route rt_closed", "Route rt_both", "Rogue"].map((name) => db.clientCa(name)),
+  );
+  caIds = { rt_mtls: routeCa!.id, rt_closed: closedCa!.id, rt_both: bothCa!.id };
+  [good, doomed, overdueClient, goodBoth, rogue] = await Promise.all([
+    db.issue(routeCa!.id, "laptop"),
+    db.issue(routeCa!.id, "phone"),
+    db.issue(routeCa!.id, "watchdog"),
+    db.issue(bothCa!.id, "laptop"),
+    db.issue(rogueCa!.id, "rogue"),
+  ]);
+  let seeded = false;
   edge = await startGateEdge({
     runtime,
     directory,
     name: runName,
     gateToken,
-    hostnames: [openHost, limitedHost, mtlsHost, closedHost, bothHost],
+    hostnames: [openHost, limitedHost, alsoLimitedHost, mtlsHost, closedHost, bothHost],
     targetedHttp: true,
+    lease: () => (seeded ? db.lease() : Promise.resolve(undefined)),
     policy: (peerIp) =>
-      fixtureRoutes(peerIp, "before").map(({ id, hostname, stableId, ip, port }) => ({
+      fixtureRoutes(peerIp).map(({ id, hostname, stableId, ip, port }) => ({
         id,
         kind: "http",
         hostname,
@@ -480,18 +597,35 @@ try {
     },
   });
   httpsPort = edge.httpsPort;
-  const applied = await edge.edgeApply(fixturePlan(edge.peerIp, "before"));
-  if (!applied.applied || applied.httpRoutes.toSorted().join() !== "rt_both,rt_closed,rt_lim,rt_mtls,rt_open")
+  const routes = fixtureRoutes(edge.peerIp);
+  await db.seed(edge, routes, caIds);
+  seeded = true;
+  const applied = await edge.edgeApply(await db.plan());
+  if (
+    !applied.applied ||
+    applied.httpRoutes.toSorted().join() !==
+      routes
+        .map(({ id }) => id)
+        .toSorted()
+        .join()
+  )
     throw new Error(`edge.apply did not load every route: ${JSON.stringify(applied)}`);
   await waitFor("the plain route through 443", async () => {
     const outcome = await attempt(openHost, "/headers");
     return outcome.kind === "http" && outcome.reply.status === 200 ? true : undefined;
   });
   await run("FD-23: per-route rate limit through HAProxy", rateLimitTest);
+  await run("FD-23: two HAProxy clients and independent route quotas", quotaIsolationTest);
   await run("FD-23: HTTP mTLS refuses in the TLS handshake", mtlsTest);
   await run("FD-23: SNI/Host 421 between mTLS and plain routes", strictSniTest);
   await run("FD-23: mTLS combined with Ark login", combinedTest);
-  await run("FD-23: revocation after a CRL update", revocationTest);
+  await run("FD-23: HTTP revocation and domain worker drain", (report) =>
+    revocationTest(report, doomed, false),
+  );
+  await run("FD-23: watchdog withdrawal after the revocation deadline", (report) =>
+    revocationTest(report, overdueClient, true),
+  );
+  await run("FD-23: malformed certificate isolation and CRL repair", damagedPkiTest);
   console.log(`\nFD-23 HTTP control tests passed (${reports.length} groups).`);
 } catch (error) {
   failed = true;
@@ -499,6 +633,7 @@ try {
   await runtime.dumpLogs();
 } finally {
   removeSignalHandlers();
+  await database?.close();
   await cleanupGateEdge(runtime, runName, edge);
 }
 process.exit(failed ? 1 : 0);

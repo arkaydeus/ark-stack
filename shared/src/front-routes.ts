@@ -21,7 +21,7 @@ import {
   type EdgeL4TlsMode,
   type L4Limits,
 } from "./edge-l4.ts";
-import { rateLimitPerSecond, type HttpRateLimit } from "./edge-http.ts";
+import { rateLimitWindowMs, type HttpRateLimit } from "./edge-http.ts";
 import { ValidationError } from "./errors.ts";
 import { checkAllowedOrigins, checkBypassPaths } from "./gate.ts";
 import { normalizeHostname } from "./hostnames.ts";
@@ -106,6 +106,10 @@ export const frontRouteCreateInput = z
 
 export const frontRouteUpdateInput = z
   .object({
+    version: z
+      .string()
+      .regex(/^\d{1,10}$/)
+      .optional(),
     target: target.optional(),
     targetPort: port.optional(),
     accessMode: z.enum(["public", "sso"]).optional(),
@@ -124,7 +128,7 @@ export const frontRouteUpdateInput = z
     allowedOrigins: z.array(z.string()).optional(),
   })
   .strict()
-  .refine((value) => Object.values(value).some((item) => item !== undefined), {
+  .refine(({ version: _version, ...changes }) => Object.values(changes).some((item) => item !== undefined), {
     message:
       "Change at least one of target, targetPort, accessMode, redirectTo, bypassPaths, allowedOrigins, rateLimit, mtls, tlsMode, sourceCidrs, allowInternet, protocolAuthConfirmed, limits or compatPort.",
   });
@@ -240,13 +244,14 @@ export function looseningChanges(
   if (next.allowedOrigins?.some((origin) => !(current.allowedOrigins ?? []).includes(origin)))
     changes.push("allowedOrigins");
   if (next.mtls === false && current.mtls === true) changes.push("mtls");
-  if (next.rateLimit !== undefined) {
-    const before = current.rateLimit ?? null;
+  if (current.rateLimit && next.rateLimit !== undefined) {
+    const before = current.rateLimit;
     const after = next.rateLimit;
-    // A higher sustained rate or a larger burst admits more requests from one client.
+    // Partition the old window into intervals no longer than the new window. Each
+    // can admit a full burst, even if the new average throughput is lower.
     if (
-      rateLimitPerSecond(after) > rateLimitPerSecond(before) ||
-      (after?.requests ?? Number.POSITIVE_INFINITY) > (before?.requests ?? Number.POSITIVE_INFINITY)
+      !after ||
+      Math.ceil(rateLimitWindowMs(before) / rateLimitWindowMs(after)) * after.requests > before.requests
     )
       changes.push("rateLimit");
   }

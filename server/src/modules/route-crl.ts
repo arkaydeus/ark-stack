@@ -1,3 +1,5 @@
+import { X509Certificate } from "node:crypto";
+
 import { fromPem, parseCrl } from "./x509.ts";
 
 const serialKey = (hex: string) => BigInt(`0x${hex}`).toString();
@@ -49,7 +51,8 @@ export function admittedClientCertificates(input: {
     if (certificate.notBefore.getTime() > now || certificate.notAfter.getTime() <= now) continue;
     try {
       if (revoked.has(serialKey(certificate.serial))) continue;
-      admitted.push(fromPem(certificate.certPem, ["CERTIFICATE"]).toString("base64"));
+      const der = caCertificateDer(certificate.certPem);
+      if (der) admitted.push(der);
     } catch {
       // A malformed stored row is never admitted.
     }
@@ -61,7 +64,8 @@ export function admittedClientCertificates(input: {
 export function caCertificateDer(certPem: string | null | undefined) {
   if (!certPem) return null;
   try {
-    return fromPem(certPem, ["CERTIFICATE"]).toString("base64");
+    const der = fromPem(certPem, ["CERTIFICATE"]);
+    return new X509Certificate(der).raw.equals(der) ? der.toString("base64") : null;
   } catch {
     return null;
   }

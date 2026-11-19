@@ -97,11 +97,10 @@ import { EDGE_OBSERVE_TARGET, edgePolicy, loadEdgeSnapshot } from "./edge-observ
 import { enabledSniPorts, isL4Kind, storedL4Settings } from "./l4-routes.ts";
 import * as pki from "./pki.ts";
 
-export type RouteEnqueue = (input: {
-  kind: OperationKind;
-  targetIds: string[];
-  payload?: Record<string, unknown>;
-}) => Promise<unknown>;
+export type RouteEnqueue = (
+  input: { kind: OperationKind; targetIds: string[]; payload?: Record<string, unknown> },
+  tx?: DbTransaction,
+) => Promise<unknown>;
 
 export type RouteAuthorize = (tx: DbTransaction) => Promise<unknown>;
 
@@ -347,9 +346,11 @@ function summarize(
   records: Array<typeof dnsRecords.$inferSelect>,
   certificate: typeof certificates.$inferSelect | null,
   serving: Set<string>,
+  version: string,
 ) {
   return {
     id: route.id,
+    version,
     kind: route.kind,
     hostname: endpoint.hostname,
     listenPort: route.listenPort,
@@ -412,7 +413,7 @@ export type FrontRouteSummary = ReturnType<typeof summarize>;
 /** `GET /api/front/routes`: status, listener, pinned target, DNS and certificate state. */
 export async function listFrontRoutes(routeId?: string): Promise<FrontRouteSummary[]> {
   const rows = await db
-    .select({ route: frontRoutes, endpoint: endpoints })
+    .select({ route: frontRoutes, endpoint: endpoints, version: routeVersion })
     .from(frontRoutes)
     .innerJoin(endpoints, eq(endpoints.id, frontRoutes.endpointId))
     .where(routeId ? eq(frontRoutes.id, routeId) : undefined);
@@ -425,7 +426,7 @@ export async function listFrontRoutes(routeId?: string): Promise<FrontRouteSumma
   ]);
   const serving = new Set(policy.routes.map((route) => route.id));
   return rows
-    .map(({ route, endpoint }) => {
+    .map(({ route, endpoint, version }) => {
       const domain = domains.find((item) => item.id === endpoint.domainId) ?? null;
       const certificate =
         certs
@@ -439,6 +440,7 @@ export async function listFrontRoutes(routeId?: string): Promise<FrontRouteSumma
         records.filter((record) => record.domainId === endpoint.domainId),
         certificate,
         serving,
+        version,
       );
     })
     .toSorted((a, b) => a.hostname.localeCompare(b.hostname) || a.id.localeCompare(b.id));
@@ -733,6 +735,8 @@ export type RouteUpdatePlan = Awaited<ReturnType<typeof prepareRouteUpdate>>;
 export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdateInput) {
   const { route, endpoint, domain, version } = await loadRoute(routeId);
   requireManaged(route);
+  if (input.version !== undefined && input.version !== version)
+    throw new FrontRouteError(409, "The route changed state; reload and retry.");
   l4Check(() => assertFieldsForKind(route.kind as SupportedRouteKind, input));
   if (input.accessMode !== undefined) assertSupportedAccessMode(input.accessMode, "update");
   let l4: { current: L4RouteSettings; next: L4RouteSettings } | null = null;
@@ -775,12 +779,9 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     route.kind === "http"
       ? gateSettings(accessMode, input, currentGate)
       : { bypassPaths: [], allowedOrigins: [] };
-  // FD-23: an invalid stored limit counts as none, so replacing it is never mistaken for tightening.
-  const currentRateLimit = route.kind === "http" ? (storedRateLimit(route) ?? null) : null;
-  const rateLimit =
-    route.kind === "http" && input.rateLimit !== undefined
-      ? requestedRateLimit(input.rateLimit)
-      : currentRateLimit;
+  // A malformed stored limit closes the route. Only an explicit, authorized edit may repair it.
+  const currentRateLimit = route.kind === "http" ? storedRateLimit(route) : null;
+  const rateLimit = input.rateLimit === undefined ? undefined : requestedRateLimit(input.rateLimit);
   const currentMtls = route.kind === "http" && route.clientCaId !== null;
   const mtls = route.kind === "http" ? (input.mtls ?? currentMtls) : false;
   const current = {
@@ -801,9 +802,10 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     allowSensitivePort: input.allowSensitivePort,
     bypassPaths: gate.bypassPaths,
     allowedOrigins: gate.allowedOrigins,
-    rateLimit: input.rateLimit === undefined ? undefined : rateLimit,
+    rateLimit,
     mtls: input.mtls === undefined ? undefined : mtls,
   });
+  if (currentRateLimit === undefined && rateLimit !== undefined) loosening.push("rateLimit");
   if (l4) loosening.push(...l4LooseningChanges(l4.current, l4.next));
   // Tightening the gate of a route that may have open upgraded connections (§3.9.3).
   // Switching client certificates on (FD-23) also ends connections admitted without one.
@@ -839,8 +841,8 @@ export async function prepareRouteUpdate(routeId: string, input: FrontRouteUpdat
     changes.bypassPaths = { from: currentGate.bypassPaths, to: gate.bypassPaths };
   if (JSON.stringify(gate.allowedOrigins) !== JSON.stringify(currentGate.allowedOrigins))
     changes.allowedOrigins = { from: currentGate.allowedOrigins, to: gate.allowedOrigins };
-  if (JSON.stringify(rateLimit) !== JSON.stringify(currentRateLimit))
-    changes.rateLimit = { from: currentRateLimit, to: rateLimit };
+  if (rateLimit !== undefined && JSON.stringify(rateLimit) !== JSON.stringify(currentRateLimit))
+    changes.rateLimit = { from: route.rateLimit, to: rateLimit };
   if (mtls !== currentMtls) changes.mtls = { from: currentMtls, to: mtls };
   if (pinned && (pinned.stableId !== route.targetNodeStableId || pinned.ip !== route.targetIp))
     changes.pinned = {
@@ -882,7 +884,7 @@ export async function commitRouteUpdate(
   const now = new Date();
   if (plan.allowedOrigins.length) httpOptions.allowedOrigins = plan.allowedOrigins;
   else delete httpOptions.allowedOrigins;
-  await db.transaction(async (tx) => {
+  const apply = await db.transaction(async (tx) => {
     await authorize?.(tx);
     if (l4?.compatPort != null && l4.compatPort !== route.compatPort) {
       await lockRawPorts(tx);
@@ -925,7 +927,10 @@ export async function commitRouteUpdate(
               ...(route.kind === "postgres" ? { compatPort: l4.compatPort } : {}),
             }
           : route.kind === "http"
-            ? { clientCaId: httpClientCaId, rateLimit: plan.rateLimit }
+            ? {
+                clientCaId: httpClientCaId,
+                ...(plan.rateLimit === undefined ? {} : { rateLimit: plan.rateLimit }),
+              }
             : {}),
         targetInput: plan.targetInput,
         targetPort: plan.targetPort,
@@ -950,9 +955,9 @@ export async function commitRouteUpdate(
       );
       await tx.execute(statement`SELECT ark_gate_revoke(${route.id}, 'route_gate_tightened')`);
     }
+    return enqueue({ kind: "edge.apply", targetIds: ["platform"] }, tx);
   });
   const live = route.enabled && route.status === "ready";
-  const apply = await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   // A changed L4 policy renames the route's HAProxy servers: the old ones are fenced and drained.
   const policyChanged = [
     "tlsMode",
@@ -1306,8 +1311,7 @@ export async function routesCertificateFailed(endpointId: string, message: strin
 
 // ---- Route client certificates (terminate_mtls, §3.8.4, FD-14; HTTP mTLS, FD-23) ----------------------
 
-async function mtlsRoute(routeId: string) {
-  const { route, endpoint } = await loadRoute(routeId);
+function mtlsCa(route: RouteRow) {
   const l4Mtls = (route.kind === "tls" || route.kind === "postgres") && route.tlsMode === "terminate_mtls";
   if (!(l4Mtls || route.kind === "http") || !route.clientCaId) {
     throw new FrontRouteError(
@@ -1315,7 +1319,12 @@ async function mtlsRoute(routeId: string) {
       "Client certificates exist only for tls or postgres routes in terminate_mtls mode and for HTTP routes with mtls.",
     );
   }
-  return { route, endpoint, caId: route.clientCaId };
+  return route.clientCaId;
+}
+
+async function mtlsRoute(routeId: string) {
+  const { route, endpoint } = await loadRoute(routeId);
+  return { route, endpoint, caId: mtlsCa(route) };
 }
 
 /** The route CA (public certificate) and its client certificates. Never a private key. */
@@ -1357,46 +1366,65 @@ export async function issueRouteClientCertificate(
   routeId: string,
   input: { name: string; csrPem?: string },
   actor: RouteActor,
-  enqueue?: RouteEnqueue,
+  enqueue: RouteEnqueue,
+  authorize: RouteAuthorize,
 ) {
-  const { route, caId } = await mtlsRoute(routeId);
-  if (route.kind === "http") {
-    // The edge renders each admitted certificate; past the limit it would omit the route instead.
-    const [row] = await db
-      .select({ n: statement<number>`count(*)::int` })
-      .from(clientCertificates)
-      .where(
-        and(
-          eq(clientCertificates.caId, caId),
-          eq(clientCertificates.status, "issued"),
-          gt(clientCertificates.notAfter, new Date()),
-        ),
+  const issued = await db.transaction(async (tx) => {
+    // Lock the route before the CA, in the same order as edits that retire the CA.
+    const [route] = await tx.select().from(frontRoutes).where(eq(frontRoutes.id, routeId)).for("update");
+    if (!route) throw new FrontRouteError(404, "Route not found.");
+    const caId = mtlsCa(route);
+    if (route.kind === "http") {
+      await tx.select({ id: privateCas.id }).from(privateCas).where(eq(privateCas.id, caId)).for("update");
+      // Count unexpired issued rows, including any that could become valid later.
+      const [row] = await tx
+        .select({ n: statement<number>`count(*)::int` })
+        .from(clientCertificates)
+        .where(
+          and(
+            eq(clientCertificates.caId, caId),
+            eq(clientCertificates.status, "issued"),
+            gt(clientCertificates.notAfter, new Date()),
+          ),
+        );
+      if ((row?.n ?? 0) >= HTTP_CLIENT_CERTIFICATE_LIMIT)
+        throw new FrontRouteError(
+          409,
+          `The route already has ${HTTP_CLIENT_CERTIFICATE_LIMIT} client certificates; revoke unused ones first.`,
+        );
+    }
+    await authorize(tx);
+    let result: Awaited<ReturnType<typeof pki.issueClientCertificate>>;
+    try {
+      result = await pki.issueClientCertificate(
+        {
+          caId,
+          subjectCn: input.name,
+          csrPem: input.csrPem,
+          keyOwner: { resourceType: "platform", resourceId: "platform" },
+        },
+        tx,
       );
-    if ((row?.n ?? 0) >= HTTP_CLIENT_CERTIFICATE_LIMIT)
-      throw new FrontRouteError(
-        409,
-        `The route already has ${HTTP_CLIENT_CERTIFICATE_LIMIT} client certificates; revoke unused ones first.`,
-      );
-  }
-  let issued: Awaited<ReturnType<typeof pki.issueClientCertificate>>;
-  try {
-    issued = await pki.issueClientCertificate({
-      caId,
-      subjectCn: input.name,
-      csrPem: input.csrPem,
-      keyOwner: { resourceType: "platform", resourceId: "platform" },
-    });
-  } catch (error) {
-    if (error instanceof pki.PkiPolicyError) throw new FrontRouteError(422, error.message);
-    throw error;
-  }
-  await auditRoute(actor, "front_route.client_certificate_issue", routeId, {
-    certificateId: issued.certificate.id,
-    subjectCn: input.name,
-    serial: issued.certificate.serial,
-    keySource: input.csrPem === undefined ? "generated" : "csr",
+    } catch (error) {
+      if (error instanceof pki.PkiPolicyError) throw new FrontRouteError(422, error.message);
+      throw error;
+    }
+    await auditRoute(
+      actor,
+      "front_route.client_certificate_issue",
+      routeId,
+      {
+        certificateId: result.certificate.id,
+        subjectCn: input.name,
+        serial: result.certificate.serial,
+        keySource: input.csrPem === undefined ? "generated" : "csr",
+      },
+      undefined,
+      tx,
+    );
+    if (route.kind === "http") await enqueue({ kind: "edge.apply", targetIds: ["platform"] }, tx);
+    return result;
   });
-  if (route.kind === "http") await enqueue?.({ kind: "edge.apply", targetIds: ["platform"] });
   return {
     id: issued.certificate.id,
     serial: issued.certificate.serial,

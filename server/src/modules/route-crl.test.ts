@@ -28,6 +28,7 @@ const crl = (serials: string[]) =>
     nextUpdate: new Date(now.getTime() + 14 * 86_400_000),
     crlNumber: 2n,
   }).crlPem;
+const invalidDer = "-----BEGIN CERTIFICATE-----\nMAMCAQE=\n-----END CERTIFICATE-----";
 const row = (certificate: typeof good, status = "issued") => ({ ...certificate, status });
 const der = (pem: string) => new X509Certificate(pem).raw.toString("base64");
 
@@ -51,6 +52,7 @@ test("expired, not-yet-valid and malformed rows are never admitted", () => {
       certificates: [
         { ...row(good), certPem: null },
         { ...row(good), certPem: "-----BEGIN X-----" },
+        { ...row(good), certPem: invalidDer },
       ],
       now,
     }),
@@ -66,6 +68,7 @@ test("the CA certificate is passed as base64 DER, or null when unreadable", () =
   expect(caCertificateDer(ca.certPem)).toBe(der(ca.certPem));
   expect(caCertificateDer(null)).toBeNull();
   expect(caCertificateDer("garbage")).toBeNull();
+  expect(caCertificateDer(invalidDer)).toBeNull();
   // The CRL coverage check of the refresh loop reads the same CRL.
   expect(routeCrlCovers(crl([revoked.serial]), [revoked.serial])).toBe(true);
 });

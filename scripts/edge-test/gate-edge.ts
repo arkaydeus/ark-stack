@@ -76,6 +76,11 @@ export type GateEdge = {
   overdue: Set<string>;
   events: WatchdogEvent[];
   edgeApply: (plan: unknown) => Promise<{ applied: boolean; httpRoutes: string[] }>;
+  runCoordinator: (
+    kind: "edge.apply" | "edge.drain" | "edge.l4_apply",
+    env: Record<string, string>,
+    options?: { acknowledgeIngress?: boolean; enqueue?: boolean },
+  ) => Promise<{ id: string; status: string; error: string | null; evidence: unknown }>;
   /** `GET /__seen` from inside a fixture container. */
   seen: (container: string) => Promise<unknown[]>;
   stop: () => void;
@@ -295,7 +300,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     500,
   );
 
-  const edgeApply = async (plan: unknown) => {
+  async function edgeWorker<T>(args: string[], env: Record<string, string> = {}): Promise<T> {
     const output = await docker(
       "run",
       "--rm",
@@ -313,6 +318,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
       "ARK_EDGE_RELOAD_URL=http://edge-admin:2019",
       "--env",
       "ARK_ACME_WEBROOT=/var/lib/ark/acme",
+      ...Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
       "--volume",
       `${writeEdgeBundle}:/harness:ro`,
       "--volume",
@@ -323,11 +329,10 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
       bunImage,
       "bun",
       "/harness/write-edge.js",
-      options.targetedHttp ? "write-routed" : "write",
-      JSON.stringify(plan),
+      ...args,
     );
-    return JSON.parse(output) as { applied: boolean; httpRoutes: string[] };
-  };
+    return JSON.parse(output.split("\n").at(-1)!) as T;
+  }
 
   const seen = async (container: string) =>
     JSON.parse(
@@ -348,7 +353,9 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     peerName,
     overdue,
     events,
-    edgeApply,
+    edgeApply: (plan) => edgeWorker([options.targetedHttp ? "write-routed" : "write", JSON.stringify(plan)]),
+    runCoordinator: (kind, env, settings) =>
+      edgeWorker(["coordinator", JSON.stringify({ kind, ...settings })], env),
     seen,
     stop: () => leaseApi.stop(true),
   };

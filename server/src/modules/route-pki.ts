@@ -9,9 +9,9 @@
 // CA's certificates that are neither revoked nor listed in its CRL (`admittedClientCertificates`); the
 // CRL is still kept current here, for clients and audits that read it.
 
-import { eq, and, inArray } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 
-import { db } from "../db.ts";
+import { db, type DbTransaction } from "../db.ts";
 import { privateCas } from "../schema.ts";
 import * as pki from "./pki.ts";
 import { revokedSerials } from "./l4-routes.ts";
@@ -21,12 +21,12 @@ import { routeCrlCovers } from "./route-crl.ts";
 export const ROUTE_CRL_REFRESH_DAYS = 7;
 
 /** Route CAs whose CRL is missing or due for its weekly refresh. */
-export async function routeCrlsDue(now = new Date()) {
+export async function routeCrlsDue(now = new Date(), purpose: "tcp-client" | "http-client" = "tcp-client") {
   const threshold = new Date(now.getTime() + ROUTE_CRL_REFRESH_DAYS * 86_400_000);
   const cas = await db
     .select()
     .from(privateCas)
-    .where(and(inArray(privateCas.purpose, ["tcp-client", "http-client"]), eq(privateCas.status, "active")));
+    .where(and(eq(privateCas.purpose, purpose), eq(privateCas.status, "active")));
   const revoked = await revokedSerials(cas.map((ca) => ca.id));
   return cas
     .filter(
@@ -46,4 +46,28 @@ export async function refreshRouteCrls(now = new Date()) {
     refreshed.push(id);
   }
   return refreshed;
+}
+
+/** Repair each HTTP CA independently and queue its admission reload in the same transaction. */
+export async function refreshHttpRouteCrls(
+  schedule: (tx: DbTransaction) => Promise<unknown>,
+  now = new Date(),
+) {
+  const refreshed: string[] = [];
+  const errors: { id: string; error: string }[] = [];
+  for (const { id } of await routeCrlsDue(now, "http-client")) {
+    try {
+      const repaired = await db.transaction(async (tx) => {
+        const [ca] = await tx.select().from(privateCas).where(eq(privateCas.id, id)).for("update");
+        if (ca?.status !== "active") return;
+        await pki.generateCaCrl({ caId: id, now }, tx);
+        await schedule(tx);
+        return true;
+      });
+      if (repaired) refreshed.push(id);
+    } catch (error) {
+      errors.push({ id, error: (error as Error).message });
+    }
+  }
+  return { refreshed, errors };
 }
