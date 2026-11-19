@@ -1,6 +1,7 @@
 // `mise run test:edge-reload` (also part of `mise run test:edge`): HAProxy master-CLI reload safety
 // (docs/design/front-door.md §3.8.6, FD-25) against the pinned edge-l4 image and the shipped launch
-// guard, in disposable containers. No Compose stack, watchdog, Caddy or Python is needed.
+// guard, in disposable containers. The protected reopen cases inject watchdog decisions and CLI
+// transport faults around that same real master socket. No Compose stack or Caddy is needed.
 //
 // The race being fixed: HAProxy's master re-executes as soon as it parses a `reload` and answers only
 // the connection that sent it. Every other master-CLI connection it had accepted is closed with no
@@ -26,7 +27,7 @@
 //
 // `ARK_EDGE_RELOAD_ROUNDS` sets ROUNDS (default 50).
 import { randomBytes } from "node:crypto";
-import { chmod, mkdtemp } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -56,6 +57,7 @@ const publisher = `${project}-publisher`;
 const reloader = `${project}-reloader`;
 const guard = "/usr/local/bin/ark-edge-l4-launch-guard";
 const hammerStop = "/run/ark-l4/stop-hammer";
+const guardState = "/var/run/haproxy/guard-test";
 
 type Report = { name: string; lines: string[] };
 
@@ -103,10 +105,15 @@ type Invalid = {
   installed: boolean;
   error: string;
   restored: boolean;
+  pending: boolean;
+  dropped: number;
+  requests: number;
   previousVersion: string;
   before: Proc;
   after: Proc;
 };
+type Variant = Proc & { modes: Array<"full" | "closed" | null> };
+type Publication = { reloaded: boolean; version: string; reloadConfirmedBy: string; reloadAttempts: number };
 
 async function probe<T>(container: string, ...args: string[]) {
   const output = await docker("exec", container, "bun", "/probe/reload-race-probe.js", ...args);
@@ -204,6 +211,54 @@ async function setup() {
   }
   const seeded = await probe<{ generation: string; marked: boolean }>(publisher, "seed");
   if (seeded.error || !seeded.marked) throw new Error(`seed failed: ${JSON.stringify(seeded)}`);
+  const lock = await probe(reloader, "create-lock");
+  if (lock.error) throw new Error(lock.error);
+  const shims = join(directory, "guard-test");
+  await mkdir(shims, { mode: 0o755 });
+  await writeFile(
+    join(shims, "wget"),
+    `#!/bin/sh
+state=${guardState}
+case "$*" in
+  *supervise*) echo ok ;;
+  *cached=1*)
+    decision="$(cat "$state/decision")"
+    if [ "$decision" = open ]; then touch "$state/guard-polled-open"; fi
+    printf '%s\n' "$decision"
+    ;;
+  *) touch "$state/guard-rechecked"; cat "$state/decision" ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  await writeFile(
+    join(shims, "socat"),
+    `#!/bin/sh
+set -eu
+state=${guardState}
+read -r command
+if [ "$command" = reload ] && [ -r "$state/fault" ]; then
+  case "$(cat "$state/fault")" in
+    failed)
+      touch "$state/guard-held"
+      while [ ! -f "$state/release-guard" ]; do sleep 0.1; done
+      printf 'Success=0\n--\nInjected rejected reload\n'
+      exit
+      ;;
+    lost)
+      answer="$(printf 'reload\n' | /usr/bin/socat "$@")"
+      case "$answer" in
+        Success=1*) rm "$state/fault"; touch "$state/guard-dropped"; exit ;;
+      esac
+      printf '%s\n' "$answer"
+      exit
+      ;;
+  esac
+fi
+printf '%s\n' "$command" | /usr/bin/socat "$@"
+`,
+    { mode: 0o755 },
+  );
   runtime.containers.push(edgeL4);
   await docker(
     "run",
@@ -231,10 +286,14 @@ async function setup() {
     "ARK_HAPROXY_MASTER_SOCKET=/var/run/haproxy/master.sock",
     "--env",
     "ARK_EDGE_WATCHDOG_URL=http://127.0.0.1:9",
+    "--env",
+    "PATH=/guard-test:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "--volume",
     `${volumes.config}:/usr/local/etc/haproxy:ro`,
     "--volume",
     `${join(root, "infra/platform/edge-l4-launch-guard.sh")}:${guard}:ro`,
+    "--volume",
+    `${shims}:/guard-test:ro`,
     "--volume",
     `${volumes.run}:/var/run/haproxy`,
     "--entrypoint",
@@ -285,6 +344,13 @@ echo "$sent $lost"`;
 }
 
 async function serialisedTest(report: Report) {
+  const owner = await docker("exec", edgeL4, "stat", "-c", "%u:%g:%a", "/var/run/haproxy/reload.lock");
+  expect(
+    report,
+    owner === "1000:4400:660",
+    "the guard opens the group-readable lock created by uid 1000",
+    owner,
+  );
   const before = await proc();
   const started = Date.now();
   const [published, reloaded, guarded] = await Promise.all([
@@ -325,6 +391,21 @@ async function serialisedTest(report: Report) {
 }
 
 async function recoveredTest(report: Report) {
+  const before = await proc();
+  const lost = await probe<Publication & { dropped: number }>(publisher, "lost-publication");
+  const after = await proc();
+  expect(
+    report,
+    !lost.error &&
+      lost.dropped === 1 &&
+      lost.reloadConfirmedBy === "workers" &&
+      lost.reloadAttempts === 1 &&
+      after.reloads === before.reloads + 1 &&
+      after.serving.length > 0 &&
+      after.serving.every((version) => version === lost.version),
+    "dropping a real publisher reply requires worker confirmation and sends no duplicate reload",
+    JSON.stringify(lost),
+  );
   const stop = startHammer();
   let published: Publish;
   let hammer = { sent: 0, lost: 0 };
@@ -344,7 +425,7 @@ async function recoveredTest(report: Report) {
   expect(
     report,
     hammer.lost > 0 || published.confirmedByWorkers > 0 || published.retried > 0,
-    "the race was exercised: replies were lost and recovered by version confirmation or a resend",
+    "the unlocked race dropped at least one reply",
     `unlocked reloader: ${hammer.lost}/${hammer.sent} unanswered; publisher: ${published.confirmedByWorkers} confirmed from the serving worker, ${published.retried} resent`,
   );
   // Settle: the hammer's last reload may still be starting its worker.
@@ -367,6 +448,21 @@ async function invalidTest(report: Report) {
       kept?.version === alone.previousVersion,
     "an invalid configuration answers Success=0, is reported as failed and the old worker keeps serving the previous version",
     `${alone.error.slice(0, 90)}; failed reloads ${alone.before.failed} -> ${alone.after.failed}; worker ${serving?.pid} still ${kept?.section ?? "gone"}`,
+  );
+  const lost = await probe<Invalid>(publisher, "invalid", "drop");
+  expect(
+    report,
+    lost.dropped === 1 &&
+      !lost.installed &&
+      lost.restored &&
+      lost.pending &&
+      /old workers keep serving/.test(lost.error) &&
+      lost.requests === 2 &&
+      lost.after.workers.some(
+        (worker) => worker.pid === serving?.pid && worker.version === alone.previousVersion,
+      ),
+    "a version-marked invalid config is never confirmed after its reply is dropped and fails on retry",
+    `${lost.error.slice(0, 90)}; ${lost.requests} requests, ${lost.dropped} dropped; pending=${lost.pending}`,
   );
   const stop = startHammer();
   let raced: Invalid;
@@ -392,6 +488,100 @@ async function invalidTest(report: Report) {
   );
 }
 
+function guardExec(...args: string[]) {
+  return docker("exec", edgeL4, ...args);
+}
+
+function setGuardState(file: "decision" | "fault", value: "closed" | "open" | "failed" | "lost") {
+  return guardExec("sh", "-c", 'printf "%s\\n" "$1" > "$2"', "guard-test", value, `${guardState}/${file}`);
+}
+
+function guardFlag(file: string) {
+  return waitFor(
+    file,
+    async () => {
+      await guardExec("test", "-f", `${guardState}/${file}`);
+      return true;
+    },
+    10_000,
+  );
+}
+
+function servingVariant(mode: "closed" | "full", version?: string) {
+  return waitFor(
+    `the ${mode} variant to serve`,
+    async () => {
+      const sample = await probe<Variant>(publisher, "mode");
+      if (sample.error || !sample.modes.length || !sample.modes.every((value) => value === mode)) return;
+      if (version && !sample.serving.every((value) => value === version)) return;
+      return sample;
+    },
+    10_000,
+  );
+}
+
+async function protectedReopenTest(report: Report) {
+  await guardExec("mkdir", "-m", "2775", guardState);
+  await setGuardState("decision", "closed");
+  await docker("stop", "-t", "3", edgeL4);
+  const seeded = await probe(publisher, "seed-protected");
+  if (seeded.error) throw new Error(seeded.error);
+  await docker("start", edgeL4);
+  const closed = await servingVariant("closed");
+  await guardExec("rm", `${guardState}/guard-rechecked`);
+
+  const publisherHolding = probe<Publication>(publisher, "publish-protected", "hold");
+  await guardFlag("publisher-held");
+  await setGuardState("decision", "open");
+  await guardFlag("guard-polled-open");
+  await setGuardState("decision", "closed");
+  await guardExec("touch", `${guardState}/release-publisher`);
+  const published = await publisherHolding;
+  await guardFlag("guard-rechecked");
+  const afterRevocation = await servingVariant("closed", published.version);
+  expect(
+    report,
+    !published.error && published.reloaded && afterRevocation.reloads === closed.reloads + 1,
+    "a lease revoked while the real guard waits leaves only the publisher's closed reload",
+    JSON.stringify(published),
+  );
+
+  await setGuardState("fault", "failed");
+  await setGuardState("decision", "open");
+  await guardFlag("guard-held");
+  const publisherWaiting = probe<Publication>(publisher, "publish-protected");
+  await guardFlag("publisher-validated");
+  await setGuardState("decision", "closed");
+  await guardExec("touch", `${guardState}/release-guard`);
+  const queued = await publisherWaiting;
+  const afterFailure = await servingVariant("closed", queued.version);
+  expect(
+    report,
+    !queued.error && queued.reloaded && afterFailure.reloads === afterRevocation.reloads + 1,
+    "a failed guard reopen restores the closed selector before handing off to a queued publisher",
+    JSON.stringify(queued),
+  );
+
+  await setGuardState("fault", "lost");
+  await setGuardState("decision", "open");
+  await guardFlag("guard-dropped");
+  await waitFor(
+    "the guard to confirm full mode",
+    async () =>
+      (await runtime.dockerOutput("logs", edgeL4)).stderr.includes("switched to the full configuration")
+        ? true
+        : undefined,
+    10_000,
+  );
+  const full = await servingVariant("full", queued.version);
+  expect(
+    report,
+    full.reloads === afterFailure.reloads + 1 && full.failed === afterFailure.failed,
+    "the real guard confirms a full worker after a lost reply without repeating the reload",
+    `master reloads ${afterFailure.reloads} -> ${full.reloads}`,
+  );
+}
+
 async function run(name: string, test: (report: Report) => Promise<void>) {
   const report: Report = { name, lines: [] };
   const started = Date.now();
@@ -407,6 +597,7 @@ try {
   await run("concurrent reloads under the shared lock", serialisedTest);
   await run("lost replies recovered from the serving worker", recoveredTest);
   await run("an invalid configuration still fails (FD-25)", invalidTest);
+  await run("protected reopen alongside generation publication", protectedReopenTest);
   console.log("\nAll edge-l4 reload safety tests passed.");
 } catch (error) {
   failed = true;

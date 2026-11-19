@@ -10,10 +10,15 @@
 //   reload <rounds>            rounds x HaproxyMaster.reload() (a second reloader that changes nothing)
 //   invalid                    an invalid configuration through the same installer
 //   proc                       master reload counters and the serving workers' versions
+import { dirname, join } from "node:path";
+
 import {
+  acquireReloadLock,
   currentGeneration,
   edgeL4ConfigVersion,
   generationId,
+  haproxyCli,
+  haproxyReloadLockPath,
   HaproxyMaster,
   installEdgeL4Generation,
   renderEdgeL4Generation,
@@ -21,6 +26,7 @@ import {
 
 const root = process.env.ARK_EDGE_L4_DIR ?? "/usr/local/etc/haproxy";
 const masterSocket = process.env.ARK_HAPROXY_MASTER_SOCKET ?? "/var/run/haproxy/master.sock";
+const state = join(dirname(masterSocket), "guard-test");
 const master = new HaproxyMaster(masterSocket);
 const [command = "", argument = ""] = process.argv.slice(2);
 
@@ -37,6 +43,55 @@ const generations = {
   a: renderEdgeL4Generation({ httpHostnames: ["a.reload-race.example.com"] }),
   b: renderEdgeL4Generation({ httpHostnames: ["b.reload-race.example.com"] }),
 };
+
+const protectedRoute = {
+  id: "rt_guard",
+  hostname: "guard.reload-race.example.com",
+  stableId: "test-device",
+  ip: "100.64.0.10",
+  port: 1883,
+  sourceCidrs: ["192.0.2.0/24"],
+};
+const protectedGenerations = {
+  p: renderEdgeL4Generation({ httpHostnames: [], sniPorts: [8883], tlsRoutes: [protectedRoute] }),
+  q: renderEdgeL4Generation({
+    httpHostnames: [],
+    sniPorts: [8883],
+    tlsRoutes: [{ ...protectedRoute, sourceCidrs: ["198.51.100.0/24"] }],
+  }),
+};
+
+function install(generation: ReturnType<typeof renderEdgeL4Generation>, reloader?: HaproxyMaster) {
+  return installEdgeL4Generation({
+    root,
+    generation,
+    validatorSocket: "/unused",
+    validate: trusted,
+    master: reloader,
+    force: true,
+  });
+}
+
+/** Drop precisely one real reply, after the master has acted on the request. */
+function dropReply(success: 0 | 1) {
+  let dropped = 0;
+  let requests = 0;
+  const reloader = new HaproxyMaster(
+    masterSocket,
+    async (socket, request, timeout) => {
+      if (request === "reload") requests++;
+      const answer = await haproxyCli(socket, request, timeout);
+      if (!dropped && request === "reload" && new RegExp(`^Success=${success}$`, "m").test(answer)) {
+        dropped++;
+        return "";
+      }
+      return answer;
+    },
+    3_000,
+    { lock: haproxyReloadLockPath(masterSocket), confirmMs: 500 },
+  );
+  return { reloader, dropped: () => dropped, requests: () => requests };
+}
 
 /** Master counters and workers, once the master answers (a racing reload may be re-executing it). */
 async function proc() {
@@ -146,8 +201,15 @@ async function reload(rounds: number) {
 
 /** HAProxy refuses this at reload, as it would any configuration the validator could not catch. */
 function brokenGeneration() {
-  const config = `global\n    this-is-not-a-directive ${Date.now()}\n`;
-  const files = { "haproxy.cfg": config, "haproxy.closed.cfg": config, "manifest.json": "{}\n" };
+  const files = { ...generations.a.files };
+  for (const variant of ["haproxy.cfg", "haproxy.closed.cfg"]) {
+    files[variant] = files[variant]!.replace(
+      /^global$/m,
+      `global\n    this-is-not-a-directive ${Date.now()}`,
+    );
+    // Give the invalid candidate its own marker. No worker should ever report this version.
+    files[variant] = files[variant]!.replace(generations.a.version!, "f".repeat(64));
+  }
   return {
     id: generationId(files),
     files,
@@ -155,19 +217,14 @@ function brokenGeneration() {
   };
 }
 
-async function invalid() {
+async function invalid(loseReply: boolean) {
   const previous = await currentGeneration(root);
   const before = await proc();
   let error = "";
   let installed = false;
+  const loss = dropReply(0);
   try {
-    await installEdgeL4Generation({
-      root,
-      generation: brokenGeneration(),
-      validatorSocket: "/unused",
-      validate: trusted,
-      master,
-    });
+    await install(brokenGeneration(), loseReply ? loss.reloader : master);
     installed = true;
   } catch (cause) {
     error = (cause as Error).message;
@@ -175,7 +232,10 @@ async function invalid() {
   return {
     installed,
     error,
+    dropped: loss.dropped(),
+    requests: loss.requests(),
     restored: (await currentGeneration(root)) === previous,
+    pending: await Bun.file(join(root, "reload-pending")).exists(),
     previousVersion: previous === generations.a.id ? generations.a.version : generations.b.version,
     before,
     after: await proc(),
@@ -202,7 +262,58 @@ async function run(): Promise<unknown> {
     case "reload":
       return reload(Number(argument));
     case "invalid":
-      return invalid();
+      return invalid(argument === "drop");
+    case "lost-publication": {
+      const loss = dropReply(1);
+      const outcome = await install(generations.b, loss.reloader);
+      return { ...outcome, dropped: loss.dropped(), version: generations.b.version };
+    }
+    case "create-lock":
+      (await acquireReloadLock(haproxyReloadLockPath(masterSocket)))();
+      return {};
+    case "seed-protected":
+      return install(protectedGenerations.p);
+    case "publish-protected": {
+      const candidate = protectedGenerations[argument === "hold" ? "q" : "p"];
+      const reloader = new HaproxyMaster(
+        masterSocket,
+        async (socket, request, timeout) => {
+          if (request === "reload" && argument === "hold") {
+            await Bun.write(join(state, "publisher-held"), "");
+            const deadline = Date.now() + 10_000;
+            while (!(await Bun.file(join(state, "release-publisher")).exists())) {
+              if (Date.now() >= deadline) throw new Error("timed out waiting for the guard to queue");
+              await Bun.sleep(20);
+            }
+          }
+          return haproxyCli(socket, request, timeout);
+        },
+        3_000,
+        { lock: haproxyReloadLockPath(masterSocket), reloadAttempts: 1 },
+      );
+      const outcome = await installEdgeL4Generation({
+        root,
+        generation: candidate,
+        validatorSocket: "/unused",
+        validate: async (socket, id) => {
+          if (argument !== "hold") await Bun.write(join(state, "publisher-validated"), "");
+          return trusted(socket, id);
+        },
+        master: reloader,
+      });
+      return { ...outcome, version: candidate.version };
+    }
+    case "mode": {
+      const sample = await proc();
+      const accepting = sample.workers.filter(({ section }) => section === "current");
+      const modes = await Promise.all(
+        accepting.map(async ({ pid }) => {
+          const info = await master.worker(pid, "show info");
+          return /^description: ark-edge-l4 generation [a-f0-9]{64} (closed|full)$/m.exec(info)?.[1] ?? null;
+        }),
+      );
+      return { ...sample, modes };
+    }
     case "proc":
       return proc();
     default:

@@ -120,7 +120,9 @@ describe("edge-l4 rendering (§3.8.5 fe_tls443)", () => {
   });
 
   test("without tailnet routes the closed variant is the same router", () => {
-    expect(generation.files["haproxy.closed.cfg"]).toBe(config);
+    expect(generation.files["haproxy.closed.cfg"]).toBe(
+      config.replace(/^(    description ark-edge-l4 generation [a-f0-9]{64}) full$/m, "$1 closed"),
+    );
     expect(haproxyLaunchDecision(config, new Set())).toMatchObject({ open: true, guarded: false });
   });
 
@@ -320,7 +322,7 @@ function fakeMaster(workers: FakeWorker[], log: string[] = []): HaproxyCli {
     if (command === "show proc") {
       const current = workers.filter((worker) => worker.section === "current");
       const old = workers.filter((worker) => worker.section === "old");
-      return `#<PID>          <type>          <reloads>       <uptime>        <version>\n1               master          0 [failed: 0]   0d00h00m01s     3.2.26\n# workers\n${current.map((w) => `${w.pid}               worker          0               0d00h00m01s     3.2.26\n`).join("")}# old workers\n${old.map((w) => `${w.pid}               worker          1               0d00h00m01s     3.2.26\n`).join("")}`;
+      return `#<PID>          <type>          <reloads>       <uptime>        <version>\n1               master          0 [failed: 0]   0d00h00m01s     3.2.26\n# workers\n${current.map((w) => `${w.pid}               worker          0               0d00h00m01s     3.2.26\n`).join("")}# old workers\n${old.map((w) => `${w.pid}               worker          1               0d00h00m01s     3.2.26\n`).join("")}\n`;
     }
     const match = /^@!(\d+) (.*)$/.exec(command);
     if (!match) return "Unknown command.\n";
@@ -513,21 +515,25 @@ describe("HaproxyWithdrawalAdapter", () => {
     expect(result).toMatchObject({ unreachable: true });
   });
 
-  test("a brief master socket refusal during reload is retried before the watchdog reports failure", async () => {
-    const cli = fakeMaster(workers());
-    let refused = false;
-    const reexec: HaproxyCli = async (socket, command, timeout) => {
-      if (command === "show proc" && !refused) {
-        refused = true;
-        throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
-      }
-      return cli(socket, command, timeout);
-    };
-    const result = await new HaproxyWithdrawalAdapter("/fake", reexec).enforce(new Set());
-    expect(refused).toBe(true);
-    expect(result.error).toBeUndefined();
-    expect(result.withdrawn).toEqual(["100.88.1.20:1883", "100.88.1.30:1883"]);
-  });
+  test.each(["ECONNREFUSED", "ECONNRESET", "empty"])(
+    "a transient initial show proc %s during reload is retried before the watchdog reports failure",
+    async (failure) => {
+      const cli = fakeMaster(workers());
+      let refused = false;
+      const reexec: HaproxyCli = async (socket, command, timeout) => {
+        if (command === "show proc" && !refused) {
+          refused = true;
+          if (failure === "empty") return "";
+          throw Object.assign(new Error("master CLI disconnected"), { code: failure });
+        }
+        return cli(socket, command, timeout);
+      };
+      const result = await new HaproxyWithdrawalAdapter("/fake", reexec).enforce(new Set());
+      expect(refused).toBe(true);
+      expect(result.error).toBeUndefined();
+      expect(result.withdrawn).toEqual(["100.88.1.20:1883", "100.88.1.30:1883"]);
+    },
+  );
 
   test("stop fences tailnet servers and sessions without shutting down public HTTP", async () => {
     const state = workers();
@@ -685,7 +691,7 @@ describe("generation install (§3.8.6)", () => {
       commands.push(command);
       return command === "reload"
         ? "Success=1\n--\n[NOTICE] Loading success.\n"
-        : "#<PID> <type>\n1 master 0\n# workers\n9 worker 0\n";
+        : "#<PID> <type>\n1 master 0\n# workers\n9 worker 0\n\n";
     });
     const first = renderEdgeL4Generation({ httpHostnames: ["www.example.com"] });
     const result = await installEdgeL4Generation({
@@ -780,7 +786,7 @@ describe("generation install (§3.8.6)", () => {
           const master = new HaproxyMaster(
             "/fake",
             async (_socket, command) => {
-              if (command !== "reload") return "#<PID> <type>\n1 master 0\n# workers\n9 worker 0\n";
+              if (command !== "reload") return "#<PID> <type>\n1 master 0\n# workers\n9 worker 0\n\n";
               if (++attempts <= failing) {
                 if (failure === "empty") return "";
                 if (failure === "Success=0") return "Success=0\n--\n";
@@ -815,7 +821,8 @@ describe("generation install (§3.8.6)", () => {
       const master = new HaproxyMaster(
         "/fake",
         async (_socket, command) => {
-          if (command !== "reload") return "#<PID>\n1 master 0\n";
+          if (command === "show proc") return "#<PID>\n1 master 0\n";
+          if (command !== "reload") throw new Error(`no baseline to confirm: ${command}`);
           if (++attempts <= 2) throw new Error("ambiguous timeout");
           return "Success=1\n--\n";
         },
@@ -824,8 +831,70 @@ describe("generation install (§3.8.6)", () => {
       );
       const input = { root, generation, validatorSocket: "/v", validate: valid, master };
       await expect(installEdgeL4Generation({ ...input, force: true })).rejects.toThrow();
+      expect(await readFile(join(root, "reload-pending"), "utf8")).toBe(generation.id);
       expect((await installEdgeL4Generation(input)).reloaded).toBe(true);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("publication waits to swap current and restores it before releasing the reload lock", async () => {
+    const root = await scratch();
+    const lock = join(root, "reload.lock");
+    const releaseGuard = await acquireReloadLock(lock);
+    const validated = Promise.withResolvers<void>();
+    const reloading = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<string>();
+    let apply: Promise<unknown> | undefined;
+    try {
+      const previous = renderEdgeL4Generation({ httpHostnames: [], tlsRoutes: [route] });
+      const candidate = renderEdgeL4Generation({
+        httpHostnames: [],
+        tlsRoutes: [{ ...route, sourceCidrs: ["198.51.100.0/24"] }],
+      });
+      await installEdgeL4Generation({ root, generation: previous, validatorSocket: "/v", validate: valid });
+      const master = new HaproxyMaster(
+        "/fake",
+        async (_socket, command) => {
+          if (command === "show proc") return "#<PID>\n1 master 0\n# workers\n9 worker 0\n\n";
+          reloading.resolve();
+          return reply.promise;
+        },
+        3_000,
+        { lock },
+      );
+      apply = installEdgeL4Generation({
+        root,
+        generation: candidate,
+        validatorSocket: "/v",
+        validate: async (socket, id) => {
+          validated.resolve();
+          return valid(socket, id);
+        },
+        master,
+      }).catch((error: unknown) => error);
+      await validated.promise;
+      await Bun.sleep(75);
+      expect(await currentGeneration(root)).toBe(previous.id);
+      const allowlist = `allow/${route.id}.lst`;
+      expect(await readFile(join(root, "current", allowlist), "utf8")).toBe(previous.files[allowlist]!);
+      releaseGuard();
+      await reloading.promise;
+      expect(await currentGeneration(root)).toBe(candidate.id);
+      await expect(acquireReloadLock(lock, 0)).rejects.toThrow(/still held/);
+      const nextHolder = acquireReloadLock(lock);
+      reply.resolve("Success=0\n");
+      const releaseNext = await nextHolder;
+      try {
+        expect(await currentGeneration(root)).toBe(previous.id);
+        expect(await apply).toBeInstanceOf(Error);
+      } finally {
+        releaseNext();
+      }
+    } finally {
+      releaseGuard();
+      reply.resolve("Success=0\n");
+      await apply;
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -950,6 +1019,7 @@ describe("master-CLI reload under concurrency (lost replies, FD-25)", () => {
             ? ["# old workers", ...old.map((item) => `${item} worker 1 0d00h00m09s 3.2.26`)]
             : []),
           "",
+          "",
         ].join("\n");
       }
       const info = /^@!(\d+) show info$/.exec(command);
@@ -1009,6 +1079,51 @@ describe("master-CLI reload under concurrency (lost replies, FD-25)", () => {
     const fake = fakeHaproxy([{ answer: "" }, { answer: "Success=1\n--\n", worker: { version: versionA } }]);
     const master = new HaproxyMaster("/fake", fake.cli, 3_000, fastRetries);
     expect(await master.reload({ expect: versionA })).toMatchObject({ confirmedBy: "answer", attempts: 2 });
+  });
+
+  test.each(["reset", "incomplete"])(
+    "a pre-reload census with %s cannot confirm a same-version worker that never restarted",
+    async (failure) => {
+      const fake = fakeHaproxy([{ answer: "" }, { answer: "" }]);
+      let census = 0;
+      const master = new HaproxyMaster(
+        "/fake",
+        async (socket, command, timeout) => {
+          if (command === "show proc" && ++census === 1) {
+            if (failure === "reset") throw Object.assign(new Error("reset"), { code: "ECONNRESET" });
+            return "#<PID>\n1 master 0\n# workers\n100 worker 0\n";
+          }
+          return fake.cli(socket, command, timeout);
+        },
+        3_000,
+        fastRetries,
+      );
+      await expect(master.reload({ expect: versionA })).rejects.toThrow(/after 2 attempt/);
+      expect(fake.reloadCount()).toBe(2);
+      expect(fake.current().pid).toBe(100);
+    },
+  );
+
+  test("a worker that leaves during its version check cannot confirm a reload", async () => {
+    const fake = fakeHaproxy([{ answer: "", worker: { version: versionB } }, { answer: "Success=1\n" }]);
+    let switched = false;
+    const master = new HaproxyMaster(
+      "/fake",
+      async (socket, command, timeout) => {
+        const answer = await fake.cli(socket, command, timeout);
+        if (command === "@!101 show info") switched = true;
+        if (switched && command === "show proc") {
+          return answer.replace("# workers\n", "# workers\n102 worker 0\n# old workers\n");
+        }
+        if (command === "@!102 show info")
+          return `Pid: 102\ndescription: ark-edge-l4 generation ${versionA}\n`;
+        return answer;
+      },
+      3_000,
+      fastRetries,
+    );
+    expect(await master.reload({ expect: versionB })).toMatchObject({ confirmedBy: "answer", attempts: 2 });
+    expect(switched).toBe(true);
   });
 
   test("a failed reload hidden behind a lost reply still ends as Success=0", async () => {
@@ -1131,13 +1246,16 @@ describe("master-CLI reload under concurrency (lost replies, FD-25)", () => {
     expect(edgeL4ConfigVersion(generation.files["haproxy.cfg"])).toBe(version);
     expect(edgeL4ConfigVersion(generation.files["haproxy.closed.cfg"])).toBe(version);
     expect(generation.files["haproxy.cfg"]).toContain(
-      `global\n    description ark-edge-l4 generation ${version}\n`,
+      `global\n    description ark-edge-l4 generation ${version} full\n`,
+    );
+    expect(generation.files["haproxy.closed.cfg"]).toContain(
+      `global\n    description ark-edge-l4 generation ${version} closed\n`,
     );
     // The ID still hashes the stamped files; the version hashes them without the stamp.
     const unstamped = Object.fromEntries(
       Object.entries(generation.files).map(([path, text]) => [
         path,
-        text.replace(/^ {4}description ark-edge-l4 generation [a-f0-9]{64}\n/m, ""),
+        text.replace(/^ {4}description ark-edge-l4 generation [a-f0-9]{64} (?:full|closed)\n/m, ""),
       ]),
     );
     expect(generationId(unstamped)).toBe(version);

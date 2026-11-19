@@ -109,23 +109,43 @@ export class HaproxyMaster {
 
   /** Current and leaving workers (the master and external programs excluded). */
   async workers(): Promise<HaproxyProcess[]> {
-    // The Unix listener can refuse a connect briefly while the master re-execs on reload.
-    // Retry within the watchdog pass without treating a failed inspection as verified.
-    let text: string;
+    // Master re-exec can refuse or reset the connection, or close it with an incomplete census.
+    // Give the watchdog a short recovery window within the original CLI timeout.
+    const deadline = performance.now() + this.timeoutMs;
     for (let attempt = 0; ; attempt++) {
       try {
-        text = await this.command("show proc");
-        break;
+        return (await this.processes(Math.max(1, deadline - performance.now()))).filter(
+          (process) => process.type === "worker",
+        );
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (attempt >= 3 || (code !== "ECONNREFUSED" && code !== "ENOENT")) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 75));
+        const transient =
+          error instanceof IncompleteProcessList ||
+          code === "ECONNREFUSED" ||
+          code === "ECONNRESET" ||
+          code === "ENOENT";
+        if (!transient || attempt >= 3 || performance.now() + 75 >= deadline) throw error;
+        await sleep(75);
       }
     }
-    if (!/<PID>|master/.test(text)) throw new Error(`unexpected show proc answer: ${text.slice(0, 120)}`);
-    const workers = parseShowProc(text).filter((process) => process.type === "worker");
-    if (!workers.length) throw new Error("show proc returned no inspectable worker");
-    return workers;
+  }
+
+  private async processes(timeoutMs = this.timeoutMs) {
+    const text = await this.command("show proc", timeoutMs);
+    const processes = parseShowProc(text);
+    const rows = text.split("\n").filter((line) => line.trim() && !line.startsWith("#"));
+    if (
+      !text.endsWith("\n\n") || // The pinned master terminates a complete census with a blank line.
+      !/^#<PID>/m.test(text) ||
+      !/^# workers$/m.test(text) ||
+      rows.length !== processes.length ||
+      new Set(processes.map(({ pid }) => pid)).size !== processes.length ||
+      processes.filter(({ section }) => section === "master").length !== 1 ||
+      !processes.some(({ type }) => type === "worker")
+    ) {
+      throw new IncompleteProcessList("incomplete show proc answer");
+    }
+    return processes;
   }
 
   async worker(pid: number, command: string) {
@@ -178,7 +198,9 @@ export class HaproxyMaster {
   async loadedVersion(pid: number) {
     const text = await this.worker(pid, "show info");
     // A connection dropped by a racing reload answers nothing; that is not an unmarked worker.
-    if (!/^Pid: \d+/m.test(text)) throw new Error("incomplete show info answer");
+    if (!text.endsWith("\n") || !new RegExp(`^Pid: ${pid}$`, "m").test(text)) {
+      throw new Error("incomplete show info answer");
+    }
     return parseShowInfoVersion(text);
   }
 
@@ -202,19 +224,28 @@ export class HaproxyMaster {
    *
    * Such a request (unanswered, refused, timed out or refused as busy) is ambiguous, not a failure:
    * a reloader outside the lock can still cause it. It is confirmed from the workers instead. It counts
-   * as succeeded only when every current worker is new since the request and reports the `expect`ed
-   * content version in `show info`. Without `expect` (an unmarked configuration) nothing can prove
+   * as succeeded only with a valid pre-request census and a stable set of new current workers all
+   * reporting the `expect`ed content version in `show info`. Without `expect` (an unmarked configuration) nothing can prove
    * which configuration a new worker read, so the request is only sent again. Either way an unconfirmed
    * request is sent again, up to `reloadAttempts` times with doubling backoff. An answered `Success=0`
    * (an invalid configuration: the old workers keep serving) is returned at once and never retried or
    * confirmed into a success.
    */
-  async reload(options: { expect?: string | null; timeoutMs?: number } = {}): Promise<ReloadOutcome> {
+  reload(options: ReloadOptions = {}): Promise<ReloadOutcome> {
+    return this.withReloadLock((reload) => reload(options));
+  }
+
+  /** Runs a selector change and its reload/rollback as one transaction with the launch guard. */
+  async withReloadLock<T>(
+    operation: (reload: (options?: ReloadOptions) => Promise<ReloadOutcome>) => Promise<T>,
+  ) {
     const release = this.options.lock
       ? await acquireReloadLock(this.options.lock, this.options.lockWaitMs)
       : null;
     try {
-      return await this.reloadLocked(options.expect ?? null, options.timeoutMs ?? 60_000);
+      return await operation((options = {}) =>
+        this.reloadLocked(options.expect ?? null, options.timeoutMs ?? 60_000),
+      );
     } finally {
       release?.();
     }
@@ -225,7 +256,11 @@ export class HaproxyMaster {
     const problems: string[] = [];
     for (let attempt = 1; attempt <= attempts; attempt++) {
       // Taken after the caller's file changes: a worker missing here parsed the configuration later.
-      const before = await this.processIds().catch(() => null);
+      const before = expect
+        ? await this.processes()
+            .then((processes) => new Set(processes.map(({ pid }) => pid)))
+            .catch(() => null)
+        : null;
       let text = "";
       let problem = "";
       try {
@@ -263,28 +298,24 @@ export class HaproxyMaster {
     );
   }
 
-  /** Every listed process ID (master, current and leaving workers). */
-  private async processIds() {
-    const text = await this.command("show proc");
-    if (!/<PID>|master/.test(text)) throw new Error("unexpected show proc answer");
-    return new Set(parseShowProc(text).map((process) => process.pid));
-  }
-
   /**
-   * True once every current worker started after `before` was taken (when that snapshot exists) and
+   * True once every current worker started after `before` was taken and
    * serves the `expect`ed content version. A failed reload never starts a new worker, so it is never
    * confirmed. Worker turnover alone is not proof: a racing reload may have read the files before the
    * caller changed them, so an unmarked configuration is never confirmed this way.
    */
   private async confirmReload(before: Set<number> | null, expect: string | null) {
-    if (!expect) return false;
+    if (!before || !expect) return false;
     const deadline = Date.now() + (this.options.confirmMs ?? 10_000);
     for (;;) {
       try {
         const current = (await this.workers()).filter((worker) => worker.section === "current");
-        if (current.length && current.every((worker) => !before?.has(worker.pid))) {
+        if (current.length && current.every((worker) => !before.has(worker.pid))) {
           const versions = await Promise.all(current.map((worker) => this.loadedVersion(worker.pid)));
-          if (versions.every((version) => version === expect)) return true;
+          if (versions.every((version) => version === expect)) {
+            const after = (await this.workers()).filter((worker) => worker.section === "current");
+            if (workerSet(after) === workerSet(current)) return true;
+          }
         }
       } catch {
         // The master may still be re-executing; keep asking until the deadline.
@@ -294,6 +325,9 @@ export class HaproxyMaster {
     }
   }
 }
+
+class IncompleteProcessList extends Error {}
+type ReloadOptions = { expect?: string | null; timeoutMs?: number };
 
 /** HAProxy 3.2's answer to a `reload` that arrived while another one was still starting its worker. */
 const RELOAD_BUSY = /^Another reload is still in progress\.?$/m;
@@ -832,7 +866,7 @@ export class InvalidGenerationError extends Error {
  * 1. write the complete immutable generation;
  * 2. the restricted validator checks it (`haproxy -c` on the same build) and returns its hash;
  * 3. re-hash: no byte may have changed since validation;
- * 4. swap `current` atomically, then `reload` on the master CLI under the shared reload lock; an
+ * 4. under the shared reload lock, swap `current` atomically, then `reload` on the master CLI; an
  *    unanswered request is confirmed from the serving worker's content version or sent again;
  * 5. Any failed or unconfirmed reload restores `current` and leaves a durable retry marker.
  */
@@ -846,12 +880,11 @@ export async function installEdgeL4Generation(input: {
   force?: boolean;
 }): Promise<InstallResult> {
   const { root, generation } = input;
-  const previous = await currentGeneration(root);
   await writeGeneration(root, generation);
   const verdict = await (input.validate ?? validateGeneration)(input.validatorSocket, generation.id);
   if (!verdict.ok || verdict.hash !== generation.id) {
     // Never leave a refused candidate where a later restart could pick it up by mistake.
-    if (generation.id !== previous)
+    if (generation.id !== (await currentGeneration(root)))
       await rm(join(root, "generations", generation.id), { recursive: true, force: true });
     throw new InvalidGenerationError(
       generation.id,
@@ -860,46 +893,53 @@ export async function installEdgeL4Generation(input: {
   }
   const rehash = await hashGenerationDir(join(root, "generations", generation.id));
   if (rehash !== generation.id) throw new Error(`generation ${generation.id} changed after validation`);
-  const pending = await lstat(join(root, "reload-pending")).catch(() => null);
-  if (previous === generation.id && !input.force && !pending) {
-    return { generation: generation.id, previous, changed: false, reloaded: false, pruned: [] };
-  }
-  if (input.master) await writeFile(join(root, "reload-pending"), generation.id, { mode: FILE_MODE });
-  await pointCurrent(root, generation.id);
-  if (!input.master) {
-    return { generation: generation.id, previous, changed: true, reloaded: false, pruned: [] };
-  }
-  let reload: ReloadOutcome;
-  try {
-    // The version stamped into the generation lets an unanswered reload be confirmed from the
-    // worker that serves (unmarked hand-written generations fall back to worker turnover alone).
-    reload = await input.master.reload({ expect: edgeL4ConfigVersion(generation.files["haproxy.cfg"]) });
-    if (!reload.success)
-      throw new Error(`HAProxy reload failed (old workers keep serving): ${reload.log.slice(-1_000)}`);
-  } catch (error) {
-    // A timeout is ambiguous: keep both generations and force the next apply to reload, even
-    // after a process restart or a same-generation forced reload. Never treat the link as proof.
-    if (previous) await pointCurrent(root, previous);
-    else await rm(join(root, "current"), { force: true });
-    throw error;
-  }
-  await rm(join(root, "reload-pending"), { force: true });
-  // Keep every generation while a previous worker is still draining; prune once it has left.
-  const workers = await input.master.workers().catch(() => null);
-  const pruned =
-    workers && workers.length <= 1
-      ? await pruneGenerations(root, [generation.id, ...(previous ? [previous] : [])])
-      : [];
-  return {
-    generation: generation.id,
-    previous,
-    changed: true,
-    reloaded: true,
-    reloadLog: reload.log,
-    reloadConfirmedBy: reload.confirmedBy,
-    reloadAttempts: reload.attempts,
-    pruned,
+  const activate = async (
+    reload?: (options: ReloadOptions) => Promise<ReloadOutcome>,
+  ): Promise<InstallResult> => {
+    const pending = await lstat(join(root, "reload-pending")).catch(() => null);
+    const previous = await currentGeneration(root);
+    if (previous === generation.id && !input.force && !pending) {
+      return { generation: generation.id, previous, changed: false, reloaded: false, pruned: [] };
+    }
+    if (!reload || !input.master) {
+      await pointCurrent(root, generation.id);
+      return { generation: generation.id, previous, changed: true, reloaded: false, pruned: [] };
+    }
+    await writeFile(join(root, "reload-pending"), generation.id, { mode: FILE_MODE });
+    await pointCurrent(root, generation.id);
+    let outcome: ReloadOutcome;
+    try {
+      // The version stamped into the generation lets an unanswered reload be confirmed from the
+      // worker that serves. Unmarked hand-written generations require an answered reload.
+      outcome = await reload({ expect: edgeL4ConfigVersion(generation.files["haproxy.cfg"]) });
+      if (!outcome.success)
+        throw new Error(`HAProxy reload failed (old workers keep serving): ${outcome.log.slice(-1_000)}`);
+    } catch (error) {
+      // A timeout is ambiguous: keep both generations and force the next apply to reload, even
+      // after a process restart or a same-generation forced reload. Never treat the link as proof.
+      if (previous) await pointCurrent(root, previous);
+      else await rm(join(root, "current"), { force: true });
+      throw error;
+    }
+    await rm(join(root, "reload-pending"), { force: true });
+    // Keep every generation while a previous worker is still draining; prune once it has left.
+    const workers = await input.master.workers().catch(() => null);
+    const pruned =
+      workers && workers.length <= 1
+        ? await pruneGenerations(root, [generation.id, ...(previous ? [previous] : [])])
+        : [];
+    return {
+      generation: generation.id,
+      previous,
+      changed: true,
+      reloaded: true,
+      reloadLog: outcome.log,
+      reloadConfirmedBy: outcome.confirmedBy,
+      reloadAttempts: outcome.attempts,
+      pruned,
+    };
   };
+  return input.master ? input.master.withReloadLock(activate) : activate();
 }
 
 /** Admin-socket `show stat` (the current worker only), for status and tests. */

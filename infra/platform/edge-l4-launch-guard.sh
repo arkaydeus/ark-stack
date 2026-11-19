@@ -27,7 +27,8 @@
 # `edge.l4_apply` therefore made one of them report "the master CLI did not answer the reload".
 # Every reloader holds an exclusive flock(2) on `reload.lock` beside the master socket (the shared
 # `ark_haproxy_run` tmpfs) for the whole request: this guard with BusyBox `flock`, the worker through
-# `HaproxyMaster.reload` (shared/src/haproxy-control.ts). The kernel drops the lock when a holder exits.
+# `HaproxyMaster.withReloadLock` (shared/src/haproxy-control.ts). The lock also covers generation
+# activation, selector changes and rollback. The kernel drops it when a holder exits.
 # `ark-edge-l4-launch-guard reload` runs only this guard's locked reload, once, and prints the answer.
 set -eu
 
@@ -48,16 +49,16 @@ guarded() { grep -Eq '^# ark-(tailnet|http)-route ' "$full" 2>/dev/null; }
 # name can take the resolver's 5 s timeout (Docker behind systemd-resolved). Bound the whole request.
 ask() { timeout 1 wget -q -T 1 -O - "$watchdog/v1/launch?proxy=haproxy$1" 2>/dev/null || true; }
 point() {
-  ln -s "$1" "$link.next"
-  mv -f "$link.next" "$link"
+  if ! rm -f "$link.next" || ! ln -s "$1" "$link.next" || ! mv -f "$link.next" "$link"; then
+    rm -f "$link.next"
+    echo "ark edge-l4 launch guard: could not select $1" >&2
+    return 1
+  fi
 }
 # The worker derives the same path from its master socket (haproxyReloadLockPath); the override is for
 # scripts/edge-l4-guard.test.ts, which runs this script on the host.
 reload_lock="${ARK_HAPROXY_RELOAD_LOCK:-${master%/*}/reload.lock}"
-# Prints the master's answer to `reload`, sent under the reload lock. With an argument, the launch link
-# is first pointed at it inside the same lock. Waits at most 60 s for the lock (another reloader holds
-# it for at most its own bounded request and confirmation); prints nothing when it cannot be taken.
-locked_reload() {
+with_reload_lock() {
   [ -e "$reload_lock" ] || (umask 007 && : >>"$reload_lock") 2>/dev/null || true
   (
     tries=0
@@ -69,12 +70,12 @@ locked_reload() {
       fi
       sleep 0.1
     done
-    if [ -n "${1:-}" ]; then point "$1"; fi
-    echo reload | socat -t 30 - "UNIX-CONNECT:$master" 2>&1
+    "$@"
   ) 9<"$reload_lock"
 }
+reload_cli() { printf 'reload\n' | timeout 30 socat -t 30 - "UNIX-CONNECT:$master" 2>&1; }
 if [ "${1:-}" = reload ]; then
-  locked_reload
+  with_reload_lock reload_cli
   exit
 fi
 
@@ -149,24 +150,110 @@ supervise() {
     sleep 0.25
   done
 }
+# A re-exec can close an inspection socket too. Reject incomplete process lists and require
+# the worker to remain current after its version was read.
+inspect_cli() { printf '%s\n' "$1" | timeout 0.5 socat -t 0.5 - "UNIX-CONNECT:$master" 2>/dev/null; }
+worker_pids() {
+  # Preserve the final blank line of the census through shell command substitution.
+  listing="$(inspect_cli 'show proc' && printf .)" || return 1
+  printf '%s\n' "$listing" | awk -v current_only="$1" '
+    /^#<PID>/ { header = 1; next }
+    /^# workers$/ { accepting = 1; workers = 1; next }
+    /^# (old workers|programs)$/ { accepting = 0; next }
+    /^[0-9]+[[:space:]]+master[[:space:]]+[0-9]+/ { master++; next }
+    /^[0-9]+[[:space:]]+worker[[:space:]]+[0-9]+/ {
+      if (!current_only || accepting) pids = pids $1 "\n"
+      count++
+      next
+    }
+    /^$/ { blank = NR; next }
+    /^\.$/ { finished = (blank == NR - 1) }
+    END {
+      if (!finished || !header || master != 1 || !workers || !count || !pids) exit 1
+      printf "%s", pids
+    }'
+}
+confirm_full() {
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  before="$1"
+  marker="$2"
+  attempts=0
+  while [ "$attempts" -lt 5 ]; do
+    if current="$(worker_pids 1)"; then
+      verified=1
+      for pid in $current; do
+        if printf '%s\n' "$before" | grep -Fxq "$pid" ||
+          ! info="$(inspect_cli "@!$pid show info")" ||
+          ! printf '%s\n' "$info" | grep -Fxq "Pid: $pid" ||
+          ! printf '%s\n' "$info" | grep -Fxq "$marker"; then
+          verified=0
+          break
+        fi
+      done
+      if [ "$verified" = 1 ] && [ "$current" = "$(worker_pids 1)" ]; then
+        return 0
+      fi
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+restore_closed() {
+  if point "$closed"; then return 0; fi
+  echo "ark edge-l4 launch guard: cannot restore the closed selector; terminating HAProxy" >&2
+  kill_all
+  return 1
+}
+
+try_reopen() {
+  before="$(worker_pids 0)" || before=""
+  marker="$(sed -n 's/^    description \(ark-edge-l4 generation [a-f0-9]\{64\} full\)$/description: \1/p' "$full")"
+  # Authorise the generation now selected by current, after waiting for the publisher.
+  [ "$(ask "")" = open ] || return 1
+  point "$full" || return 1
+  answer="$(reload_cli || true)"
+  if printf '%s\n' "$answer" | grep -qx 'Success=1'; then return 0; fi
+  if printf '%s\n' "$answer" | grep -qx 'Success=0' &&
+    ! printf '%s\n' "$answer" | grep -Eq '^Another reload is still in progress\.?$'; then
+    restore_closed
+    echo "ark edge-l4 launch guard: HAProxy rejected the full configuration" >&2
+    return 1
+  fi
+  if confirm_full "$before" "$marker" && [ "$(ask "&cached=1")" = open ]; then return 0; fi
+  # The full variant may be live despite the lost reply. Re-establish closed workers before
+  # letting another publisher run. A closed symlink by itself does not close live routes.
+  restore_closed || return 1
+  answer="$(reload_cli || true)"
+  if printf '%s\n' "$answer" | grep -qx 'Success=1'; then
+    echo "ark edge-l4 launch guard: restored closed workers after ambiguous reopen" >&2
+  else
+    echo "ark edge-l4 launch guard: cannot confirm closed workers after ambiguous reopen; terminating HAProxy" >&2
+    kill_all
+  fi
+  return 1
+}
+
+try_close() {
+  [ "$(ask "&cached=1")" = closed ] && restore_closed
+}
+
 # A separate process may block on the CLI without delaying heartbeat enforcement.
 reopen() {
   while kill -0 "$haproxy_pid" 2>/dev/null; do
     if guarded; then
       decision="$(ask "&cached=1")"
       if [ "$mode" = closed ] && [ "$decision" = "open" ]; then
-        answer="$(locked_reload "$full" || true)"
-        if printf '%s\n' "$answer" | grep -q '^Success=1$'; then
+        if with_reload_lock try_reopen; then
           mode=full
           echo "ark edge-l4 launch guard: lease valid; switched to the full configuration" >&2
-        else
-          point "$closed"
-          echo "ark edge-l4 launch guard: full reload unconfirmed; retaining closed mode and retrying" >&2
         fi
       elif [ "$mode" = full ] && [ "$decision" = "closed" ]; then
-        point "$closed"
-        mode=closed
-        echo "ark edge-l4 launch guard: lease no longer allows every protected route; later reloads use the closed configuration" >&2
+        if with_reload_lock try_close; then
+          mode=closed
+          echo "ark edge-l4 launch guard: lease no longer allows every protected route; later reloads use the closed configuration" >&2
+        fi
       fi
     fi
     sleep 1
