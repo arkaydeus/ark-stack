@@ -9,6 +9,7 @@
 //   - inline and fenced HTTP `METHOD /api/...` requests are registered in server/src/app.ts;
 //   - backticked Ark environment variables (ARK_*, TS_*, BETTER_AUTH_*, …) occur in tracked source;
 //   - ports named as `TCP n`, `UDP n`, `port n` or a backticked `:n` occur in tracked source.
+// The docs-site pages under docs/ (index.md and the section folders) are checked in full too.
 // The front-door design document is historical, so only its links, paths and tasks are checked.
 import { readFileSync } from "node:fs";
 import { join, dirname, normalize, relative } from "node:path";
@@ -270,11 +271,19 @@ export const FULL = [
   "docs/guides/backups.md",
 ];
 export const LINKS_ONLY = ["docs/design/front-door.md"];
+/** Docs-site pages (`docs/index.md` and the section folders) are checked in full as well. */
+export const SITE_PAGES =
+  /^docs\/(?:index\.md|(?:introduction|getting-started|features|operations|security|development|reference)\/[^/]+\.md)$/;
+
+/** Every Markdown file checked in full: the fixed list plus the docs-site pages. */
+export function fullFiles(ctx: Context) {
+  return [...FULL, ...[...ctx.tracked].filter((file) => SITE_PAGES.test(file)).toSorted()];
+}
 
 export function checkDocs(root = join(import.meta.dir, "..")) {
   const ctx = context(root);
   return [
-    ...FULL.flatMap((file) => checkFile(ctx, file, "full")),
+    ...fullFiles(ctx).flatMap((file) => checkFile(ctx, file, "full")),
     ...LINKS_ONLY.flatMap((file) => checkFile(ctx, file, "links")),
   ];
 }
@@ -282,6 +291,7 @@ export function checkDocs(root = join(import.meta.dir, "..")) {
 if (import.meta.main) {
   const root = join(import.meta.dir, "..");
   const problems = checkDocs(root);
+  const checked = fullFiles(context(root)).length + LINKS_ONLY.length;
   for (const problem of problems)
     console.log(
       `${relative(root, join(root, problem.file))}:${problem.line}: ${problem.kind}: ${problem.detail}`,
@@ -289,7 +299,7 @@ if (import.meta.main) {
   console.log(
     problems.length
       ? `\n${problems.length} documentation problem(s).`
-      : `Documentation check passed: ${FULL.length + LINKS_ONLY.length} files.`,
+      : `Documentation check passed: ${checked} files.`,
   );
   process.exit(problems.length ? 1 : 0);
 }

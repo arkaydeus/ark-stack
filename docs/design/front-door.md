@@ -1480,7 +1480,7 @@ sequenceDiagram
   participant L as Login origin (login.example.com)
   B->>E: GET /dashboard (no __Host-ark_gate)
   E->>A: forward_auth GET /api/gate/check?route=rt_k3x9 (+X-Ark-Edge-Token, X-Forwarded-Uri)
-  A-->>E: 302 Location: https://login.example.com/gate/authorize?route=rt_k3x9&state=S&rd=%2Fdashboard<br/>Set-Cookie: __Host-ark_gate_state=S; Max-Age=600
+  A-->>E: 302 Location: https://login.example.com/gate/authorize?route=rt_k3x9&state=S&rd=%2Fdashboard<br/>Set-Cookie: __Host-ark_gate_state=S#59; Max-Age=600
   E-->>B: (response copied)
   B->>L: GET /gate/authorize?route=rt_k3x9&state=S&rd=/dashboard
   alt no gate session on login origin
@@ -1494,7 +1494,7 @@ sequenceDiagram
   E->>A: reverse_proxy /api/gate/callback (+X-Ark-Edge-Token, X-Ark-Route)
   A->>A: UPDATE gate_handoffs SET consumed_at=now() WHERE code_hash=H(C) AND consumed_at IS NULL AND expires_at>now() RETURNING *
   A->>A: check route.hostname == Host, H(S) == state_hash == H(cookie), user still allowed
-  A-->>B: 303 https://www.example.com/dashboard<br/>Set-Cookie: __Host-ark_gate=T; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200<br/>Set-Cookie: __Host-ark_gate_state=; Max-Age=0
+  A-->>B: 303 https://www.example.com/dashboard<br/>Set-Cookie: __Host-ark_gate=T#59; Secure#59; HttpOnly#59; SameSite=Lax#59; Path=/#59; Max-Age=43200<br/>Set-Cookie: __Host-ark_gate_state=#59; Max-Age=0
   B->>E: GET /dashboard (__Host-ark_gate=T)
   E->>A: forward_auth check → token_hash lookup, parent session valid, user allowed
   A-->>E: 204 + X-Ark-User, X-Ark-Email

@@ -33,11 +33,21 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts"
 
 [tasks."docs:check"]
 description = "Check that the operator docs and guides name only existing files, links, anchors, mise tasks, API endpoints, env vars and ports"
 run = "bun scripts/check-docs.ts"
+
+[tasks."docs:build"]
+description = "Build the static documentation site from docs/ and docs/nav.json into dist/docs (or --out dir)"
+run = "bun scripts/docs-site/build.ts build"
+raw_args = true
+
+[tasks."docs:serve"]
+description = "Serve the documentation site on http://127.0.0.1:4321/ (or --port n), rebuilding when docs change"
+run = "bun scripts/docs-site/build.ts serve"
+raw_args = true
 
 [tasks."test:db"]
 description = "Run the DB-backed server tests (or the bun test arguments given) against a throwaway, migrated postgres:17.6 container that is always removed"
@@ -138,7 +148,7 @@ run = "ARK_DOCKER_INTEGRATION=1 go test -run TestDisposableDockerDeploymentAndDu
 dir = "agent"
 
 [tasks.typecheck]
-description = "Typecheck every TypeScript workspace, the image publisher, PgBouncer probes and the docs check"
+description = "Typecheck every TypeScript workspace, the image publisher, PgBouncer probes, the docs check and the docs site"
 run = [
   "bunx tsc --noEmit -p shared/tsconfig.json",
   "bunx tsc --noEmit -p server/tsconfig.json",
