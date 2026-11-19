@@ -25,7 +25,10 @@ test.each(["Success=0", "disconnect", "ln", "mv", "busy"])(
           '#!/bin/sh\necho $$ > "$TEST_ROOT/pid"\ntrap "exit 0" USR1 TERM INT\nwhile :; do /bin/sleep 0.1; done\n',
         wget: '#!/bin/sh\ncase "$*" in *supervise*) echo ok;; *) cat "$TEST_ROOT/decision";; esac\n',
         // The guard bounds each request with `timeout`, which stock macOS lacks; pass through.
-        timeout: '#!/bin/sh\nshift\nexec "$@"\n',
+        timeout:
+          failure === "busy"
+            ? '#!/bin/sh\nif [ "$1" = 60 ] && [ "$2" = flock ]; then exit 124; fi\nshift\nexec "$@"\n'
+            : '#!/bin/sh\nshift\nexec "$@"\n',
         socat: `#!/bin/sh
 read -r command
 [ "$command" = reload ] || exit 0
@@ -42,9 +45,6 @@ fi
 `,
         pkill: '#!/bin/sh\nkill -KILL "$(cat "$TEST_ROOT/pid")" 2>/dev/null || true\n',
         ...(hostFlock ? {} : { flock: "#!/bin/sh\nexit 0\n" }),
-        ...(failure === "busy"
-          ? { flock: "#!/bin/sh\nexit 1\n", sleep: '#!/bin/sh\n[ "$1" = 0.1 ] || exec /bin/sleep "$@"\n' }
-          : {}),
         ...(failure === "ln"
           ? {
               ln: '#!/bin/sh\ncase "$2" in */haproxy.cfg) exit 1;; esac\nexec /bin/ln "$@"\n',
@@ -84,7 +84,6 @@ fi
         : failure === "busy"
           ? "reload.lock is busy"
           : "could not select";
-      // The fake sleep accelerates the real 600-attempt timeout path.
       let output = "";
       while (Date.now() < deadline) {
         output = await readFile(logPath, "utf8");

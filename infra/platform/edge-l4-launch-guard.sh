@@ -28,7 +28,7 @@
 # Every reloader holds an exclusive flock(2) on `reload.lock` beside the master socket (the shared
 # `ark_haproxy_run` tmpfs) for the whole request: this guard with BusyBox `flock`, the worker through
 # `HaproxyMaster.withReloadLock` (shared/src/haproxy-control.ts). The lock also covers generation
-# activation, selector changes and rollback. The kernel drops it when a holder exits.
+# activation, live selector changes and rollback. The kernel drops it when a holder exits.
 # `ark-edge-l4-launch-guard reload` runs only this guard's locked reload, once, and prints the answer.
 set -eu
 
@@ -61,15 +61,11 @@ reload_lock="${ARK_HAPROXY_RELOAD_LOCK:-${master%/*}/reload.lock}"
 with_reload_lock() {
   [ -e "$reload_lock" ] || (umask 007 && : >>"$reload_lock") 2>/dev/null || true
   (
-    tries=0
-    until flock -n 9; do
-      tries=$((tries + 1))
-      if [ "$tries" -ge 600 ]; then
-        echo "ark edge-l4 launch guard: the reload lock $reload_lock is busy" >&2
-        exit 1
-      fi
-      sleep 0.1
-    done
+    # BusyBox flock has no wait option. Bound the blocking call and keep its open file in this shell.
+    if ! timeout 60 flock 9; then
+      echo "ark edge-l4 launch guard: the reload lock $reload_lock is busy" >&2
+      exit 1
+    fi
     "$@"
   ) 9<"$reload_lock"
 }
@@ -218,7 +214,7 @@ try_reopen() {
   if printf '%s\n' "$answer" | grep -qx 'Success=0' &&
     ! printf '%s\n' "$answer" | grep -Eq '^Another reload is still in progress\.?$'; then
     restore_closed
-    echo "ark edge-l4 launch guard: HAProxy rejected the full configuration" >&2
+    echo "ark edge-l4 launch guard: full reload unconfirmed (HAProxy rejected it), retaining closed mode" >&2
     return 1
   fi
   if confirm_full "$before" "$marker" && [ "$(ask "&cached=1")" = open ]; then return 0; fi
