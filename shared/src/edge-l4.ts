@@ -315,8 +315,45 @@ export type EdgeL4Manifest = {
   pooler?: { hostname: string | null; server: string; admits: "internet" | "allowlist" | "nobody" } | null;
 };
 
-/** The files of one generation, by path relative to the generation directory. */
-export type EdgeL4Generation = { id: string; files: Record<string, string>; manifest: EdgeL4Manifest };
+/**
+ * The files of one generation, by path relative to the generation directory. `version` is the content
+ * version stamped into both configuration variants (see `EDGE_L4_VERSION_MARKER`).
+ */
+export type EdgeL4Generation = {
+  id: string;
+  files: Record<string, string>;
+  manifest: EdgeL4Manifest;
+  version?: string;
+};
+
+/**
+ * Runtime-visible content version. Both configuration variants carry it in `global` as
+ * `description ark-edge-l4 generation <version> <full|closed>`, which every worker reports in
+ * `show info`. The publisher confirms the generation and the launch guard confirms the variant.
+ * `<version>` is the generation ID of the same files rendered without this line (a generation's own
+ * ID cannot appear in its content), so it differs whenever any file of the generation differs.
+ */
+export const EDGE_L4_VERSION_MARKER = "ark-edge-l4 generation";
+const VERSION_LINE = /^ {4}description ark-edge-l4 generation ([a-f0-9]{64})(?: (?:full|closed))?$/m;
+const SHOW_INFO_VERSION = /^description: ark-edge-l4 generation ([a-f0-9]{64})(?: (?:full|closed))?$/m;
+
+/** The content version a configuration file was rendered with, or null (unmarked or not rendered). */
+export function edgeL4ConfigVersion(config: string | undefined) {
+  return (config && VERSION_LINE.exec(config)?.[1]) || null;
+}
+
+/** The content version a running worker loaded, from its `show info` answer, or null. */
+export function parseShowInfoVersion(text: string) {
+  return SHOW_INFO_VERSION.exec(text)?.[1] ?? null;
+}
+
+function stampVersion(config: string, version: string, variant: "full" | "closed") {
+  if (!/^global\n/m.test(config)) throw new Error("rendered HAProxy configuration has no global section");
+  return config.replace(
+    /^global\n/m,
+    `global\n    description ${EDGE_L4_VERSION_MARKER} ${version} ${variant}\n`,
+  );
+}
 
 const GENERATION_PATH = /^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/;
 /** A generation ID is the SHA-256 of its contents (see `generationId`). */
@@ -1038,7 +1075,11 @@ export function renderEdgeL4Generation(input: EdgeL4Input): EdgeL4Generation {
       files[`cas/${route.id}.crl`] = route.clientCa.crl;
     }
   }
-  return { id: generationId(files), files, manifest };
+  // Both variants identify the same generation and their own admission mode.
+  const version = generationId(files);
+  files["haproxy.cfg"] = stampVersion(files["haproxy.cfg"]!, version, "full");
+  files["haproxy.closed.cfg"] = stampVersion(files["haproxy.closed.cfg"]!, version, "closed");
+  return { id: generationId(files), files, manifest, version };
 }
 
 /** A server line of a rendered or running configuration. */

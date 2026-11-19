@@ -78,7 +78,7 @@ description = "Run native mail lifecycle checks against a disposable pinned Stal
 run = "env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts"
 
 [tasks."test:edge"]
-description = "Check edge harness cleanup and pins, Caddy configurations, edge behaviour, public port nftables rules, LocalAPI deployment, route withdrawal, HAProxy SNI routing and TLS-TCP/raw-TCP routes (FD-14), the PostgreSQL router on 5432 with PgBouncer and postgres routes (FD-26), login gate routing, Origin contract, bypass guard and revocation (FD-11), and HTTP route rate limits and HTTP mTLS on the custom Caddy build (FD-23)"
+description = "Check edge harness cleanup and pins, Caddy configurations, edge behaviour, public port nftables rules, LocalAPI deployment, route withdrawal, HAProxy SNI routing and TLS-TCP/raw-TCP routes (FD-14), the PostgreSQL router on 5432 with PgBouncer and postgres routes (FD-26), login gate routing, Origin contract, bypass guard and revocation (FD-11), concurrent HAProxy master-CLI reload safety, and HTTP route rate limits and HTTP mTLS on the custom Caddy build (FD-23)"
 run = [
   "bun test scripts/edge-test scripts/edge-l4-guard.test.ts scripts/maintain.test.ts",
   "bun scripts/test-edge-config.ts",
@@ -88,8 +88,13 @@ run = [
   "bun scripts/test-edge-l4-routes.ts",
   "bun scripts/test-edge-pg5432.ts",
   "bun scripts/test-edge-gate.ts",
+  "bun scripts/test-edge-reload-race.ts",
   "bun scripts/test-edge-http-controls.ts",
 ]
+
+[tasks."test:edge-reload"]
+description = "Race HAProxy master-CLI reloads (publisher, second reloader and the shipped launch guard under the shared reload lock; publications against an unlocked reloader) on the pinned edge-l4 image, and check that an invalid configuration still fails with the old worker serving (requires Docker)"
+run = "bun scripts/test-edge-reload-race.ts"
 
 [tasks."test:pgbouncer"]
 description = "Start app-postgres and pgbouncer-public from the platform Compose file and test mTLS, SCRAM, admin-socket reloads, database clients (connect, read-only preview, revoke) and certificate rollover (two-CA overlap, emergency removal, retirement drain by not_after + 5 s; needs the migrated platform database)"

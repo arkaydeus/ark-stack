@@ -159,7 +159,8 @@ describe("writeEdge", () => {
       connection.on("end", () => {
         const command = input.trim();
         timeline.push(command);
-        if (command === "show proc") return connection.end("#<PID> <type>\n# workers\n10 worker 0\n");
+        if (command === "show proc")
+          return connection.end("#<PID> <type>\n1 master 0\n# workers\n10 worker 0\n\n");
         if (command === "@!10 show servers state")
           return connection.end(
             `1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_port\n1 ${backend} 1 ${name} 127.0.0.1 2 ${adminState} 8443\n`,

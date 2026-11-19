@@ -715,8 +715,8 @@ volumes:
       type: tmpfs
       device: tmpfs
       o: uid=1000,gid=1000,mode=0700,size=1m
-  # edge-l4 master and admin sockets (front door §3.8.6): owned by HAProxy's uid 99 and the shared group
-  # 4400, setgid so the sockets inherit the group. Mounted into edge-l4, domain-worker and edge-watchdog.
+  # edge-l4 sockets and reload lock (front door §3.8.6). The volume is uid 99, setgid group 4400.
+  # The guard or domain worker can create the group-readable lock. The watchdog inspects without it.
   ark_haproxy_run:
     driver: local
     driver_opts:

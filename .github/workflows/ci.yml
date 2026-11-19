@@ -102,6 +102,7 @@ jobs:
       - run: bun scripts/test-edge-l4.ts
       # FD-26: the PostgreSQL router on 5432 (V-13 matrix, pooler policy, compat port, isolation).
       - run: bun scripts/test-edge-pg5432.ts
+      - run: bun scripts/test-edge-reload-race.ts
       - name: Native IPv6 and AAAA preflight (FD-27)
         run: |
           bun test scripts/install-docker-ipv6.test.ts
