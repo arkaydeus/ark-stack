@@ -37,20 +37,13 @@ There is no email flow. Password reset by email and email verification are not c
 
 The first account is created with a one-time setup token.
 
-1. `mise run host:install` generates `ARK_SETUP_TOKEN` (and every other secret) into `.env` without overwriting existing values, then prints `Setup URL: http://127.0.0.1:3000` and the token. The installer's default `BETTER_AUTH_URL` is that same local origin.
-2. Open the setup URL through an SSH tunnel (see [Admin access modes](admin-access-modes.md#local-bootstrap-listener)). The UI calls `GET /api/setup/status`; while it reports `required`, the sign-in screen is **Create the owner**.
+1. `mise run host:install` generates `ARK_SETUP_TOKEN` (and every other secret) into `.env` without overwriting existing values, then prints `Setup URL: http://localhost:3000` and the token. A fresh install registers `http://localhost:3000` as `BETTER_AUTH_URL`.
+2. Open `http://localhost:3000` through an SSH tunnel (see [Admin access modes](admin-access-modes.md#local-bootstrap-listener)). The UI calls `GET /api/setup/status`; while it reports `required`, the sign-in screen is **Create the owner**.
 3. The form posts to `POST /api/auth/sign-up/email` with the token in an `x-setup-token` header. Under a PostgreSQL advisory lock, the API checks that setup is still open and compares the token in constant time. Only then does Better Auth create the user. On success the API inserts a `platform_access` row with role `owner`, and marks setup completed (`bootstrap_closed_at`).
 4. Sign-up is then closed for good. Any later sign-up request gets `403` ("Administrator setup is closed or the token is invalid"). If a user row exists while setup is not marked complete, the request repairs that state by closing setup, and is refused.
 5. The new owner must enrol TOTP before anything else ([MFA](#mfa-totp)) and then run the domain wizard.
 
-The recovery CLI inspects bootstrap state without changing data:
-
-```sh
-mise run recover -- status   # setup flags, user count, whether a setup token is configured
-mise run recover -- owners   # emails and roles of administration accounts
-```
-
-`mise run recover -- reset-setup` reopens setup only when no users exist at all, and prints a suggested new token. With users present it refuses. The installer never imports legacy users as owners ([Import](../operating.md#import)).
+The [recovery CLI](../operations/recovery.md#the-recover-cli) inspects bootstrap state and lists account roles. Its `reset-setup` command reopens setup only when no users exist at all, and prints a suggested new token. With users present it refuses. The installer never imports legacy users as owners ([Import](../operating.md#import)).
 
 ## Roles and permissions
 
@@ -264,12 +257,8 @@ The **Activity** page shows the latest 50 entries from `GET /api/state` (action,
 
 Keep the recovery codes from enrolment and the generated `ARK_MFA_RECOVERY_TOKEN` off the host. A backup code replaces a TOTP code at sign-in (**Use a recovery code**).
 
-If an owner has lost every factor, run on the host:
-
-```sh
-mise run recover:mfa -- owner@example.com RESET:owner@example.com "$ARK_MFA_RECOVERY_TOKEN"
-```
+If an owner has lost every factor, follow the [MFA recovery procedure](../operations/recovery.md#resetting-an-owners-mfa) for your deployment.
 
 [`scripts/recover-mfa.ts`](../../scripts/recover-mfa.ts) requires the email, a confirmation string of exactly `RESET:<email>` and the recovery token (compared in constant time). In one transaction, under an advisory lock, it checks that the account is an owner, then deletes its `two_factor` row, its step-up grants and every session, clears `two_factor_enabled` and `mfa_enrolled_at`, and writes an `mfa.recovery_reset` audit event. The owner then signs in with their password and must enrol TOTP again before any change. The script only resets owners; it does not change passwords.
 
-A forgotten password has no reset flow. Setup cannot be reopened while users exist (`mise run recover -- reset-setup` refuses), so a lost owner password needs a reviewed database change on the host. Host-level recovery is covered in [Recovery](../operating.md#recovery) and [Recovery operations](../operations/recovery.md).
+A forgotten password has no reset flow. Setup cannot be reopened while users exist (`reset-setup` refuses), so a lost owner password needs a reviewed database change on the host. Host-level recovery is covered in [Recovery](../operating.md#recovery) and [Recovery operations](../operations/recovery.md).

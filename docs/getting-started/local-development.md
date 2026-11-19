@@ -90,7 +90,7 @@ The optional provider settings (`DNS_API_TOKEN`, `AWS_*`, `STALWART_*`, `ARK_ALE
 
 `mise run db:up` starts `postgres` and `app-postgres` from `infra/platform/docker-compose.yml` with the development override `infra/platform/docker-compose.dev.yml`, which binds them to `127.0.0.1:5433` and `127.0.0.1:5434`.
 
-Compose reads a `.env` file only from the Compose file's own directory (`infra/platform/`), not from the repository root, and this task does not load `.env` itself. Compose also checks every required variable in the file, not only those of the two services. Export `.env` into your shell first:
+The task points Compose at the files under `infra/platform/`. Export the checkout-root `.env` so interpolation uses its values regardless of where Compose would find an env file. Compose checks required variables across the file, including variables for services the task does not start:
 
 ```sh
 set -a; . ./.env; set +a

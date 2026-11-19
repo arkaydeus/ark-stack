@@ -27,7 +27,7 @@ Most problems are visible as a state, an alert or a failed operation before anyt
 
 ### The API refuses to start: "ARK_BACKUP_EXECUTE must be 1 when backup execution is required."
 
-- **Cause:** `ARK_BACKUP_REQUIRED=1` with `ARK_BACKUP_EXECUTE` not `1`.
+- **Cause:** the API process received `ARK_BACKUP_REQUIRED=1` and `ARK_BACKUP_EXECUTE` was not `1`. The shipped Compose configuration passes these settings only to the backup worker.
 - **Fix:** set `ARK_BACKUP_EXECUTE=1` where pgBackRest or restic should actually run, or drop the requirement. Plan-only execution fails backup operations instead of reporting success ([Backups](../operating.md#backups)).
 
 ### `ArkApiDown` fires
@@ -40,7 +40,7 @@ Most problems are visible as a state, an alert or a failed operation before anyt
 ### "This host is not a registered Ark origin." (421)
 
 - **Cause:** the request's `Host` is not the host of `BETTER_AUTH_URL`, of an entry in `BETTER_AUTH_TRUSTED_ORIGINS`, or the login host. The API refuses unknown hosts before authentication, with no fallback.
-- **Fix:** open the admin UI at its configured origin. If you sign in through an SSH tunnel to `127.0.0.1:3000`, keep `http://127.0.0.1:3000` in `BETTER_AUTH_TRUSTED_ORIGINS` ([Edge Tailscale node](../operating.md#edge-tailscale-node)).
+- **Fix:** open the admin UI at its configured origin. For a fresh install, open `http://localhost:3000` through the tunnel. Keep it registered as described in [Local bootstrap listener](../features/admin-access-modes.md#local-bootstrap-listener).
 
 ### "The request origin is not trusted." (403)
 
@@ -64,7 +64,7 @@ Most problems are visible as a state, an alert or a failed operation before anyt
 
 ### Locked out, or an owner lost every MFA factor
 
-- **Fix:** use the local recovery tools on the host: `mise run recover -- status` to inspect bootstrap state, and `mise run recover:mfa` to reset owner MFA, which revokes every session and step-up grant. See [Recovery](recovery.md).
+- **Fix:** use the [recovery CLI](recovery.md#the-recover-cli) to inspect bootstrap state or follow the [owner MFA reset procedure](recovery.md#resetting-an-owners-mfa) to revoke every session and step-up grant and allow re-enrollment.
 
 ## Login gate (SSO routes)
 

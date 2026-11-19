@@ -154,11 +154,11 @@ Each prints a skip message and exits 0 unless its credentials are set. CI never 
 `recover` has four subcommands: `help` (the default), `status` (bootstrap state, user count and whether a setup token is configured; read-only), `owners` (platform owners and their roles) and `reset-setup`, which reopens first-run setup only when no users exist and prints a suggested token.
 
 ```sh
-mise run recover -- status
-mise run recover:mfa -- owner@example.com RESET:owner@example.com "$ARK_MFA_RECOVERY_TOKEN"
 mise run recover-host
 mise run import -- inventory.json
 ```
+
+The first two tasks are for a locally reachable development database. For production, follow the [recovery CLI](../operations/recovery.md#the-recover-cli) and [MFA reset](../operations/recovery.md#resetting-an-owners-mfa) procedures inside the API container.
 
 `recover:mfa` needs the owner's email, the literal confirmation `RESET:<email>` and the recovery token; it revokes every session and step-up grant before re-enrollment. `recover-host` prints which recovery inputs are present (`ARK_ROOT_KEY`, `DATABASE_URL`, `BETTER_AUTH_SECRET`, `ARK_SETUP_TOKEN`), the host-loss checklist and the isolated restore manifest `infra/restore/docker-compose.yml`, and exits nonzero if the root key or database URL is missing. `import` compares an Orkmail or PgStack inventory read-only and never imports owners. See [Recovery](../operations/recovery.md).
 

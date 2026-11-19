@@ -179,16 +179,28 @@ export function applyEdgeAuthKey(env: string, supplied?: string): EdgeAuthKeyRes
   return { env: `${base}TS_EDGE_AUTHKEY=${key}\n`, status: "set" };
 }
 
-export function assertNoPlaceholderSecrets(env: Record<string, string | undefined> = process.env) {
+const externalServiceSecrets = new Set<string>([
+  "ARK_PLATFORM_PG_EXECUTOR_TOKEN",
+  "ARK_APP_PG_EXECUTOR_TOKEN",
+  "ARK_PLATFORM_PG_REPO_CIPHER_PASS",
+  "ARK_APP_PG_REPO_CIPHER_PASS",
+  "ARK_CONTROL_DB_PASSWORD",
+  "ARK_APP_DB_PASSWORD",
+  "ARK_API_DB_PASSWORD",
+  "STALWART_ADMIN_PASSWORD",
+]);
+
+export function assertNoPlaceholderSecrets(
+  env: Record<string, string | undefined> = process.env,
+  { embeddedWorkers = true } = {},
+) {
   for (const key of installEnvKeys) {
-    // The API and edge read the gate token (FD-10); enabling the login origin requires it. Older
-    // deployments without it keep running with no edge-trusted client address; refuse a published
-    // value when supplied, without requiring it.
-    if (key === "ARK_EDGE_GATE_TOKEN" && !env[key]) continue;
-    // Optional for the API: without it the watchdog cannot read the lease and tailnet routes stay
-    // withdrawn. A published placeholder is still refused.
-    if (key === "ARK_EDGE_WATCHDOG_TOKEN" && !env[key]) continue;
     const value = env[key] ?? "";
+    // Without the optional edge tokens the API does not trust proxy addresses or serve watchdog leases.
+    if (!value && (key === "ARK_EDGE_GATE_TOKEN" || key === "ARK_EDGE_WATCHDOG_TOKEN")) continue;
+    // Compose projects the effective credentials into DATABASE_URL and keeps other services' secrets
+    // out of the API container. If a host supplies any of them anyway, still validate the value.
+    if (!value && !embeddedWorkers && externalServiceSecrets.has(key)) continue;
     if (!value || isPlaceholderValue(key, value)) {
       throw new Error(
         `${key} still has a published example placeholder. Refuse to start until it is replaced.`,

@@ -40,8 +40,8 @@ Useful commands:
 | `mise run test:backups-tailnet`      | home-machine backups via backup-ts (Docker) |
 | `mise run test:backups-tailnet-live` | opt-in home backup on a real tailnet        |
 | `mise run test:pgbouncer`            | PgBouncer mTLS/SCRAM, DB client, rollover   |
-| `mise run recover -- status`         | local lockout / bootstrap inspection        |
-| `mise run recover:mfa -- …`          | token- and confirmation-gated MFA reset     |
+| `mise run recover -- status`         | development lockout / bootstrap inspection  |
+| `mise run recover:mfa -- …`          | development owner MFA reset                 |
 | `mise run host:install`              | build and start the complete host topology  |
 | `mise run host:audit`                | check the VPS firewall and public ports     |
 | `mise run images:publish`            | build and push all images to GHCR           |
@@ -50,6 +50,8 @@ Useful commands:
 | `mise run recover-host`              | host-loss checklist                         |
 | `mise run db:studio`                 | Drizzle Studio                              |
 | `mise run docs:serve`                | browse the documentation site locally       |
+
+For production lockouts and MFA resets, follow the [recovery runbook](docs/operations/recovery.md).
 
 `mise run test:db` needs only Docker, not `.env` or `mise run db:up`. It starts a uniquely named, labelled `postgres:17.6` container on a loopback port that Docker picks, applies the migrations as the owner role `ark_migration`, runs `bun test server` with fixed test-only secrets and an allowlisted host environment, and removes the container afterwards, also when tests fail or the run is interrupted. Cleanup failures return a nonzero status; `down` also fails if the named container is absent. Concurrent runs do not collide, and the shared `ark-platform` Compose project is never touched. Pass other `bun test` arguments to run something else (`mise run test:db -- server/src/coordinator.test.ts`). To keep a database for repeated single-file runs, load it with `eval "$(mise run test:db:up)"`, run `ark_test_db <file>` (the emitted helper also isolates follow-up tests from your shell’s provider settings), and remove it with the `mise run test:db:down <container>` command that `up` prints.
 
@@ -89,7 +91,7 @@ templates/  Reviewed application service definitions
 
 Public administration and public database endpoints are independent. Tailnet-only admin mode does not publish a public dashboard route.
 
-The full documentation starts at [docs/index.md](docs/index.md): an introduction, installation, every feature, operations, security and reference pages, organised by the sidebar in [docs/nav.json](docs/nav.json). Browse it as a site with `mise run docs:serve` (http://127.0.0.1:4321/), build it with `mise run docs:build` (static HTML in `dist/docs`) and check it with `mise run docs:check`.
+The full documentation starts at [docs/index.md](docs/index.md): an introduction, installation, every feature, operations, security and reference pages, organised by the sidebar in [docs/nav.json](docs/nav.json). Browse it as a site with `mise run docs:serve` (http://127.0.0.1:4321/), build it with `mise run docs:build` (static HTML in `dist/docs`) and check it with `mise run docs:check`. Builds require an empty output directory or one with a docs build manifest. If you have an older unmarked `dist/docs`, move it aside or choose a fresh directory with `--out`.
 
 Documentation: [architecture](docs/architecture.md), [operating runbooks](docs/operating.md), [security review](docs/security-review.md), and the guides for the [front door](docs/guides/front-door.md), [database access from Vercel](docs/guides/vercel-database.md) and [off-VPS backups](docs/guides/backups.md). The front-door design and its as-built summary are in [docs/design/front-door.md](docs/design/front-door.md).
 

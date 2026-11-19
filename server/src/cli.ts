@@ -22,7 +22,8 @@ if (command === "status") {
         setup,
         users: counts.users,
         setupTokenConfigured: Boolean(process.env.ARK_SETUP_TOKEN),
-        recoveryHint: "Use an SSH tunnel to http://127.0.0.1:3000 and the setup token from the host secret.",
+        recoveryHint:
+          "Use an SSH tunnel and a registered browser origin (http://localhost:3000 by default) with the host setup token.",
       },
       null,
       2,

@@ -2,29 +2,20 @@
 // with a sidebar of sections, an "On this page" list, previous/next links and offline full-text search.
 //
 //   bun scripts/docs-site/build.ts build [--out dir]     (also: mise run docs:build, default out dist/docs)
-//   bun scripts/docs-site/build.ts serve [--port n]      (also: mise run docs:serve, rebuilds on change)
+//   bun scripts/docs-site/build.ts serve [--out dir] [--port n]      (also: mise run docs:serve, rebuilds on change)
 //
 // The navigation is docs/nav.json. Every Markdown file under docs/ must appear in it exactly once.
 // Pages keep working on GitHub: links between .md files are rewritten to the generated .html pages,
 // and links to other repository files point at the repository on GitHub. Heading anchors use the same
 // GitHub slugs as scripts/check-docs.ts, so `page.md#anchor` links resolve on both.
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  statSync,
-  watch,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, watch } from "node:fs";
 import { dirname, join, normalize, posix, relative, resolve } from "node:path";
 
-import { slug } from "../check-docs.ts";
+import { headingIds } from "../check-docs.ts";
+import { loadNav, type Nav } from "./nav.ts";
+import { outputDirectory, previewResponse, writeSite } from "./output.ts";
 
-export type NavPage = { file: string; title?: string };
-export type NavSection = { title: string; pages: NavPage[] };
-export type Nav = { title: string; repository: string; branch: string; sections: NavSection[] };
+export { loadNav, type Nav, type NavPage, type NavSection } from "./nav.ts";
 
 export type Heading = { level: number; id: string; text: string };
 export type Page = {
@@ -40,12 +31,18 @@ export type SearchEntry = { page: string; section: string; title: string; url: s
 
 const ROOT = join(import.meta.dir, "..", "..");
 const ASSETS = import.meta.dir;
-const MERMAID = "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const MERMAID = "https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.esm.min.mjs";
 
 /** Output path of a source file, relative to the site root: docs/a/b.md → a/b.html, README.md → readme.html. */
 export function pageUrl(file: string) {
   if (file === "README.md") return "readme.html";
-  if (!file.startsWith("docs/") || !file.endsWith(".md")) throw new Error(`not a docs page: ${file}`);
+  if (
+    !file.startsWith("docs/") ||
+    !file.endsWith(".md") ||
+    file.includes("\\") ||
+    posix.normalize(file) !== file
+  )
+    throw new Error(`not a docs page: ${file}`);
   return file.slice("docs/".length, -".md".length) + ".html";
 }
 
@@ -53,13 +50,6 @@ export function pageUrl(file: string) {
 export function relativeUrl(fromUrl: string, toPath: string) {
   const result = posix.relative(posix.dirname(fromUrl), toPath);
   return result === "" ? posix.basename(toPath) : result;
-}
-
-export function loadNav(root = ROOT): Nav {
-  const nav = JSON.parse(readFileSync(join(root, "docs/nav.json"), "utf8")) as Nav;
-  if (!nav.title || !nav.repository || !Array.isArray(nav.sections))
-    throw new Error("docs/nav.json is malformed");
-  return nav;
 }
 
 /** Every Markdown file under docs/, relative to the repository root. */
@@ -125,9 +115,16 @@ export type RenderContext = {
 /** Rewrite one link target found in `file` (rendered at `url`). */
 export function rewriteHref(ctx: RenderContext, file: string, url: string, href: string) {
   if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(href)) return href;
-  const [pathPart, anchor] = href.split("#") as [string, string | undefined];
-  const resolved = normalize(join(dirname(file), decodeURI(pathPart))).replace(/\\/g, "/");
-  const hash = anchor === undefined ? "" : `#${anchor}`;
+  const separator = href.indexOf("#");
+  const pathPart = separator < 0 ? href : href.slice(0, separator);
+  const hash = separator < 0 ? "" : href.slice(separator);
+  let decoded: string;
+  try {
+    decoded = decodeURI(pathPart);
+  } catch {
+    return href;
+  }
+  const resolved = normalize(join(dirname(file), decoded)).replace(/\\/g, "/");
   const target = ctx.pages.get(resolved);
   if (target) return relativeUrl(url, target) + hash;
   if (resolved.startsWith("..")) return href;
@@ -140,15 +137,12 @@ export function renderMarkdown(ctx: RenderContext, file: string, markdown: strin
   const url = ctx.pages.get(file) ?? pageUrl(file);
   let html = Bun.markdown.html(markdown, { autolinks: { url: true, www: false, email: false } });
   const headings: Heading[] = [];
-  const seen = new Map<string, number>();
+  const nextId = headingIds();
 
   // Heading ids are GitHub slugs with -1, -2 suffixes for repeats, like scripts/check-docs.ts anchors().
   html = html.replace(/<h([1-6])>([\s\S]*?)<\/h\1>/g, (_, level: string, inner: string) => {
     const text = stripTags(inner).trim();
-    const base = slug(text);
-    const count = seen.get(base) ?? 0;
-    seen.set(base, count + 1);
-    const id = count ? `${base}-${count}` : base;
+    const id = nextId(text);
     headings.push({ level: Number(level), id, text });
     const anchor =
       Number(level) > 1 ? `<a class="anchor" href="#${id}" aria-label="Link to this section">#</a>` : "";
@@ -198,12 +192,12 @@ export function searchEntries(page: Page): SearchEntry[] {
       ? stripTags(match[3]!.replace(/<a class="anchor"[\s\S]*?<\/a>/, "")).trim()
       : page.title;
     const body = match ? part.slice(match[0].length) : part;
-    const text = stripTags(body.replace(/<pre[\s\S]*?<\/pre>/g, " "))
+    const text = stripTags(body.replace(/<\/(?:p|li|t[dh]|pre|h[1-6])>/g, " "))
       .replace(/\s+/g, " ")
       .trim();
     if (!text && !match) continue;
     const url = match && match[1] !== "1" ? `${page.url}#${match[2]}` : page.url;
-    entries.push({ page: page.title, section: page.section, title, url, text: text.slice(0, 4000) });
+    entries.push({ page: page.title, section: page.section, title, url, text });
   }
   return entries;
 }
@@ -313,20 +307,18 @@ export function renderSite(root = ROOT) {
 }
 
 export function buildSite(out: string, root = ROOT) {
+  out = outputDirectory(out, root, ASSETS);
   const { nav, pages } = renderSite(root);
-  rmSync(out, { recursive: true, force: true });
-  mkdirSync(join(out, "assets"), { recursive: true });
-  pages.forEach((page, index) => {
-    const target = join(out, page.url);
-    mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, layout(nav, pages, index));
-  });
-  writeFileSync(join(out, "assets/style.css"), readFileSync(join(ASSETS, "style.css")));
-  writeFileSync(join(out, "assets/site.js"), readFileSync(join(ASSETS, "site.js")));
+  const files = new Map<string, string | Buffer>(
+    pages.map((page, index) => [page.url, layout(nav, pages, index)]),
+  );
+  files.set("assets/style.css", readFileSync(join(ASSETS, "style.css")));
+  files.set("assets/site.js", readFileSync(join(ASSETS, "site.js")));
   // Loaded on first search, as a script rather than JSON so the site also works from file://.
   const index = pages.flatMap(searchEntries);
-  writeFileSync(join(out, "assets/search-index.js"), `window.ARK_DOCS_INDEX=${JSON.stringify(index)};\n`);
-  writeFileSync(join(out, ".nojekyll"), "");
+  files.set("assets/search-index.js", `window.ARK_DOCS_INDEX=${JSON.stringify(index)};\n`);
+  files.set(".nojekyll", "");
+  writeSite(out, files);
   return { pages: pages.length, entries: index.length };
 }
 
@@ -335,36 +327,36 @@ function option(args: string[], name: string) {
   return index >= 0 ? args[index + 1] : undefined;
 }
 
-async function serve(out: string, port: number) {
+export function servePreview(out: string, port: number) {
+  return Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    fetch: (request) => previewResponse(out, request),
+  });
+}
+
+function serve(out: string, port: number) {
+  out = outputDirectory(out, ROOT, ASSETS);
   const rebuild = () => {
-    try {
-      const result = buildSite(out);
-      console.log(`built ${result.pages} pages`);
-    } catch (error) {
-      console.error((error as Error).message);
-    }
+    const result = buildSite(out);
+    console.log(`built ${result.pages} pages`);
   };
   rebuild();
   let timer: Timer | undefined;
   const schedule = () => {
     clearTimeout(timer);
-    timer = setTimeout(rebuild, 150);
+    timer = setTimeout(() => {
+      try {
+        rebuild();
+      } catch (error) {
+        console.error((error as Error).message);
+      }
+    }, 150);
   };
   watch(join(ROOT, "docs"), { recursive: true }, schedule);
   watch(ASSETS, schedule);
   watch(join(ROOT, "README.md"), schedule);
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port,
-    fetch(request) {
-      let path = decodeURIComponent(new URL(request.url).pathname);
-      if (path.endsWith("/")) path += "index.html";
-      const file = normalize(join(out, path));
-      if (!file.startsWith(out) || !existsSync(file) || statSync(file).isDirectory())
-        return new Response("Not found", { status: 404 });
-      return new Response(Bun.file(file));
-    },
-  });
+  const server = servePreview(out, port);
   console.log(`docs site on http://127.0.0.1:${server.port}/ (rebuilds when docs change)`);
 }
 
@@ -377,9 +369,9 @@ if (import.meta.main) {
       `Built ${result.pages} pages (${result.entries} search entries) in ${relative(process.cwd(), out) || "."}`,
     );
   } else if (command === "serve") {
-    await serve(out, Number(option(args, "--port") ?? 4321));
+    serve(out, Number(option(args, "--port") ?? 4321));
   } else {
-    console.error("usage: bun scripts/docs-site/build.ts build [--out dir] | serve [--port n]");
+    console.error("usage: bun scripts/docs-site/build.ts build [--out dir] | serve [--out dir] [--port n]");
     process.exit(2);
   }
 }

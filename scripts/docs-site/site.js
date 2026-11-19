@@ -137,6 +137,7 @@
   var index = null;
   var loading = null;
   var selected = -1;
+  var searchRequest = 0;
 
   function loadIndex() {
     if (index) return Promise.resolve(index);
@@ -148,7 +149,11 @@
         index = window.ARK_DOCS_INDEX || [];
         resolve(index);
       });
-      script.addEventListener("error", reject);
+      script.addEventListener("error", function () {
+        loading = null;
+        script.remove();
+        reject(new Error("Could not load the search index"));
+      });
       document.head.appendChild(script);
     });
     return loading;
@@ -264,23 +269,48 @@
   function move(step) {
     var links = results.querySelectorAll("a");
     if (!links.length) return;
-    selected = (selected + step + links.length) % links.length;
+    selected = selected < 0 && step < 0 ? links.length - 1 : (selected + step + links.length) % links.length;
     links.forEach(function (link, i) {
       link.setAttribute("aria-selected", String(i === selected));
     });
     links[selected].scrollIntoView({ block: "nearest" });
   }
 
+  function dismiss() {
+    searchRequest += 1;
+    selected = -1;
+    results.hidden = true;
+    results.textContent = "";
+  }
+
   input.addEventListener("focus", function () {
     loadIndex().catch(function () {});
   });
   input.addEventListener("input", function () {
+    dismiss();
     var query = input.value.trim();
-    loadIndex().then(function () {
-      if (input.value.trim() === query) render(query);
-    });
+    if (!terms(query).length) return;
+    var request = searchRequest;
+    loadIndex()
+      .then(function () {
+        if (request === searchRequest) render(query);
+      })
+      .catch(function () {
+        if (request !== searchRequest) return;
+        var message = document.createElement("div");
+        message.className = "empty";
+        message.textContent = "Search is unavailable. Edit your query to try again.";
+        results.appendChild(message);
+        results.hidden = false;
+      });
   });
   input.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") {
+      dismiss();
+      input.blur();
+      return;
+    }
+    if (results.hidden) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
       move(1);
@@ -291,13 +321,10 @@
       var links = results.querySelectorAll("a");
       var target = links[selected >= 0 ? selected : 0];
       if (target) window.location.href = target.href;
-    } else if (event.key === "Escape") {
-      results.hidden = true;
-      input.blur();
     }
   });
   document.addEventListener("click", function (event) {
-    if (!event.target.closest(".search")) results.hidden = true;
+    if (!event.target.closest(".search")) dismiss();
   });
   document.addEventListener("keydown", function (event) {
     var typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);

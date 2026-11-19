@@ -132,7 +132,13 @@ export async function ensureMailSubmission(
 }
 
 export async function startLocalMail(root: string, credential: Credential) {
-  const compose = ["compose", "-f", join(root, "infra", "mail", "docker-compose.yml")];
+  const compose = [
+    "compose",
+    "--env-file",
+    join(root, ".env"),
+    "-f",
+    join(root, "infra", "mail", "docker-compose.yml"),
+  ];
   await hostCommand("docker", [...compose, "up", "-d", "--wait", "--wait-timeout", "120"]);
   const container = (await hostCommand("docker", [...compose, "ps", "-q", "stalwart"])).trim();
   if (!container) throw new Error("Stalwart container not found after Compose startup.");

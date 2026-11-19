@@ -66,13 +66,10 @@ test("Compose propagates exact peer pins and allows API startup without an optio
     expect(api.ARK_EDGE_PEER_ADDRESSES).toBe(env.ARK_EDGE_PEER_ADDRESSES!);
     expect(api.ARK_EDGE_GATE_TOKEN).toBe(supplied ?? "");
     expect(config.services["tailnet-gateway"].environment.ARK_EDGE_GATE_TOKEN).toBe(supplied ?? "");
-    // Supply the other startup secrets from the installer fixture; the contract under test is
-    // the rendered token and peer-pin values, not unrelated deployment secret provisioning.
-    const startup = { ...generateInstallSecrets(), ...api };
-    expect(() => assertNoPlaceholderSecrets(startup)).not.toThrow();
+    expect(() => assertNoPlaceholderSecrets(api, { embeddedWorkers: false })).not.toThrow();
     if (!supplied) {
       const started = await run(["bun", "server/src/index.ts"], {
-        ...startup,
+        ...api,
         PATH: process.env.PATH,
         DATABASE_URL: process.env.DATABASE_URL,
         ARK_SKIP_LISTEN: "1",

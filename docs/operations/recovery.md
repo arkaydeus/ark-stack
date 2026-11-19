@@ -26,23 +26,27 @@ The raw API listener is published only on `127.0.0.1:3000` on the host. Whatever
 ssh -L 3000:127.0.0.1:3000 <user>@<host>
 ```
 
-Then open `http://127.0.0.1:3000`. The API answers only registered hosts, so keep `http://127.0.0.1:3000` in `BETTER_AUTH_TRUSTED_ORIGINS` if you rely on tunnel sign-in.
+Open `http://localhost:3000` in your local browser. Keep that origin in `BETTER_AUTH_TRUSTED_ORIGINS` if you later change the admin URL. To use `http://127.0.0.1:3000` in the browser, add it explicitly and recreate the API service.
 
 ### The recover CLI
 
-`mise run recover -- <command>` runs `server/src/cli.ts` against the database in `.env`. It never changes data except for `reset-setup`.
+The recovery CLI (`server/src/cli.ts`) reads bootstrap state and users. Only `reset-setup` changes data.
 
 | Command       | What it does                                                                                                                                                               |
 | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `help`        | Lists the commands (the default).                                                                                                                                          |
-| `status`      | Prints the `platform_setup` row, the user count, whether `ARK_SETUP_TOKEN` is configured, and a hint to use an SSH tunnel to `http://127.0.0.1:3000` with the setup token. |
+| `status`      | Prints the `platform_setup` row, the user count, whether `ARK_SETUP_TOKEN` is configured, and a tunnel hint. Use the registered browser origin from the preceding section. |
 | `owners`      | Lists every user's email and platform role.                                                                                                                                |
 | `reset-setup` | Reopens setup and the domain wizard, and prints a suggested token. It refuses while any user exists.                                                                       |
 
+On the production VPS, run from the repository root. The API container already has the internal database URL and the setup token. Production Compose leaves the database on an internal network, so host tasks using the development URL on loopback cannot connect.
+
 ```sh
-mise run recover -- status
-mise run recover -- owners
+docker compose --env-file .env -f infra/platform/docker-compose.yml exec api bun server/src/cli.ts status
+docker compose --env-file .env -f infra/platform/docker-compose.yml exec api bun server/src/cli.ts owners
 ```
+
+In local development with PostgreSQL listening on the host as configured in `.env`, use `mise run recover -- status` or `mise run recover -- owners`. Use the same environment-specific invocation for `reset-setup`.
 
 Setup cannot be reopened while users exist. If the remaining owners are unusable, change roles through the UI or a reviewed SQL break-glass, as the CLI's refusal message says; do not delete users to reopen setup.
 
@@ -55,10 +59,20 @@ Setup cannot be reopened while users exist. If the remaining owners are unusable
 
 ## Resetting an owner's MFA
 
-`mise run recover:mfa` (`scripts/recover-mfa.ts`) is a deliberate, host-local reset for an owner who has lost every factor. It needs three arguments: the owner's email, the confirmation `RESET:<email>`, and the value of `ARK_MFA_RECOVERY_TOKEN`.
+The reset script (`scripts/recover-mfa.ts`) takes the owner's email, the confirmation `RESET:<email>`, and the value of `ARK_MFA_RECOVERY_TOKEN`. Replace the example email with the owner's email in lowercase.
+
+On the production VPS, run from the repository root. The shell inside the API container expands the token using the container's environment.
 
 ```sh
-mise run recover:mfa -- owner@example.com RESET:owner@example.com "$ARK_MFA_RECOVERY_TOKEN"
+docker compose --env-file .env -f infra/platform/docker-compose.yml exec api \
+  sh -c 'exec bun scripts/recover-mfa.ts "$1" "RESET:$1" "$ARK_MFA_RECOVERY_TOKEN"' sh owner@example.com
+```
+
+For a local development database, read the token with Bun before passing it to the reset task.
+
+```sh
+mise run recover:mfa -- owner@example.com RESET:owner@example.com \
+  "$(bun --env-file=.env -p 'process.env.ARK_MFA_RECOVERY_TOKEN ?? ""')"
 ```
 
 The script refuses (and prints its usage) unless the confirmation matches the email exactly and the token matches `ARK_MFA_RECOVERY_TOKEN` in a constant-time comparison. It then, in one transaction under an advisory lock:

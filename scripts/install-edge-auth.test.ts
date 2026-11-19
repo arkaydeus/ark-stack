@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, copyFile, mkdir, mkdtemp, rm, stat, symlink } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -119,7 +119,15 @@ for (const inherited of ["tskey-auth-inherited-other", ""]) {
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));
-      expect(calls.some((call) => call.args.includes("compose"))).toBe(true);
+      const composeCalls = calls.filter((call) => call.args[0] === "compose");
+      expect(composeCalls.length).toBeGreaterThan(0);
+      const generatedEnv = await realpath(envPath);
+      for (const { args } of composeCalls) {
+        const envFlag = args.indexOf("--env-file");
+        expect(envFlag).toBeGreaterThan(0);
+        expect(args[envFlag + 1]).toBe(generatedEnv);
+      }
+      expect(stdout).toContain("Setup URL: http://localhost:3000");
       expect(calls.map((call) => ({ args: call.args, key: call.key }))).toEqual(
         calls.map((call) => ({ args: call.args, key: installedKey })),
       );
@@ -134,6 +142,42 @@ for (const inherited of ["tskey-auth-inherited-other", ""]) {
     }
   });
 }
+
+test("the first install passes its generated environment to Compose", async () => {
+  const directory = await fixture();
+  try {
+    await copyFile(join(root, ".env.example"), join(directory, ".env.example"));
+    const child = Bun.spawn([process.execPath, "scripts/install.ts"], {
+      cwd: directory,
+      env: {
+        ...process.env,
+        PATH: `${directory}/bin:${process.env.PATH}`,
+        TS_EDGE_AUTHKEY: "",
+        ARK_INSTALL_NONINTERACTIVE: "1",
+        ARK_INSTALL_SKIP_DOCKER: "0",
+        INSTALL_CALLS: join(directory, "calls"),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    expect(code, stderr).toBe(0);
+    const envPath = await realpath(join(directory, ".env"));
+    const calls = (await Bun.file(join(directory, "calls")).text()).trim().split("\n");
+    const build = calls
+      .map((line) => JSON.parse(line).args as string[])
+      .find((args) => args.includes("build"));
+    expect(build?.slice(0, 3)).toEqual(["compose", "--env-file", envPath]);
+    expect(await Bun.file(envPath).text()).toContain("BETTER_AUTH_URL=http://localhost:3000");
+    expect(stdout).toContain("Setup URL: http://localhost:3000");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("prompt selection writes a normalized key without echoing it", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ark-auth-prompt-"));

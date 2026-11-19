@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,8 +23,11 @@ import {
   renderSite,
   rewriteHref,
   searchEntries,
+  servePreview,
   type RenderContext,
 } from "./build.ts";
+
+import { isWithinDirectory } from "./output.ts";
 
 const root = join(import.meta.dir, "..", "..");
 const nav = loadNav(root);
@@ -54,6 +66,11 @@ describe("docs site paths", () => {
     );
     expect(rewriteHref(ctx, ...from, "../../infra")).toBe(`${nav.repository}/tree/${nav.branch}/infra`);
     expect(rewriteHref(ctx, "README.md", "readme.html", "docs/operating.md")).toBe("operating.html");
+  });
+  test("malformed percent-encoding leaves a relative link unchanged", () => {
+    const href = "literal%file.md#section";
+    expect(rewriteHref(ctx, "docs/index.md", "index.html", href)).toBe(href);
+    expect(renderMarkdown(ctx, "docs/index.md", `[Percent](${href})`).html).toContain(`href="${href}"`);
   });
 });
 
@@ -113,6 +130,42 @@ describe("docs site rendering", () => {
     ]);
     expect(entries[1]!.text).toBe("See runbooks.");
   });
+  test("numbered headings have distinct self-links and search destinations", () => {
+    const fixture = "# Title\n## Setup\n## Setup\n## Setup 1\n## Setup";
+    const rendered = renderMarkdown(ctx, "docs/index.md", fixture);
+    const ids = ["title", "setup", "setup-1", "setup-1-1", "setup-2"];
+    expect(rendered.headings.map(({ id }) => id)).toEqual(ids);
+    expect([...anchors(fixture)]).toEqual(ids);
+    for (const id of ids.slice(1)) {
+      expect(rendered.html).toContain(`<h2 id="${id}">`);
+      expect(rendered.html).toContain(`href="#${id}"`);
+    }
+    const entries = searchEntries({
+      ...rendered,
+      file: "docs/index.md",
+      url: "index.html",
+      title: "Title",
+      section: "Start",
+    });
+    expect(entries.slice(1).map(({ url }) => url)).toEqual(ids.slice(1).map((id) => `index.html#${id}`));
+  });
+
+  test("search indexes commands and the end of a long section", () => {
+    const fixture =
+      "# Title\n## Commands\n" +
+      "before ".repeat(800) +
+      "\n\n```sh\nexport SOME_SETTING=ready\n```\n\nlate-reference";
+    const rendered = renderMarkdown(ctx, "docs/index.md", fixture);
+    const [, commands] = searchEntries({
+      ...rendered,
+      file: "docs/index.md",
+      url: "index.html",
+      title: "Title",
+      section: "Start",
+    });
+    expect(commands!.text).toContain("export SOME_SETTING=ready");
+    expect(commands!.text).toEndWith("late-reference");
+  });
 });
 
 describe("the documentation site", () => {
@@ -164,6 +217,106 @@ describe("the documentation site", () => {
       expect(index.startsWith("window.ARK_DOCS_INDEX=")).toBe(true);
     } finally {
       rmSync(out, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("docs output ownership and preview", () => {
+  test("rejects source directories, their parents and aliases without touching data", () => {
+    const parent = mkdtempSync(join(tmpdir(), "ark-docs-source-"));
+    try {
+      const checkout = join(parent, "checkout");
+      mkdirSync(join(checkout, "docs"), { recursive: true });
+      writeFileSync(join(checkout, "docs/index.md"), "source");
+      const alias = join(parent, "alias");
+      symlinkSync(join(checkout, "docs"), alias, "dir");
+      for (const out of [
+        parent,
+        checkout,
+        join(checkout, "docs"),
+        join(checkout, "docs/site"),
+        join(alias, "new"),
+      ])
+        expect(() => buildSite(out, checkout)).toThrow("overlaps documentation sources");
+      expect(readFileSync(join(checkout, "docs/index.md"), "utf8")).toBe("source");
+      expect(existsSync(join(alias, "new"))).toBe(false);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses unmarked output and preserves unowned files on later builds", () => {
+    const out = mkdtempSync(join(tmpdir(), "ark-docs-output-"));
+    try {
+      const sentinel = join(out, "unrelated.txt");
+      writeFileSync(sentinel, "keep");
+      expect(() => buildSite(out, root)).toThrow("has no docs manifest");
+      expect(readFileSync(sentinel, "utf8")).toBe("keep");
+
+      const clean = join(out, "site");
+      buildSite(clean, root);
+      const later = join(clean, "unrelated.html");
+      writeFileSync(later, "keep this too");
+      buildSite(clean, root);
+      expect(readFileSync(later, "utf8")).toBe("keep this too");
+      expect(existsSync(join(clean, "index.html"))).toBe(true);
+    } finally {
+      rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test("rebuild removes obsolete generated pages while keeping files in the same folder", () => {
+    const parent = mkdtempSync(join(tmpdir(), "ark-docs-rebuild-"));
+    try {
+      const checkout = join(parent, "checkout");
+      const out = join(checkout, "dist/docs");
+      const guide = "docs/guides/temporary.md";
+      mkdirSync(join(checkout, "docs/guides"), { recursive: true });
+      writeFileSync(join(checkout, "docs/index.md"), "# Home");
+      writeFileSync(join(checkout, guide), "# Temporary");
+      const manifest = (paths: string[]) => ({
+        ...nav,
+        sections: [{ title: "Fixture", pages: paths.map((file) => ({ file })) }],
+      });
+      writeFileSync(join(checkout, "docs/nav.json"), JSON.stringify(manifest(["docs/index.md", guide])));
+      buildSite(out, checkout);
+      expect(existsSync(join(out, "guides/temporary.html"))).toBe(true);
+      writeFileSync(join(out, "guides/keep.txt"), "keep");
+      rmSync(join(checkout, guide));
+      writeFileSync(join(checkout, "docs/nav.json"), JSON.stringify(manifest(["docs/index.md"])));
+      buildSite(out, checkout);
+      expect(existsSync(join(out, "guides/temporary.html"))).toBe(false);
+      expect(readFileSync(join(out, "guides/keep.txt"), "utf8")).toBe("keep");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("containment distinguishes a child, a sibling with a common prefix, and a dotted filename", () => {
+    const out = join(tmpdir(), "ark-docs");
+    expect(isWithinDirectory(out, join(out, "guides/intro.html"))).toBe(true);
+    expect(isWithinDirectory(out, join(out, "..notes.html"))).toBe(true);
+    expect(isWithinDirectory(out, join(tmpdir(), "ark-docs-private", "intro.html"))).toBe(false);
+  });
+
+  test("preview serves nested files and handles missing or invalid paths and out-of-root links", async () => {
+    const parent = realpathSync(mkdtempSync(join(tmpdir(), "ark-docs-preview-")));
+    const out = join(parent, "site");
+    mkdirSync(join(out, "nested"), { recursive: true });
+    writeFileSync(join(out, "nested/guide.html"), "guide");
+    writeFileSync(join(parent, "other.html"), "another fixture");
+    symlinkSync(join(parent, "other.html"), join(out, "shortcut.html"));
+    const server = servePreview(out, 0);
+    try {
+      const response = await fetch(new URL("/nested/guide.html", server.url));
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("guide");
+      for (const path of ["/nested/", "/missing.html", "/shortcut.html"])
+        expect((await fetch(new URL(path, server.url))).status).toBe(404);
+      expect((await fetch(new URL("/invalid%", server.url))).status).toBe(400);
+    } finally {
+      await server.stop(true);
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 });

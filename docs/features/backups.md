@@ -42,7 +42,7 @@ flowchart LR
 
 ## Enabling backup execution
 
-Backups are planned but not executed until the operator turns execution on. All of these settings reach only `backup-worker` in the shipped Compose file.
+Backups are planned but not executed until the operator turns execution on. The shipped Compose file passes the execution, required and restore-runner settings to `backup-worker`. The scheduling and mail snapshot settings need a Compose override.
 
 | Setting                   | Default | Effect                                                                                                                                                                        |
 | ------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -53,6 +53,49 @@ Backups are planned but not executed until the operator turns execution on. All 
 | `ARK_MAIL_SNAPSHOT_READY` | unset   | Mail backups refuse to run unless this is `1`, set after a completed native Stalwart snapshot or quiesce step. A live RocksDB copy is not treated as a backup.                |
 
 Set `ARK_BACKUP_EXECUTE=1` in `.env` and recreate the worker with `docker compose --env-file .env -f infra/platform/docker-compose.yml up -d backup-worker`. The installer leaves execution off.
+
+To pause scheduling, save this override as `compose.backup-schedule.local.yml` in the checkout root:
+
+```yaml
+services:
+  backup-worker:
+    environment:
+      ARK_BACKUP_SCHEDULE: "0"
+```
+
+Apply it from the checkout root:
+
+```sh
+docker compose --env-file .env -f infra/platform/docker-compose.yml \
+  -f compose.backup-schedule.local.yml up -d backup-worker
+```
+
+Already queued jobs can still run. Without new observations, the home target’s six-minute lease expires and transfers to that target stop or fail closed. Remove the scheduling override and recreate the worker to resume.
+
+For mail, first complete a native Stalwart snapshot or a quiesced copy. Save a separate override as `compose.mail-snapshot.local.yml`:
+
+```yaml
+services:
+  backup-worker:
+    environment:
+      ARK_MAIL_SNAPSHOT_READY: "1"
+    volumes:
+      - type: bind
+        source: /srv/ark/completed-stalwart-snapshot
+        target: /var/lib/stalwart-snapshot
+        read_only: true
+        bind:
+          create_host_path: false
+```
+
+Replace the source with the absolute path to the completed snapshot. Recreate the worker with the mail override after enabling backup execution:
+
+```sh
+docker compose --env-file .env -f infra/platform/docker-compose.yml \
+  -f compose.mail-snapshot.local.yml up -d backup-worker
+```
+
+Include any other worker overrides you still need when recreating the service. Remove the readiness override and recreate it when the completed snapshot is no longer available.
 
 The installer generates the per-cluster secrets the PostgreSQL containers need: `ARK_PLATFORM_PG_EXECUTOR_TOKEN`, `ARK_APP_PG_EXECUTOR_TOKEN`, `ARK_PLATFORM_PG_REPO_CIPHER_PASS` and `ARK_APP_PG_REPO_CIPHER_PASS`. Copy both cipher passes off-host: without them an off-VPS copy cannot be decrypted (see [Recovery material to keep off-host](../guides/backups.md#recovery-material-to-keep-off-host)).
 

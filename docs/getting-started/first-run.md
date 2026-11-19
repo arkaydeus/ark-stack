@@ -36,7 +36,7 @@ Setup is single-use:
 - If users exist but setup was never marked complete (for example after an interrupted bootstrap), the API grants the existing users the owner role, closes setup and answers `Setup is already complete. Sign in with the existing administrator.`
 - `GET /api/setup/status` reports `required` (no owner yet) and `wizardRequired` (owner exists, wizard not done).
 
-The token is not used again. `mise run recover -- reset-setup` reopens setup only when no users exist at all; see [Recovery](../operations/recovery.md).
+The token is not used again. The [recovery CLI](../operations/recovery.md#the-recover-cli) can reopen setup only when no users exist.
 
 ## Enrol MFA
 

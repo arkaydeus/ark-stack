@@ -75,7 +75,9 @@ const edgeAuthKey = await configureEdgeAuthKey(envPath);
 const sni = applyEdgeSniPorts(await Bun.file(envPath).text(), process.env.ARK_EDGE_SNI_PORTS);
 const values = parseEnvFile(sni.env);
 const enableMail = mailEnabled(process.env.ARK_MAIL_ENABLED ?? values.ARK_MAIL_ENABLED);
-const compose = ["compose", "-f", "infra/platform/docker-compose.yml"];
+const composeEnv = ["--env-file", envPath];
+const compose = ["compose", ...composeEnv, "-f", "infra/platform/docker-compose.yml"];
+const mailCompose = ["compose", ...composeEnv, "-f", "infra/mail/docker-compose.yml"];
 const edgeNetwork = {
   project: "ark-platform",
   network: "admin",
@@ -87,14 +89,14 @@ const mailNetwork = {
   project: "ark-mail",
   network: "mail-public",
   service: "stalwart",
-  compose: ["compose", "-f", "infra/mail/docker-compose.yml"],
+  compose: mailCompose,
 };
 async function stopDisabledMail() {
   if (!useDocker || enableMail) return;
   // Stop the old firewall writer before changing the baseline and remove its old container
   // configuration so that Docker cannot restart it with mail enabled after an interrupted install.
   if (hardened) await run("docker", [...compose, "rm", "--stop", "--force", "database-ingress"]);
-  await run("docker", ["compose", "-f", "infra/mail/docker-compose.yml", "stop", "stalwart"]);
+  await run("docker", [...mailCompose, "stop", "stalwart"]);
   // Until the API is recreated with the new setting it can still accept mail mutations.
   await run("docker", [...compose, "stop", "mail-worker", "api"]);
 }
@@ -308,11 +310,12 @@ if (useDocker) {
   // A re-run that restarted edge-ts in place would otherwise leave edge and edge-l4 in its old namespace.
   await rejoinNamespaceDependents({
     project: "ark-platform",
-    composeArgs: ["-f", join(root, "infra/platform/docker-compose.yml"), "-p", "ark-platform"],
+    composeArgs: [...composeEnv, "-f", join(root, "infra/platform/docker-compose.yml"), "-p", "ark-platform"],
   });
   if (hardened) await installIpv6Observer(root);
   await run("docker", [
     "compose",
+    ...composeEnv,
     "-f",
     "infra/monitoring/docker-compose.yml",
     "up",
@@ -324,7 +327,7 @@ if (useDocker) {
 }
 
 console.log(`Ark Stack host install ready.
-Setup URL: http://127.0.0.1:3000
+Setup URL: http://localhost:3000
 Setup token: ${parsed.ARK_SETUP_TOKEN}
 Use an SSH tunnel if this host is remote. Create the owner, enroll MFA, then run the domain wizard.
 Do not reuse this token after bootstrap closes.

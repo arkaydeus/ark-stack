@@ -392,7 +392,7 @@ Confirm listener and session state independently. Check database worker and `pgb
 
 ## Recovery
 
-`mise run recover -- status` prints bootstrap state without changing data. Setup cannot be reopened while users exist. Keep local recovery codes and the generated `ARK_MFA_RECOVERY_TOKEN` off-host. If an owner loses every factor, run `mise run recover:mfa -- owner@example.com RESET:owner@example.com "$ARK_MFA_RECOVERY_TOKEN"` on the host. It revokes every session and step-up grant before permitting re-enrollment.
+Use the [recovery CLI](operations/recovery.md#the-recover-cli) to inspect bootstrap state without changing data. Setup cannot be reopened while users exist. Keep local recovery codes and the generated `ARK_MFA_RECOVERY_TOKEN` off-host. If an owner loses every factor, follow [Resetting an owner’s MFA](operations/recovery.md#resetting-an-owners-mfa). The reset revokes every session and step-up grant before re-enrollment.
 
 `mise run recover-host` prints the host-loss checklist. Restore into `infra/restore/docker-compose.yml` first. Do not reuse a failed Tailscale node identity.
 

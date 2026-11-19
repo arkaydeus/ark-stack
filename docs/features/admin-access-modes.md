@@ -37,18 +37,18 @@ The tailnet gateway's configuration does not depend on the mode. Whenever the `t
 
 ## Local bootstrap listener
 
-The `api` service publishes `127.0.0.1:3000:3000` and nothing else (`infra/platform/docker-compose.yml`). That is the bootstrap and host-recovery path: the installer prints `Setup URL: http://127.0.0.1:3000` and the setup token.
+The `api` service publishes `127.0.0.1:3000:3000` and nothing else (`infra/platform/docker-compose.yml`). That is the bootstrap and host-recovery path: the installer prints `Setup URL: http://localhost:3000` and the setup token.
 
 From a remote machine, forward the port over SSH (Tailscale SSH works once the host is hardened):
 
 ```sh
 ssh -L 3000:127.0.0.1:3000 <user>@<vps>
-# then open http://127.0.0.1:3000 in a local browser
+# then open http://localhost:3000 in a local browser
 ```
 
 Points to know:
 
-- **The host must be registered.** The API answers session-bearing requests only for the hosts of `BETTER_AUTH_URL` and `BETTER_AUTH_TRUSTED_ORIGINS`, and gives `421` for anything else. The installer's defaults are `BETTER_AUTH_URL=http://127.0.0.1:3000` and `BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:3000,http://127.0.0.1:5173`. When you later set `BETTER_AUTH_URL` to an HTTPS admin origin, keep `http://127.0.0.1:3000` in `BETTER_AUTH_TRUSTED_ORIGINS` if you still want to sign in through the tunnel ([Edge Tailscale node](../operating.md#edge-tailscale-node)).
+- **The host must be registered.** The API answers session-bearing requests only for the hosts of `BETTER_AUTH_URL` and `BETTER_AUTH_TRUSTED_ORIGINS`, and gives `421` for anything else. A fresh install uses `BETTER_AUTH_URL=http://localhost:3000` and trusts `http://localhost:5173` and `http://localhost:3000`. Keep `http://localhost:3000` in `BETTER_AUTH_TRUSTED_ORIGINS` when switching to an HTTPS admin origin. To use `http://127.0.0.1:3000` in the browser, add it explicitly to that list in `.env` and recreate the API service ([Edge Tailscale node](../operating.md#edge-tailscale-node)).
 - **No proxy in front.** Requests reach the API directly. Rate limits key on the transport peer, and no forwarded header is trusted.
 - **The maintenance endpoint is local only.** Both gateways answer `404` for `/api/internal/*`, `/api/metrics/prometheus` and `/api/platform/maintain`. `POST /api/platform/maintain` is therefore reachable only here. It needs an owner, the `x-maintenance-token` header (`ARK_MAINTENANCE_TOKEN`) and a `platform.update` grant. The usual maintenance path is `mise run maintain` on the host ([Maintenance](../operating.md#maintenance)).
 - **Recovery.** If both remote paths fail, the tunnel still works, as long as its origin stays registered.

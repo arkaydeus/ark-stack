@@ -57,7 +57,7 @@ What the directories cover:
 - **`.env`.** The task passes `--env-file=.env`. Database-backed test files also load `.env` themselves when `DATABASE_URL` is unset.
 - **A migrated database.** The `server` suites connect to `DATABASE_URL`. Locally, that is the dev cluster from `mise run db:up` and `mise run db:migrate`. Several suites refuse anything but a loopback host and create and drop their own uniquely named databases inside it.
 - **OpenSSL 3 or newer.** PKI and CSR tests use OpenSSL as an independent verifier and never fall back to macOS LibreSSL. `server/src/modules/test-openssl.ts` looks for `ARK_OPENSSL_BIN`, `openssl` on `PATH`, then the Homebrew `openssl@3` paths, and fails with "Tests require OpenSSL 3 or newer" otherwise.
-- **The built UI**, for `tests/browser/flows.test.ts`.
+- **The built UI**, for `tests/browser/flows.test.ts`. The broad unit selection includes both the browser HTTP flows and the IPv6 PostgreSQL probe. Export a disposable, migrated connection from `mise run test:db:up` before running the selection, even when it excludes the `server/` directory.
 
 > [!TIP]
 > If you do not want the unit run to touch your dev database, use `mise run test:db` for the `server` suites instead. It needs only Docker.
@@ -107,7 +107,7 @@ The custom Caddy build has its own Go test, `infra/edge-caddy/ratelimit-budget_t
 
 Playwright is configured in `playwright.config.ts`: specs in `e2e/`, one worker, no retries, traces kept on failure, and a base URL from `ARK_E2E_BASE_URL` (default `http://127.0.0.1:3199`). Install Chromium once with `bunx playwright install chromium`.
 
-There are three kinds of spec:
+There are four kinds of spec:
 
 - **UI-only specs** (`e2e/front-acl.spec.ts`, `e2e/gate-users.spec.ts`, `e2e/front-controls.spec.ts`, `e2e/dns-review.spec.ts`, `e2e/vercel-rollover.spec.ts`) start their own Vite dev server on the current `web/` source and answer the API with Playwright route stubs, including deliberately delayed responses. They need no database or API and can be run directly:
 
@@ -117,6 +117,7 @@ There are three kinds of spec:
 
 - **Onboarding** (`e2e/onboarding.spec.ts`) needs the harness below, which supplies a setup token, owner password and domain.
 - **The login gate** (`e2e/gate.spec.ts`) runs only through its own harness and is skipped in the regular run.
+- **Documentation site** (`bunx playwright test e2e/docs-site.spec.ts`) starts the local static preview and exercises search failure and retry, keyboard selection, the mobile sidebar and lazy Mermaid loading. It uses controlled browser routes, so it needs Chromium and Bun but no database or CDN access.
 
 ### `test:e2e`
 
@@ -195,7 +196,7 @@ Add `--watch` to `bun test` to rerun on change.
 3. `scripts/test-db.test.ts` with `ARK_TEST_DB_DOCKER=1`.
 4. Install `postgresql-client` and `openssl`, build the UI, then the unit run (`bun test shared server workers tests ...`), which includes the bounded DER fuzz and the OpenSSL CSR differential tests.
 5. `ARK_DOCKER_INTEGRATION=1 go test ./...` in `agent/`.
-6. Install Chromium, `bunx playwright test e2e/vercel-rollover.spec.ts`, then `scripts/test-e2e.ts`, `scripts/test-upgrade-migrations.ts`, the Stalwart integration and `scripts/test-pgbouncer-public.ts`.
+6. Install Chromium, `bunx playwright test e2e/vercel-rollover.spec.ts e2e/docs-site.spec.ts`, then `scripts/test-e2e.ts`, `scripts/test-upgrade-migrations.ts`, the Stalwart integration and `scripts/test-pgbouncer-public.ts`.
 7. Load the legacy IPv6 netfilter tables, then every `test:edge` step, `scripts/test-db-ingress.ts`, the native IPv6 preflight (`scripts/install-docker-ipv6.test.ts` and `scripts/ipv6-preflight-test/preflight.test.ts` through `scripts/test-db.ts`), `scripts/test-e2e-gate.ts`, and both backup suites.
 8. `scripts/check-image-plan.ts`, a `--no-cache` `docker buildx bake` of every image, `docker build --check` for the root and agent Dockerfiles, `docker compose config --quiet` for the platform (with and without the dev override), mail and monitoring manifests, and a `docker compose up --wait` of the two PostgreSQL services.
 
@@ -205,7 +206,7 @@ Add `--watch` to `bun test` to rerun on change.
 
 ## The documentation check
 
-`mise run docs:check` (`bun scripts/check-docs.ts`) keeps the docs honest. For the operator docs, the guides, the README and every docs-site page (`docs/index.md` and the section folders) it verifies:
+`mise run docs:check` (`bun scripts/check-docs.ts`) keeps the docs honest. It reads the published pages from `docs/nav.json`, including the README, guides and nested pages, and verifies:
 
 - relative links resolve to a file in the repository and `#anchors` to a heading in it, using GitHub's heading slugs;
 - backticked repository paths exist (anything under `docs/`, `scripts/`, `server/`, `shared/`, `workers/`, `web/`, `infra/`, `tests/`, `e2e/`, `agent/`, `templates/`, `.github/`, and root files such as `mise.toml` and `Dockerfile`); a `:line` suffix, globs and `<placeholders>` are allowed;
@@ -214,6 +215,6 @@ Add `--watch` to `bun test` to rerun on change.
 - backticked environment variables with the `ARK_`, `TS_`, `BETTER_AUTH_`, `DNS_API_`, `GHCR_` and `STALWART_` prefixes occur in tracked source;
 - ports written as `TCP n`, `UDP n`, `port n` or a backticked `:n` occur in tracked source.
 
-The historical front-door design document is checked for links, paths and tasks only. Files that are not yet committed are accepted, so a new page can link to another new page in the same change.
+The archived front-door design and first Fable review get structural checks for links, paths and tasks. The original implementation plan retains exceptions for its external source citations and proposed directory layout. Files that are not yet committed are accepted, so a new page can link to another new page in the same change.
 
 The check also runs as a unit test: `scripts/check-docs.test.ts` tests the slug, anchor and route-matching rules and asserts that the real repository has no drift, so `mise run test` and CI fail on a broken link or a renamed endpoint. Format docs with `bunx oxfmt <file>` like code.
