@@ -2,8 +2,10 @@
 //
 // It asks a short set of questions up front, then drives the existing installer phases in the order
 // of docs/getting-started/production-install.md: enrol the host, confirm Tailscale SSH, harden and
-// install, enrol the edge node, set the admin origin and ACME, close public SSH, apply the provider
-// firewall rules and audit, then print a summary. Progress is one line per step; the detail goes to
+// install, enrol the edge node (and, optionally, the backup node), set the admin origin and ACME,
+// close public SSH, apply the provider firewall rules and audit, then print a summary. With a
+// Tailscale API credential the policy change and the auth keys are automated (tailscale-api.ts); a
+// provider firewall adapter (provider-firewall.ts) applies the rules where one detects the provider. Progress is one line per step; the detail goes to
 // a redacted log. A root-only state file records each step, so a re-run verifies and resumes.
 import { join, resolve } from "node:path";
 
@@ -32,8 +34,17 @@ import {
   type HostPaths,
   type SessionOrigin,
 } from "./host-setup/steps.ts";
-import { Redactor, SetupLog, TerminalUi, runCommand, type Runner, type Ui } from "./host-setup/system.ts";
-import { manualKeySource, type TailscaleKeySource } from "./host-setup/tailscale-keys.ts";
+import {
+  Redactor,
+  SECRET_VARIABLES,
+  SetupLog,
+  TerminalUi,
+  runCommand,
+  type Runner,
+  type Ui,
+} from "./host-setup/system.ts";
+import { automaticKeySource } from "./host-setup/tailscale-api.ts";
+import type { TailscaleKeySource } from "./host-setup/tailscale-keys.ts";
 import { hostFirewallPath } from "./install-host-hardening.ts";
 
 export type SetupDependencies = {
@@ -53,7 +64,12 @@ export type SetupDependencies = {
     env: Record<string, string | undefined>;
     ui: Ui;
     interactive: boolean;
+    options: Options;
+    redactor: Redactor;
+    log: SetupLog;
   }) => TailscaleKeySource;
+  /** The Tailscale API base URL (tests point it at a mock server). */
+  tailscaleApi?: string;
   firewalls?: ProviderFirewall[];
   sleep?: (ms: number) => Promise<void>;
   sessionOrigin?: () => Promise<SessionOrigin>;
@@ -97,7 +113,7 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
   const stateDir = resolve(deps.stateDir);
   const envPath = join(deps.root, ".env");
   redactor.addEnv(readEnv(envPath));
-  for (const key of ["TS_VPS_AUTHKEY", "TS_EDGE_AUTHKEY", "DNS_API_TOKEN"]) redactor.add(deps.env[key]);
+  for (const key of SECRET_VARIABLES) redactor.add(deps.env[key]);
   const log = new SetupLog(join(stateDir, "setup.log"), redactor);
   const interactive = !options.nonInteractive && deps.stdinIsTty;
   const ui = deps.ui?.(interactive, log, redactor) ?? new TerminalUi(interactive, log, redactor, out);
@@ -153,7 +169,18 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
     options,
     interactive,
     env: deps.env,
-    keys: (deps.keys ?? manualKeySource)({ env: deps.env, ui, interactive }),
+    keys: (
+      deps.keys ??
+      ((input) =>
+        automaticKeySource({
+          ...input,
+          approve: options.approveTailnetPolicy,
+          backup: options.backupNode,
+          secret: (value) => redactor.add(value),
+          log: (line) => log.write(line),
+          apiBase: deps.tailscaleApi,
+        }))
+    )({ env: deps.env, ui, interactive, options, redactor, log }),
     firewalls: deps.firewalls ?? providerFirewalls,
     paths: deps.paths,
     isRoot: deps.isRoot,

@@ -8,20 +8,28 @@
 //   ARK_TEST_INSTALL_DOMAIN       a scratch domain
 //   ARK_TEST_INSTALL_VPS_AUTHKEY  a one-off, pre-approved key for tag:ark-vps
 //   ARK_TEST_INSTALL_EDGE_AUTHKEY optional one-off key for tag:ark-edge (the edge step is skipped without it)
+//   ARK_TEST_INSTALL_TS_API_KEY   optional scratch-tailnet API access token instead of both keys: setup
+//                                 merges the policy (--approve-tailnet-policy), mints and revokes the keys
+//   ARK_TEST_INSTALL_HCLOUD_TOKEN optional Read & Write token of the scratch Hetzner Cloud project that
+//                                 holds the VPS: the Hetzner adapter applies the firewall
+//                                 (--approve-provider-firewall) and the rerun must change nothing
 //   ARK_TEST_INSTALL_ACME_EMAIL   optional; ARK_TEST_INSTALL_REF optional branch or tag (default main)
 //
 // Test the pre-hardening gate, a timed-out cutover that restores fresh public SSH, a successful
-// cutover with a fresh off-host proof, and an idempotent rerun.
+// cutover with a fresh off-host proof, and an idempotent rerun. With the API credentials it also
+// checks that every minted key is revoked and that no credential or key reached the checkout.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
 
+const tsApiKey = process.env.ARK_TEST_INSTALL_TS_API_KEY?.trim();
+const hcloudToken = process.env.ARK_TEST_INSTALL_HCLOUD_TOKEN?.trim();
 const required = [
   "ARK_TEST_INSTALL_VPS",
   "ARK_TEST_INSTALL_TS_SSH",
   "ARK_TEST_INSTALL_DOMAIN",
-  "ARK_TEST_INSTALL_VPS_AUTHKEY",
+  ...(tsApiKey ? [] : ["ARK_TEST_INSTALL_VPS_AUTHKEY"]),
 ] as const;
 const missing = required.filter((key) => !process.env[key]?.trim());
 if (missing.length) {
@@ -30,13 +38,9 @@ if (missing.length) {
   );
   process.exit(0);
 }
-const [vps, tsSsh, domain, vpsKey] = required.map((key) => process.env[key]!.trim()) as [
-  string,
-  string,
-  string,
-  string,
-];
-const edgeKey = process.env.ARK_TEST_INSTALL_EDGE_AUTHKEY?.trim();
+const [vps, tsSsh, domain] = required.map((key) => process.env[key]!.trim()) as [string, string, string];
+const vpsKey = tsApiKey ? undefined : process.env.ARK_TEST_INSTALL_VPS_AUTHKEY!.trim();
+const edgeKey = tsApiKey ? undefined : process.env.ARK_TEST_INSTALL_EDGE_AUTHKEY?.trim();
 const email = process.env.ARK_TEST_INSTALL_ACME_EMAIL?.trim();
 const ref = process.env.ARK_TEST_INSTALL_REF?.trim() || "main";
 assert.match(vps, /^root@[A-Za-z0-9.:[\]-]+$/, "ARK_TEST_INSTALL_VPS must be root@<address>.");
@@ -75,27 +79,39 @@ const publicSsh = (command: string, stdin?: Uint8Array | string) =>
 const tailnetArgs = ["tailscale", "ssh", tsSsh, "-o", "ControlPath=none"];
 const tailnetSsh = (command: string) => sh([...tailnetArgs, command]);
 const secretCheck = (output: string) => {
-  for (const secret of [vpsKey, edgeKey].filter(Boolean))
-    assert.ok(!output.includes(secret!), "a key reached the output");
+  for (const secret of [vpsKey, edgeKey, tsApiKey, hcloudToken].filter(Boolean))
+    assert.ok(!output.includes(secret!), "a key or credential reached the output");
+  assert.ok(!/tskey-(?:auth|api|client)-[A-Za-z0-9]{6,}/.test(output), "a Tailscale key reached the output");
 };
+// Credentials travel like the keys: on stdin into root-only files that the setup command reads.
+const credentialEnv = [
+  ...(tsApiKey ? ['TS_API_KEY="$(cat /root/ark-test-ts-api-key)"'] : []),
+  ...(hcloudToken ? ['HCLOUD_TOKEN="$(cat /root/ark-test-hcloud-token)"'] : []),
+].join(" ");
+const firewallFlag = hcloudToken ? "--approve-provider-firewall" : "--provider-firewall-applied";
 
 const answers = [
   "--non-interactive",
   "--domain",
   domain,
   ...(email ? ["--acme-email", email] : []),
-  ...(edgeKey ? [] : ["--skip-edge"]),
+  ...(edgeKey || tsApiKey ? [] : ["--skip-edge"]),
+  ...(tsApiKey ? ["--approve-tailnet-policy"] : []),
   "--ssh-user",
   tsSsh.split("@")[0]!,
 ].join(" ");
 
 // Keys travel on stdin into root-only files, never on a command line.
-assert.equal(publicSsh("umask 077; cat > /root/ark-test-vps-key", `${vpsKey}\n`).status, 0);
+if (vpsKey) assert.equal(publicSsh("umask 077; cat > /root/ark-test-vps-key", `${vpsKey}\n`).status, 0);
 if (edgeKey) assert.equal(publicSsh("umask 077; cat > /root/ark-test-edge-key", `${edgeKey}\n`).status, 0);
+if (tsApiKey)
+  assert.equal(publicSsh("umask 077; cat > /root/ark-test-ts-api-key", `${tsApiKey}\n`).status, 0);
+if (hcloudToken)
+  assert.equal(publicSsh("umask 077; cat > /root/ark-test-hcloud-token", `${hcloudToken}\n`).status, 0);
 
 console.log("1. piped install without the Tailscale SSH confirmation must pause before hardening");
 const first = publicSsh(
-  `ARK_REF=${ref} TS_VPS_AUTHKEY="$(cat /root/ark-test-vps-key)" bash -s -- ${answers}`,
+  `ARK_REF=${ref} ${vpsKey ? 'TS_VPS_AUTHKEY="$(cat /root/ark-test-vps-key)" ' : ""}${credentialEnv} bash -s -- ${answers}`,
   script,
 );
 secretCheck(first.output);
@@ -110,7 +126,7 @@ console.log(
 assert.equal(tailnetSsh("true").status, 0, "tailscale ssh to the scratch VPS failed");
 const recoverySource = publicSsh('printf "%s\\n" "$SSH_CONNECTION"').output.trim().split(/\s+/)[0]!;
 assert.ok(isIP(recoverySource), "Could not determine the public SSH client's recovery IP");
-const setup = `mise run host:setup ${answers} --ssh-recovery-source ${recoverySource} --provider-firewall-applied`;
+const setup = `${credentialEnv} mise run host:setup ${answers} --ssh-recovery-source ${recoverySource} ${firewallFlag}`;
 const resume = `cd /opt/ark-stack && sudo -n bash -c 'rm -f /root/ark-test-vps-key; ${edgeKey ? "TS_EDGE_AUTHKEY=$(cat /root/ark-test-edge-key) " : ""}${setup} --tailscale-ssh-confirmed --verify-ssh-cutover; status=$?; rm -f /root/ark-test-edge-key; exit $status'`;
 const denied = tailnetSsh(resume);
 secretCheck(denied.output);
@@ -122,12 +138,15 @@ assert.equal(
   "OpenSSH was not reachable from its original client after rollback",
 );
 
-const paused = tailnetSsh(`cd /opt/ark-stack && sudo -n ${setup} --tailscale-ssh-confirmed`);
+const paused = tailnetSsh(`cd /opt/ark-stack && sudo -n bash -c '${setup} --tailscale-ssh-confirmed'`);
 assert.equal(paused.status, 2, paused.output.slice(-3000));
 
 console.log("3. Supply a fresh off-host proof while OpenSSH is stopped.");
 const closing = Bun.spawn(
-  [...tailnetArgs, `cd /opt/ark-stack && sudo -n ${setup} --tailscale-ssh-confirmed --verify-ssh-cutover`],
+  [
+    ...tailnetArgs,
+    `cd /opt/ark-stack && sudo -n bash -c '${setup} --tailscale-ssh-confirmed --verify-ssh-cutover'`,
+  ],
   { stdout: "pipe", stderr: "pipe", timeout: 10 * 60_000 },
 );
 const stderr = new Response(closing.stderr).text();
@@ -156,11 +175,40 @@ assert.notEqual(publicSsh("true").status, 0, "public SSH still accepts connectio
 assert.equal(tailnetSsh("true").status, 0);
 assert.equal(tailnetSsh("cd /opt/ark-stack && sudo -n mise run host:audit").status, 0);
 assert.equal(tailnetSsh("sudo -n grep -c tskey- /opt/ark-stack/tmp/host-setup/setup.log").output.trim(), "0");
+for (const file of ["/root/ark-test-ts-api-key", "/root/ark-test-hcloud-token"]) {
+  // Neither credential may appear anywhere in the checkout (.env, state, log, inventory).
+  const found = tailnetSsh(
+    `sudo -n sh -c 'test ! -s ${file} || ! grep -rqF -f ${file} /opt/ark-stack/.env /opt/ark-stack/tmp'`,
+  );
+  assert.equal(found.status, 0, `a credential from ${file} was written to the checkout`);
+}
 
 console.log("5. A rerun verifies and skips.");
 const again = tailnetSsh(
-  `cd /opt/ark-stack && sudo -n mise run host:setup ${answers} --provider-firewall-applied`,
+  `cd /opt/ark-stack && sudo -n bash -c '${credentialEnv} mise run host:setup ${answers} ${firewallFlag}'`,
 );
+secretCheck(again.output);
 assert.equal(again.status, 0, again.output.slice(-3000));
 assert.match(again.output, /already hardened and installed with these settings/);
+if (hcloudToken) assert.match(again.output, /provider already matches \(Hetzner Cloud API\)/);
+tailnetSsh("sudo -n rm -f /root/ark-test-ts-api-key /root/ark-test-hcloud-token");
+
+if (tsApiKey) {
+  console.log("6. Every key setup minted is revoked.");
+  const response = await fetch("https://api.tailscale.com/api/v2/tailnet/-/keys?all=true", {
+    headers: { authorization: `Bearer ${tsApiKey}` },
+    signal: AbortSignal.timeout(30_000),
+  });
+  assert.equal(response.status, 200, `listing keys failed: HTTP ${response.status}`);
+  const { keys } = (await response.json()) as { keys: { id: string; description?: string }[] };
+  for (const { id, description } of keys) {
+    if (!description?.startsWith("ark-stack setup")) continue;
+    const lookup: Response = await fetch(`https://api.tailscale.com/api/v2/tailnet/-/keys/${id}`, {
+      headers: { authorization: `Bearer ${tsApiKey}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+    const detail = (await lookup.json().catch(() => ({}))) as { invalid?: boolean; revoked?: string };
+    assert.ok(lookup.status === 404 || detail.invalid || detail.revoked, `minted key ${id} is still valid`);
+  }
+}
 console.log("test:install-live passed. Remove the scratch VPS and its tailnet devices, and revoke the keys.");

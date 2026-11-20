@@ -8,6 +8,7 @@
     "test-ghcr-publish.ts",
     "host-setup.ts",
     "host-setup/*.ts",
+    "host-setup/provider-firewalls/*.ts",
     "host-setup.test.ts",
     "install-sh.test.ts",
     "test-install-bootstrap.ts",

@@ -2,9 +2,11 @@
 //
 // The setup derives the inbound rules from `host:audit --inventory` and hands them to the first
 // adapter whose `detect` succeeds (or the one named by --provider-firewall). The manual adapter works
-// for every provider: it prints the exact rules and waits for the owner to confirm. An API adapter
-// (part 2: Hetzner) implements the same three calls and is listed before the manual one, so the
-// setup flow does not change.
+// for every provider: it prints the exact rules and waits for the owner to confirm. API adapters
+// (scripts/host-setup/provider-firewalls/, starting with Hetzner Cloud) implement the same three
+// calls and are listed before the manual one. Adding a provider means adding one adapter module
+// there and listing it in `providerFirewalls` (docs/getting-started/production-install.md#provider-firewall-adapters).
+import { hetznerProviderFirewall } from "./provider-firewalls/hetzner.ts";
 import type { Ui } from "./system.ts";
 
 /** One `providerRules` entry from `host:audit --inventory`. */
@@ -19,6 +21,12 @@ export type FirewallContext = {
   /** The owner already said the rules are applied (--provider-firewall-applied). */
   confirmed: boolean;
   retainSsh?: boolean;
+  /** --approve-provider-firewall: an API adapter may apply its plan without asking. */
+  approved?: boolean;
+  /** Registers a credential with the redactor (it stays in memory, never on disk or in the log). */
+  secret?: (value: string) => void;
+  /** One line to the detail log (never a credential or a response body). */
+  log?: (line: string) => void;
 };
 
 export type FirewallPlan = {
@@ -27,6 +35,8 @@ export type FirewallPlan = {
   inSync: boolean;
   /** Human-readable changes or instructions, printed before `apply`. */
   changes: string[];
+  /** Adapter-private data from `plan` that `apply` needs (the provider's current state). */
+  state?: unknown;
 };
 
 export type FirewallResult =
@@ -88,8 +98,8 @@ export const manualProviderFirewall: ProviderFirewall = {
   },
 };
 
-/** Adapters in priority order. Part 2 adds API adapters before the manual fallback. */
-export const providerFirewalls: ProviderFirewall[] = [manualProviderFirewall];
+/** Adapters in priority order: API adapters first, the manual fallback last. */
+export const providerFirewalls: ProviderFirewall[] = [hetznerProviderFirewall(), manualProviderFirewall];
 
 export async function selectProviderFirewall(
   adapters: ProviderFirewall[],

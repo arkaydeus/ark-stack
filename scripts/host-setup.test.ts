@@ -1,6 +1,6 @@
 // The guided setup (scripts/host-setup.ts) against a simulated Ubuntu host: every system command is
 // answered by a stub, so nothing here touches the machine running the tests.
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   copyFileSync,
   existsSync,
@@ -9,6 +9,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  type Dirent,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +19,7 @@ import {
   generateInstallSecrets,
   mergeInstallEnv,
   parseEnvFile,
+  parseHujson,
   parseSniPorts,
   readHostSshAccess,
   renderHostFirewall,
@@ -35,8 +37,23 @@ import {
   type FirewallContext,
   type ProviderFirewall,
 } from "./host-setup/provider-firewall.ts";
+import { portRanges } from "./host-setup/provider-firewalls/common.ts";
+import {
+  hetznerProviderFirewall,
+  hetznerRules,
+  type HetznerFirewall,
+  type HetznerRule,
+} from "./host-setup/provider-firewalls/hetzner.ts";
 import { detectSessionOrigin, publicSshListeners, publicUfwSshRules } from "./host-setup/steps.ts";
 import { Redactor, type RunOptions, type RunResult, type Ui } from "./host-setup/system.ts";
+import { lineDiff, mergeArkPolicy } from "./host-setup/tailnet-policy.ts";
+import {
+  KEY_EXPIRY_SECONDS,
+  TailscaleApi,
+  apiKeySource,
+  automaticKeySource,
+  credentialFromEnv,
+} from "./host-setup/tailscale-api.ts";
 import { manualKeySource } from "./host-setup/tailscale-keys.ts";
 
 const repoRoot = join(import.meta.dir, "..");
@@ -62,6 +79,11 @@ class FakeHost {
   ssh = { service: { enabled: true, active: true }, socket: { enabled: false, active: false } };
   edge = { running: false, tags: [] as string[] };
   edgeJoinTags = ["tag:ark-edge"];
+  backup = { running: false, tags: [] as string[] };
+  /** Every key a container was started with, and where it came from. */
+  containerKeys: { service: string; key: string; from: "env" | ".env" }[] = [];
+  /** Keys still present in a container's configuration. */
+  configuredKeys = new Map<string, string>();
   ufw: string | undefined;
   failInstall = 0;
   failAudit = 0;
@@ -172,7 +194,8 @@ class FakeHost {
     if (line.includes("exec -T edge-ts")) {
       if (!this.edge.running) {
         const key =
-          existsSync(this.envPath) && parseEnvFile(readFileSync(this.envPath, "utf8")).TS_EDGE_AUTHKEY;
+          this.configuredKeys.get("edge-ts") ??
+          (existsSync(this.envPath) && parseEnvFile(readFileSync(this.envPath, "utf8")).TS_EDGE_AUTHKEY);
         if (
           key &&
           key === this.rejectEdgeKey &&
@@ -185,11 +208,37 @@ class FakeHost {
       return ok(JSON.stringify({ BackendState: "Running", Self: { Tags: this.edge.tags } }));
     }
     if (line.endsWith("up -d edge-ts edge edge-l4")) {
-      const key = parseEnvFile(readFileSync(this.envPath, "utf8")).TS_EDGE_AUTHKEY;
+      const fromFile = parseEnvFile(readFileSync(this.envPath, "utf8")).TS_EDGE_AUTHKEY;
+      const key = options.env?.TS_EDGE_AUTHKEY || fromFile;
+      if (key) {
+        this.containerKeys.push({
+          service: "edge-ts",
+          key,
+          from: options.env?.TS_EDGE_AUTHKEY ? "env" : ".env",
+        });
+        this.configuredKeys.set("edge-ts", key);
+      }
       if (key && key !== this.rejectEdgeKey) {
         this.edge = { running: true, tags: this.edgeJoinTags };
       }
       return ok();
+    }
+    if (line.endsWith("up -d edge-ts") || line.endsWith("up -d backup-ts")) {
+      // Compose recreates the container with whatever key the environment or .env now gives it.
+      const service = argv.at(-1)!;
+      const variable = service === "edge-ts" ? "TS_EDGE_AUTHKEY" : "TS_BACKUP_AUTHKEY";
+      const key = options.env?.[variable] || parseEnvFile(readFileSync(this.envPath, "utf8"))[variable] || "";
+      if (key) {
+        this.containerKeys.push({ service, key, from: options.env?.[variable] ? "env" : ".env" });
+        this.configuredKeys.set(service, key);
+      } else this.configuredKeys.delete(service);
+      if (service === "backup-ts" && (key || this.backup.running))
+        this.backup = { running: true, tags: ["tag:ark-backup"] };
+      return ok();
+    }
+    if (line.includes("exec -T backup-ts")) {
+      if (!this.backup.running) return ok(JSON.stringify({ BackendState: "NeedsLogin" }));
+      return ok(JSON.stringify({ BackendState: "Running", Self: { Tags: this.backup.tags } }));
     }
     if (line.endsWith("scripts/edge-namespace.ts"))
       return this.failRejoin-- > 0
@@ -393,6 +442,8 @@ async function setup(
     },
     sessionOrigin: async () => ({ via: "openssh", detail: "203.0.113.10", source: RECOVERY_IP }),
     out: (text) => (out += text),
+    // Never probe the real Hetzner metadata service from a test machine.
+    firewalls: [manualProviderFirewall],
     ...(ui ? { ui: () => ui } : {}),
     ...overrides,
   });
@@ -519,6 +570,7 @@ describe("host:setup Tailscale SSH gate", () => {
       ],
       [
         ["Cloudflare", ""],
+        ["Tailscale API access token", ""],
         ["tag:ark-vps key", VPS_KEY],
       ],
     );
@@ -589,7 +641,7 @@ describe("host:setup full run", () => {
     expect(result.text).toContain("allow TCP 25, 80, 443, 465, 587, 993, 5432 from 0.0.0.0/0 and ::/0");
     expect(result.text).toContain("ARK_ROOT_KEY, ARK_ROOT_KEY_ID, ARK_MFA_RECOVERY_TOKEN");
     expect(result.text).toContain("sudo ufw status verbose");
-    for (const line of result.text.split("\n").filter((item) => /^\[\d\/9\]/.test(item)))
+    for (const line of result.text.split("\n").filter((item) => /^\[\d+\/10\]/.test(item)))
       expect(line.length).toBeLessThan(60);
 
     // No secret in the log: not the setup token, keys, DNS token or any generated secret.
@@ -1039,5 +1091,756 @@ describe("host:setup helpers", () => {
     expect(describeProviderRules([])).toContain(
       "  remove inbound public OpenSSH allowances: administration is over Tailscale SSH",
     );
+  });
+});
+
+// ---- Part 2: the Tailscale API key source and the Hetzner Cloud firewall, against mock servers ----
+
+const API_TOKEN = "tskey-api-kAPI1234CNTRL-apiSecretValue0123456789";
+const OAUTH_SECRET = "tskey-client-kOAU5678CNTRL-oauthSecretValue0123456789";
+const OAUTH_ACCESS = "oauthAccessToken0123456789abcdefABCDEF";
+const BACKUP_KEY = "tskey-auth-kBAK9012CNTRL-backupSecretValue0123456789";
+const HCLOUD_TOKEN = "hcloudToken0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+const SECRETS = [API_TOKEN, OAUTH_SECRET, OAUTH_ACCESS, VPS_KEY, EDGE_KEY, BACKUP_KEY, HCLOUD_TOKEN];
+
+/** Tailscale's default policy for a new tailnet: tabs, comments, trailing commas, a catch-all grant. */
+const DEFAULT_POLICY = `// Example/default ACLs for unrestricted connections.
+{
+\t// Declare static groups of users.
+\t// "groups": {},
+
+\t// Define grants that govern access for users, groups, autogroups, tags,
+\t// Tailscale IP addresses, and subnet ranges.
+\t"grants": [
+\t\t// Allow all connections.
+\t\t{"src": ["*"], "dst": ["*"], "ip": ["*"]},
+\t],
+
+\t// Define users and devices that can use Tailscale SSH.
+\t"ssh": [
+\t\t// Allow all users to SSH into their own devices in check mode.
+\t\t{
+\t\t\t"action": "check",
+\t\t\t"src":    ["autogroup:member"],
+\t\t\t"dst":    ["autogroup:self"],
+\t\t\t"users":  ["autogroup:nonroot", "root"],
+\t\t},
+\t],
+}
+`;
+
+const servers: { stop: (force?: boolean) => unknown }[] = [];
+afterEach(() => {
+  for (const server of servers.splice(0)) server.stop(true);
+});
+
+/** A mock of the Tailscale API v2 endpoints the setup uses. */
+class MockTailscale {
+  policy = DEFAULT_POLICY;
+  etag = '"etag-1"';
+  requests: { method: string; path: string; auth: string; body: string; ifMatch?: string }[] = [];
+  keys = new Map<string, { key: string; body: Record<string, any>; revoked: boolean }>();
+  validateProblem?: string;
+  /** Change the policy behind the setup's back on the next read (a concurrent edit). */
+  raceOnRead = false;
+  timeline?: string[];
+  readonly server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (request) => this.handle(request) });
+
+  constructor() {
+    servers.push(this.server);
+  }
+
+  get url() {
+    return `http://127.0.0.1:${this.server.port}`;
+  }
+
+  writes() {
+    return this.requests.filter((request) => request.method !== "GET" && !request.path.endsWith("/validate"));
+  }
+
+  private async handle(request: Request) {
+    const url = new URL(request.url);
+    const body = await request.text();
+    const auth = request.headers.get("authorization") ?? "";
+    this.requests.push({
+      method: request.method,
+      path: url.pathname,
+      auth,
+      body,
+      ifMatch: request.headers.get("if-match") ?? undefined,
+    });
+    this.timeline?.push(`api ${request.method} ${url.pathname}`);
+    if (url.pathname === "/api/v2/oauth/token") {
+      const form = new URLSearchParams(body);
+      if (form.get("client_id") !== "kOAU5678CNTRL" || form.get("client_secret") !== OAUTH_SECRET)
+        return Response.json({ message: "invalid client" }, { status: 401 });
+      return Response.json({ access_token: OAUTH_ACCESS, token_type: "Bearer", expires_in: 3600 });
+    }
+    if (auth !== `Bearer ${API_TOKEN}` && auth !== `Bearer ${OAUTH_ACCESS}`)
+      return Response.json({ message: "unauthorized" }, { status: 401 });
+    const base = "/api/v2/tailnet/-";
+    if (request.method === "GET" && url.pathname === `${base}/acl`) {
+      const response = new Response(this.policy, {
+        headers: { "content-type": "application/hujson", etag: this.etag },
+      });
+      if (this.raceOnRead) {
+        this.policy = `${this.policy}// edited elsewhere\n`;
+        this.etag = '"etag-race"';
+      }
+      return response;
+    }
+    if (request.method === "POST" && url.pathname === `${base}/acl/validate`) {
+      parseHujson(body);
+      return this.validateProblem ? Response.json({ message: this.validateProblem }) : new Response("");
+    }
+    if (request.method === "POST" && url.pathname === `${base}/acl`) {
+      if (request.headers.get("if-match") !== this.etag)
+        return Response.json({ message: "precondition failed" }, { status: 412 });
+      this.policy = body;
+      this.etag = `"etag-${this.requests.length}"`;
+      return new Response(body, { headers: { etag: this.etag } });
+    }
+    if (request.method === "POST" && url.pathname === `${base}/keys`) {
+      const parsed = JSON.parse(body);
+      const tag = parsed.capabilities.devices.create.tags[0];
+      const key = tag === "tag:ark-vps" ? VPS_KEY : tag === "tag:ark-edge" ? EDGE_KEY : BACKUP_KEY;
+      const id = `k${this.keys.size + 1}`;
+      this.keys.set(id, { key, body: parsed, revoked: false });
+      return Response.json({ id, key, keyType: "auth", capabilities: parsed.capabilities });
+    }
+    const revoke = new RegExp(`^${base}/keys/(k\\d+)$`).exec(url.pathname);
+    if (request.method === "DELETE" && revoke) {
+      const entry = this.keys.get(revoke[1]!);
+      if (!entry) return Response.json({ message: "not found" }, { status: 404 });
+      entry.revoked = true;
+      return new Response(null, { status: 200 });
+    }
+    return Response.json({ message: `unexpected ${request.method} ${url.pathname}` }, { status: 500 });
+  }
+}
+
+/** A mock of the Hetzner Cloud metadata service and API v1. */
+class MockHetzner {
+  serverId = 4242;
+  serverIpv4 = "203.0.113.10";
+  firewalls: HetznerFirewall[] = [];
+  requests: { method: string; path: string; auth: string }[] = [];
+  actions = new Map<number, number>();
+  timeline?: string[];
+  readonly server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (request) => this.handle(request) });
+
+  constructor() {
+    servers.push(this.server);
+  }
+
+  get url() {
+    return `http://127.0.0.1:${this.server.port}`;
+  }
+
+  adapter() {
+    return hetznerProviderFirewall({
+      apiBase: `${this.url}/v1`,
+      metadataBase: this.url,
+      sleep: async () => {},
+    });
+  }
+
+  writes() {
+    return this.requests.filter((request) => request.method !== "GET");
+  }
+
+  private action() {
+    const id = this.actions.size + 1;
+    this.actions.set(id, 0);
+    return { id, status: "running" };
+  }
+
+  private async handle(request: Request) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const auth = request.headers.get("authorization") ?? "";
+    this.requests.push({ method: request.method, path, auth });
+    this.timeline?.push(`hetzner ${request.method} ${path}`);
+    if (path === "/hetzner/v1/metadata/instance-id") return new Response(`${this.serverId}`);
+    if (auth !== `Bearer ${HCLOUD_TOKEN}`)
+      return Response.json(
+        { error: { code: "unauthorized", message: "unable to authenticate" } },
+        { status: 401 },
+      );
+    const body = request.method === "POST" ? await request.json() : undefined;
+    if (path === `/v1/servers/${this.serverId}`) {
+      return Response.json({
+        server: {
+          id: this.serverId,
+          name: "ark-vps-1",
+          public_net: {
+            ipv4: { ip: this.serverIpv4 },
+            ipv6: { ip: "2001:db8::/64" },
+            firewalls: this.firewalls
+              .filter((firewall) => firewall.applied_to?.some((item) => item.server?.id === this.serverId))
+              .map((firewall) => ({ id: firewall.id, status: "applied" })),
+          },
+        },
+      });
+    }
+    if (path === "/v1/firewalls" && request.method === "GET") {
+      const name = url.searchParams.get("name");
+      return Response.json({
+        firewalls: this.firewalls.filter((firewall) => !name || firewall.name === name),
+      });
+    }
+    if (path === "/v1/firewalls" && request.method === "POST") {
+      const firewall: HetznerFirewall = {
+        id: 100 + this.firewalls.length,
+        name: body.name,
+        labels: body.labels,
+        rules: body.rules,
+        applied_to: body.apply_to,
+      };
+      this.firewalls.push(firewall);
+      return Response.json({ firewall, actions: [this.action()] }, { status: 201 });
+    }
+    const match = /^\/v1\/firewalls\/(\d+)(?:\/actions\/(set_rules|apply_to_resources))?$/.exec(path);
+    if (match) {
+      const firewall = this.firewalls.find((item) => item.id === Number(match[1]));
+      if (!firewall) return Response.json({ error: { message: "not found" } }, { status: 404 });
+      if (!match[2]) return Response.json({ firewall });
+      if (match[2] === "set_rules") firewall.rules = body.rules;
+      else firewall.applied_to = [...(firewall.applied_to ?? []), ...body.apply_to];
+      return Response.json({ actions: [this.action()] }, { status: 201 });
+    }
+    const action = /^\/v1\/actions\/(\d+)$/.exec(path);
+    if (action) return Response.json({ action: { id: Number(action[1]), status: "success" } });
+    return Response.json({ error: { message: `unexpected ${request.method} ${path}` } }, { status: 500 });
+  }
+}
+
+/** Every file under `directory` whose content contains one of `secrets`. */
+function filesWithSecrets(directory: string, secrets: string[]): string[] {
+  const found: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true }) as Dirent[]) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) found.push(...filesWithSecrets(path, secrets));
+    else if (entry.isFile()) {
+      const content = readFileSync(path, "utf8");
+      for (const secret of secrets)
+        if (content.includes(secret)) found.push(`${path}: ${secret.slice(0, 12)}…`);
+    }
+  }
+  return found;
+}
+
+const tsApi = (mock: MockTailscale) => ({ tailscaleApi: mock.url });
+
+describe("host:setup with a Tailscale API credential", () => {
+  test("merges the policy after approval, mints one-off keys, revokes each after its join; no secret is stored or shown", async () => {
+    const f = fixture();
+    const mock = new MockTailscale();
+    mock.timeline = f.host.calls;
+    const result = await setup(
+      f,
+      [...FULL, "--approve-tailnet-policy"],
+      { TS_API_KEY: API_TOKEN },
+      tsApi(mock),
+    );
+    expect(result.code).toBe(0);
+
+    // The policy: read with its ETag, validated, applied with If-Match, the owner's content intact.
+    const write = mock.requests.find(
+      (request) => request.method === "POST" && request.path.endsWith("/acl"),
+    )!;
+    expect(write.ifMatch).toBe('"etag-1"');
+    expect(mock.requests.some((request) => request.path.endsWith("/acl/validate"))).toBe(true);
+    for (const line of DEFAULT_POLICY.split("\n")) expect(mock.policy).toContain(line);
+    const policy = parseHujson(mock.policy) as Record<string, any>;
+    expect(policy.tagOwners).toEqual({
+      "tag:ark-vps": ["autogroup:admin"],
+      "tag:ark-edge": ["autogroup:admin"],
+    });
+    expect(policy.grants).toContainEqual({ src: ["autogroup:admin"], dst: ["tag:ark-vps"], ip: ["tcp:22"] });
+    expect(policy.ssh).toHaveLength(2);
+    expect(result.text).toContain('+ \t"tagOwners"');
+    expect(result.text).toContain("catch-all grant");
+    expect(result.text).toContain("Tailnet policy updated.");
+
+    // Keys: single-use, not ephemeral, pre-approved, one tag, an hour at most; every one revoked.
+    expect([...mock.keys.values()].map((entry) => entry.body.capabilities.devices.create.tags)).toEqual([
+      ["tag:ark-vps"],
+      ["tag:ark-edge"],
+    ]);
+    for (const { body, revoked } of mock.keys.values()) {
+      expect(body.capabilities.devices.create).toMatchObject({
+        reusable: false,
+        ephemeral: false,
+        preauthorized: true,
+      });
+      expect(body.expirySeconds).toBeLessThanOrEqual(3600);
+      expect(revoked).toBe(true);
+    }
+    const at = (needle: string) => f.host.calls.findIndex((call) => call === needle || call.endsWith(needle));
+    expect(at("api POST /api/v2/tailnet/-/acl")).toBeLessThan(at("api POST /api/v2/tailnet/-/keys"));
+    expect(at(`${BUN} scripts/install.ts --enroll-vps --key-stdin`)).toBeLessThan(
+      at("api DELETE /api/v2/tailnet/-/keys/k1"),
+    );
+    expect(at("api DELETE /api/v2/tailnet/-/keys/k1")).toBeLessThan(
+      at(`${BUN} scripts/install.ts --harden-vps`),
+    );
+    // The edge key reaches Compose through the environment only, and edge-ts is recreated without it.
+    expect(f.host.containerKeys).toEqual([{ service: "edge-ts", key: EDGE_KEY, from: "env" }]);
+    expect(f.host.configuredKeys.has("edge-ts")).toBe(false);
+    expect(at("up -d edge-ts")).toBeLessThan(at("api DELETE /api/v2/tailnet/-/keys/k2"));
+    expect(result.state.steps.edge.status).toBe("done");
+
+    // No credential or key anywhere: output, log, state, .env or any other file setup wrote.
+    for (const secret of SECRETS) {
+      expect(result.text).not.toContain(secret);
+      expect(result.log).not.toContain(secret);
+    }
+    expect(filesWithSecrets(f.root, SECRETS)).toEqual([]);
+    expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_AUTHKEY).toBe("");
+  });
+
+  test("scripted runs without --approve-tailnet-policy show the change and apply nothing", async () => {
+    const f = fixture();
+    const mock = new MockTailscale();
+    const result = await setup(f, FULL, { TS_API_KEY: API_TOKEN }, tsApi(mock));
+    expect(result.code).toBe(1);
+    expect(result.text).toContain('+ \t"tagOwners"');
+    expect(result.text).toContain("--approve-tailnet-policy");
+    expect(mock.writes()).toEqual([]);
+    expect(f.host.calls.some((call) => call.includes("--enroll-vps"))).toBe(false);
+  });
+
+  test("a key whose node fails to join is revoked as well", async () => {
+    const f = fixture();
+    const mock = new MockTailscale();
+    f.host.rejectEdgeKey = EDGE_KEY;
+    const result = await setup(
+      f,
+      [...FULL, "--approve-tailnet-policy"],
+      { TS_API_KEY: API_TOKEN },
+      tsApi(mock),
+    );
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("Tailscale rejected the edge auth key");
+    expect([...mock.keys.values()].every((entry) => entry.revoked)).toBe(true);
+    expect(filesWithSecrets(f.root, SECRETS)).toEqual([]);
+  });
+
+  test("--backup-node mints, uses and revokes a tag:ark-backup key and declares the tag", async () => {
+    const f = fixture();
+    const mock = new MockTailscale();
+    const result = await setup(
+      f,
+      [...FULL, "--approve-tailnet-policy", "--backup-node"],
+      { TS_API_KEY: API_TOKEN },
+      tsApi(mock),
+    );
+    expect(result.code).toBe(0);
+    expect((parseHujson(mock.policy) as any).tagOwners["tag:ark-backup"]).toEqual(["autogroup:admin"]);
+    expect(
+      [...mock.keys.values()].map((entry) => [entry.body.capabilities.devices.create.tags, entry.revoked]),
+    ).toEqual([
+      [["tag:ark-vps"], true],
+      [["tag:ark-edge"], true],
+      [["tag:ark-backup"], true],
+    ]);
+    expect(f.host.containerKeys).toContainEqual({ service: "backup-ts", key: BACKUP_KEY, from: "env" });
+    expect(f.host.configuredKeys.has("backup-ts")).toBe(false);
+    expect(result.state.steps["backup-node"].status).toBe("done");
+    expect(filesWithSecrets(f.root, SECRETS)).toEqual([]);
+  });
+
+  test("without a credential the manual flow is unchanged and the API is never called", async () => {
+    const f = fixture();
+    const mock = new MockTailscale();
+    const result = await setup(f, FULL, KEYS, tsApi(mock));
+    expect(result.code).toBe(0);
+    expect(mock.requests).toEqual([]);
+    expect(result.text).toContain("make sure the tailnet policy file has:");
+    expect(result.state.steps["backup-node"].status).toBe("skipped");
+    expect(result.text).not.toContain("Backup node enrolment (tag:ark-backup): skipped");
+  });
+
+  test("an explicitly supplied key wins over the API for that node", async () => {
+    const f = fixture();
+    const mock = new MockTailscale();
+    const result = await setup(
+      f,
+      [...FULL, "--approve-tailnet-policy"],
+      { TS_API_KEY: API_TOKEN, TS_VPS_AUTHKEY: VPS_KEY },
+      tsApi(mock),
+    );
+    expect(result.code).toBe(0);
+    expect([...mock.keys.values()].map((entry) => entry.body.capabilities.devices.create.tags)).toEqual([
+      ["tag:ark-edge"],
+    ]);
+  });
+});
+
+describe("Tailscale API key source", () => {
+  const quietUi = (answers: [string, string][] = [], secrets: [string, string][] = []) =>
+    new ScriptedUi(true, answers, secrets);
+  const api = (mock: MockTailscale, credential = credentialFromEnv({ TS_API_KEY: API_TOKEN })!) => {
+    const seen: string[] = [];
+    return {
+      seen,
+      api: new TailscaleApi(credential, {
+        base: mock.url,
+        secret: (value) => seen.push(value),
+        log: () => {},
+      }),
+      credential,
+    };
+  };
+
+  test("interactive: shows the diff and a 'no' applies nothing and mints nothing", async () => {
+    const mock = new MockTailscale();
+    const ui = quietUi([["Apply this change to the tailnet policy", "no"]]);
+    const { api: client, credential } = api(mock);
+    const source = apiKeySource(client, credential, { ui, interactive: true, approve: false, backup: false });
+    await expect(
+      source.acquire({ tag: "tag:ark-vps", variable: "TS_VPS_AUTHKEY", optional: false }),
+    ).rejects.toThrow("declined");
+    expect(ui.output.join("\n")).toContain("Proposed tailnet policy change");
+    expect(mock.writes()).toEqual([]);
+  });
+
+  test("an unchanged policy is neither validated nor rewritten", async () => {
+    const mock = new MockTailscale();
+    mock.policy = mergeArkPolicy(DEFAULT_POLICY, {
+      tags: ["tag:ark-vps", "tag:ark-edge"],
+      owners: ["autogroup:admin"],
+    }).text;
+    const ui = quietUi();
+    const { api: client, credential } = api(mock);
+    const source = apiKeySource(client, credential, { ui, interactive: true, approve: false, backup: false });
+    await source.preparePolicy!();
+    expect(ui.output.join("\n")).toContain("already has the Ark tag owners");
+    expect(mock.requests.map((request) => request.method + " " + request.path)).toEqual([
+      "GET /api/v2/tailnet/-/acl",
+    ]);
+  });
+
+  test("a policy edited elsewhere meanwhile (If-Match mismatch) is not overwritten", async () => {
+    const mock = new MockTailscale();
+    mock.raceOnRead = true;
+    const { api: client, credential } = api(mock);
+    const source = apiKeySource(client, credential, {
+      ui: quietUi(),
+      interactive: false,
+      approve: true,
+      backup: false,
+    });
+    await expect(source.preparePolicy!()).rejects.toThrow("changed while setup was showing it");
+    expect(mock.policy).toContain("edited elsewhere");
+    expect(mock.policy).not.toContain("tag:ark-vps");
+  });
+
+  test("a policy Tailscale rejects is not applied", async () => {
+    const mock = new MockTailscale();
+    mock.validateProblem = "test(s) failed";
+    const { api: client, credential } = api(mock);
+    const source = apiKeySource(client, credential, {
+      ui: quietUi(),
+      interactive: false,
+      approve: true,
+      backup: false,
+    });
+    await expect(source.preparePolicy!()).rejects.toThrow("Tailscale rejected the merged policy");
+    expect(mock.writes()).toEqual([]);
+  });
+
+  test("an OAuth client exchanges its secret, owns the Ark tags through its tag and mints with the token", async () => {
+    const mock = new MockTailscale();
+    const credential = credentialFromEnv({ TS_OAUTH_CLIENT_SECRET: OAUTH_SECRET })!;
+    expect(credential).toMatchObject({ kind: "oauth", clientId: "kOAU5678CNTRL", tag: "tag:ark-setup" });
+    const { api: client, seen } = api(mock, credential);
+    const source = apiKeySource(client, credential, {
+      ui: quietUi(),
+      interactive: false,
+      approve: true,
+      backup: false,
+    });
+    const key = await source.acquire({ tag: "tag:ark-edge", variable: "TS_EDGE_AUTHKEY", optional: true });
+    expect(key).toMatchObject({ key: EDGE_KEY, inMemoryOnly: true });
+    const policy = parseHujson(mock.policy) as any;
+    expect(policy.tagOwners).toEqual({
+      "tag:ark-setup": ["autogroup:admin"],
+      "tag:ark-vps": ["autogroup:admin", "tag:ark-setup"],
+      "tag:ark-edge": ["autogroup:admin", "tag:ark-setup"],
+    });
+    expect(
+      mock.requests.filter((request) => request.path.startsWith("/api/v2/tailnet")).map((r) => r.auth),
+    ).toEqual(expect.arrayContaining([`Bearer ${OAUTH_ACCESS}`]));
+    expect(mock.requests.some((request) => request.auth.includes(OAUTH_SECRET))).toBe(false);
+    expect(seen).toEqual(expect.arrayContaining([OAUTH_SECRET, OAUTH_ACCESS, EDGE_KEY]));
+    await key!.release!();
+    expect(mock.keys.get("k1")!.revoked).toBe(true);
+    expect(mock.keys.get("k1")!.body.expirySeconds).toBe(KEY_EXPIRY_SECONDS);
+  });
+
+  test("the automatic source asks once for a credential and falls back to the manual steps on Enter", async () => {
+    const ui = quietUi(
+      [["policy is saved", ""]],
+      [
+        ["Tailscale API access token", ""],
+        ["tag:ark-edge key", EDGE_KEY],
+      ],
+    );
+    const source = automaticKeySource({
+      env: {},
+      ui,
+      interactive: true,
+      approve: false,
+      backup: false,
+      secret: () => {},
+      log: () => {},
+    });
+    await source.preparePolicy!();
+    expect(ui.output.join("\n")).toContain("make sure the tailnet policy file has:");
+    expect(
+      await source.acquire({ tag: "tag:ark-edge", variable: "TS_EDGE_AUTHKEY", optional: true }),
+    ).toEqual({
+      key: EDGE_KEY,
+    });
+  });
+
+  test("rejects malformed credentials", () => {
+    expect(() => credentialFromEnv({ TS_API_KEY: "nope" })).toThrow("tskey-api-");
+    expect(() => credentialFromEnv({ TS_OAUTH_CLIENT_SECRET: "nope" })).toThrow("tskey-client-");
+    expect(() => credentialFromEnv({ TS_API_KEY: API_TOKEN, TS_OAUTH_CLIENT_SECRET: OAUTH_SECRET })).toThrow(
+      "only one",
+    );
+    expect(credentialFromEnv({})).toBeUndefined();
+  });
+});
+
+describe("tailnet policy merge", () => {
+  const request = { tags: ["tag:ark-vps", "tag:ark-edge"], owners: ["autogroup:admin"] };
+
+  test("adds only the Ark entries, keeps comments and is idempotent", () => {
+    const merged = mergeArkPolicy(DEFAULT_POLICY, request);
+    expect(merged.changed).toBe(true);
+    expect(merged.additions).toHaveLength(4);
+    const diff = lineDiff(DEFAULT_POLICY, merged.text);
+    expect(diff.filter((line) => line.startsWith("- "))).toEqual([]);
+    expect(diff.some((line) => line.startsWith('+ \t\t{ "src": ["autogroup:admin"]'))).toBe(true);
+    const again = mergeArkPolicy(merged.text, request);
+    expect(again).toMatchObject({ changed: false, additions: [] });
+    expect(again.text).toBe(merged.text);
+  });
+
+  test("keeps an existing tag entry, adds a missing one inline and handles one-line containers", () => {
+    const text = `{"tagOwners": {"tag:ark-vps": ["group:ops"], /* keep */ "tag:other": ["autogroup:admin"]}, "grants": [], "ssh": []}`;
+    const merged = mergeArkPolicy(text, request);
+    const policy = parseHujson(merged.text) as any;
+    expect(policy.tagOwners).toEqual({
+      "tag:ark-vps": ["group:ops"],
+      "tag:other": ["autogroup:admin"],
+      "tag:ark-edge": ["autogroup:admin"],
+    });
+    expect(merged.text).toContain("/* keep */");
+    expect(policy.grants).toHaveLength(1);
+    expect(policy.ssh).toHaveLength(1);
+  });
+
+  test("an empty policy and a policy without the sections get them", () => {
+    for (const text of ["", "{\n  // nothing yet\n}\n"]) {
+      const policy = parseHujson(mergeArkPolicy(text, request).text) as any;
+      expect(Object.keys(policy.tagOwners)).toEqual(["tag:ark-vps", "tag:ark-edge"]);
+      expect(policy.grants).toHaveLength(1);
+    }
+  });
+
+  test("a very large policy still gets an insert-only diff", () => {
+    const hosts = Array.from(
+      { length: 3000 },
+      (_, index) => `    "host-${index}": "100.64.${index >> 8}.${index & 255}",`,
+    );
+    const text = `{\n  "grants": [\n    { "src": ["group:ops"], "dst": ["host-1"], "ip": ["tcp:443"] },\n  ],\n  "hosts": {\n${hosts.join("\n")}\n  },\n}\n`;
+    const merged = mergeArkPolicy(text, request);
+    const diff = lineDiff(text, merged.text);
+    expect(diff.filter((line) => line.startsWith("- "))).toEqual([]);
+    expect(diff.filter((line) => line.startsWith("+ ")).length).toBeGreaterThan(5);
+    expect(diff.length).toBeLessThan(40);
+  });
+
+  test("refuses a policy it cannot merge safely", () => {
+    expect(() => mergeArkPolicy("[]", request)).toThrow("not a JSON object");
+    expect(() => mergeArkPolicy('{"grants": {}}', request)).toThrow('"grants" is not a list');
+    expect(() => mergeArkPolicy('{"grants": [', request)).toThrow("not valid HuJSON");
+  });
+});
+
+describe("Hetzner Cloud provider firewall", () => {
+  const firewallArgs = [...BASE, "--tailscale-ssh-confirmed", "--verify-ssh-cutover"];
+
+  test("creates one Ark firewall for this server after approval, leaves others alone; a rerun changes nothing", async () => {
+    const f = fixture();
+    const hetzner = new MockHetzner();
+    hetzner.timeline = f.host.calls;
+    const own: HetznerFirewall = {
+      id: 7,
+      name: "user-fw",
+      labels: {},
+      rules: [{ direction: "in", protocol: "tcp", port: "8080", source_ips: ["0.0.0.0/0"] }],
+      applied_to: [
+        { type: "server", server: { id: 4242 } },
+        { type: "server", server: { id: 9 } },
+      ],
+    };
+    hetzner.firewalls.push(structuredClone(own));
+    const deps = { firewalls: [hetzner.adapter(), manualProviderFirewall] };
+    const env = { ...KEYS, HCLOUD_TOKEN };
+    const result = await setup(f, [...firewallArgs, "--approve-provider-firewall"], env, deps);
+    expect(result.code).toBe(0);
+    expect(result.state.steps["provider-firewall"].status).toBe("done");
+    expect(result.text).toContain("Create the Hetzner Cloud firewall ark-stack-4242");
+    expect(result.text).toContain('Note: firewall "user-fw" (id 7) also applies to this server');
+
+    const created = hetzner.firewalls.find((firewall) => firewall.name === "ark-stack-4242")!;
+    expect(created.labels).toMatchObject({ "managed-by": "ark-stack", "ark-stack-server": "4242" });
+    expect(created.applied_to).toEqual([{ type: "server", server: { id: 4242 } }]);
+    const rules = created.rules.map(
+      (rule: HetznerRule) => `${rule.protocol} ${rule.port ?? "-"} ${rule.source_ips!.join(",")}`,
+    );
+    expect(rules).toEqual([
+      ...["25", "80", "443", "465", "587", "993", "5432"].map((port) => `tcp ${port} 0.0.0.0/0,::/0`),
+      "udp 41641-41642 0.0.0.0/0,::/0",
+      "icmp - 0.0.0.0/0,::/0",
+    ]);
+    expect(rules.some((rule) => rule.startsWith("tcp 22 "))).toBe(false);
+    expect(hetzner.firewalls.find((firewall) => firewall.id === 7)).toEqual(own);
+    expect(hetzner.writes().some((request) => request.path.startsWith("/v1/firewalls/7"))).toBe(false);
+    // The local audit runs after the provider change, not before it.
+    const createdAt = f.host.calls.indexOf("hetzner POST /v1/firewalls");
+    const auditAt = f.host.calls.lastIndexOf(`${BUN} scripts/host-audit.ts`);
+    expect(createdAt).toBeGreaterThan(-1);
+    expect(auditAt).toBeGreaterThan(createdAt);
+    for (const output of [result.text, result.log]) expect(output).not.toContain(HCLOUD_TOKEN);
+    expect(filesWithSecrets(f.root, [HCLOUD_TOKEN])).toEqual([]);
+
+    const writes = hetzner.writes().length;
+    const again = await setup(f, firewallArgs, env, deps);
+    expect(again.code).toBe(0);
+    expect(hetzner.writes()).toHaveLength(writes);
+    expect(again.text).toContain("provider already matches (Hetzner Cloud API)");
+  });
+
+  test("keeps TCP 22 open while public SSH is retained, and removes it once SSH is closed", async () => {
+    const f = fixture();
+    const hetzner = new MockHetzner();
+    const deps = { firewalls: [hetzner.adapter(), manualProviderFirewall] };
+    const env = { ...KEYS, HCLOUD_TOKEN };
+    const kept = await setup(
+      f,
+      [...firewallArgs, "--keep-public-ssh", "--approve-provider-firewall"],
+      env,
+      deps,
+    );
+    expect(kept.code).toBe(0);
+    const firewall = () => hetzner.firewalls.find((item) => item.name === "ark-stack-4242")!;
+    expect(firewall().rules).toContainEqual(expect.objectContaining({ protocol: "tcp", port: "22" }));
+    const closed = await setup(f, [...firewallArgs, "--approve-provider-firewall"], env, deps);
+    expect(closed.code).toBe(0);
+    expect(closed.text).toContain("- inbound TCP 22 from 0.0.0.0/0, ::/0");
+    expect(firewall().rules.some((rule) => rule.port === "22")).toBe(false);
+    expect(hetzner.writes().map((request) => request.path)).toEqual([
+      "/v1/firewalls",
+      "/v1/firewalls/100/actions/set_rules",
+    ]);
+  });
+
+  test("scripted runs without --approve-provider-firewall show the plan and leave it pending", async () => {
+    const f = fixture();
+    const hetzner = new MockHetzner();
+    const result = await setup(
+      f,
+      firewallArgs,
+      { ...KEYS, HCLOUD_TOKEN },
+      {
+        firewalls: [hetzner.adapter(), manualProviderFirewall],
+      },
+    );
+    expect(result.code).toBe(0);
+    expect(result.state.steps["provider-firewall"].status).toBe("pending");
+    expect(result.text).toContain("+ inbound TCP 443 from 0.0.0.0/0, ::/0");
+    expect(result.text).toContain("--approve-provider-firewall");
+    expect(hetzner.writes()).toEqual([]);
+  });
+
+  test("without a token, or off Hetzner, the print-the-rules adapter is used", async () => {
+    const f = fixture();
+    const hetzner = new MockHetzner();
+    const noToken = await setup(f, FULL, KEYS, { firewalls: [hetzner.adapter(), manualProviderFirewall] });
+    expect(noToken.code).toBe(0);
+    expect(noToken.text).toContain("rules applied (any provider (manual))");
+    const offHetzner = hetznerProviderFirewall({
+      metadataBase: "http://127.0.0.1:9",
+      apiBase: `${hetzner.url}/v1`,
+    });
+    const context = {
+      ui: new ScriptedUi(false),
+      interactive: false,
+      env: { HCLOUD_TOKEN },
+      publicAddresses: { ipv4: ["203.0.113.10"], ipv6: [] },
+      confirmed: false,
+    } satisfies FirewallContext;
+    expect((await selectProviderFirewall([offHetzner, manualProviderFirewall], context)).id).toBe("manual");
+    expect(hetzner.writes()).toEqual([]);
+  });
+
+  test("refuses a same-named firewall Ark did not create, one attached elsewhere, or another server", async () => {
+    const hetzner = new MockHetzner();
+    const context = {
+      ui: new ScriptedUi(false),
+      interactive: false,
+      env: { HCLOUD_TOKEN },
+      publicAddresses: { ipv4: ["203.0.113.10"], ipv6: [] },
+      confirmed: false,
+      approved: true,
+    } satisfies FirewallContext;
+    const adapter = hetzner.adapter();
+    expect(await adapter.detect(context)).toBe(true);
+    hetzner.firewalls.push({ id: 5, name: "ark-stack-4242", labels: {}, rules: [], applied_to: [] });
+    await expect(adapter.plan(PROVIDER_RULES as never, context)).rejects.toThrow("Ark did not create it");
+    hetzner.firewalls[0] = {
+      id: 5,
+      name: "ark-stack-4242",
+      labels: { "managed-by": "ark-stack" },
+      rules: [],
+      applied_to: [{ type: "label_selector", label_selector: { selector: "env=prod" } }],
+    };
+    await expect(adapter.plan(PROVIDER_RULES as never, context)).rejects.toThrow(
+      "also applied to other resources",
+    );
+    hetzner.serverIpv4 = "198.51.100.99";
+    await expect(adapter.detect(context)).rejects.toThrow("Nothing was changed");
+    await expect(
+      adapter.detect({ ...context, env: { HCLOUD_TOKEN: "wrong-token-0123456789" } }),
+    ).rejects.toThrow("HTTP 401");
+    expect(hetzner.writes()).toEqual([]);
+  });
+
+  test("rule helpers: ranges, both address families and ICMP", () => {
+    expect(portRanges([443, 80, 20001, 20002, 20003, 80])).toEqual(["80", "443", "20001-20003"]);
+    expect(
+      hetznerRules([{ protocol: "udp", ports: [41642, 41641], sourceCidrs: ["::/0", "0.0.0.0/0"] }]),
+    ).toEqual([
+      {
+        direction: "in",
+        protocol: "udp",
+        port: "41641-41642",
+        source_ips: ["0.0.0.0/0", "::/0"],
+        description: "Ark Stack UDP 41641-41642",
+      },
+      {
+        direction: "in",
+        protocol: "icmp",
+        source_ips: ["0.0.0.0/0", "::/0"],
+        description: "Ark Stack ICMP and ICMPv6",
+      },
+    ]);
   });
 });

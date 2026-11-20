@@ -86,7 +86,7 @@ Locally, DNS checks are stubbed and certificates are self-signed, so endpoints e
 You need:
 
 - an Ubuntu 22.04, 24.04 or 26.04 LTS VPS with a public IPv4 address (IPv6 optional), a provider firewall you control, and working console or rescue access;
-- a Tailscale tailnet where you can edit the policy file and create auth keys, and your own (untagged) device on it for SSH;
+- a Tailscale tailnet where you can edit the policy file and create auth keys (or an API access token, so setup does both for you), and your own (untagged) device on it for SSH;
 - a domain whose DNS you control, at Cloudflare (reviewed automatic publishing) or any other provider such as Namecheap (manual records);
 - an email address for the Let's Encrypt account.
 
@@ -104,7 +104,7 @@ It installs whatever is missing (Docker Engine with Compose v2, `git`, `curl`, `
 - an optional Cloudflare DNS token (read without echo);
 - the daily automatic reboot time for security updates, and your local user for Tailscale SSH.
 
-Then it enrols the host in your tailnet, hardens it and installs the platform, enrols the edge node, sets the admin origin and ACME settings, closes public SSH and audits the host firewall. You never edit a file. It stops only to let you paste the one-off `tag:ark-vps` and `tag:ark-edge` auth keys, to have you check that `tailscale ssh <user>@<vps-magicdns-name>` works from your own device (it will not harden the host until you confirm), and to have you apply the provider firewall rules it prints. The final summary gives the SSH tunnel command, the setup token, the DNS records to create and the recovery material to copy off the host.
+Then it enrols the host in your tailnet, hardens it and installs the platform, enrols the edge node, sets the admin origin and ACME settings, closes public SSH and audits the host firewall. You never edit a file. It stops only to let you paste the one-off `tag:ark-vps` and `tag:ark-edge` auth keys (or, given a Tailscale API credential, to confirm the policy change it then applies before minting the keys itself), to have you check that `tailscale ssh <user>@<vps-magicdns-name>` works from your own device (it will not harden the host until you confirm), and to have you apply the provider firewall rules it prints (on Hetzner Cloud, with an API token, to confirm the firewall it then applies). The final summary gives the SSH tunnel command, the setup token, the DNS records to create and the recovery material to copy off the host.
 
 Re-running the same command is safe: finished steps are checked and skipped, and no secret is rotated. Every answer can also be a flag or environment variable for a scripted `--non-interactive` install. [Production install](docs/getting-started/production-install.md#install-with-one-command) describes the questions, flags and safety checks, and [what the installer does](docs/getting-started/production-install.md#what-the-installer-does--manual-install) documents each phase for a manual install.
 

@@ -66,6 +66,17 @@ export const runCommand: Runner = async (argv, options = {}) => {
   return { status, stdout, stderr };
 };
 
+/** Credentials the setup may read from its environment: redacted everywhere, never passed on. */
+export const SECRET_VARIABLES = [
+  "TS_VPS_AUTHKEY",
+  "TS_EDGE_AUTHKEY",
+  "TS_BACKUP_AUTHKEY",
+  "TS_API_KEY",
+  "TS_OAUTH_CLIENT_SECRET",
+  "HCLOUD_TOKEN",
+  "DNS_API_TOKEN",
+];
+
 /** Values that must never reach the terminal (except the setup token in the summary) or the log. */
 export class Redactor {
   private secrets = new Set<string>();

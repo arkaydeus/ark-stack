@@ -167,13 +167,24 @@ Copy `ARK_ROOT_KEY`, `ARK_ROOT_KEY_ID`, `ARK_MFA_RECOVERY_TOKEN`, both cipher pa
 
 Each key is one-off, pre-approved, non-ephemeral and tagged for exactly one node. Remove it after the node has joined and revoke it.
 
-| Variable              | Read by                         | Node and tag                                                                                                        |
-| --------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `TS_VPS_AUTHKEY_FILE` | `host:install --enroll-vps`     | Absolute path to a private file holding the host key, `tag:ark-vps`.                                                |
-| `TS_VPS_AUTHKEY`      | `host:setup`                    | The host key itself, `tag:ark-vps`, for a non-interactive guided setup. Setup passes it to enrolment through stdin. |
-| `TS_EDGE_AUTHKEY`     | installer, `edge-ts`            | `edge-ts`, `tag:ark-edge`. The installer prompts for it on a terminal and never prints it.                          |
-| `TS_BACKUP_AUTHKEY`   | `backup-ts`                     | `backup-ts`, `tag:ark-backup`. Never reuse the edge key.                                                            |
-| `TS_AUTHKEY`          | `tailscale` (profile `tailnet`) | The tailnet admin node, `tag:ark-stack-admin`.                                                                      |
+| Variable              | Read by                         | Node and tag                                                                                                            |
+| --------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `TS_VPS_AUTHKEY_FILE` | `host:install --enroll-vps`     | Absolute path to a private file holding the host key, `tag:ark-vps`.                                                    |
+| `TS_VPS_AUTHKEY`      | `host:setup`                    | The host key itself, `tag:ark-vps`, for a non-interactive guided setup. Setup passes it to enrolment through stdin.     |
+| `TS_EDGE_AUTHKEY`     | installer, `edge-ts`            | `edge-ts`, `tag:ark-edge`. The installer prompts for it on a terminal and never prints it.                              |
+| `TS_BACKUP_AUTHKEY`   | `backup-ts`, `host:setup`       | `backup-ts`, `tag:ark-backup`. Never reuse the edge key. `host:setup --backup-node` reads it from the environment only. |
+| `TS_AUTHKEY`          | `tailscale` (profile `tailnet`) | The tailnet admin node, `tag:ark-stack-admin`.                                                                          |
+
+Instead of the keys, `host:setup` accepts one Tailscale API credential in its environment and mints and revokes the keys itself ([Tailscale API automation](production-install.md#tailscale-api-automation)). These are never written to `.env` or passed on to another process:
+
+| Variable                 | Purpose                                                                                                                                                     |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TS_API_KEY`             | An API access token (`tskey-api-…`) of a tailnet admin.                                                                                                     |
+| `TS_OAUTH_CLIENT_SECRET` | Or an OAuth client secret (`tskey-client-…`) with the `policy_file` and `auth_keys` scopes.                                                                 |
+| `TS_OAUTH_CLIENT_ID`     | The OAuth client's ID, when it cannot be read from the secret.                                                                                              |
+| `TS_OAUTH_TAG`           | The OAuth client's tag (default `tag:ark-setup`), made an owner of the Ark tags.                                                                            |
+| `TS_TAILNET`             | The tailnet the credential manages (default `-`).                                                                                                           |
+| `HCLOUD_TOKEN`           | A Hetzner Cloud API token (Read & Write) for the Hetzner firewall adapter ([Provider firewall adapters](production-install.md#provider-firewall-adapters)). |
 
 ## Host and installer
 
@@ -188,7 +199,7 @@ Each key is one-off, pre-approved, non-ephemeral and tagged for exactly one node
 | `ARK_INSTALL_SKIP_DOCKER`                | unset                    | installer                                                 | `1` writes `.env` and the `tmp/` files only: no Docker, no lock, no hardening.                                                                  |
 | `ARK_CONTAINER_UID`, `ARK_CONTAINER_GID` | `1000`                   | installer                                                 | Owner given to the `tmp/` bind-mount directories when run as root on Linux.                                                                     |
 
-The guided setup (`mise run host:setup`) also reads its answers from `ARK_SETUP_DOMAIN`, `ARK_SETUP_ADMIN_HOST`, `ARK_SETUP_SSH_USER` and the step switches `ARK_SETUP_NON_INTERACTIVE`, `ARK_SETUP_TAILSCALE_SSH_CONFIRMED`, `ARK_SETUP_SKIP_EDGE`, `ARK_SETUP_KEEP_PUBLIC_SSH`, `ARK_SETUP_PROVIDER_FIREWALL` and `ARK_SETUP_PROVIDER_FIREWALL_APPLIED`, besides the settings above; see [Install with one command](production-install.md#install-with-one-command). `install.sh` reads `ARK_REF`, `ARK_INSTALL_DIR` and `ARK_REPO_URL`.
+The guided setup (`mise run host:setup`) also reads its answers from `ARK_SETUP_DOMAIN`, `ARK_SETUP_ADMIN_HOST`, `ARK_SETUP_SSH_USER` and the step switches `ARK_SETUP_NON_INTERACTIVE`, `ARK_SETUP_TAILSCALE_SSH_CONFIRMED`, `ARK_SETUP_SKIP_EDGE`, `ARK_SETUP_KEEP_PUBLIC_SSH`, `ARK_SETUP_PROVIDER_FIREWALL`, `ARK_SETUP_PROVIDER_FIREWALL_APPLIED`, `ARK_SETUP_APPROVE_PROVIDER_FIREWALL`, `ARK_SETUP_APPROVE_TAILNET_POLICY` and `ARK_SETUP_BACKUP_NODE`, besides the settings above; see [Install with one command](production-install.md#install-with-one-command). `install.sh` reads `ARK_REF`, `ARK_INSTALL_DIR` and `ARK_REPO_URL`.
 
 ## Databases, pooler and ingress
 

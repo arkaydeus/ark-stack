@@ -1,9 +1,11 @@
 // Tailscale policy (HuJSON) snippet generator, docs/design/front-door.md §3.7 (FD-07).
 //
-// Ark never holds a key that can write the tailnet policy. Instead it generates the exact snippet
-// the owner pastes: one grant per (target host, port, protocol) for the edge node, one per backup
-// target for the backup node, and a `tests` block whose deny assertions make Tailscale reject the
-// whole policy when a sampled destination is reachable. These tests are not an exhaustive audit.
+// The running platform never holds a key that can write the tailnet policy (only the guided installer,
+// scripts/host-setup/tailscale-api.ts, can add the tag owners and the owner SSH rule, with a credential
+// the owner supplies for the install). Instead it generates the exact snippet the owner pastes: one
+// grant per (target host, port, protocol) for the edge node, one per backup target for the backup node,
+// and a `tests` block whose deny assertions make Tailscale reject the whole policy when a sampled
+// destination is reachable. These tests are not an exhaustive audit.
 //
 // The generator is pure and deterministic: the same routes give byte-identical output whatever
 // their order, there are no timestamps, and only public routing facts (hostnames, ports, Tailscale

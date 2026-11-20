@@ -9,6 +9,7 @@ export const STEP_IDS = [
   "ssh-gate",
   "install",
   "edge",
+  "backup-node",
   "configuration",
   "public-ssh",
   "provider-firewall",
