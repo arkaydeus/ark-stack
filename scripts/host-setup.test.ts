@@ -31,7 +31,13 @@ import {
 } from "@ark-stack/shared";
 
 import { runSetup, type SetupDependencies } from "./host-setup.ts";
-import { parseFlags, resolveOptions } from "./host-setup/answers.ts";
+import {
+  USAGE,
+  derivedNodeName,
+  parseFlags,
+  resolveOptions,
+  sanitizeHostname,
+} from "./host-setup/answers.ts";
 import { desiredConfiguration, setEnvValues } from "./host-setup/env-file.ts";
 import {
   describeProviderRules,
@@ -62,6 +68,7 @@ import {
   type Ui,
 } from "./host-setup/system.ts";
 import { lineDiff, mergeArkPolicy } from "./host-setup/tailnet-policy.ts";
+import { enrollVps, validateTailscaleHostname } from "./install-host-hardening.ts";
 import {
   KEY_EXPIRY_SECONDS,
   TailscaleApi,
@@ -100,9 +107,17 @@ class FakeHost {
   runSsh = false;
   healthy = false;
   ssh = { service: { enabled: true, active: true }, socket: { enabled: false, active: false } };
-  edge = { running: false, tags: [] as string[] };
+  edge = { running: false, tags: [] as string[], hostName: "" };
   edgeJoinTags = ["tag:ark-edge"];
-  backup = { running: false, tags: [] as string[] };
+  backup = { running: false, tags: [] as string[], hostName: "" };
+  /** The host node's requested machine name (Self.HostName). */
+  vpsHostName = "ark-vps";
+  /** Names already used by another machine: Tailscale assigns `<name>-1` instead. */
+  takenNames = new Set<string>();
+  /** Every `tailscale set --hostname` on the host or in a container: [where, name]. */
+  renames: [string, string][] = [];
+  /** `tailscale up` on the host was run with this machine name. */
+  enrolledHostName?: string;
   /** Every key a container was started with, and where it came from. */
   containerKeys: { service: string; key: string; from: "env" | ".env" }[] = [];
   stdinEnrolments: string[] = [];
@@ -155,6 +170,27 @@ class FakeHost {
 
   get envPath() {
     return join(this.root, ".env");
+  }
+
+  /** Tailscale's assigned name: the requested one, or `<name>-1` if another machine has it. */
+  assigned(name: string) {
+    return this.takenNames.has(name) ? `${name}-1` : name;
+  }
+
+  /** TS_HOSTNAME as Compose resolves it from .env (infra/platform/docker-compose.yml). */
+  composeName(service: string) {
+    const values = existsSync(this.envPath) ? parseEnvFile(readFileSync(this.envPath, "utf8")) : {};
+    return service === "edge-ts"
+      ? values.TS_EDGE_HOSTNAME || "ark-edge"
+      : values.TS_BACKUP_HOSTNAME || "ark-backup";
+  }
+
+  containerSelf(node: { tags: string[]; hostName: string }) {
+    return {
+      Tags: node.tags,
+      HostName: node.hostName,
+      DNSName: `${this.assigned(node.hostName)}.tail1234.ts.net.`,
+    };
   }
 
   finishSshReload() {
@@ -292,15 +328,27 @@ class FakeHost {
             ID: this.nodeId,
             Online: online,
             Tags: this.vpsTags ?? (this.enrolled ? ["tag:ark-vps"] : []),
-            DNSName: "ark-vps.tail1234.ts.net.",
+            HostName: this.vpsHostName,
+            DNSName: `${this.assigned(this.vpsHostName)}.tail1234.ts.net.`,
             TailscaleIPs: ["100.100.1.2", "fd7a:115c:a1e0::1"],
           },
         }),
       );
     }
     if (line === "tailscale debug prefs") return ok(JSON.stringify({ RunSSH: this.runSsh }));
+    if (argv[0] === "tailscale" && argv[1] === "set" && argv[2]?.startsWith("--hostname=")) {
+      expect(this.enrolled).toBe(true);
+      this.vpsHostName = argv[2].slice("--hostname=".length);
+      this.renames.push(["vps", this.vpsHostName]);
+      return ok();
+    }
     if (line === "systemctl is-active tailscaled.service") return ok("active\n");
     if (line.startsWith(`${BUN} scripts/install.ts --enroll-vps`)) {
+      // enrollVps: `tailscale up --hostname` for a new node, `tailscale set --hostname` otherwise.
+      const name = options.env?.TS_VPS_HOSTNAME;
+      if (name && this.enrolled && name !== this.vpsHostName) this.renames.push(["vps", name]);
+      if (name && !this.enrolled) this.enrolledHostName = name;
+      if (name) this.vpsHostName = name;
       const file = options.env?.TS_VPS_AUTHKEY_FILE ?? "";
       if (file) {
         this.vpsKeyFiles.push(file);
@@ -355,15 +403,27 @@ class FakeHost {
       const service = argv[argv.indexOf("-T") + 1]!;
       expect(this.configuredKeys.has(service)).toBe(false);
       this.stdinEnrolments.push(service);
+      const hostName = argv.at(-1)!;
       if (service === "edge-ts") {
         expect(options.stdin).toBe(EDGE_KEY);
         if (options.stdin === this.rejectEdgeKey) return fail("Tailscale rejected the edge auth key");
-        this.edge = { running: true, tags: this.edgeJoinTags };
+        this.edge = { running: true, tags: this.edgeJoinTags, hostName };
       } else {
         expect(service).toBe("backup-ts");
         expect(options.stdin).toBe(BACKUP_KEY);
-        this.backup = { running: true, tags: ["tag:ark-backup"] };
+        this.backup = { running: true, tags: ["tag:ark-backup"], hostName };
       }
+      return ok();
+    }
+    const containerRename = /exec -T (edge-ts|backup-ts) tailscale --socket=\S+ set --hostname=(\S+)$/.exec(
+      line,
+    );
+    if (containerRename) {
+      const [, service, name] = containerRename;
+      const node = service === "edge-ts" ? this.edge : this.backup;
+      expect(node.running).toBe(true);
+      node.hostName = name!;
+      this.renames.push([service!, name!]);
       return ok();
     }
     if (line.includes("exec -T edge-ts")) {
@@ -380,7 +440,7 @@ class FakeHost {
         }
         return fail("service edge-ts is not running");
       }
-      return ok(JSON.stringify({ BackendState: "Running", Self: { Tags: this.edge.tags } }));
+      return ok(JSON.stringify({ BackendState: "Running", Self: this.containerSelf(this.edge) }));
     }
     if (line.endsWith("up -d edge-ts edge edge-l4")) {
       const fromFile = parseEnvFile(readFileSync(this.envPath, "utf8")).TS_EDGE_AUTHKEY;
@@ -394,7 +454,7 @@ class FakeHost {
         this.configuredKeys.set("edge-ts", key);
       } else this.configuredKeys.delete("edge-ts");
       if (key && key !== this.rejectEdgeKey) {
-        this.edge = { running: true, tags: this.edgeJoinTags };
+        this.edge = { running: true, tags: this.edgeJoinTags, hostName: this.composeName("edge-ts") };
       }
       return ok();
     }
@@ -407,13 +467,16 @@ class FakeHost {
         this.containerKeys.push({ service, key, from: options.env?.[variable] ? "env" : ".env" });
         this.configuredKeys.set(service, key);
       } else this.configuredKeys.delete(service);
-      if (service === "backup-ts" && (key || this.backup.running))
-        this.backup = { running: true, tags: ["tag:ark-backup"] };
+      if (service === "backup-ts" && key && !this.backup.running)
+        this.backup = { running: true, tags: ["tag:ark-backup"], hostName: this.composeName(service) };
+      // containerboot repeats --hostname=$TS_HOSTNAME on every start.
+      else if (service === "backup-ts" && this.backup.running)
+        this.backup.hostName = this.composeName(service);
       return ok();
     }
     if (line.includes("exec -T backup-ts")) {
       if (!this.backup.running) return ok(JSON.stringify({ BackendState: "NeedsLogin" }));
-      return ok(JSON.stringify({ BackendState: "Running", Self: { Tags: this.backup.tags } }));
+      return ok(JSON.stringify({ BackendState: "Running", Self: this.containerSelf(this.backup) }));
     }
     if (line.endsWith("scripts/edge-namespace.ts"))
       return this.failRejoin-- > 0
@@ -625,6 +688,7 @@ async function setup(
     platform: "linux",
     bun: BUN,
     stdinIsTty: Boolean(ui?.interactive),
+    hostname: "ark-vps",
     sleep: async (ms) => {
       f.host.sleeps.push(ms);
       if (ms === 250 && f.host.delayedSshReload) f.host.finishSshReload();
@@ -784,6 +848,7 @@ describe("host:setup Tailscale SSH gate", () => {
         ["Shared SNI", "8883"],
         ["reboot time", "03:30"],
         ["local (non-root) user", "alice"],
+        ["Tailscale machine name", "<default>"],
         ["Continue", "<default>"],
         ["policy is saved", ""],
         ["session works", "not yet"],
@@ -829,6 +894,7 @@ describe("host:setup missing SSH user", () => {
         ["Shared SNI", "8883"],
         ["reboot time", "03:30"],
         ["local (non-root) user", "alice"],
+        ["Tailscale machine name", "<default>"],
         ["Continue", "<default>"],
         ["policy is saved", ""],
         ["Create alice", create],
@@ -1545,6 +1611,355 @@ describe("host:setup provider firewall", () => {
   });
 });
 
+describe("host:setup Tailscale machine names", () => {
+  const interactive = (names: string[]) =>
+    new ScriptedUi(
+      true,
+      [
+        ["Your domain", "example.com"],
+        ["Admin hostname", "<default>"],
+        ["Let's Encrypt", "ops@example.com"],
+        ["trusted Let's Encrypt", "<default>"],
+        ["incoming mail", "<default>"],
+        ["Shared SNI", "<default>"],
+        ["reboot time", "<default>"],
+        ["local (non-root) user", "alice"],
+        ...names.map((name): [string, string] => ["Tailscale machine name", name]),
+        ["Continue", "<default>"],
+        ["policy is saved", ""],
+        ["session works", "not yet"],
+      ],
+      [
+        ["Cloudflare", ""],
+        ["Tailscale API access token", ""],
+        ["tag:ark-vps key", VPS_KEY],
+      ],
+    );
+
+  test("interactive: asks with the sanitised OS hostname, re-prompts on an invalid name and joins with it", async () => {
+    const f = fixture();
+    f.host.vpsHostName = "Ubuntu-4GB_hel1-2";
+    const ui = interactive(["my box", "-edge", "<default>"]);
+    const result = await setup(f, [], {}, { scripted: ui, hostname: "Ubuntu-4GB_hel1-2.example.net" });
+    expect(result.code).toBe(2);
+    expect(result.text).toContain(
+      'Tailscale machine name "my box" is not valid: use 1-63 lowercase letters, digits and hyphens, not starting or ending with a hyphen',
+    );
+    expect(result.text).toContain('Tailscale machine name "-edge" is not valid');
+    expect(result.text).toContain("Tailscale names:     ubuntu-4gb-hel1-2 (this VPS)");
+    expect(result.text).toContain("edge ubuntu-4gb-hel1-2-edge (a new edge node)");
+    expect(result.text).toContain("tailscale ssh alice@ubuntu-4gb-hel1-2.tail1234.ts.net");
+    expect(f.host.enrolledHostName).toBe("ubuntu-4gb-hel1-2");
+    expect(result.state.answers.tailscaleHostname).toBe("ubuntu-4gb-hel1-2");
+    expect(result.state.tailscaleNames.vps).toEqual({
+      requested: "ubuntu-4gb-hel1-2",
+      assigned: "ubuntu-4gb-hel1-2",
+    });
+
+    // A re-run offers the previous answer, not the OS hostname.
+    const again = interactive(["<default>"]);
+    await setup(f, [], {}, { scripted: again, hostname: "something-else" });
+    expect(again.output.join("\n")).toContain("Tailscale names:     ubuntu-4gb-hel1-2 (this VPS)");
+  });
+
+  test("non-interactive: a flag or variable is used without prompting; uppercase is lowercased", async () => {
+    const f = fixture();
+    const result = await setup(f, [...FULL, "--tailscale-hostname", "Prod-VPS"], KEYS);
+    expect(result.code).toBe(0);
+    expect(f.host.enrolledHostName).toBe("prod-vps");
+    expect(f.host.edge.hostName).toBe("prod-vps-edge");
+    expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_HOSTNAME).toBe("prod-vps-edge");
+    expect(result.state.answers.tailscaleHostname).toBe("prod-vps");
+    expect(result.state.tailscaleNames).toEqual({
+      vps: { requested: "prod-vps", assigned: "prod-vps" },
+      edge: { requested: "prod-vps-edge", assigned: "prod-vps-edge" },
+    });
+    expect(result.text).toContain("Tailscale names:     prod-vps (this VPS)");
+    expect(result.text).toContain("  This VPS:      prod-vps");
+    expect(result.text).toContain("  Edge node:     prod-vps-edge");
+    expect(result.text).toContain("  Connect with:  tailscale ssh alice@prod-vps.tail1234.ts.net");
+    expect(f.host.renames).toEqual([]);
+
+    const g = fixture();
+    const scripted = await setup(g, FULL, { ...KEYS, ARK_SETUP_TAILSCALE_HOSTNAME: "from-env" });
+    expect(scripted.code).toBe(0);
+    expect(g.host.enrolledHostName).toBe("from-env");
+  });
+
+  test("non-interactive without a name uses the sanitised OS hostname and does not fail", async () => {
+    const f = fixture();
+    const result = await setup(f, FULL, KEYS, { hostname: "UBUNTU--4gb_hel1-2.local" });
+    expect(result.code).toBe(0);
+    expect(f.host.enrolledHostName).toBe("ubuntu-4gb-hel1-2");
+    expect(f.host.edge.hostName).toBe("ubuntu-4gb-hel1-2-edge");
+  });
+
+  test.each([
+    ["has space", "has space"],
+    ["a.b", "a.b"],
+    ["a_b", "a_b"],
+    ["-leading", "-leading"],
+    ["trailing-", "trailing-"],
+    ["x".repeat(64), "x".repeat(64)],
+  ])("non-interactive: refuses %s before any host command", async (name) => {
+    const f = fixture();
+    const result = await setup(f, [...FULL, "--tailscale-hostname", name], KEYS);
+    expect(result.code).toBe(1);
+    expect(result.text).toContain(
+      "is not valid: use 1-63 lowercase letters, digits and hyphens, not starting or ending with a hyphen (no spaces, dots or underscores).",
+    );
+    expect(f.host.calls).toEqual([]);
+  });
+
+  test("refuses an invalid edge or backup override", async () => {
+    const f = fixture();
+    const result = await setup(f, FULL, { ...KEYS, ARK_SETUP_TAILSCALE_EDGE_HOSTNAME: "edge_1" });
+    expect(result.code).toBe(1);
+    expect(result.text).toContain(
+      'Edge node name (--tailscale-edge-hostname or ARK_SETUP_TAILSCALE_EDGE_HOSTNAME) "edge_1" is not valid',
+    );
+    const backup = await setup(f, [...FULL, "--tailscale-backup-hostname=b.k"], KEYS);
+    expect(backup.text).toContain(
+      'Backup node name (--tailscale-backup-hostname or ARK_SETUP_TAILSCALE_BACKUP_HOSTNAME) "b.k"',
+    );
+    expect(f.host.calls).toEqual([]);
+  });
+
+  test("renames an enrolled host in place, without re-enrolling or touching tags; a second run changes nothing", async () => {
+    const f = fixture();
+    expect((await setup(f, FULL, KEYS)).code).toBe(0);
+    const enrolments = f.host.calls.filter((call) => call.includes("--enroll-vps")).length;
+    f.host.calls = [];
+
+    const renamed = await setup(f, [...FULL, "--tailscale-hostname", "new-name"], {});
+    expect(f.host.renames).toEqual([["vps", "new-name"]]);
+    expect(f.host.calls.filter((call) => call.includes("--enroll-vps"))).toEqual([]);
+    expect(f.host.calls.some((call) => /tailscale (?:up|logout|down)|advertise-tags/.test(call))).toBe(false);
+    expect(f.host.vpsTags).toBeUndefined();
+    expect(renamed.text).toContain("renamed to new-name");
+    // The SSH command changed, so the gate asks for a fresh confirmation (it is never skipped).
+    expect(renamed.code).toBe(2);
+    expect(renamed.text).toContain("tailscale ssh alice@new-name.tail1234.ts.net");
+    // The edge node was enrolled earlier under the old name and keeps it.
+    expect(f.host.edge.hostName).toBe("ark-vps-edge");
+
+    const resumed = await setup(f, [...FULL, "--tailscale-hostname", "new-name"], {});
+    expect(resumed.code).toBe(0);
+    const again = await setup(f, [...FULL, "--tailscale-hostname", "new-name"], {});
+    expect(again.code).toBe(0);
+    expect(f.host.renames).toEqual([["vps", "new-name"]]);
+    expect(enrolments).toBe(1);
+    expect(again.text).toContain("  Edge node:     ark-vps-edge");
+  });
+
+  test("reports the name Tailscale actually assigned when the requested one is taken", async () => {
+    const f = fixture();
+    f.host.takenNames.add("prod");
+    f.host.takenNames.add("prod-edge");
+    const result = await setup(f, [...FULL, "--tailscale-hostname", "prod"], KEYS);
+    expect(result.code).toBe(0);
+    expect(result.text).toContain(
+      "Tailscale assigned the name prod-1, not the requested prod (the name is taken on the tailnet",
+    );
+    expect(result.text).toContain("Tailscale assigned the name prod-edge-1, not the requested prod-edge");
+    expect(result.text).toContain("tailscale ssh alice@prod-1.tail1234.ts.net");
+    expect(result.text).toContain(
+      "  This VPS:      prod-1 (requested prod; Tailscale assigned a different name)",
+    );
+    expect(result.text).toContain(
+      "  Edge node:     prod-edge-1 (requested prod-edge; Tailscale assigned a different name)",
+    );
+    expect(result.state.tailscaleNames.vps).toEqual({ requested: "prod", assigned: "prod-1" });
+  });
+
+  test("the scripted gate also names the assigned host name when it differs", async () => {
+    const f = fixture();
+    f.host.takenNames.add("prod");
+    const result = await setup(f, [...BASE, "--tailscale-hostname", "prod"], KEYS);
+    expect(result.code).toBe(2);
+    expect(result.text).toContain("tailscale ssh alice@prod-1.tail1234.ts.net -o ControlPath=none");
+    expect(result.text).toContain("Tailscale assigned the name prod-1, not the requested prod");
+  });
+
+  test("an existing edge node keeps its name unless one is given explicitly", async () => {
+    const f = fixture();
+    // An install from before machine names: the edge node is ark-edge and .env names nothing.
+    f.host.edge = { running: true, tags: ["tag:ark-edge"], hostName: "ark-edge" };
+    const first = await setup(f, [...FULL, "--tailscale-hostname", "prod"], KEYS);
+    expect(first.code).toBe(0);
+    expect(f.host.edge.hostName).toBe("ark-edge");
+    expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_HOSTNAME ?? "").toBe("");
+    expect(first.text).toContain("edge-ts already joined as tag:ark-edge (ark-edge)");
+    expect(first.text).toContain("  Edge node:     ark-edge");
+    expect(f.host.renames).toEqual([]);
+
+    const renamed = await setup(f, [...FULL, "--tailscale-edge-hostname", "Prod-Edge"], {});
+    expect(renamed.code).toBe(0);
+    expect(f.host.renames).toEqual([["edge-ts", "prod-edge"]]);
+    expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_HOSTNAME).toBe("prod-edge");
+    expect(renamed.text).toContain("edge-ts already joined as tag:ark-edge; renamed to prod-edge");
+    expect(renamed.state.answers.tailscaleEdgeHostname).toBe("prod-edge");
+
+    // The recorded explicit name is re-applied idempotently: nothing changes again.
+    const again = await setup(f, FULL, {});
+    expect(again.code).toBe(0);
+    expect(f.host.renames).toEqual([["edge-ts", "prod-edge"]]);
+    expect(f.host.edge.tags).toEqual(["tag:ark-edge"]);
+  });
+
+  test("the backup node joins as <name>-backup, or with its explicit name", async () => {
+    const f = fixture();
+    const result = await setup(f, [...FULL, "--backup-node", "--tailscale-hostname", "prod"], {
+      ...KEYS,
+      TS_BACKUP_AUTHKEY: BACKUP_KEY,
+    });
+    expect(result.code).toBe(0);
+    expect(f.host.backup.hostName).toBe("prod-backup");
+    expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_BACKUP_HOSTNAME).toBe("prod-backup");
+    expect(result.text).toContain("backup-ts joined as tag:ark-backup named prod-backup");
+    expect(result.text).toContain("  Backup node:   prod-backup");
+
+    const renamed = await setup(
+      f,
+      [...FULL, "--backup-node", "--tailscale-backup-hostname", "home-backup"],
+      {},
+    );
+    expect(renamed.code).toBe(0);
+    expect(f.host.renames).toEqual([["backup-ts", "home-backup"]]);
+    expect(f.host.backup.tags).toEqual(["tag:ark-backup"]);
+  });
+
+  test("name helpers: sanitising, derived names within 63 characters, usage", () => {
+    expect(sanitizeHostname("Ubuntu-4GB_hel1-2.example.net")).toBe("ubuntu-4gb-hel1-2");
+    expect(sanitizeHostname("--a__b--")).toBe("a-b");
+    expect(sanitizeHostname("___")).toBe("ark-vps");
+    expect(sanitizeHostname(undefined)).toBe("ark-vps");
+    expect(sanitizeHostname(`${"a".repeat(62)}-b`)).toBe("a".repeat(62));
+    expect(validateTailscaleHostname(" Prod-1 ")).toBe("prod-1");
+    expect(validateTailscaleHostname("x".repeat(63))).toBe("x".repeat(63));
+    const long = derivedNodeName("x".repeat(63), "backup");
+    expect(long).toBe(`${"x".repeat(56)}-backup`);
+    expect(long.length).toBe(63);
+    expect(derivedNodeName(`${"x".repeat(57)}-yz`, "edge")).toBe(`${"x".repeat(57)}-edge`);
+    expect(USAGE).toContain("--tailscale-hostname NAME");
+    expect(USAGE).toContain("ARK_SETUP_TAILSCALE_EDGE_HOSTNAME");
+    expect(
+      parseFlags(["--tailscale-hostname=a", "--tailscale-edge-hostname", "b"]).get(
+        "--tailscale-edge-hostname",
+      ),
+    ).toBe("b");
+  });
+});
+
+describe("enrollVps (host:install --enroll-vps)", () => {
+  /** A stubbed host tailscale: records every command and answers status like the real CLI. */
+  function stubHost(initial: { state: string; tags?: string[]; hostName?: string; tun?: boolean }) {
+    const calls: string[][] = [];
+    const logs: string[] = [];
+    const node = { ...initial, taken: new Set<string>() };
+    const run = async (wrapper: string, argv: string[]) => {
+      calls.push([wrapper, ...argv]);
+      // The key-on-stdin form runs `sh -c 'cat | tailscale "$@"' sh <args>`.
+      const [command, args] = wrapper === "sh" ? ["tailscale", argv.slice(3)] : [wrapper, argv];
+      if (command === "tailscale" && args[0] === "status") {
+        const running = node.state === "Running";
+        const name = node.hostName ?? "ubuntu-4gb-hel1-2";
+        return JSON.stringify({
+          BackendState: node.state,
+          TUN: node.tun ?? true,
+          Self: {
+            Online: running,
+            Tags: running ? (node.tags ?? ["tag:ark-vps"]) : [],
+            HostName: name,
+            DNSName: `${node.taken.has(name) ? `${name}-1` : name}.tail1234.ts.net.`,
+          },
+        });
+      }
+      if (command === "tailscale" && args[0] === "up") {
+        node.state = "Running";
+        const hostname = args.find((arg) => arg.startsWith("--hostname="));
+        if (hostname) node.hostName = hostname.slice("--hostname=".length);
+      }
+      if (command === "tailscale" && args[0] === "set" && args[1]?.startsWith("--hostname=")) {
+        node.hostName = args[1].slice("--hostname=".length);
+      }
+      return "";
+    };
+    const io = {
+      run,
+      which: () => "/usr/bin/tailscale",
+      requireRoot: () => {},
+      sleep: async () => {},
+      log: (line: string) => logs.push(line),
+    };
+    return { calls, logs, node, io };
+  }
+
+  test("without a name, a fresh node joins with exactly the earlier flags", async () => {
+    const host = stubHost({ state: "NeedsLogin" });
+    await enrollVps(async () => VPS_KEY, undefined, host.io);
+    const up = host.calls.find((call) => call.includes("up"))!;
+    expect(up).toEqual([
+      "sh",
+      "-c",
+      'cat | tailscale "$@"',
+      "sh",
+      "up",
+      "--auth-key=file:/dev/stdin",
+      "--advertise-tags=tag:ark-vps",
+      "--accept-dns=false",
+    ]);
+    expect(host.calls.filter((call) => call[1] === "set")).toEqual([["tailscale", "set", "--ssh"]]);
+    expect(host.logs).toEqual([
+      "Verify Tailscale SSH as the owner before running host:install --harden-vps.",
+    ]);
+  });
+
+  test("with TS_VPS_HOSTNAME, a fresh node joins with that name and the same tag, TUN and DNS settings", async () => {
+    const host = stubHost({ state: "NeedsLogin" });
+    await enrollVps(async () => VPS_KEY, "Prod-VPS", host.io);
+    const up = host.calls.find((call) => call.includes("up"))!;
+    expect(up.slice(4)).toEqual([
+      "up",
+      "--auth-key=file:/dev/stdin",
+      "--advertise-tags=tag:ark-vps",
+      "--accept-dns=false",
+      "--hostname=prod-vps",
+    ]);
+    expect(host.calls.filter((call) => call[1] === "set")).toEqual([["tailscale", "set", "--ssh"]]);
+    expect(host.logs).toContain("Tailscale machine name: prod-vps");
+  });
+
+  test("an enrolled, tagged node is renamed in place; a second run changes nothing", async () => {
+    const host = stubHost({ state: "Running" });
+    host.node.taken.add("prod");
+    await enrollVps(undefined, "prod", host.io);
+    expect(host.calls.some((call) => call.includes("up") || call.includes("logout"))).toBe(false);
+    expect(host.calls.filter((call) => call[1] === "set")).toEqual([
+      ["tailscale", "set", "--hostname=prod"],
+      ["tailscale", "set", "--ssh"],
+    ]);
+    expect(host.logs).toContain("Tailscale machine name: prod-1");
+    expect(host.logs.join("\n")).toContain("Tailscale assigned the name prod-1, not the requested prod");
+    host.calls.length = 0;
+    await enrollVps(undefined, "prod", host.io);
+    expect(host.calls.filter((call) => call[1] === "set")).toEqual([["tailscale", "set", "--ssh"]]);
+  });
+
+  test("keeps refusing a wrongly tagged or userspace node, and an invalid name before any command", async () => {
+    const tagged = stubHost({ state: "Running", tags: ["tag:server"] });
+    await expect(enrollVps(undefined, "prod", tagged.io)).rejects.toThrow("must use the host TUN interface");
+    expect(tagged.calls.some((call) => call.join(" ").includes("--hostname"))).toBe(false);
+    const userspace = stubHost({ state: "Running", tun: false });
+    await expect(enrollVps(undefined, "prod", userspace.io)).rejects.toThrow("userspace networking");
+    const invalid = stubHost({ state: "NeedsLogin" });
+    await expect(enrollVps(undefined, "bad_name", invalid.io)).rejects.toThrow(
+      'TS_VPS_HOSTNAME "bad_name" is not valid',
+    );
+    expect(invalid.calls).toEqual([]);
+  });
+});
+
 describe("host:setup helpers", () => {
   test("identifies the client through sudo's proc ancestry when SSH_CONNECTION is missing", async () => {
     const proc = mkdtempSync(join(tmpdir(), "ark-setup-proc-"));
@@ -1604,6 +2019,7 @@ describe("host:setup helpers", () => {
       sniPorts: [],
       rebootTime: "04:00",
       sshUser: "",
+      tailscaleHostname: "ark-vps",
     };
     const current = "BETTER_AUTH_TRUSTED_ORIGINS=https://admin.example.com,http://localhost:5173\n";
     const { desired } = desiredConfiguration(answers, current, "https://admin.example.com");

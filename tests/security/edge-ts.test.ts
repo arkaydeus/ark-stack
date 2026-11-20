@@ -50,6 +50,8 @@ describe("edge-ts", () => {
     expect(edgeTs.environment).toEqual({
       TS_USERSPACE: "false",
       TS_AUTHKEY: "${TS_EDGE_AUTHKEY:-}",
+      // containerboot repeats --hostname on every start; the default is the original name.
+      TS_HOSTNAME: "${TS_EDGE_HOSTNAME:-ark-edge}",
       TS_STATE_DIR: "/var/lib/tailscale",
       TS_SOCKET: "/var/run/tailscale/tailscaled.sock",
       TS_ACCEPT_DNS: "false",

@@ -36,6 +36,8 @@ The guided setup (`mise run host:setup`, started by `install.sh`) runs these ste
    sudo TS_VPS_AUTHKEY_FILE=/root/ark-vps-authkey mise run host:install --enroll-vps
    ```
 
+   Add `TS_VPS_HOSTNAME=<name>` to choose the node's Tailscale machine name instead of the OS hostname.
+
 3. From the owner's device, verify a new `tailscale ssh <user>@<vps-magicdns-name>` session and keep it open. From that session or the provider console, run the hardening phase. Set `ARK_MAIL_ENABLED=0` in `.env` if this install should run without Stalwart. The default maintenance window is 04:00 in the server's time zone. Set `ARK_HOST_REBOOT_TIME=HH:MM` in the installer environment or `.env` to change it.
 
    ```sh
@@ -49,6 +51,15 @@ The guided setup (`mise run host:setup`, started by `install.sh`) runs these ste
    To disable mail on an existing installation, rerun `host:install` with `ARK_MAIL_ENABLED=0`. The installer stops the prior firewall reconciler on a hardened host, then stops Stalwart, its worker and the old API before applying the mail-off baseline. If the build fails, retry the installer to restore the API and reconciler with the saved settings. On Ubuntu, the installer and signed maintenance refuse overlapping runs. Signed maintenance keeps the mail worker stopped while mail is disabled. Mail operations return an unavailable response, and jobs already queued resume when mail is enabled again.
 
 4. After confirming a new Tailscale SSH session works with the baseline active, remove public TCP 22 at the provider. Stop Ubuntu's legacy public OpenSSH listener or bind it to a private address before running the audit. Tailscale SSH is served by `tailscaled`. Use nftables for the Ark host firewall and remove conflicting UFW rules. Keep the provider's required ICMP and ICMPv6 allowances.
+
+### Renaming a Tailscale node
+
+The guided setup names the host node after its Tailscale machine name question and the edge and backup nodes `<name>-edge` and `<name>-backup` (see [The questions](getting-started/production-install.md#the-questions)). Renaming never re-enrols a node, logs it out or changes its tags, and route pins are unaffected because they name stable node IDs, not machine names.
+
+- **The host node.** Rerun setup with the new name: `sudo mise run host:setup --tailscale-hostname <new-name>`. It runs `tailscale set --hostname=<new-name>` on the enrolled node. The `tailscale ssh` command changes with the name, so setup asks you to confirm a fresh Tailscale SSH session before it continues (with `--non-interactive`, it pauses and prints the resume command). Without the guided setup, run `sudo TS_VPS_HOSTNAME=<new-name> mise run host:install --enroll-vps`.
+- **The edge or backup node.** A node that has joined keeps its name when only the host name changes. Rerun setup with `--tailscale-edge-hostname <new-name>` or `--tailscale-backup-hostname <new-name>` (add `--backup-node` for the backup node). Setup writes `TS_EDGE_HOSTNAME` or `TS_BACKUP_HOSTNAME` to `.env`, so the container repeats the name on every start, and renames the running node with `tailscale --socket=/var/run/tailscale/tailscaled.sock set --hostname=<new-name>` inside its container. By hand, set the `.env` value and recreate the container: `docker compose --env-file .env -f infra/platform/docker-compose.yml up -d edge-ts edge edge-l4` followed by `mise run edge:rejoin` (or `up -d backup-ts`). Do not use `tailscale set --hostname` in a container alone: its next start would repeat the `.env` name.
+
+Tailscale appends a suffix such as `-1` when another machine already uses the name. Setup reads back the assigned name and reports when it differs from the one requested. A machine renamed by hand in the admin console keeps that name; rename it there again, or turn on its automatic name, if you want the requested one.
 
 ### Provider firewall and audit
 
@@ -122,7 +133,7 @@ The existing admin node, `tailscale` with `tailnet-gateway` (profile `tailnet`, 
 5. Delete the key from `.env` (leave `TS_EDGE_AUTHKEY=` empty) and revoke it in the console. The node authenticates from its state volume (`ark_edge_ts_state`) from then on. Tagged devices have key expiry disabled by default.
 6. With Tailnet Lock enabled, sign the new node from a trusted signing node (`tailscale lock sign <node key>`). Then check `GET /api/front/tailnet`: the next `edge.observe` (or `POST /api/front/tailnet/observe`) must commit a generation whose self node carries `tag:ark-edge`. Routes then wait in `awaiting_acl` until their grants from [Tailnet policy snippet](#tailnet-policy-snippet) are merged.
 
-**Re-enrolling or replacing the edge node.** Never reuse a failed node identity. Remove the old `ark-edge` device in the admin console, then create a fresh one-off key and repeat steps 2–6. The `ark_edge_ts_state` Compose volume (`ark-platform_ark_edge_ts_state` in Docker) holds the old identity, so stop and remove the `edge-ts` container, then remove that one volume. Every route's pinned target stays valid, because pins name the target machines, not the edge. Routes are withdrawn while the lease has no valid generation and return after the first observation of the new node.
+**Re-enrolling or replacing the edge node.** Never reuse a failed node identity. Remove the old edge device (`<name>-edge`, or `ark-edge` on installs from before machine names) in the admin console, then create a fresh one-off key and repeat steps 2–6. The `ark_edge_ts_state` Compose volume (`ark-platform_ark_edge_ts_state` in Docker) holds the old identity, so stop and remove the `edge-ts` container, then remove that one volume. Every route's pinned target stays valid, because pins name the target machines, not the edge. Routes are withdrawn while the lease has no valid generation and return after the first observation of the new node.
 
 Allow UDP 41642 in the host and provider firewalls so the edge node can make direct WireGuard connections. Without it, tailnet traffic is relayed through DERP. The host's own tailscaled keeps UDP 41641.
 
