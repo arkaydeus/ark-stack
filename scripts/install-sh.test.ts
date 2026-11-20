@@ -67,7 +67,8 @@ fi`,
     esac ;;
 esac`,
   curl: 'while [ $# -gt 0 ]; do [ "$1" = -o ] && echo KEY > "$2"; shift; done',
-  mise: '[ "$1" = --version ] && echo "mise 2026.11.0"; exit 0',
+  mise: 'case "$1" in --version) echo "mise 2026.11.0" ;; which) echo "$STUB_TEMPLATES/bun" ;; esac',
+  bun: '[[ "$TS_API_KEY" = tskey-api-bootstrap-probe && "$TS_OAUTH_CLIENT_ID" = client-probe && "$HCLOUD_TOKEN" = hcloud-bootstrap-probe ]] || exit 9',
   systemctl: 'rm -f "$STUB_STATE/docker-stopped"',
   flock: 'exit "${STUB_LOCK_EXIT:-0}"',
   ip: "exit 0",
@@ -95,7 +96,16 @@ function sandbox(present: string[]) {
   for (const path of [bin, templates, state, join(rootfs, "etc")]) mkdirSync(path, { recursive: true });
   for (const [name, body] of Object.entries(STUBS)) {
     const file = join(templates, name);
-    writeFileSync(file, `#!/bin/bash\necho "${name} $*" >> "$STUB_CALLS"\n${body}\n`);
+    const rejectApiEnv =
+      name === "bun"
+        ? ""
+        : `
+if [[ -n "$TS_API_KEY$TS_OAUTH_CLIENT_SECRET$TS_OAUTH_CLIENT_ID$HCLOUD_TOKEN" ]]; then
+  echo "API credential reached ${name}" >&2
+  exit 9
+fi
+`;
+    writeFileSync(file, `#!/bin/bash\necho "${name} $*" >> "$STUB_CALLS"\n${rejectApiEnv}${body}\n`);
     chmodSync(file, 0o755);
   }
   for (const name of [...present, "id", "uname", "dpkg-query", "apt-get", "systemctl", "flock"]) {
@@ -162,6 +172,24 @@ const CHANGES = /^(apt-get|git clone|git -C \S+ (merge|checkout|fetch)|curl|mise
 const changed = (calls: string[]) => calls.filter((call) => CHANGES.test(call));
 
 describe("install.sh", () => {
+  test("API credentials reach only the guided setup on a fresh host", () => {
+    const box = sandbox([]);
+    const result = run(box, {
+      env: {
+        TS_API_KEY: "tskey-api-bootstrap-probe",
+        TS_OAUTH_CLIENT_ID: "client-probe",
+        HCLOUD_TOKEN: "hcloud-bootstrap-probe",
+      },
+      args: ["--non-interactive", "--domain", "example.com"],
+      stdin: script,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain("API credential reached");
+    expect(result.calls.slice(-2)).toEqual([
+      "mise which bun",
+      "bun --no-env-file scripts/host-setup.ts --non-interactive --domain example.com",
+    ]);
+  });
   test("is valid bash and runs everything from one function called on the last line", () => {
     expect(Bun.spawnSync(["bash", "-n", join(repoRoot, "install.sh")]).exitCode).toBe(0);
     const lines = script.trimEnd().split("\n");

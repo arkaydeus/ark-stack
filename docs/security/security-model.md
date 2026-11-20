@@ -25,7 +25,7 @@ The full asset list, attacker model and residual risks are in the front-door des
 Root on the VPS can read `.env` and the Docker volumes, so every Ark secret falls with it: the root key (and so every sealed secret and private CA key), `BETTER_AUTH_SECRET` (so sessions can be forged), the Tailscale node keys, and any connected Vercel project token. What still limits the damage:
 
 - **Tailnet reach is limited to granted ports.** The edge node reaches only the `host:port` pairs granted to `tag:ark-edge`, and the backup node only the home backup server. This holds only if the tailnet policy has no broad rules, which is why the generated snippet carries `tests`.
-- **The tailnet policy is out of reach.** Ark holds no Tailscale API key or OAuth client, so it cannot widen grants or add nodes. Tailnet Lock, when enabled, stops new nodes from joining with stolen keys.
+- **The tailnet policy is out of reach.** The running platform holds no Tailscale API key or OAuth client, so it cannot widen grants or add nodes. The guided installer can use one the owner supplies, in memory only and for the install alone, to add the Ark tag owners and the owner SSH rule after confirmation and to mint one-off keys it revokes after each join. Tailnet Lock, when enabled, stops new nodes from joining with stolen keys.
 - **Existing backups survive.** Off-VPS credentials are write-only or append-only, and pruning happens off-host ([backups guide](../guides/backups.md)).
 - **Client certificates expire.** Database client certificates last 90 days, and retirement drains their sessions by `not_after + 5 s`.
 

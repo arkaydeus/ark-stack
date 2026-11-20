@@ -49,7 +49,10 @@ export const runCommand: Runner = async (argv, options = {}) => {
   try {
     child = Bun.spawn(argv, {
       cwd: options.cwd,
-      env: (options.env ?? process.env) as Record<string, string>,
+      env: (options.env ? withoutApiCredentials(options.env) : withoutSetupSecrets(process.env)) as Record<
+        string,
+        string
+      >,
       stdin: options.stdin === undefined ? "ignore" : new TextEncoder().encode(options.stdin),
       stdout: "pipe",
       stderr: "pipe",
@@ -65,6 +68,29 @@ export const runCommand: Runner = async (argv, options = {}) => {
   ]);
   return { status, stdout, stderr };
 };
+
+const API_SECRETS = ["TS_API_KEY", "TS_OAUTH_CLIENT_SECRET", "HCLOUD_TOKEN"];
+
+/** Shell-supplied secrets to register with the setup redactor. */
+export const SECRET_VARIABLES = [
+  "TS_VPS_AUTHKEY",
+  "TS_EDGE_AUTHKEY",
+  "TS_BACKUP_AUTHKEY",
+  ...API_SECRETS,
+  "DNS_API_TOKEN",
+];
+
+export function withoutApiCredentials(source: Record<string, string | undefined>) {
+  const env = { ...source };
+  for (const key of [...API_SECRETS, "TS_OAUTH_CLIENT_ID"]) delete env[key];
+  return env;
+}
+
+export function withoutSetupSecrets(source: Record<string, string | undefined>) {
+  const env = { ...source };
+  for (const key of [...SECRET_VARIABLES, "TS_VPS_AUTHKEY_FILE", "TS_OAUTH_CLIENT_ID"]) delete env[key];
+  return env;
+}
 
 /** Values that must never reach the terminal (except the setup token in the summary) or the log. */
 export class Redactor {

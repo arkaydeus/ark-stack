@@ -251,7 +251,7 @@ env = { _.file = ".env" }
 raw_args = true
 
 [tasks."host:setup"]
-description = "Guided production install on an Ubuntu VPS (run as root; started by install.sh): questions, Tailscale enrolment, SSH safety check, hardening and install, edge node, admin origin and ACME, closing public SSH, provider firewall and audit, summary"
+description = "Guided production install on an Ubuntu VPS (run as root; started by install.sh): questions, Tailscale enrolment (manual keys or Tailscale API), SSH safety check, hardening and install, edge and optional backup node, admin origin and ACME, closing public SSH, provider firewall (manual or Hetzner Cloud API) and audit, summary"
 run = "bun --no-env-file scripts/host-setup.ts"
 raw_args = true
 
@@ -273,7 +273,7 @@ description = "Test bootstrap on supported Ubuntu releases, Docker conflict and 
 run = "bun --no-env-file scripts/test-install-bootstrap.ts"
 
 [tasks."test:install-live"]
-description = "Opt-in: check the SSH gate, failed and successful cutovers, hardening and audit on a scratch VPS and tailnet (skips without ARK_TEST_INSTALL_* variables)"
+description = "Opt-in: check the SSH gate, failed and successful cutovers, hardening and audit on a scratch VPS and tailnet, optionally with the Tailscale and Hetzner APIs (skips without ARK_TEST_INSTALL_* variables)"
 run = "bun --no-env-file scripts/test-install-live.ts"
 
 [tasks.import]

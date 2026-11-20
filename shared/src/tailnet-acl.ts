@@ -1,9 +1,11 @@
 // Tailscale policy (HuJSON) snippet generator, docs/design/front-door.md §3.7 (FD-07).
 //
-// Ark never holds a key that can write the tailnet policy. Instead it generates the exact snippet
-// the owner pastes: one grant per (target host, port, protocol) for the edge node, one per backup
-// target for the backup node, and a `tests` block whose deny assertions make Tailscale reject the
-// whole policy when a sampled destination is reachable. These tests are not an exhaustive audit.
+// The running platform never holds a key that can write the tailnet policy (only the guided installer,
+// scripts/host-setup/tailscale-api.ts, can add the tag owners and the owner SSH rule, with a credential
+// the owner supplies for the install). Instead it generates the exact snippet the owner pastes: one
+// grant per (target host, port, protocol) for the edge node, one per backup target for the backup node,
+// and a `tests` block whose deny assertions make Tailscale reject the whole policy when a sampled
+// destination is reachable. These tests are not an exhaustive audit.
 //
 // The generator is pure and deterministic: the same routes give byte-identical output whatever
 // their order, there are no timestamps, and only public routing facts (hostnames, ports, Tailscale
@@ -564,14 +566,14 @@ function arrayLines(key: string, values: string[]) {
  * snippet because it grants a user identity access to `tag:ark-vps`, which the front-door snippet
  * never does. `check` mode makes the user re-authenticate before a session.
  */
-export function sshPolicyExample(input: { admin?: string } = {}) {
+export function sshPolicyExample(input: { admin?: string; useDefaultCheckPeriod?: boolean } = {}) {
   const admin =
     input.admin && TAG_OWNER.test(input.admin) && !input.admin.startsWith("tag:")
       ? input.admin
       : "autogroup:admin";
   return [
     "// Optional: Tailscale SSH to the Ark VPS. Not part of the generated front-door snippet.",
-    '// "check" re-authenticates the user with the identity provider before each session.',
+    '// "check" periodically re-authenticates the user with the identity provider.',
     "{",
     '  "grants": [',
     `    { "src": [${json(admin)}], "dst": [${json(ARK_VPS_TAG)}], "ip": ["tcp:22"] },`,
@@ -582,7 +584,7 @@ export function sshPolicyExample(input: { admin?: string } = {}) {
     `      "src": [${json(admin)}],`,
     `      "dst": [${json(ARK_VPS_TAG)}],`,
     '      "users": ["autogroup:nonroot"],',
-    '      "checkPeriod": "12h",',
+    ...(input.useDefaultCheckPeriod ? [] : ['      "checkPeriod": "12h",']),
     "    },",
     "  ],",
     "}",

@@ -17,6 +17,12 @@ export type Options = {
   tailscaleSshConfirmed: boolean;
   providerFirewallApplied: boolean;
   providerFirewall?: string;
+  /** Apply an API adapter's provider firewall plan without asking. */
+  approveProviderFirewall: boolean;
+  /** Apply the Tailscale API source's policy change without asking. */
+  approveTailnetPolicy: boolean;
+  /** Enrol the backup node (backup-ts, tag:ark-backup) for a home backup target. */
+  backupNode: boolean;
   help: boolean;
 };
 
@@ -44,6 +50,9 @@ const BOOLEAN_FLAGS = new Set([
   "--skip-edge",
   "--tailscale-ssh-confirmed",
   "--provider-firewall-applied",
+  "--approve-provider-firewall",
+  "--approve-tailnet-policy",
+  "--backup-node",
   "--mail",
   "--no-mail",
   "--trusted-certificates",
@@ -69,9 +78,22 @@ Questions:
   --reboot-time HH:MM           ARK_HOST_REBOOT_TIME        Automatic reboot time (default 04:00)
   --ssh-user NAME               ARK_SETUP_SSH_USER          Your local user for Tailscale SSH
 
-Tailscale keys (environment only; read without echo otherwise):
-  TS_VPS_AUTHKEY or TS_VPS_AUTHKEY_FILE   one-off key for tag:ark-vps
+Tailscale (environment only; read without echo otherwise):
+  TS_API_KEY                              API access token: setup merges the policy and mints the keys
+  TS_OAUTH_CLIENT_SECRET                  or an OAuth client (scopes policy_file, auth_keys,
+                                         devices:posture_attributes and devices:core:read)
+    [TS_OAUTH_CLIENT_ID, TS_OAUTH_TAG]    tag tag:ark-setup; TS_TAILNET picks the tailnet (default -)
+  TS_VPS_AUTHKEY or TS_VPS_AUTHKEY_FILE   or a one-off key for tag:ark-vps, pasted or given here
   TS_EDGE_AUTHKEY                         one-off key for tag:ark-edge
+  TS_BACKUP_AUTHKEY                       one-off key for tag:ark-backup (with --backup-node)
+  --approve-tailnet-policy      ARK_SETUP_APPROVE_TAILNET_POLICY=1   Preapprove the shown change with --non-interactive
+  --backup-node                 ARK_SETUP_BACKUP_NODE=1              Also enrol backup-ts (tag:ark-backup)
+
+Provider firewall:
+  --provider-firewall ID        ARK_SETUP_PROVIDER_FIREWALL          Adapter: hetzner or manual (default: detect)
+  (environment only)            HCLOUD_TOKEN                         Hetzner Cloud API token (Read & Write)
+  --approve-provider-firewall   ARK_SETUP_APPROVE_PROVIDER_FIREWALL=1  Preapprove the shown change with --non-interactive
+  --provider-firewall-applied   ARK_SETUP_PROVIDER_FIREWALL_APPLIED=1  You applied the printed rules (manual)
 
 Steps and safety:
   --non-interactive             ARK_SETUP_NON_INTERACTIVE=1          Never prompt
@@ -80,8 +102,6 @@ Steps and safety:
   --keep-public-ssh             ARK_SETUP_KEEP_PUBLIC_SSH=1          Leave OpenSSH listening
   --ssh-recovery-source IP      ARK_SETUP_SSH_RECOVERY_SOURCE         IP allowed to reconnect during SSH cutover
   --verify-ssh-cutover           ARK_SETUP_VERIFY_SSH_CUTOVER=1       Wait for off-host proof in scripted mode
-  --provider-firewall ID        ARK_SETUP_PROVIDER_FIREWALL          Firewall adapter (default: manual)
-  --provider-firewall-applied   ARK_SETUP_PROVIDER_FIREWALL_APPLIED=1  You applied the printed rules
 `;
 
 export function parseFlags(argv: string[]): Flags {
@@ -126,6 +146,9 @@ export function resolveOptions(flags: Flags, env: Record<string, string | undefi
     tailscaleSshConfirmed: flag("--tailscale-ssh-confirmed", "ARK_SETUP_TAILSCALE_SSH_CONFIRMED"),
     providerFirewallApplied: flag("--provider-firewall-applied", "ARK_SETUP_PROVIDER_FIREWALL_APPLIED"),
     providerFirewall: typeof firewall === "string" && firewall.trim() ? firewall.trim() : undefined,
+    approveProviderFirewall: flag("--approve-provider-firewall", "ARK_SETUP_APPROVE_PROVIDER_FIREWALL"),
+    approveTailnetPolicy: flag("--approve-tailnet-policy", "ARK_SETUP_APPROVE_TAILNET_POLICY"),
+    backupNode: flag("--backup-node", "ARK_SETUP_BACKUP_NODE"),
     help: flags.has("--help") || flags.has("-h"),
   };
 }
