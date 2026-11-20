@@ -63,8 +63,9 @@ export function tailnetPolicyInstructions({ backup = false }: { backup?: boolean
       .split("\n")
       .map((line) => `  ${line}`),
     "",
-    `"autogroup:nonroot" lets you log in as any local user except root. If this VPS has only root,`,
-    "create a user with sudo first (adduser <name> && usermod -aG sudo <name>) or list it in users.",
+    `"autogroup:nonroot" lets you log in as any local user except root. After enrolment, interactive`,
+    "setup offers to create the selected user if it is missing. For scripted runs, create the user",
+    "with sudo access beforehand (adduser <name> && usermod -aG sudo <name>).",
     `Add no grant with ${ARK_EDGE_TAG}${backup ? ` or ${ARK_BACKUP_TAG}` : ""} as the source, and check that no catch-all rule`,
     '(such as "src": ["*"], "dst": ["*"]) covers it.',
   ];

@@ -51,10 +51,10 @@ On a rerun, installed `.env` values take precedence over saved answers. Flags an
 
 ### What you do during the install
 
-You never edit a file. The installer stops for you only at these points:
+The installer guides you through these steps:
 
 1. **Tailnet policy and the host key.** It first asks for an optional Tailscale API credential. With one, it shows the exact policy change (the `tag:ark-vps` and `tag:ark-edge` tag owners and the owner-only Tailscale SSH rule in `check` mode), applies it after your `yes` and mints every auth key itself ([Tailscale API automation](#tailscale-api-automation)). Without one (press Enter), it prints the policy you need (see [Plan the Tailscale identities](#plan-the-tailscale-identities)) and asks you to paste a one-off `tag:ark-vps` auth key. Either way the key is passed to enrolment through stdin.
-2. **The Tailscale SSH check.** It prints `tailscale ssh <user>@<vps-magicdns-name>`. Open that from your own device, keep it open, and type `yes` once it works. If you do not, it stops **before** hardening, with nothing on the firewall or OpenSSH changed, and prints the command to resume. It also says whether the current session already arrives over Tailscale.
+2. **The Tailscale SSH check.** After enrolment, interactive setup offers to create the selected local user if it is missing. It requires an unused `/home/<user>` and, where OpenSSH is installed, a policy that denies that user or disables both `PasswordAuthentication` and `KbdInteractiveAuthentication` for them. Apply and reload that policy while keeping your recovery session open. For custom OpenSSH policies with group or connection-specific `Match` rules, create a protected local account manually and select it with `--ssh-user`. Setup prompts for the new user's sudo password without echo. Next it prints `tailscale ssh <user>@<vps-magicdns-name>`. Open that from your own device, keep it open, and type `yes` once it works. A newly created account always needs a fresh login check. Setup pauses before hardening until you confirm and prints the resume command.
 3. **The edge key.** It asks for a one-off `tag:ark-edge` key, or mints one with the API credential (Enter skips this step, and the summary says how to finish it), brings up `edge-ts`, `edge` and `edge-l4`, rejoins the namespace, checks the node is tagged exactly `["tag:ark-edge"]` and then empties `TS_EDGE_AUTHKEY` in `.env`. A minted key never reaches `.env`, and it is revoked once the node has joined. With `--backup-node` the backup node (`backup-ts`, `tag:ark-backup`) is enrolled the same way.
 4. **Closing public SSH.** Hardening preserves OpenSSH access from your current OpenSSH client's IP. From a console or Tailscale session, give that client's IP with `--ssh-recovery-source IP` if public OpenSSH is active. Setup arms a five-minute systemd rollback timer, stops the units serving public listeners, and asks you to test a fresh Tailscale SSH login from your device. After confirmation, it disables those units and removes the recovery rule and unambiguously public UFW SSH allowances. If verification fails or the session drops before confirmation, rollback restores the OpenSSH units and preserves the scoped firewall path. With `--keep-public-ssh`, setup retains OpenSSH and its audit and provider allowances.
 5. **The provider firewall.** Setup prints the inbound rules for your provider and asks you to confirm them, or, on Hetzner Cloud with an API token, shows the planned changes to an Ark firewall and applies them after your `yes`. It then runs the local audit of the firewall and listeners. Keep the listed OpenSSH allowance while cutover is pending. After cutover, setup prints the external scan command to run from another machine.
@@ -63,7 +63,7 @@ Then it prints the summary: the SSH tunnel command, `http://localhost:3000` and 
 
 ### Scripted installs
 
-`--non-interactive` never prompts. A missing required answer fails with a message that names its flag or variable. Supply the Tailscale keys in the environment (`TS_VPS_AUTHKEY` or a private `TS_VPS_AUTHKEY_FILE`, and `TS_EDGE_AUTHKEY`) and confirm the two human checks with flags:
+`--non-interactive` never prompts. Provision the local user with a login shell and sudo access before starting. A missing required answer fails with a message that names its flag or variable. Supply the Tailscale keys in the environment (`TS_VPS_AUTHKEY` or a private `TS_VPS_AUTHKEY_FILE`, and `TS_EDGE_AUTHKEY`) and confirm the two human checks with flags:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh \
@@ -85,6 +85,8 @@ curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh
 ### Re-running and resuming
 
 Run the same command again, or `cd /opt/ark-stack && sudo mise run host:setup`. Setup records progress in the root-only `tmp/host-setup/state.json` file and verifies completed steps on rerun. The install step runs again if its settings or Git commit changed, or if the live firewall or platform health check fails. Configuration checks that both the API and the domain worker are ready with the expected Compose configuration. Secrets in `.env` are never rotated. Progress is one line per step, and details are in `tmp/host-setup/setup.log`. The setup token appears only in the final terminal summary.
+
+If account creation is interrupted or cleanup fails, use the recovery session to inspect the account and follow the printed recovery command. Setup preserves the home directory and mail spool. Inspect and move aside a leftover home directory before retrying with the same user name.
 
 ### Tailscale API automation
 

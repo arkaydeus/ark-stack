@@ -118,8 +118,14 @@ class FakeHost {
   vpsKeyFromStdin = false;
   /** Local accounts that `getent passwd` does not find; `useradd` creates them. */
   missingUsers = new Set<string>();
+  createdHomes = new Map<string, string>();
+  userShell = "/bin/bash";
+  passwdLookupError?: RunResult;
+  opensshConfig = ok("passwordauthentication no\nkbdinteractiveauthentication no\n");
+  failUseradd?: "before-create" | "after-create";
   passwords = new Map<string, string>();
   failChpasswd = false;
+  failUserdel = false;
 
   constructor(
     readonly root: string,
@@ -144,22 +150,35 @@ class FakeHost {
     if (argv[0] === "sh" && argv[2] === 'command -v "$1"') return ok(`/usr/bin/${argv[4]}\n`);
     if (line === "docker compose version" || line.startsWith("docker info")) return ok("v2\n");
     if (line.startsWith("getent passwd ")) {
-      return this.missingUsers.has(argv[2]!)
-        ? fail("", 2)
-        : ok(`${argv[2]}:x:1000:1000::/home/${argv[2]}:/bin/bash\n`);
+      if (this.passwdLookupError) return this.passwdLookupError;
+      const user = argv[2]!;
+      if (this.missingUsers.has(user)) return fail("", 2);
+      const home = this.createdHomes.get(user);
+      const uid = home ? statSync(home).uid : 1000;
+      return ok(`${user}:x:${uid}:1000::${home ?? `/home/${user}`}:${this.userShell}\n`);
     }
+    if (argv[0] === "/usr/sbin/sshd") return this.opensshConfig;
     if (argv[0] === "useradd") {
-      this.missingUsers.delete(argv.at(-1)!);
+      if (this.failUseradd === "before-create") return fail("useradd: group 'sudo' does not exist", 6);
+      const user = argv.at(-1)!;
+      const home = argv[argv.indexOf("--home-dir") + 1]!;
+      this.missingUsers.delete(user);
+      mkdirSync(home, { recursive: true });
+      this.createdHomes.set(user, home);
+      if (this.failUseradd === "after-create") return fail("useradd: post-create hook failed", 14);
       return ok();
     }
     if (argv[0] === "chpasswd") {
-      if (this.failChpasswd) return fail("chpasswd: failure");
-      const [user, password] = (options.stdin ?? "").trim().split(":");
-      this.passwords.set(user!, password!);
+      if (this.failChpasswd) return fail(`Rejected input: ${options.stdin}`);
+      const record = options.stdin ?? "";
+      const separator = record.indexOf(":");
+      this.passwords.set(record.slice(0, separator), record.slice(separator + 1, -1));
       return ok();
     }
     if (argv[0] === "userdel") {
+      if (this.failUserdel) return fail("userdel: user is logged in", 8);
       this.missingUsers.add(argv.at(-1)!);
+      this.createdHomes.delete(argv.at(-1)!);
       return ok();
     }
     if (line === "tailscale status --json") {
@@ -451,6 +470,9 @@ class ScriptedUi implements Ui {
   async askSecret(question: string) {
     return this.take(this.secrets, question);
   }
+  async askPassword(question: string) {
+    return this.take(this.secrets, question);
+  }
 }
 
 function fixture() {
@@ -463,8 +485,9 @@ function fixture() {
     'ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\nPRETTY_NAME="Ubuntu 24.04 LTS"\n',
   );
   const host = new FakeHost(root, join(hostDir, "ark-host.nft"));
+  const homeBase = join(hostDir, "home");
   const stateDir = join(root, "tmp", "host-setup");
-  return { root, host, stateDir, osRelease };
+  return { root, host, stateDir, osRelease, homeBase };
 }
 
 type Fixture = ReturnType<typeof fixture>;
@@ -483,7 +506,7 @@ async function setup(
     env: { PATH: "/usr/bin", SUDO_USER: "alice", ...env },
     run: f.host.run,
     stateDir: f.stateDir,
-    paths: { osRelease: f.osRelease, hostFirewall: f.host.firewallPath },
+    paths: { osRelease: f.osRelease, hostFirewall: f.host.firewallPath, sshHomeBase: f.homeBase },
     isRoot: true,
     platform: "linux",
     bun: BUN,
@@ -647,7 +670,11 @@ describe("host:setup Tailscale SSH gate", () => {
 
 describe("host:setup missing SSH user", () => {
   const PASSWORD = "correct-horse-battery";
-  const interactiveUi = (create: string, passwords: [string, string][] = []) =>
+  const passwordPrompts = (password = PASSWORD): [string, string][] => [
+    ["Password for alice", password],
+    ["Repeat the password", password],
+  ];
+  const interactiveUi = (create: string, passwords = passwordPrompts()) =>
     new ScriptedUi(
       true,
       [
@@ -690,14 +717,21 @@ describe("host:setup missing SSH user", () => {
     ]);
     const result = await setup(f, [], {}, { scripted: ui });
     expect(result.code).toBe(2);
-    expect(f.host.calls).toContain("useradd --create-home --shell /bin/bash --groups sudo -- alice");
+    expect(f.host.calls).toContain(
+      `useradd --create-home --home-dir ${join(f.homeBase, "alice")} --shell /bin/bash --groups sudo -- alice`,
+    );
     expect(f.host.passwords.get("alice")).toBe(PASSWORD);
     expect(result.text).toContain("Use at least 8 characters.");
     expect(result.text).toContain("The passwords did not match.");
     expect(result.text).toContain("Created alice (member of sudo).");
     expect(result.text).toContain("tailscale ssh alice@ark-vps.tail1234.ts.net");
+    expect(result.text.indexOf("After enrolment, interactive")).toBeLessThan(
+      result.text.indexOf("Created alice"),
+    );
+    expect(result.text).toContain("For scripted runs, create the user");
     expect(result.log).not.toContain(PASSWORD);
     expect(result.text).not.toContain(PASSWORD);
+    expect(result.state.sshUserProvisioning).toBeUndefined();
   });
 
   test("interactive: declining stops without creating the account", async () => {
@@ -709,19 +743,158 @@ describe("host:setup missing SSH user", () => {
     expect(f.host.calls.some((call) => call.startsWith("useradd"))).toBe(false);
   });
 
-  test("a failed password change removes the new account", async () => {
+  test("preserves the literal password and requires an exact confirmation", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    const literal = ` ${PASSWORD}: with spaces  `;
+    const ui = interactiveUi("yes", [
+      ["Password for alice", literal],
+      ["Repeat the password", literal.trim()],
+      ...passwordPrompts(literal),
+    ]);
+    const result = await setup(f, [], {}, { scripted: ui });
+    expect(result.code).toBe(2);
+    expect(result.text).toContain("The passwords did not match.");
+    expect(f.host.passwords.get("alice")).toBe(literal);
+    expect(result.log).not.toContain(PASSWORD);
+    expect(JSON.stringify(result.state)).not.toContain(PASSWORD);
+  });
+
+  test("refuses a pre-existing home and preserves its files", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    const home = join(f.homeBase, "alice");
+    mkdirSync(home, { recursive: true });
+    const sentinel = join(home, "saved-file");
+    writeFileSync(sentinel, "keep");
+    const result = await setup(f, [], {}, { scripted: interactiveUi("yes", []) });
+    expect(result.code).toBe(1);
+    expect(result.text).toContain(`The home path ${home} already exists`);
+    expect(f.host.calls.some((call) => /^(useradd|userdel|chpasswd)/.test(call))).toBe(false);
+    expect(readFileSync(sentinel, "utf8")).toBe("keep");
+  });
+
+  test("a failed password change removes only the new account", async () => {
     const f = fixture();
     f.host.missingUsers.add("alice");
     f.host.failChpasswd = true;
-    const ui = interactiveUi("yes", [
-      ["Password for alice", PASSWORD],
-      ["Repeat the password", PASSWORD],
-    ]);
-    const result = await setup(f, [], {}, { scripted: ui });
+    const result = await setup(f, [], {}, { scripted: interactiveUi("yes") });
     expect(result.code).toBe(1);
     expect(result.text).toContain("the account was removed");
-    expect(f.host.calls).toContain("userdel --remove -- alice");
+    expect(f.host.calls.filter((call) => call.startsWith("userdel"))).toEqual(["userdel -- alice"]);
+    expect(existsSync(join(f.homeBase, "alice"))).toBe(true);
     expect(f.host.missingUsers.has("alice")).toBe(true);
+    expect(result.state.sshUserProvisioning).toBeUndefined();
+    expect(result.log).not.toContain(PASSWORD);
+    expect(result.text).not.toContain(PASSWORD);
+  });
+
+  test.each(["after-create", "interrupted", "cleanup-failed"])(
+    "blocks later runs after provisioning is %s",
+    async (failure) => {
+      const f = fixture();
+      f.host.missingUsers.add("alice");
+      if (failure === "after-create") f.host.failUseradd = "after-create";
+      if (failure === "cleanup-failed") {
+        f.host.failChpasswd = true;
+        f.host.failUserdel = true;
+      }
+      const result = await setup(
+        f,
+        [],
+        {},
+        {
+          scripted: interactiveUi("yes"),
+          run: async (argv, options) => {
+            if (failure === "interrupted" && argv[0] === "chpasswd") throw new Error("Interrupted");
+            return f.host.run(argv, options);
+          },
+        },
+      );
+      expect(result.code).toBe(1);
+      expect(f.host.missingUsers.has("alice")).toBe(false);
+      const diagnostic = {
+        "after-create": "post-create hook failed",
+        interrupted: "Interrupted",
+        "cleanup-failed": "Cleanup failed (userdel exit 8) and alice still exists",
+      }[failure]!;
+      expect(result.text).toContain(diagnostic);
+      expect(result.state.sshUserProvisioning).toEqual({ user: "alice" });
+
+      f.host.calls.length = 0;
+      const retry = await setup(f, FULL);
+      expect(retry.code).toBe(1);
+      expect(retry.text).toContain("Setup did not finish provisioning alice");
+      expect(retry.text).toContain("sudo userdel -- alice");
+      expect(f.host.calls.some((call) => /chpasswd|--harden-vps/.test(call))).toBe(false);
+    },
+  );
+
+  test("reports a useradd failure before creation and retries once the cause is fixed", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    f.host.failUseradd = "before-create";
+    const failed = await setup(f, [], {}, { scripted: interactiveUi("yes") });
+    expect(failed.code).toBe(1);
+    expect(failed.text).toContain("group 'sudo' does not exist");
+    expect(f.host.calls).not.toContain("chpasswd");
+    f.host.failUseradd = undefined;
+    expect((await setup(f, [], {}, { scripted: interactiveUi("yes") })).code).toBe(2);
+    expect(f.host.passwords.get("alice")).toBe(PASSWORD);
+  });
+
+  test("a recreated account needs fresh confirmation even with the flag and the same node and name", async () => {
+    const f = fixture();
+    f.host.failInstall = 1;
+    const first = await setup(f, FULL, KEYS);
+    expect(first.state.sshConfirmation).toBeDefined();
+    f.host.missingUsers.add("alice");
+    f.host.calls.length = 0;
+    const blocked = await setup(f, ["--tailscale-ssh-confirmed"], {}, { scripted: interactiveUi("yes") });
+    expect(blocked.code).toBe(2);
+    expect(blocked.state.sshConfirmation).toBeUndefined();
+    expect(f.host.calls).not.toContain(`${BUN} scripts/install.ts --harden-vps`);
+    expect((await setup(f, FULL)).code).toBe(0);
+    expect(f.host.calls).toContain(`${BUN} scripts/install.ts --harden-vps`);
+  });
+
+  test.each(["/usr/sbin/nologin", "/bin/false"])("blocks a login shell of %s", async (shell) => {
+    const f = fixture();
+    f.host.userShell = shell;
+    const result = await setup(f, FULL, KEYS);
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("alice exists but cannot log in");
+    expect(f.host.calls).not.toContain(`${BUN} scripts/install.ts --harden-vps`);
+  });
+
+  test("stops on a getent execution failure without offering creation", async () => {
+    const f = fixture();
+    f.host.passwdLookupError = fail(`getent failed while reading ${VPS_KEY}`, 127);
+    const result = await setup(f, [], KEYS, { scripted: interactiveUi("yes", []) });
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("Could not look up the local user alice (getent exit 127)");
+    expect(result.text).toContain("getent failed while reading <redacted>");
+    expect(result.text).not.toContain("does not exist");
+    expect(f.host.calls.some((call) => call.startsWith("useradd"))).toBe(false);
+  });
+
+  test.each([
+    { password: "yes", keyboard: "no", match: "" },
+    { password: "no", keyboard: "yes", match: "" },
+    { password: "no", keyboard: "no", match: "debug3: checking syntax for 'Match Address 203.0.113.2'\n" },
+  ])("refuses an unsafe or unverified OpenSSH policy while retaining public SSH", async (policy) => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    f.host.opensshConfig = {
+      ...ok(`passwordauthentication ${policy.password}\nkbdinteractiveauthentication ${policy.keyboard}\n`),
+      stderr: policy.match,
+    };
+    const result = await setup(f, ["--keep-public-ssh"], {}, { scripted: interactiveUi("yes", []) });
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("Cannot verify that OpenSSH blocks password login for alice");
+    expect(f.host.calls).toContain("/usr/sbin/sshd -ddd -T -C user=alice");
+    expect(f.host.calls.some((call) => /^(useradd|chpasswd)|--harden-vps/.test(call))).toBe(false);
+    expect(f.host.ssh.service.active).toBe(true);
   });
 });
 

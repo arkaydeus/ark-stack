@@ -8,7 +8,7 @@ import { createInterface } from "node:readline/promises";
 
 import { isSecretKey, parseEnvFile, redactLogLine } from "@ark-stack/shared";
 
-import { promptHidden } from "../install-edge-auth.ts";
+import { promptHidden, readHidden } from "../install-edge-auth.ts";
 
 export type RunOptions = {
   env?: Record<string, string | undefined>;
@@ -149,6 +149,7 @@ export interface Ui {
   print(line?: string): void;
   ask(question: string, fallback?: string, signal?: AbortSignal): Promise<string>;
   askSecret(question: string): Promise<string>;
+  askPassword(question: string): Promise<string>;
 }
 
 export class TerminalUi implements Ui {
@@ -179,9 +180,18 @@ export class TerminalUi implements Ui {
   }
 
   async askSecret(question: string) {
-    if (!this.interactive) throw new Error(`Cannot ask "${question}" in non-interactive mode.`);
-    const value = await promptHidden(`${question}: `);
+    const value = await this.askHidden(question, promptHidden);
     this.redactor.add(value);
+    return value;
+  }
+
+  async askPassword(question: string) {
+    return this.askHidden(question, readHidden);
+  }
+
+  private async askHidden(question: string, prompt: (question: string) => Promise<string>) {
+    if (!this.interactive) throw new Error(`Cannot ask "${question}" in non-interactive mode.`);
+    const value = await prompt(`${question}: `);
     this.log.write(`? ${question} -> ${value ? "<entered>" : "<empty>"}`);
     return value;
   }

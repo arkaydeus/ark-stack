@@ -46,6 +46,10 @@ export type SetupState = {
   answers: Partial<StoredAnswers>;
   /** The node and account for which the operator confirmed a working Tailscale SSH session. */
   sshConfirmation?: { target: string; at: string };
+  /** An account may exist without a usable password until provisioning finishes. */
+  sshUserProvisioning?: { user: string };
+  /** A newly provisioned account needs a fresh check even if a confirmation flag was supplied. */
+  sshUserNeedsConfirmation?: boolean;
   sshCutoverPending?: boolean;
   /** The admin origin this setup last wrote, so a changed hostname replaces it. */
   adminOrigin?: string;

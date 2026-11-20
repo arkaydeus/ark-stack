@@ -4,9 +4,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   symlinkSync,
   writeFileSync,
@@ -140,32 +142,40 @@ function run(
   if (!file) writeFileSync(target, script);
   const installDir = join(box.dir, "opt", "ark-stack");
   const calls = join(box.state, "calls");
-  const result = Bun.spawnSync(
-    [join(box.bin, "bash"), ...(stdin === undefined ? [target] : ["-s", "--"]), ...args],
-    {
-      cwd: box.dir,
-      env: {
-        PATH: box.bin,
-        HOME: box.dir,
-        STUB_CALLS: calls,
-        STUB_STATE: box.state,
-        STUB_BIN: box.bin,
-        STUB_TEMPLATES: box.templates,
-        ARK_BOOTSTRAP_ROOTFS: box.rootfs,
-        ARK_INSTALL_DIR: installDir,
-        ...env,
+  // Supplying the script through a descriptor avoids Bun.spawnSync stalling on large stdin buffers.
+  const input = join(box.dir, "stdin.sh");
+  if (stdin !== undefined) writeFileSync(input, stdin);
+  const descriptor = stdin === undefined ? undefined : openSync(input, "r");
+  try {
+    const result = Bun.spawnSync(
+      [join(box.bin, "bash"), ...(descriptor === undefined ? [target] : ["-s", "--"]), ...args],
+      {
+        cwd: box.dir,
+        env: {
+          PATH: box.bin,
+          HOME: box.dir,
+          STUB_CALLS: calls,
+          STUB_STATE: box.state,
+          STUB_BIN: box.bin,
+          STUB_TEMPLATES: box.templates,
+          ARK_BOOTSTRAP_ROOTFS: box.rootfs,
+          ARK_INSTALL_DIR: installDir,
+          ...env,
+        },
+        stdin: descriptor ?? "ignore",
       },
-      stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
-    },
-  );
-  return {
-    status: result.exitCode,
-    stdout: result.stdout.toString(),
-    stderr: result.stderr.toString(),
-    calls: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n").filter(Boolean) : [],
-    rootfs: box.rootfs,
-    installDir,
-  };
+    );
+    return {
+      status: result.exitCode,
+      stdout: result.stdout.toString(),
+      stderr: result.stderr.toString(),
+      calls: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n").filter(Boolean) : [],
+      rootfs: box.rootfs,
+      installDir,
+    };
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
 }
 
 const CHANGES = /^(apt-get|git clone|git -C \S+ (merge|checkout|fetch)|curl|mise|systemctl|extrepo)/;
