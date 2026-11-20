@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 
 import { EventEmitter } from "node:events";
 
-import { configureEdgeAuthKey, promptHidden } from "./install-edge-auth.ts";
+import { configureEdgeAuthKey, promptHidden, readHidden } from "./install-edge-auth.ts";
 
 const root = resolve(import.meta.dir, "..");
 const installedKey = "tskey-auth-installed-secret";
@@ -305,7 +305,10 @@ test("skipping the prompt leaves the key absent and never prompts in noninteract
   }
 });
 
-test("hidden prompt uses raw mode, handles erase and restores input without echoing the key", async () => {
+test.each([
+  { prompt: promptHidden, expected: "tskey-auth-secret" },
+  { prompt: readHidden, expected: "  tskey-auth-secret  " },
+])("hidden input restores raw mode without echoing and returns $expected", async ({ prompt, expected }) => {
   class Input extends EventEmitter {
     modes: boolean[] = [];
     paused = false;
@@ -320,10 +323,10 @@ test("hidden prompt uses raw mode, handles erase and restores input without echo
   }
   const input = new Input();
   const output: string[] = [];
-  const result = promptHidden("Key: ", input, { write: (value) => output.push(value) });
-  input.emit("data", "tskey-auth-typo\u007f\u007f\u007f\u007fsecret\r");
-  expect(await result).toBe("tskey-auth-secret");
-  expect(output).toEqual(["Key: ", "\n"]);
+  const result = prompt("Secret: ", input, { write: (value) => output.push(value) });
+  input.emit("data", "  tskey-auth-typo\u007f\u007f\u007f\u007fsecret  \r");
+  expect(await result).toBe(expected);
+  expect(output).toEqual(["Secret: ", "\n"]);
   expect(input.modes).toEqual([true, false]);
   expect(input.paused).toBe(true);
   expect(input.listenerCount("data")).toBe(0);

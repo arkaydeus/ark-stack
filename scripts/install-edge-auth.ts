@@ -55,6 +55,14 @@ export function promptHidden(
   stdin: HiddenInput = process.stdin,
   stdout: { write: (value: string) => unknown } = process.stdout,
 ) {
+  return readHidden(question, stdin, stdout).then((value) => value.trim());
+}
+
+export function readHidden(
+  question: string,
+  stdin: HiddenInput = process.stdin,
+  stdout: { write: (value: string) => unknown } = process.stdout,
+) {
   return new Promise<string>((resolve) => {
     let value = "";
     stdin.setRawMode(true);
@@ -66,7 +74,7 @@ export function promptHidden(
       stdin.pause();
       stdin.off("data", onData);
       stdout.write("\n");
-      resolve(value.trim());
+      resolve(value);
     };
     const onData = (chunk: string) => {
       for (const character of chunk) {
@@ -75,7 +83,7 @@ export function promptHidden(
           stdin.setRawMode(false);
           process.exit(130);
         }
-        if (character === "\u007f" || character === "\b") value = value.slice(0, -1);
+        if (character === "\u007f" || character === "\b") value = value.replace(/.$/su, "");
         else value += character;
       }
     };

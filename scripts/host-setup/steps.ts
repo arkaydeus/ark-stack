@@ -3,7 +3,7 @@
 // The existing installer phases do the work: `install.ts --enroll-vps`, `install.ts --harden-vps`,
 // `edge-namespace.ts` (edge:rejoin) and `host-audit.ts`. Keys come from the context's
 // TailscaleKeySource and the provider firewall from the first ProviderFirewall that detects the VPS.
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
 
@@ -48,6 +48,7 @@ export type HostPaths = {
   osRelease: string;
   hostFirewall: string;
   ufwDirectory?: string;
+  sshHomeBase?: string;
 };
 
 export type SessionOrigin = {
@@ -102,9 +103,9 @@ export async function exec(context: Context, argv: string[], options: RunOptions
   context.log.write(`$ ${argv.join(" ")}`);
   const result = await context.run(argv, {
     cwd: context.root,
+    onLine: (line) => context.log.write(`  | ${line}`),
     ...options,
     env: options.env ? withoutApiCredentials(options.env) : withoutSetupSecrets(context.env),
-    onLine: (line) => context.log.write(`  | ${line}`),
   });
   if (result.status !== 0) context.log.write(`  (exit ${result.status})`);
   return result;
@@ -191,7 +192,11 @@ function confirmationTarget(context: Context, status?: TailscaleState) {
 
 async function requireSshConfirmation(context: Context) {
   const target = confirmationTarget(context, await tailscaleStatus(context));
-  if (context.state.sshConfirmation?.target !== target) {
+  if (
+    context.state.sshUserProvisioning ||
+    context.state.sshUserNeedsConfirmation ||
+    context.state.sshConfirmation?.target !== target
+  ) {
     throw new SetupPaused("The current Tailscale node and local user need a fresh SSH confirmation.");
   }
   const problem = await tailscaleSshReady(context);
@@ -368,6 +373,181 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
   };
 }
 
+const MIN_PASSWORD_LENGTH = 8;
+
+async function lookupSshUser(context: Context, user: string) {
+  const result = await exec(context, ["getent", "passwd", user]);
+  if (result.status === 2) return undefined;
+  if (result.status !== 0) {
+    const detail = context.redactor.redact((result.stderr || result.stdout).trim().slice(-1500));
+    throw new Error(
+      `Could not look up the local user ${user} (getent exit ${result.status}).${detail ? `\n${detail}` : ""}`,
+    );
+  }
+  const [name, , uid, , , home, shell, ...extra] = result.stdout.trimEnd().split(":");
+  if (
+    name !== user ||
+    !/^\d+$/.test(uid ?? "") ||
+    home === undefined ||
+    shell === undefined ||
+    extra.length
+  ) {
+    throw new Error(`getent returned an invalid passwd entry for ${user}.`);
+  }
+  return { uid: Number(uid), home, shell };
+}
+
+function requireFreshHome(home: string) {
+  if (lstatSync(home, { throwIfNoEntry: false })) {
+    throw new Error(
+      `The home path ${home} already exists. Inspect it and move it aside or choose a different --ssh-user.`,
+    );
+  }
+}
+
+async function requireSafeOpenSshPassword(context: Context, user: string) {
+  const result = await exec(context, ["/usr/sbin/sshd", "-ddd", "-T", "-C", `user=${user}`]);
+  if (result.status === 127 && !(await sshListeners(context)).length) return;
+  // sshd evaluates Match User before the account exists. Group and connection-specific criteria
+  // can produce a different result after useradd or for a remote client. Refuse those configs.
+  const matches = [...result.stderr.matchAll(/^debug3: checking syntax for 'Match (.*)'\r?$/gim)];
+  const userOnly = matches.every(([, rule]) =>
+    /^(?:all|user[ \t]+[\w*,!?-]+)(?:[ \t]+#.*)?\s*$/i.test(rule!),
+  );
+  const policy = result.stdout.split(/\r?\n/);
+  const deniesUser = policy.some(
+    (line) => line.startsWith("denyusers ") && line.split(/\s+/).slice(1).includes(user),
+  );
+  const disablesPasswords =
+    policy.includes("passwordauthentication no") && policy.includes("kbdinteractiveauthentication no");
+  if (result.status === 0 && userOnly && (deniesUser || disablesPasswords)) return;
+  throw new Error(
+    `Cannot verify that OpenSSH blocks password login for ${user}. Keep your current recovery session open. ` +
+      `Apply and reload a policy that denies ${user} or disables PasswordAuthentication and KbdInteractiveAuthentication for ${user}, then retry. ` +
+      `For a custom OpenSSH configuration, provision a protected local account manually and pass it with --ssh-user.`,
+  );
+}
+
+async function reconcileSshUserProvisioning(context: Context) {
+  const pending = context.state.sshUserProvisioning;
+  if (!pending) return;
+  if ((await lookupSshUser(context, pending.user)) !== undefined) {
+    throw new Error(
+      `Setup did not finish provisioning ${pending.user}, and the account still exists. ` +
+        `From your recovery session, inspect the account, then run \`sudo userdel -- ${pending.user}\` to remove it and retry. ` +
+        `Inspect and move aside any leftover home directory before retrying.`,
+    );
+  }
+  delete context.state.sshUserProvisioning;
+  context.save();
+}
+
+async function rollbackSshUser(context: Context, user: string, passwordStatus: number) {
+  const removal = await exec(context, ["userdel", "--", user]);
+  const failure = `Setting the password for ${user} failed (exit ${passwordStatus})`;
+  let removed: boolean;
+  try {
+    removed = (await lookupSshUser(context, user)) === undefined;
+  } catch (error) {
+    throw new Error(
+      `${failure}. Could not verify cleanup of ${user} (userdel exit ${removal.status}). ${String(error)}`,
+      { cause: error },
+    );
+  }
+  if (!removed) {
+    throw new Error(
+      `${failure}. Cleanup failed (userdel exit ${removal.status}) and ${user} still exists. ` +
+        `From your recovery session, inspect the account and run \`sudo userdel -- ${user}\` before retrying.`,
+    );
+  }
+  delete context.state.sshUserProvisioning;
+  context.save();
+  const result =
+    removal.status === 0
+      ? "the account was removed"
+      : `userdel exited ${removal.status}, and the account is absent`;
+  throw new Error(
+    `${failure}. ${result}. Inspect and move aside the leftover home directory before retrying.`,
+  );
+}
+
+/**
+ * The Tailscale SSH user must be a local account with a login shell. A fresh VPS often has only
+ * root, so an interactive run offers to create the account (home, bash, sudo group, a password for
+ * sudo). An existing account is never changed, and non-interactive runs only say what to do.
+ */
+async function ensureSshUser(context: Context) {
+  await reconcileSshUserProvisioning(context);
+  const user = context.answers.sshUser;
+  const account = await lookupSshUser(context, user);
+  if (account !== undefined) {
+    if (/(?:^|\/)(?:nologin|false)$/.test(account.shell)) {
+      throw new Error(
+        `Set --ssh-user to a non-root account with a login shell. ${user} exists but cannot log in.`,
+      );
+    }
+    return;
+  }
+  const manual = `Create it with \`adduser ${user} && usermod -aG sudo ${user}\`, or set --ssh-user to an existing non-root account.`;
+  if (!context.interactive) throw new Error(`The local user ${user} does not exist. ${manual}`);
+  context.ui.print(`      The local user ${user} does not exist on this VPS.`);
+  const answer = await context.ui.ask(
+    `Create ${user} with a home directory, bash and sudo access? (yes/no)`,
+    "",
+  );
+  if (!/^yes$/i.test(answer.trim())) throw new Error(`The local user ${user} does not exist. ${manual}`);
+  const home = join(context.paths.sshHomeBase ?? "/home", user);
+  requireFreshHome(home);
+  await requireSafeOpenSshPassword(context, user);
+  let password: string;
+  for (;;) {
+    password = await context.ui.askPassword(`Password for ${user} (used for sudo)`);
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      context.ui.print(`  Use at least ${MIN_PASSWORD_LENGTH} characters.`);
+      continue;
+    }
+    if (/[\0\r\n]/.test(password)) {
+      context.ui.print("  The password cannot contain a NUL or line break.");
+      continue;
+    }
+    if ((await context.ui.askPassword(`Repeat the password for ${user}`)) === password) break;
+    context.ui.print("  The passwords did not match.");
+  }
+  requireFreshHome(home);
+  delete context.state.sshConfirmation;
+  context.state.sshUserNeedsConfirmation = true;
+  context.state.sshUserProvisioning = { user };
+  context.save();
+  await must(context, [
+    "useradd",
+    "--create-home",
+    "--home-dir",
+    home,
+    "--shell",
+    "/bin/bash",
+    "--groups",
+    "sudo",
+    "--",
+    user,
+  ]);
+  const created = await lookupSshUser(context, user);
+  const directory = lstatSync(home, { throwIfNoEntry: false });
+  if (
+    created?.home !== home ||
+    created.shell !== "/bin/bash" ||
+    !directory?.isDirectory() ||
+    directory.uid !== created.uid
+  ) {
+    throw new Error(`Could not verify the new login account ${user} and its home directory ${home}.`);
+  }
+  await requireSafeOpenSshPassword(context, user);
+  const set = await exec(context, ["chpasswd"], { stdin: `${user}:${password}\n`, onLine: undefined });
+  if (set.status !== 0) await rollbackSshUser(context, user, set.status);
+  delete context.state.sshUserProvisioning;
+  context.save();
+  context.ui.print(`      Created ${user} (member of sudo).`);
+}
+
 async function sshGate(context: Context): Promise<StepResult> {
   const rollback = await exec(context, [
     "systemctl",
@@ -382,16 +562,16 @@ async function sshGate(context: Context): Promise<StepResult> {
   }
   const status = await tailscaleStatus(context);
   const target = confirmationTarget(context, status);
-  const account = await exec(context, ["getent", "passwd", context.answers.sshUser]);
-  if (account.status !== 0 || /\/(?:nologin|false)$/.test(account.stdout.trim())) {
-    throw new Error(
-      `Set --ssh-user to an existing non-root account with a login shell. ${context.answers.sshUser} is unavailable.`,
-    );
-  }
-  if (!context.state.sshCutoverPending && context.state.sshConfirmation?.target === target) {
+  await ensureSshUser(context);
+  if (
+    !context.state.sshUserNeedsConfirmation &&
+    !context.state.sshCutoverPending &&
+    context.state.sshConfirmation?.target === target
+  ) {
     return { status: "done", message: `Tailscale SSH confirmed ${context.state.sshConfirmation.at}` };
   }
   const changed = Boolean(
+    context.state.sshUserNeedsConfirmation ||
     context.state.sshConfirmation ||
     context.state.sshCutoverPending ||
     context.state.steps["ssh-gate"]?.status === "done",
@@ -420,6 +600,7 @@ async function sshGate(context: Context): Promise<StepResult> {
     confirmed = /^yes$/i.test(answer.trim());
   }
   if (!confirmed) {
+    delete context.state.sshUserNeedsConfirmation;
     delete context.state.sshConfirmation;
     delete context.state.sshCutoverPending;
     delete context.state.steps["ssh-gate"];
@@ -431,6 +612,7 @@ Check that \`${command}\` works from your own device, then resume with:
   ${context.resumeCommand}${context.interactive ? "" : " --tailscale-ssh-confirmed"}`,
     );
   }
+  delete context.state.sshUserNeedsConfirmation;
   delete context.state.sshCutoverPending;
   context.state.sshConfirmation = { target, at: new Date().toISOString() };
   context.save();
