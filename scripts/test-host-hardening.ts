@@ -128,7 +128,7 @@ case "$*" in
     printf '%s\\n' "$uid" ---
     exit 0 ;;
 esac
-if [ "\${1:-}" = compose ] && [ "\${4:-}" = build ]; then
+if [ "\${1:-}" = compose ] && [ "\${6:-}" = build ]; then
   bun ${fixture} policy >/tmp/upgrade-request
   sleep 2
   echo "Injected build failure after publishing a fresh front request." >&2
@@ -159,10 +159,9 @@ async function interruptedMailOff(addresses: string[]) {
       "-e",
       "ARK_INSTALL_NONINTERACTIVE=1",
       vps,
-      "env",
-      "PATH=/work/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin",
-      "bun",
-      "/work/scripts/install.js",
+      "sh",
+      "-c",
+      'PATH=/work/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin bun /work/scripts/install.js 2>/tmp/install-fixture.stderr || { code=$?; tail -c 1500 /tmp/install-fixture.stderr >&2; exit "$code"; }',
     );
   await assert.rejects(install(), /Injected build failure/);
   assert.match(await host("cat", "/work/.env"), /^ARK_MAIL_ENABLED=0$/m);
@@ -603,6 +602,9 @@ EOF`,
   await host("nft", "add", "rule", "inet", "test_provider", "input", "udp", "dport", "41641", "drop");
   await docker("exec", "-d", vps, "bun", fixture, "unexpected-udp");
   await host("nft", "insert", "rule", "inet", "ark_host", "input", "udp", "dport", "161", "accept");
+  const input = await host("nft", "-a", "-n", "list", "chain", "inet", "ark_host", "input");
+  const udpRule = /udp dport 161 accept\s+# handle (\d+)/.exec(input)?.[1];
+  assert.ok(udpRule, input);
   const udpPid = await ready(async () => {
     const sockets = await host("ss", "-H", "-lunp", "sport", "=", ":161");
     const pid = /:161\s[^\n]*pid=(\d+)/.exec(sockets)?.[1];
@@ -616,6 +618,7 @@ EOF`,
     );
   } finally {
     await host("nft", "delete", "table", "inet", "test_provider");
+    await host("nft", "delete", "rule", "inet", "ark_host", "input", "handle", udpRule);
   }
   await host("kill", udpPid);
   await applyPolicy("on");

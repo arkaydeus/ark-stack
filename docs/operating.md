@@ -500,7 +500,7 @@ For `test:e2e` and `test:e2e-gate`, install Chromium with `bunx playwright insta
 
 The local Docker harnesses need no external credentials:
 
-Run `ARK_TEST_SETUP_DOCKER=1 bun --no-env-file test scripts/host-setup.test.ts` to check that the real Docker container configuration and process arguments stay free of minted keys during and after interrupted edge and backup enrolment. The test uses isolated containers and dummy keys.
+Run `ARK_TEST_SETUP_DOCKER=1 bun --no-env-file test scripts/host-setup.test.ts` to run the guided setup's Docker checks. A network-isolated Ubuntu guest checks live OpenSSH password rejection for the new account, password access for an existing account, refusal of alternate listeners, and Tailscale status polling during enrolment and hardening. Separate isolated containers check that configuration and process arguments stay free of dummy auth keys during and after interrupted edge and backup enrolment.
 
 - `mise run test:edge`
 - `mise run test:db-ingress`
