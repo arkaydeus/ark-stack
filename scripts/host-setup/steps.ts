@@ -368,6 +368,52 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
   };
 }
 
+const MIN_PASSWORD_LENGTH = 8;
+
+/**
+ * The Tailscale SSH user must be a local account with a login shell. A fresh VPS often has only
+ * root, so an interactive run offers to create the account (home, bash, sudo group, a password for
+ * sudo). An existing account is never changed, and non-interactive runs only say what to do.
+ */
+async function ensureSshUser(context: Context) {
+  const user = context.answers.sshUser;
+  const account = await exec(context, ["getent", "passwd", user]);
+  if (account.status === 0) {
+    if (/\/(?:nologin|false)$/.test(account.stdout.trim())) {
+      throw new Error(
+        `Set --ssh-user to a non-root account with a login shell. ${user} exists but cannot log in.`,
+      );
+    }
+    return;
+  }
+  const manual = `Create it with \`adduser ${user} && usermod -aG sudo ${user}\`, or set --ssh-user to an existing non-root account.`;
+  if (!context.interactive) throw new Error(`The local user ${user} does not exist. ${manual}`);
+  context.ui.print(`      The local user ${user} does not exist on this VPS.`);
+  const answer = await context.ui.ask(
+    `Create ${user} with a home directory, bash and sudo access? (yes/no)`,
+    "",
+  );
+  if (!/^yes$/i.test(answer.trim())) throw new Error(`The local user ${user} does not exist. ${manual}`);
+  let password: string;
+  for (;;) {
+    password = await context.ui.askSecret(`Password for ${user} (used for sudo)`);
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      context.ui.print(`  Use at least ${MIN_PASSWORD_LENGTH} characters.`);
+      continue;
+    }
+    if ((await context.ui.askSecret(`Repeat the password for ${user}`)) === password) break;
+    context.ui.print("  The passwords did not match.");
+  }
+  context.redactor.add(password);
+  await must(context, ["useradd", "--create-home", "--shell", "/bin/bash", "--groups", "sudo", "--", user]);
+  const set = await exec(context, ["chpasswd"], { stdin: `${user}:${password}\n` });
+  if (set.status !== 0) {
+    await exec(context, ["userdel", "--remove", "--", user]);
+    throw new Error(`Setting the password for ${user} failed (exit ${set.status}); the account was removed.`);
+  }
+  context.ui.print(`      Created ${user} (member of sudo).`);
+}
+
 async function sshGate(context: Context): Promise<StepResult> {
   const rollback = await exec(context, [
     "systemctl",
@@ -382,12 +428,7 @@ async function sshGate(context: Context): Promise<StepResult> {
   }
   const status = await tailscaleStatus(context);
   const target = confirmationTarget(context, status);
-  const account = await exec(context, ["getent", "passwd", context.answers.sshUser]);
-  if (account.status !== 0 || /\/(?:nologin|false)$/.test(account.stdout.trim())) {
-    throw new Error(
-      `Set --ssh-user to an existing non-root account with a login shell. ${context.answers.sshUser} is unavailable.`,
-    );
-  }
+  await ensureSshUser(context);
   if (!context.state.sshCutoverPending && context.state.sshConfirmation?.target === target) {
     return { status: "done", message: `Tailscale SSH confirmed ${context.state.sshConfirmation.at}` };
   }

@@ -116,6 +116,10 @@ class FakeHost {
   liveFirewall = "";
   vpsKeyFiles: string[] = [];
   vpsKeyFromStdin = false;
+  /** Local accounts that `getent passwd` does not find; `useradd` creates them. */
+  missingUsers = new Set<string>();
+  passwords = new Map<string, string>();
+  failChpasswd = false;
 
   constructor(
     readonly root: string,
@@ -139,7 +143,25 @@ class FakeHost {
   private async respond(argv: string[], line: string, options: RunOptions): Promise<RunResult> {
     if (argv[0] === "sh" && argv[2] === 'command -v "$1"') return ok(`/usr/bin/${argv[4]}\n`);
     if (line === "docker compose version" || line.startsWith("docker info")) return ok("v2\n");
-    if (line.startsWith("getent passwd ")) return ok();
+    if (line.startsWith("getent passwd ")) {
+      return this.missingUsers.has(argv[2]!)
+        ? fail("", 2)
+        : ok(`${argv[2]}:x:1000:1000::/home/${argv[2]}:/bin/bash\n`);
+    }
+    if (argv[0] === "useradd") {
+      this.missingUsers.delete(argv.at(-1)!);
+      return ok();
+    }
+    if (argv[0] === "chpasswd") {
+      if (this.failChpasswd) return fail("chpasswd: failure");
+      const [user, password] = (options.stdin ?? "").trim().split(":");
+      this.passwords.set(user!, password!);
+      return ok();
+    }
+    if (argv[0] === "userdel") {
+      this.missingUsers.add(argv.at(-1)!);
+      return ok();
+    }
     if (line === "tailscale status --json") {
       return ok(
         JSON.stringify({
@@ -620,6 +642,86 @@ describe("host:setup Tailscale SSH gate", () => {
       rebootTime: "03:30",
       sshUser: "alice",
     });
+  });
+});
+
+describe("host:setup missing SSH user", () => {
+  const PASSWORD = "correct-horse-battery";
+  const interactiveUi = (create: string, passwords: [string, string][] = []) =>
+    new ScriptedUi(
+      true,
+      [
+        ["Your domain", "example.com"],
+        ["Admin hostname", "<default>"],
+        ["Let's Encrypt", "ops@example.com"],
+        ["trusted Let's Encrypt", "<default>"],
+        ["incoming mail", "no"],
+        ["Shared SNI", "8883"],
+        ["reboot time", "03:30"],
+        ["local (non-root) user", "alice"],
+        ["Continue", "<default>"],
+        ["policy is saved", ""],
+        ["Create alice", create],
+        ["session works", "not yet"],
+      ],
+      [["Cloudflare", ""], ["Tailscale API access token", ""], ["tag:ark-vps key", VPS_KEY], ...passwords],
+    );
+
+  test("non-interactive: fails naming the commands and creates nothing", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    const result = await setup(f, FULL, KEYS);
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("The local user alice does not exist");
+    expect(result.text).toContain("adduser alice && usermod -aG sudo alice");
+    expect(f.host.calls.some((call) => call.startsWith("useradd"))).toBe(false);
+    expect(f.host.calls.some((call) => call.includes("--harden-vps"))).toBe(false);
+  });
+
+  test("interactive: offers to create the user with sudo and a password, then continues", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    const ui = interactiveUi("yes", [
+      ["Password for alice", "short"],
+      ["Password for alice", PASSWORD],
+      ["Repeat the password", "something-else"],
+      ["Password for alice", PASSWORD],
+      ["Repeat the password", PASSWORD],
+    ]);
+    const result = await setup(f, [], {}, { scripted: ui });
+    expect(result.code).toBe(2);
+    expect(f.host.calls).toContain("useradd --create-home --shell /bin/bash --groups sudo -- alice");
+    expect(f.host.passwords.get("alice")).toBe(PASSWORD);
+    expect(result.text).toContain("Use at least 8 characters.");
+    expect(result.text).toContain("The passwords did not match.");
+    expect(result.text).toContain("Created alice (member of sudo).");
+    expect(result.text).toContain("tailscale ssh alice@ark-vps.tail1234.ts.net");
+    expect(result.log).not.toContain(PASSWORD);
+    expect(result.text).not.toContain(PASSWORD);
+  });
+
+  test("interactive: declining stops without creating the account", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    const result = await setup(f, [], {}, { scripted: interactiveUi("no") });
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("adduser alice && usermod -aG sudo alice");
+    expect(f.host.calls.some((call) => call.startsWith("useradd"))).toBe(false);
+  });
+
+  test("a failed password change removes the new account", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    f.host.failChpasswd = true;
+    const ui = interactiveUi("yes", [
+      ["Password for alice", PASSWORD],
+      ["Repeat the password", PASSWORD],
+    ]);
+    const result = await setup(f, [], {}, { scripted: ui });
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("the account was removed");
+    expect(f.host.calls).toContain("userdel --remove -- alice");
+    expect(f.host.missingUsers.has("alice")).toBe(true);
   });
 });
 
