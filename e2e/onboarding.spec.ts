@@ -69,6 +69,7 @@ test("fresh owner completes MFA, custom-domain onboarding and region settings", 
   await page.getByRole("button", { name: "Generate DNS plan and continue" }).click();
   await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
   await expect(page.getByText(domain!, { exact: true })).toBeVisible();
+  await expect(page.locator('img[src="/brand/icon-96.png"]:visible')).toHaveJSProperty("naturalWidth", 96);
 
   await test.step("owner saves the region through step-up and sees persisted suggestions", async () => {
     await page.getByRole("button", { name: "Settings", exact: true }).click();
@@ -180,6 +181,41 @@ test("fresh owner completes MFA, custom-domain onboarding and region settings", 
   });
 
   await page.getByRole("button", { name: "Sign out" }).click();
+  await test.step("admin branding loads on desktop and mobile sign-in", async () => {
+    await expect(page.getByRole("heading", { name: "Sign in", exact: true })).toBeVisible();
+    const viewport = page.viewportSize()!;
+    try {
+      for (const width of [1280, 390]) {
+        await page.setViewportSize({ width, height: viewport.height });
+        await expect(page.getByText("Ark Stack", { exact: true }).filter({ visible: true })).toHaveCount(1);
+        const mark = page.locator('img[src="/brand/icon-96.png"]:visible');
+        await expect(mark).toHaveCount(1);
+        await expect(mark).toHaveJSProperty("naturalWidth", 96);
+      }
+    } finally {
+      await page.setViewportSize(viewport);
+    }
+    for (const [rel, path, mime] of [
+      ["icon", "/favicon.ico", "image/x-icon"],
+      ["icon", "/brand/icon-32.png", "image/png"],
+      ["apple-touch-icon", "/brand/apple-touch-icon.png", "image/png"],
+      ["manifest", "/manifest.webmanifest", "application/manifest+json"],
+    ]) {
+      await expect(page.locator(`head link[rel="${rel}"][href="${path}"]`)).toHaveCount(1);
+      const asset = await page.request.get(path);
+      expect(asset.ok()).toBe(true);
+      expect(asset.headers()["content-type"]?.split(";")[0]).toBe(mime);
+      if (rel === "manifest") {
+        const manifest = (await asset.json()) as { icons: Array<{ src: string }> };
+        expect(manifest.icons).toHaveLength(3);
+        for (const { src } of manifest.icons) {
+          const icon = await page.request.get(src);
+          expect(icon.ok()).toBe(true);
+          expect(icon.headers()["content-type"]).toBe("image/png");
+        }
+      }
+    }
+  });
   await page.getByLabel("Email").fill("browser-acceptance@example.test");
   await page.getByLabel("Password").fill(password!);
   await page.getByRole("button", { name: "Sign in" }).click();

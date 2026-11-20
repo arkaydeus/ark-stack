@@ -127,6 +127,10 @@ export function AuthScreen() {
       </section>
       <section className="grid place-items-center p-6">
         <form className="w-full max-w-md space-y-4" onSubmit={submit}>
+          <p className="flex items-center gap-3 text-xs font-semibold uppercase tracking-[0.2em] text-primary lg:hidden">
+            <BrandMark className="size-9" />
+            Ark Stack
+          </p>
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">Control plane</p>
             <h2 className="display mt-2 text-3xl">{setupRequired ? "Create the owner" : "Sign in"}</h2>

@@ -73,6 +73,11 @@ export function decodePng(bytes: Uint8Array): Image {
   }
   const channels = ({ 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 } as Record<number, number>)[colorType];
   if (!channels) throw new Error(`Unsupported PNG colour type ${colorType}.`);
+  // PNG stores colour-key samples as big-endian 16-bit values, even for 8-bit pixels.
+  const key = new DataView(transparency.buffer, transparency.byteOffset, transparency.byteLength);
+  const transparentGrey = colorType === 0 && key.byteLength === 2 ? key.getUint16(0) : -1;
+  const transparentRgb =
+    colorType === 2 && key.byteLength === 6 ? [key.getUint16(0), key.getUint16(2), key.getUint16(4)] : [];
   const raw = inflateSync(Buffer.concat(idat));
   const stride = width * channels;
   const pixels = new Uint8Array(stride * height);
@@ -94,10 +99,17 @@ export function decodePng(bytes: Uint8Array): Image {
     const p = i * channels;
     let rgba: number[];
     if (colorType === 6) rgba = [pixels[p]!, pixels[p + 1]!, pixels[p + 2]!, pixels[p + 3]!];
-    else if (colorType === 2) rgba = [pixels[p]!, pixels[p + 1]!, pixels[p + 2]!, 255];
-    else if (colorType === 4) rgba = [pixels[p]!, pixels[p]!, pixels[p]!, pixels[p + 1]!];
-    else if (colorType === 0) rgba = [pixels[p]!, pixels[p]!, pixels[p]!, 255];
-    else {
+    else if (colorType === 2) {
+      const r = pixels[p]!;
+      const g = pixels[p + 1]!;
+      const b = pixels[p + 2]!;
+      const alpha = r === transparentRgb[0] && g === transparentRgb[1] && b === transparentRgb[2] ? 0 : 255;
+      rgba = [r, g, b, alpha];
+    } else if (colorType === 4) rgba = [pixels[p]!, pixels[p]!, pixels[p]!, pixels[p + 1]!];
+    else if (colorType === 0) {
+      const grey = pixels[p]!;
+      rgba = [grey, grey, grey, grey === transparentGrey ? 0 : 255];
+    } else {
       const index = pixels[p]!;
       rgba = [...palette.subarray(index * 3, index * 3 + 3), transparency[index] ?? 255];
     }
@@ -292,7 +304,7 @@ export function resize(image: Image, size: number): Image {
     const scale = from / to;
     return Array.from({ length: to }, (_, target) => {
       const start = target * scale;
-      const end = start + scale;
+      const end = Math.min(from, start + scale);
       const taps: Array<[number, number]> = [];
       for (let source = Math.floor(start); source < Math.ceil(end); source++) {
         const weight = Math.min(end, source + 1) - Math.max(start, source);
@@ -401,6 +413,7 @@ export function navy(image: Image, radius = MASTER_CORNER_RADIUS) {
       count++;
     }
   }
+  if (count === 0) throw new Error("The master has no navy pixels from which to derive the theme colour.");
   return `#${sum
     .map((value) =>
       Math.round(value / count)
@@ -449,18 +462,38 @@ export const FAVICON_ICO = { path: "web/public/favicon.ico", sizes: [16, 32, 48]
 /** The maskable safe zone: a centred circle whose diameter is 80% of the icon. */
 export const SAFE_ZONE = 0.8;
 
-function generate() {
-  const master = decodePng(readFileSync(join(ROOT, MASTER)));
+export function generate(root = ROOT) {
+  const master = decodePng(readFileSync(join(root, MASTER)));
+  const extent = artworkExtent(master);
+  if (extent > SAFE_ZONE)
+    throw new Error(`Artwork reaches ${extent.toFixed(3)} of the half-width (> ${SAFE_ZONE}).`);
+  const colour = navy(master);
+  const themeFiles = [
+    { path: "web/index.html", patterns: [/(<meta name="theme-color" content=")[^"]+(")/] },
+    {
+      path: "web/public/manifest.webmanifest",
+      patterns: [/("theme_color"\s*:\s*")[^"]+(")/, /("background_color"\s*:\s*")[^"]+(")/],
+    },
+  ].map(({ path, patterns }) => {
+    const file = join(root, path);
+    const original = readFileSync(file, "utf8");
+    let updated = original;
+    for (const pattern of patterns) {
+      if (!pattern.test(updated)) throw new Error(`Missing generated colour field in ${path}.`);
+      updated = updated.replace(
+        pattern,
+        (_match, prefix: string, suffix: string) => prefix + colour + suffix,
+      );
+    }
+    return { file, original, updated };
+  });
   const shaped = {
     rounded: shapeCorners(master, "rounded"),
     "full-bleed": shapeCorners(master, "full-bleed"),
   };
-  const extent = artworkExtent(master);
-  if (extent > SAFE_ZONE)
-    throw new Error(`Artwork reaches ${extent.toFixed(3)} of the half-width (> ${SAFE_ZONE}).`);
   const write = (path: string, bytes: Uint8Array) => {
-    mkdirSync(dirname(join(ROOT, path)), { recursive: true });
-    writeFileSync(join(ROOT, path), bytes);
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), bytes);
     console.log(`${path.padEnd(42)} ${bytes.length.toLocaleString("en").padStart(7)} bytes`);
   };
   for (const output of Object.values(OUTPUTS))
@@ -469,9 +502,12 @@ function generate() {
     FAVICON_ICO.path,
     encodeIco(FAVICON_ICO.sizes.map((size) => ({ size, png: optimisedPng(resize(shaped.rounded, size)) }))),
   );
+  for (const { file, original, updated } of themeFiles) {
+    if (original !== updated) writeFileSync(file, updated);
+  }
   console.log(`artwork extent ${extent.toFixed(3)} of the half-width (safe zone ${SAFE_ZONE})`);
-  console.log(`navy ${navy(master)} (theme-color in web/index.html and web/public/manifest.webmanifest)`);
-  console.log(`from ${relative(process.cwd(), join(ROOT, MASTER))}`);
+  console.log(`navy ${colour} (web/index.html and web/public/manifest.webmanifest)`);
+  console.log(`from ${relative(process.cwd(), join(root, MASTER))}`);
 }
 
 if (import.meta.main) generate();

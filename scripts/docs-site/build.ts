@@ -378,8 +378,13 @@ function serve(out: string, port: number) {
   watch(join(ROOT, "docs"), { recursive: true }, schedule);
   watch(ASSETS, schedule);
   watch(join(ROOT, "README.md"), schedule);
+  for (const directory of new Set(Object.values(BRAND_FILES).map(posix.dirname))) {
+    watch(join(ROOT, directory), (_event, name) => {
+      if (name === null || BRAND_COPIES.has(posix.join(directory, name))) schedule();
+    });
+  }
   const server = servePreview(out, port);
-  console.log(`docs site on http://127.0.0.1:${server.port}/ (rebuilds when docs change)`);
+  console.log(`docs site on http://127.0.0.1:${server.port}/ (rebuilds when sources change)`);
 }
 
 if (import.meta.main) {

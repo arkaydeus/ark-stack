@@ -66,13 +66,12 @@ The dev override `infra/platform/docker-compose.dev.yml` binds the control-plane
 
 ## Documentation
 
-| Task         | Runs                                   | Notes                                                                     |
-| ------------ | -------------------------------------- | ------------------------------------------------------------------------- |
-| `docs:check` | `bun scripts/check-docs.ts`            | Fails on any documentation drift                                          |
-| `docs:build` | `bun scripts/docs-site/build.ts build` | Writes the static site to `dist/docs`, or `--out dir`                     |
-| `docs:serve` | `bun scripts/docs-site/build.ts serve` | Serves on `http://127.0.0.1:4321/` (or `--port n`) and rebuilds on change |
-
-| `brand:icons` | `bun scripts/brand-icons.ts` | Regenerates the committed icons from `assets/brand/ark-stack-icon.png`; dev only |
+| Task          | Runs                                   | Notes                                                                                                     |
+| ------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `docs:check`  | `bun scripts/check-docs.ts`            | Fails on any documentation drift                                                                          |
+| `docs:build`  | `bun scripts/docs-site/build.ts build` | Writes the static site to `dist/docs`, or `--out dir`                                                     |
+| `docs:serve`  | `bun scripts/docs-site/build.ts serve` | Serves on `http://127.0.0.1:4321/` (or `--port n`) and rebuilds on change                                 |
+| `brand:icons` | `bun scripts/brand-icons.ts`           | Regenerates the committed icons and updates the admin theme colour from `assets/brand/ark-stack-icon.png` |
 
 `docs:build` requires an empty output directory or one that holds a docs build manifest from an earlier build. If you have an older unmarked `dist/docs`, move it aside or choose a fresh directory with `--out`. What the docs check verifies is described in [Testing](../development/testing.md).
 

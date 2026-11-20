@@ -1,6 +1,16 @@
 // The committed Ark Stack icons: derived from the one master, right sizes and shapes, small files.
 import { describe, expect, test } from "bun:test";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -13,6 +23,7 @@ import {
   encodeIco,
   encodeIndexedPng,
   encodePng,
+  generate,
   navy,
   optimisedPng,
   quantize,
@@ -69,15 +80,67 @@ describe("PNG and ICO codec", () => {
     expect(decodePng(encodePng(opaque))).toEqual(opaque);
   });
 
-  test("area-average resampling of a uniform image is exact", () => {
-    const flat: Image = { width: 7, height: 7, data: new Uint8Array(7 * 7 * 4).fill(200) };
-    expect(resize(flat, 3).data.every((value) => value === 200)).toBe(true);
+  test.each([
+    [
+      "RGB",
+      "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAABnRSTlMABwAKABYlxesGAAAAD0lEQVR4nGNg5xITEBEDAAEpAGIMZux8AAAAAElFTkSuQmCC",
+      [7, 10, 22, 0, 16, 20, 22, 255],
+    ],
+    [
+      "greyscale",
+      "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAAAAADRSSBWAAAAAnRSTlMAFoJHeGkAAAALSURBVHicYxATBwAARgAuCfgjjwAAAABJRU5ErkJggg==",
+      [22, 22, 22, 0, 23, 23, 23, 255],
+    ],
+  ] as const)("decodes an 8-bit %s PNG with a colour key", (_format, png, rgba) => {
+    expect(decodePng(Buffer.from(png, "base64")).data).toEqual(Uint8Array.from(rgba));
+  });
+
+  test.each([
+    [7, 3],
+    [1014, 180],
+  ])("resamples uniform %ipx to %ipx through the edges", (from, to) => {
+    const flat: Image = { width: from, height: from, data: new Uint8Array(from * from * 4).fill(200) };
+    expect(resize(flat, to).data.every((value) => value === 200)).toBe(true);
+  });
+
+  test("reports a missing navy field", () => {
+    const white = decodePng(encodePng({ width: 2, height: 2, data: new Uint8Array(16).fill(255) }));
+    expect(() => navy(white, 0)).toThrow("The master has no navy pixels");
   });
 
   test("an ICO wraps each PNG with its size", () => {
     const png = encodePng(image);
     expect(icoEntries(encodeIco([{ size: 16, png }]))).toEqual([{ size: 16, png }]);
   });
+});
+
+test("regenerating from a shifted master updates both admin theme files", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "ark-brand-"));
+  try {
+    mkdirSync(join(fixture, "assets/brand"), { recursive: true });
+    mkdirSync(join(fixture, "web/public"), { recursive: true });
+    for (const path of ["web/index.html", "web/public/manifest.webmanifest"])
+      copyFileSync(join(root, path), join(fixture, path));
+    const shifted = {
+      ...master,
+      data: master.data.map((value, i) => (i % 4 === 2 && value < 40 && value > 4 ? value + 8 : value)),
+    };
+    const colour = navy(shifted);
+    expect(colour).not.toBe(navy(master));
+    writeFileSync(join(fixture, MASTER), encodePng(shifted));
+    generate(fixture);
+    expect(readFileSync(join(fixture, "web/index.html"), "utf8")).toContain(
+      `<meta name="theme-color" content="${colour}" />`,
+    );
+    const manifest = JSON.parse(readFileSync(join(fixture, "web/public/manifest.webmanifest"), "utf8"));
+    expect(manifest.theme_color).toBe(colour);
+    expect(manifest.background_color).toBe(colour);
+    expect(manifest.icons).toEqual(
+      JSON.parse(readFileSync(join(root, "web/public/manifest.webmanifest"), "utf8")).icons,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 describe("committed icons", () => {

@@ -102,8 +102,13 @@ describe("documentation check", () => {
     ],
     [
       "inline HTML images",
-      '<img src="../../assets/brand/ark-stack-icon-256.png" alt=""> <img alt="" src="../../assets/brand/missing.png"> <img src="https://example.com/x.png">',
+      '<img src="../../assets/brand/ark-stack-icon-256.png" alt=""> <img alt="" src="../../assets/brand/missing.png"> <img src="https://example.com/x.png"> <img src="//example.com/x.png">',
       "image: ../../assets/brand/missing.png",
+    ],
+    [
+      "single-quoted HTML image sources outside code spans",
+      "Show `<img src='example.png'>` or ``<img src='example`.png'>`` beside <img alt='Example' src='missing.png'>.",
+      "image: missing.png",
     ],
   ])("checks %s", (_, doc, diagnostic) => {
     expect(

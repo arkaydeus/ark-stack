@@ -229,11 +229,15 @@ export function checkMarkdown(ctx: Context, file: string, text: string, scope: "
         }
       }
     }
-    // Inline HTML images (outside code blocks): <img src="target">
+    // Consume complete code spans before looking for image tags.
     if (!fenced) {
-      for (const match of line.matchAll(/<img\b[^>]*?\ssrc="([^"]+)"/g)) {
-        const target = match[1]!;
-        if (/^(?:https?:|data:)/.test(target)) continue;
+      const markup = /(?<![\\`])(`+)(?!`).*?(?<!`)\1(?!`)|<img(?=\s|\/?>)((?:[^"'<>]|"[^"]*"|'[^']*')*)>/gi;
+      for (const [, , attributes] of line.matchAll(markup)) {
+        if (!attributes) continue;
+        const attribute = /\s+([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>]+)))?/g;
+        const src = [...attributes.matchAll(attribute)].find((match) => match[1]?.toLowerCase() === "src");
+        const target = src?.[2] ?? src?.[3] ?? src?.[4];
+        if (!target || /^(?:https?:|data:|\/\/)/i.test(target)) continue;
         const resolved = normalize(join(dirname(file), target));
         if (resolved.startsWith("..") || !ctx.tracked.has(resolved)) report(number, "image", target);
       }
