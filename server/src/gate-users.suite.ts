@@ -642,7 +642,9 @@ describe("first login: login origin only, TOTP enrollment before any route", () 
 
     const enrollPage = await browser.send(enrollLocation);
     expect(enrollPage.status).toBe(200);
-    expect(enrollPage.headers.get("content-security-policy")).toContain("script-src 'nonce-");
+    expect(enrollPage.headers.get("content-security-policy")).toMatch(
+      /^default-src 'none'; script-src 'nonce-([\w-]{22})'; style-src 'nonce-\1'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'$/,
+    );
     const html = await enrollPage.text();
     expect(html).toContain("Set up two-factor authentication");
     expect(html).toContain(`data-next="${authorizePath.replaceAll("&", "&amp;")}"`);

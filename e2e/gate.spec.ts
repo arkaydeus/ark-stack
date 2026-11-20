@@ -25,6 +25,10 @@ test("SSO route: login-origin redirect, password and TOTP, host-only route cooki
   page.on("request", (request) => {
     if (request.isNavigationRequest()) navigations.push(request.url());
   });
+  const cspViolations: string[] = [];
+  page.on("console", (message) => {
+    if (/Content Security Policy/i.test(message.text())) cspViolations.push(message.text());
+  });
 
   // An unauthenticated GET is redirected to the login origin (authorize, then the sign-in page).
   await page.goto(original);
@@ -32,6 +36,15 @@ test("SSO route: login-origin redirect, password and TOTP, host-only route cooki
   const authorize = navigations.map((url) => new URL(url)).find((url) => url.pathname === "/gate/authorize");
   expect(authorize?.host).toBe(loginHost);
   expect(authorize?.searchParams.get("rd")).toBe("/dashboard?tab=1");
+
+  // The Ark Stack icon loads from the login origin under the page's CSP.
+  const mark = page.getByRole("img", { name: "Ark Stack" });
+  await expect(mark).toHaveAttribute("src", "/gate/brand/icon-96.png");
+  await expect
+    .poll(() => mark.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth))
+    .toBe(96);
+  await expect(page.locator('link[rel="icon"]')).toHaveAttribute("href", "/gate/brand/icon-32.png");
+  expect(cspViolations).toEqual([]);
 
   // Password, then TOTP.
   await page.getByLabel("Email").fill(process.env.ARK_E2E_GATE_EMAIL!);

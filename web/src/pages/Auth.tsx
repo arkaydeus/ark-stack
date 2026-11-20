@@ -1,6 +1,7 @@
 import { CircleAlert, KeyRound, RefreshCw } from "lucide-react";
 import { type FormEvent, type ReactNode, useEffect, useState } from "react";
 
+import { BrandMark } from "@/components/brand-mark";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field } from "@/components/ui/input";
@@ -109,7 +110,10 @@ export function AuthScreen() {
   return (
     <main className="grid min-h-screen lg:grid-cols-2">
       <section className="hidden flex-col justify-between p-12 lg:flex">
-        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-primary">Ark Stack</p>
+        <p className="flex items-center gap-3 text-xs font-semibold uppercase tracking-[0.2em] text-primary">
+          <BrandMark className="size-9" />
+          Ark Stack
+        </p>
         <div>
           <h1 className="display text-5xl leading-tight">
             One host. Databases, mail, and services under one desk.
@@ -123,6 +127,10 @@ export function AuthScreen() {
       </section>
       <section className="grid place-items-center p-6">
         <form className="w-full max-w-md space-y-4" onSubmit={submit}>
+          <p className="flex items-center gap-3 text-xs font-semibold uppercase tracking-[0.2em] text-primary lg:hidden">
+            <BrandMark className="size-9" />
+            Ark Stack
+          </p>
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">Control plane</p>
             <h2 className="display mt-2 text-3xl">{setupRequired ? "Create the owner" : "Sign in"}</h2>

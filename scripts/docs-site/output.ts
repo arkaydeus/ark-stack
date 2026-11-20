@@ -53,7 +53,16 @@ function generatedPath(path: unknown): path is string {
     !path.startsWith("../") &&
     posix.normalize(path) === path &&
     (path.endsWith(".html") ||
-      [".nojekyll", "assets/site.js", "assets/style.css", "assets/search-index.js"].includes(path))
+      [
+        ".nojekyll",
+        "favicon.ico",
+        "assets/site.js",
+        "assets/style.css",
+        "assets/search-index.js",
+        "assets/brand/icon-32.png",
+        "assets/brand/icon-96.png",
+        "assets/brand/ark-stack-icon-256.png",
+      ].includes(path))
   );
 }
 

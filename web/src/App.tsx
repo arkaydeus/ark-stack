@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
+import { BrandMark } from "@/components/brand-mark";
 import { Button } from "@/components/ui/button";
 import { authClient } from "@/lib/auth-client";
 import type { PlatformState } from "@/lib/types";
@@ -132,9 +133,12 @@ export function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">Ark Stack</p>
-          <p className="mt-1 text-sm text-muted-foreground">Infrastructure desk</p>
+        <div className="flex items-center gap-3">
+          <BrandMark />
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">Ark Stack</p>
+            <p className="mt-1 text-sm text-muted-foreground">Infrastructure desk</p>
+          </div>
         </div>
         <nav aria-label="Main navigation" className="space-y-1">
           {navigation

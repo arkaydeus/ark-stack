@@ -6,6 +6,8 @@
     "check-docs.test.ts",
     "docs-site/build.ts",
     "docs-site/build.test.ts",
+    "brand-icons.ts",
+    "brand-icons.test.ts",
     "../e2e/docs-site.spec.ts"
   ]
 }

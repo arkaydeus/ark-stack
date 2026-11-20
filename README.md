@@ -1,3 +1,5 @@
+<img src="assets/brand/ark-stack-icon-256.png" alt="Ark Stack icon" width="112" height="112">
+
 # Ark Stack
 
 Ark Stack is a self-hosted control plane for a single Linux VPS. One administration UI, with mandatory MFA for administrators, manages:

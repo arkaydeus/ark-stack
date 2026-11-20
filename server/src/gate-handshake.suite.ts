@@ -460,8 +460,30 @@ describe("handshake (§3.9.2)", () => {
     expect(next).toBe(`/gate/authorize${authorize.search}`);
     const page = await browser.login(location);
     expect(page.status).toBe(200);
-    expect(page.headers.get("content-security-policy")).toContain("script-src 'nonce-");
-    expect(await page.text()).toContain(`data-next="${next.replaceAll("&", "&amp;")}"`);
+    expect(page.headers.get("content-security-policy")).toMatch(
+      /^default-src 'none'; script-src 'nonce-([\w-]{22})'; style-src 'nonce-\1'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'$/,
+    );
+    const html = await page.text();
+    expect(html).toContain(`data-next="${next.replaceAll("&", "&amp;")}"`);
+    expect(html).toContain('<link rel="icon" href="/gate/brand/icon-32.png"');
+    expect(html).toContain('<img class="mark" src="/gate/brand/icon-96.png"');
+  });
+
+  test("the login origin serves the page icons from /gate/brand/, cacheable; other hosts get 404", async () => {
+    const browser = new Browser();
+    for (const path of ["/gate/brand/icon-32.png", "/gate/brand/icon-96.png"]) {
+      const icon = await browser.login(path);
+      expect(icon.status).toBe(200);
+      expect(icon.headers.get("content-type")).toBe("image/png");
+      expect(icon.headers.get("cache-control")).toBe("public, max-age=604800");
+      expect(icon.headers.get("set-cookie")).toBeNull();
+      expect(new Uint8Array(await icon.arrayBuffer()).subarray(1, 4)).toEqual(
+        new TextEncoder().encode("PNG"),
+      );
+      expect((await browser.login(path, undefined, adminHost)).status).toBe(404);
+    }
+    for (const path of ["/gate/brand/", "/gate/brand/icon-512.png", "/gate/brand/..%2fmanifest.webmanifest"])
+      expect((await browser.login(path)).status).toBe(404);
   });
 
   test("password + TOTP, authorize, callback: the route cookie is __Host-, Secure, HttpOnly, Lax, no Domain", async () => {

@@ -4,6 +4,7 @@
 //
 // For every checked Markdown file it verifies:
 //   - relative links resolve to a tracked file, and `#anchors` to a heading in it (GitHub slugs);
+//   - relative `<img src>` targets are tracked files;
 //   - backticked repository paths exist (a `:line` suffix, globs and `<placeholders>` are allowed);
 //   - `mise run <task>` names a task in mise.toml;
 //   - inline and fenced HTTP `METHOD /api/...` requests are registered in server/src/app.ts;
@@ -70,7 +71,7 @@ export function routeKey(method: string, path: string) {
 }
 
 const PATH_ROOTS =
-  /^(?:docs|scripts|server|shared|workers|web|infra|tests|e2e|agent|templates|\.github)\/|^(?:mise\.toml|Dockerfile|docker-bake\.hcl|package\.json|playwright\.config\.ts|README\.md|\.env\.example)$/;
+  /^(?:docs|scripts|server|shared|workers|web|infra|tests|e2e|agent|templates|assets|\.github)\/|^(?:mise\.toml|Dockerfile|docker-bake\.hcl|package\.json|playwright\.config\.ts|README\.md|\.env\.example)$/;
 const LINE_CITATION = /:\d+(?:-\d+)?(?:,\d+)*$/;
 const INLINE_COMMAND = /^(?:bunx?|docker|mise|node|npm|npx|bash|sh)\s/;
 const API_REQUEST = /^(GET|POST|PUT|PATCH|DELETE)\s+(\/api\/[^\s`…]+)/;
@@ -226,6 +227,19 @@ export function checkMarkdown(ctx: Context, file: string, text: string, scope: "
             anchorCache.set(resolved, anchors(readFileSync(join(ctx.root, resolved), "utf8")));
           if (!anchorCache.get(resolved)!.has(anchor)) report(number, "anchor", `${resolved}#${anchor}`);
         }
+      }
+    }
+    // Consume complete code spans before looking for image tags.
+    if (!fenced) {
+      const markup = /(?<![\\`])(`+)(?!`).*?(?<!`)\1(?!`)|<img(?=\s|\/?>)((?:[^"'<>]|"[^"]*"|'[^']*')*)>/gi;
+      for (const [, , attributes] of line.matchAll(markup)) {
+        if (!attributes) continue;
+        const attribute = /\s+([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>]+)))?/g;
+        const src = [...attributes.matchAll(attribute)].find((match) => match[1]?.toLowerCase() === "src");
+        const target = src?.[2] ?? src?.[3] ?? src?.[4];
+        if (!target || /^(?:https?:|data:|\/\/)/i.test(target)) continue;
+        const resolved = normalize(join(dirname(file), target));
+        if (resolved.startsWith("..") || !ctx.tracked.has(resolved)) report(number, "image", target);
       }
     }
     // `mise run <task>` anywhere, code blocks included.
