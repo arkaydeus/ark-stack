@@ -22,9 +22,11 @@ import {
   parseSniPorts,
   preserveDbIngressGenerations,
   hostPublicIpv6Addresses,
-  renderHostFirewall,
+  readHostSshAccess,
+  updateHostFirewallPorts,
   sha256Hex,
   type IngressCounterSnapshot,
+  type HostPortConfig,
 } from "@ark-stack/shared";
 
 const dir = process.env.ARK_PGBOUNCER_DIR ?? join(process.cwd(), "tmp", "pgbouncer");
@@ -184,19 +186,19 @@ async function guardFailure(guard: Guard, error: unknown) {
   }
 }
 
-async function applyPolicies(
-  policies: [string, string][],
-  guards: Guard[],
-  host?: Parameters<typeof renderHostFirewall>[0],
-) {
+async function applyPolicies(policies: [string, string][], guards: Guard[], host?: HostPortConfig) {
   for (const [table, rules] of policies) {
     if (!declaresTable(rules, table)) throw new Error(`Policy does not declare ${table}`);
   }
   const transaction = policies.map(([, rules]) => rules);
-  if (host) transaction.push(renderHostFirewall(host));
+  if (host) transaction.push(updateHostFirewallPorts(host));
   await nft(["-f", "-"], transaction.join("\n"));
   for (const [table, rules] of policies) await verifyPolicyTable(table, rules, -1);
-  if (host) assertHostFirewall(await nft(["-s", "-y", "list", "table", "inet", HOST_FIREWALL_TABLE]), host);
+  if (host) {
+    const rules = await nft(["-s", "-y", "list", "table", "inet", HOST_FIREWALL_TABLE]);
+    const ssh = /\bchain ssh_access \{/.test(rules) ? readHostSshAccess(rules) : undefined;
+    assertHostFirewall(rules, host, ssh);
+  }
   await nft(["-f", "-"], guards.map(clearGuard).join(""));
 }
 

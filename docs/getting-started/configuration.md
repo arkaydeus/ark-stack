@@ -167,13 +167,13 @@ Copy `ARK_ROOT_KEY`, `ARK_ROOT_KEY_ID`, `ARK_MFA_RECOVERY_TOKEN`, both cipher pa
 
 Each key is one-off, pre-approved, non-ephemeral and tagged for exactly one node. Remove it after the node has joined and revoke it.
 
-| Variable              | Read by                         | Node and tag                                                                                                                                      |
-| --------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TS_VPS_AUTHKEY_FILE` | `host:install --enroll-vps`     | Absolute path to a private file holding the host key, `tag:ark-vps`.                                                                              |
-| `TS_VPS_AUTHKEY`      | `host:setup`                    | The host key itself, `tag:ark-vps`, for a non-interactive guided setup. It is written to a private temporary file for `--enroll-vps` and deleted. |
-| `TS_EDGE_AUTHKEY`     | installer, `edge-ts`            | `edge-ts`, `tag:ark-edge`. The installer prompts for it on a terminal and never prints it.                                                        |
-| `TS_BACKUP_AUTHKEY`   | `backup-ts`                     | `backup-ts`, `tag:ark-backup`. Never reuse the edge key.                                                                                          |
-| `TS_AUTHKEY`          | `tailscale` (profile `tailnet`) | The tailnet admin node, `tag:ark-stack-admin`.                                                                                                    |
+| Variable              | Read by                         | Node and tag                                                                                                        |
+| --------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `TS_VPS_AUTHKEY_FILE` | `host:install --enroll-vps`     | Absolute path to a private file holding the host key, `tag:ark-vps`.                                                |
+| `TS_VPS_AUTHKEY`      | `host:setup`                    | The host key itself, `tag:ark-vps`, for a non-interactive guided setup. Setup passes it to enrolment through stdin. |
+| `TS_EDGE_AUTHKEY`     | installer, `edge-ts`            | `edge-ts`, `tag:ark-edge`. The installer prompts for it on a terminal and never prints it.                          |
+| `TS_BACKUP_AUTHKEY`   | `backup-ts`                     | `backup-ts`, `tag:ark-backup`. Never reuse the edge key.                                                            |
+| `TS_AUTHKEY`          | `tailscale` (profile `tailnet`) | The tailnet admin node, `tag:ark-stack-admin`.                                                                      |
 
 ## Host and installer
 

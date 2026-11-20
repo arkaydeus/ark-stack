@@ -38,13 +38,16 @@ export function setEnvValues(text: string, values: Record<string, string>) {
 
 /** Atomic write that keeps the file's owner and forces mode 0600. */
 export function writeEnv(path: string, text: string) {
+  writeHostFile(path, text, 0o600);
+}
+
+export function writeHostFile(path: string, text: string, mode: number) {
   const before = existsSync(path) ? statSync(path) : undefined;
   const temporary = `${path}.${process.pid}.setup.tmp`;
-  writeFileSync(temporary, text, { mode: 0o600 });
-  chmodSync(temporary, 0o600);
+  writeFileSync(temporary, text, { mode });
+  chmodSync(temporary, mode);
   if (before && process.getuid?.() === 0) chownSync(temporary, before.uid, before.gid);
   renameSync(temporary, path);
-  chmodSync(path, 0o600);
 }
 
 /** The admin-origin, ACME, DNS and reboot settings the answers imply, given the current `.env`. */

@@ -16,6 +16,7 @@ import { join } from "node:path";
 
 const repoRoot = join(import.meta.dir, "..");
 const script = readFileSync(join(repoRoot, "install.sh"), "utf8");
+const BOOTSTRAP_TIMEOUT_MS = 60_000;
 
 // Real tools the script needs besides the stubbed ones.
 const REAL_TOOLS = [
@@ -47,13 +48,14 @@ const STUBS: Record<string, string> = {
     echo "$p" >> "$STUB_STATE/installed"
     case "$p" in
       git|curl|mise|tailscale|extrepo) cp "$STUB_TEMPLATES/$p" "$STUB_BIN/$p" ;;
+      iproute2) cp "$STUB_TEMPLATES/ip" "$STUB_BIN/ip"; cp "$STUB_TEMPLATES/ss" "$STUB_BIN/ss" ;;
       docker-ce) cp "$STUB_TEMPLATES/docker" "$STUB_BIN/docker" ;;
       docker-compose-plugin) touch "$STUB_STATE/compose" ;;
     esac
   done
 fi`,
   docker:
-    '[ "$1 $2" = "compose version" ] && { [ -f "$STUB_STATE/compose" ] && echo v2.40.0 && exit 0; exit 1; }; exit 0',
+    'case "$1 $2" in "compose version") [ -f "$STUB_STATE/compose" ] && echo v2.40.0 ;; "info --format") [ ! -f "$STUB_STATE/docker-stopped" ] ;; esac',
   snap: '[ "$1 $2" = "list docker" ] && [ "${STUB_SNAP_DOCKER:-0}" = 1 ] && exit 0; exit 1',
   git: `case "$1" in
   clone) mkdir -p "\${@: -1}/.git" ;;
@@ -66,7 +68,10 @@ fi`,
 esac`,
   curl: 'while [ $# -gt 0 ]; do [ "$1" = -o ] && echo KEY > "$2"; shift; done',
   mise: '[ "$1" = --version ] && echo "mise 2026.11.0"; exit 0',
-  systemctl: "exit 0",
+  systemctl: 'rm -f "$STUB_STATE/docker-stopped"',
+  flock: 'exit "${STUB_LOCK_EXIT:-0}"',
+  ip: "exit 0",
+  ss: "exit 0",
   extrepo: "exit 0",
   tailscale: "exit 0",
   sudo: "exit 0",
@@ -93,7 +98,7 @@ function sandbox(present: string[]) {
     writeFileSync(file, `#!/bin/bash\necho "${name} $*" >> "$STUB_CALLS"\n${body}\n`);
     chmodSync(file, 0o755);
   }
-  for (const name of [...present, "id", "uname", "dpkg-query", "apt-get", "systemctl"]) {
+  for (const name of [...present, "id", "uname", "dpkg-query", "apt-get", "systemctl", "flock"]) {
     writeFileSync(join(bin, name), readFileSync(join(templates, name)));
     chmodSync(join(bin, name), 0o755);
   }
@@ -114,27 +119,35 @@ function osRelease(rootfs: string, id: string, version: string, codename: string
 
 function run(
   box: ReturnType<typeof sandbox>,
-  { env = {}, args = [], file }: { env?: Record<string, string>; args?: string[]; file?: string } = {},
+  {
+    env = {},
+    args = [],
+    file,
+    stdin,
+  }: { env?: Record<string, string>; args?: string[]; file?: string; stdin?: string } = {},
 ): Run {
   const target = file ?? join(box.dir, "install.sh");
   if (!file) writeFileSync(target, script);
   const installDir = join(box.dir, "opt", "ark-stack");
   const calls = join(box.state, "calls");
-  const result = Bun.spawnSync([join(box.bin, "bash"), target, ...args], {
-    cwd: box.dir,
-    env: {
-      PATH: box.bin,
-      HOME: box.dir,
-      STUB_CALLS: calls,
-      STUB_STATE: box.state,
-      STUB_BIN: box.bin,
-      STUB_TEMPLATES: box.templates,
-      ARK_BOOTSTRAP_ROOTFS: box.rootfs,
-      ARK_INSTALL_DIR: installDir,
-      ...env,
+  const result = Bun.spawnSync(
+    [join(box.bin, "bash"), ...(stdin === undefined ? [target] : ["-s", "--"]), ...args],
+    {
+      cwd: box.dir,
+      env: {
+        PATH: box.bin,
+        HOME: box.dir,
+        STUB_CALLS: calls,
+        STUB_STATE: box.state,
+        STUB_BIN: box.bin,
+        STUB_TEMPLATES: box.templates,
+        ARK_BOOTSTRAP_ROOTFS: box.rootfs,
+        ARK_INSTALL_DIR: installDir,
+        ...env,
+      },
+      stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
     },
-    stdin: "ignore",
-  });
+  );
   return {
     status: result.exitCode,
     stdout: result.stdout.toString(),
@@ -152,7 +165,7 @@ describe("install.sh", () => {
   test("is valid bash and runs everything from one function called on the last line", () => {
     expect(Bun.spawnSync(["bash", "-n", join(repoRoot, "install.sh")]).exitCode).toBe(0);
     const lines = script.trimEnd().split("\n");
-    expect(lines.at(-1)).toBe('ark_bootstrap "$@"');
+    expect(lines.at(-1)).toBe('{ ark_bootstrap "$@"; }');
     // Outside the function there are only comments and blank lines.
     const start = lines.indexOf("ark_bootstrap() {");
     const end = lines.lastIndexOf("}");
@@ -160,19 +173,25 @@ describe("install.sh", () => {
     expect(outside.every((line) => line === "" || line.startsWith("#"))).toBe(true);
   });
 
-  test("a truncated download runs nothing", () => {
-    const callLine = script.lastIndexOf('ark_bootstrap "$@"');
-    const cuts = new Set<number>();
-    for (let cut = 0; cut < callLine; cut += 211) cuts.add(cut);
-    for (let cut = callLine - 40; cut < callLine + "ark_bootstra".length; cut++) cuts.add(cut);
-    for (const cut of cuts) {
+  test(
+    "a truncated download runs nothing",
+    () => {
       const box = sandbox([]);
-      const file = join(box.dir, "truncated.sh");
-      writeFileSync(file, script.slice(0, cut));
-      const result = run(box, { file });
-      expect({ cut, calls: result.calls }).toEqual({ cut, calls: [] });
-    }
-  });
+      const callLine = script.lastIndexOf('{ ark_bootstrap "$@"; }');
+      const cuts = new Set<number>();
+      for (let cut = 0; cut < callLine; cut += 211) cuts.add(cut);
+      // The final newline is optional in Bash. Every cut before the closing brace must be inert.
+      for (let cut = callLine - 40; cut < script.trimEnd().length; cut++) cuts.add(cut);
+      for (const cut of cuts) {
+        const result = run(box, { stdin: script.slice(0, cut), args: ["--non-interactive"] });
+        expect({ cut, calls: result.calls }).toEqual({ cut, calls: [] });
+      }
+      const complete = run(box, { stdin: script, args: ["--non-interactive", "--domain", "example.com"] });
+      expect(complete.status).toBe(0);
+      expect(complete.calls.at(-1)).toBe("mise run host:setup --non-interactive --domain example.com");
+    },
+    BOOTSTRAP_TIMEOUT_MS,
+  );
 
   test("without root it changes nothing, explains and prints the sudo command", () => {
     const box = sandbox(["sudo", "docker", "mise"]);
@@ -242,106 +261,184 @@ describe("install.sh", () => {
     expect(changed(result.calls)).toEqual([]);
   });
 
-  test("on a fresh host it installs every prerequisite, clones and hands off to host:setup", () => {
+  test.each(["containerd", "runc"])("refuses standalone %s without a Docker CLI", (pkg) => {
     const box = sandbox([]);
-    const result = run(box, { args: ["--non-interactive", "--domain", "example.com"] });
-    // Without systemd (macOS, containers) the script only warns that docker.service was not started.
-    expect(
-      result.stderr.replace("warning: systemd is not running, so docker.service was not started.\n", ""),
-    ).toBe("");
-    expect(result.status).toBe(0);
-    const apt = result.calls.filter((call) => call.startsWith("apt-get install"));
-    expect(apt[0]).toBe("apt-get install -y -q --no-install-recommends git curl ca-certificates jq openssl");
-    expect(apt).toContain(
-      "apt-get install -y -q --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
-    );
-    expect(apt).toContain("apt-get install -y -q --no-install-recommends extrepo");
-    expect(apt).toContain("apt-get install -y -q --no-install-recommends mise");
-    expect(apt).toContain("apt-get install -y -q --no-install-recommends tailscale");
-    const docker = readFileSync(join(box.rootfs, "etc/apt/sources.list.d/docker.sources"), "utf8");
-    expect(docker).toContain("URIs: https://download.docker.com/linux/ubuntu\nSuites: noble\n");
-    expect(docker).toContain("Architectures: amd64\nSigned-By: /etc/apt/keyrings/docker.asc");
-    expect(readFileSync(join(box.rootfs, "etc/apt/sources.list.d/tailscale.list"), "utf8")).toBe(
-      "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main\n",
-    );
-    expect(result.calls).toContain(
-      "curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o " +
-        join(box.rootfs, "etc/apt/keyrings/docker.asc"),
-    );
-    expect(result.calls).toContain("extrepo enable mise");
-    expect(result.calls).toContain(
-      `git clone --quiet --branch main -- https://github.com/arkaydeus/ark-stack.git ${result.installDir}`,
-    );
-    const mise = result.calls.filter((call) => call.startsWith("mise ") && call !== "mise --version");
-    expect(mise).toEqual([
-      `mise trust ${result.installDir}/mise.toml`,
-      "mise install",
-      "mise exec -- bun install --frozen-lockfile",
-      "mise run host:setup --non-interactive --domain example.com",
-    ]);
-  });
-
-  test("with everything present it installs nothing and fast-forwards nothing when current", () => {
-    const box = sandbox(["docker", "mise", "tailscale", "git", "curl", "snap"]);
-    writeFileSync(join(box.state, "installed"), "git\ncurl\nca-certificates\njq\nopenssl\ndocker-ce\n");
-    writeFileSync(join(box.state, "compose"), "");
-    mkdirSync(join(box.dir, "opt", "ark-stack", ".git"), { recursive: true });
-    const result = run(box);
-    expect(result.status).toBe(0);
-    expect(result.calls.filter((call) => call.startsWith("apt-get"))).toEqual([]);
-    expect(result.calls.some((call) => call.startsWith("git clone") || / merge | checkout /.test(call))).toBe(
-      false,
-    );
-    expect(result.stdout).toContain("Already at main.");
-    expect(result.calls.at(-1)).toBe("mise run host:setup");
-  });
-
-  test("updates a clean checkout with a fast-forward only, and refuses a dirty or diverged one", () => {
-    const setup = () => {
-      const box = sandbox(["docker", "mise", "tailscale", "git", "curl"]);
-      writeFileSync(join(box.state, "installed"), "git\ncurl\nca-certificates\njq\nopenssl\n");
-      writeFileSync(join(box.state, "compose"), "");
-      mkdirSync(join(box.dir, "opt", "ark-stack", ".git"), { recursive: true });
-      return box;
-    };
-    const forward = run(setup(), { env: { STUB_GIT_HEAD: "aaa", STUB_GIT_FETCH_HEAD: "bbb" } });
-    expect(forward.status).toBe(0);
-    expect(forward.calls).toContain(`git -C ${forward.installDir} merge --quiet --ff-only bbb`);
-
-    const dirty = run(setup(), { env: { STUB_GIT_STATUS: " M scripts/install.ts\n" } });
-    expect(dirty.status).toBe(1);
-    expect(dirty.stderr).toContain("has local changes");
-    expect(dirty.calls.some((call) => call.startsWith("mise trust"))).toBe(false);
-
-    const diverged = run(setup(), {
-      env: { STUB_GIT_HEAD: "aaa", STUB_GIT_FETCH_HEAD: "bbb", STUB_GIT_NOT_ANCESTOR: "1" },
-    });
-    expect(diverged.status).toBe(1);
-    expect(diverged.stderr).toContain("is not a fast-forward");
-    expect(diverged.calls.some((call) => / merge | checkout /.test(call))).toBe(false);
-  });
-
-  test("adds only the Compose plugin to Docker's own docker-ce", () => {
-    const box = sandbox(["docker", "mise", "tailscale", "git", "curl"]);
-    writeFileSync(join(box.state, "installed"), "git\ncurl\nca-certificates\njq\nopenssl\ndocker-ce\n");
-    const result = run(box);
-    expect(result.status).toBe(0);
-    expect(result.calls).toContain(
-      "apt-get install -y -q --no-install-recommends docker-compose-plugin docker-buildx-plugin",
-    );
-    expect(result.calls.some((call) => call.includes(" docker-ce docker-ce-cli"))).toBe(false);
-  });
-
-  test("refuses an install directory that is not a checkout, and a bad ARK_REF", () => {
-    const box = sandbox([]);
-    mkdirSync(join(box.dir, "opt", "ark-stack"), { recursive: true });
-    writeFileSync(join(box.dir, "opt", "ark-stack", "notes.txt"), "mine");
+    writeFileSync(join(box.state, "installed"), pkg + "\n");
     const result = run(box);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("is not a git checkout");
+    expect(result.stderr).toContain("The installed " + pkg + " package conflicts");
     expect(changed(result.calls)).toEqual([]);
-    const ref = run(sandbox([]), { env: { ARK_REF: "--upload-pack=evil" } });
-    expect(ref.status).toBe(1);
-    expect(changed(ref.calls)).toEqual([]);
+    expect(existsSync(join(box.rootfs, "etc/apt"))).toBe(false);
   });
+
+  test("refuses to mutate apt or the checkout under a competing deployment lock", () => {
+    const result = run(sandbox([]), { env: { STUB_LOCK_EXIT: "1" } });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("signed maintenance run is in progress");
+    expect(changed(result.calls)).toEqual([]);
+  });
+
+  test(
+    "starts a stopped preinstalled Docker daemon and checks it again",
+    () => {
+      const box = sandbox(["docker", "mise", "tailscale", "git", "curl", "ip", "ss"]);
+      writeFileSync(join(box.state, "installed"), "git\ncurl\nca-certificates\njq\nopenssl\n");
+      writeFileSync(join(box.state, "compose"), "");
+      writeFileSync(join(box.state, "docker-stopped"), "");
+      mkdirSync(join(box.rootfs, "run", "systemd", "system"), { recursive: true });
+      const result = run(box);
+      expect(result.status).toBe(0);
+      expect(
+        result.calls.filter((call) => call.startsWith("docker info") || call.startsWith("systemctl")),
+      ).toEqual([
+        "docker info --format {{.ServerVersion}}",
+        "systemctl enable --now docker.service",
+        "docker info --format {{.ServerVersion}}",
+      ]);
+      const resumed = run(box);
+      expect(resumed.status).toBe(0);
+      expect(resumed.calls.filter((call) => call.startsWith("systemctl"))).toHaveLength(1);
+    },
+    BOOTSTRAP_TIMEOUT_MS,
+  );
+
+  test(
+    "on a fresh host it installs every prerequisite, clones and hands off to host:setup",
+    () => {
+      const box = sandbox([]);
+      const result = run(box, { args: ["--non-interactive", "--domain", "example.com"] });
+      // Without systemd (macOS, containers) the script only warns that docker.service was not started.
+      expect(
+        result.stderr.replace("warning: systemd is not running, so docker.service was not started.\n", ""),
+      ).toBe("");
+      expect(result.status).toBe(0);
+      const apt = result.calls.filter((call) => call.startsWith("apt-get install"));
+      expect(apt[0]).toBe(
+        "apt-get install -y -q --no-remove --no-install-recommends git curl ca-certificates jq openssl iproute2",
+      );
+      expect(apt).toContain(
+        "apt-get install -y -q --no-remove --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
+      );
+      expect(apt).toContain("apt-get install -y -q --no-remove --no-install-recommends extrepo");
+      expect(apt).toContain("apt-get install -y -q --no-remove --no-install-recommends mise");
+      expect(apt).toContain("apt-get install -y -q --no-remove --no-install-recommends tailscale");
+      const docker = readFileSync(join(box.rootfs, "etc/apt/sources.list.d/docker.sources"), "utf8");
+      expect(docker).toContain("URIs: https://download.docker.com/linux/ubuntu\nSuites: noble\n");
+      expect(docker).toContain("Architectures: amd64\nSigned-By: /etc/apt/keyrings/docker.asc");
+      expect(readFileSync(join(box.rootfs, "etc/apt/sources.list.d/tailscale.list"), "utf8")).toBe(
+        "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main\n",
+      );
+      expect(result.calls).toContain(
+        "curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o " +
+          join(box.rootfs, "etc/apt/keyrings/docker.asc"),
+      );
+      expect(result.calls).toContain("extrepo enable mise");
+      expect(result.calls).toContain(
+        `git clone --quiet --branch main -- https://github.com/arkaydeus/ark-stack.git ${result.installDir}`,
+      );
+      const mise = result.calls.filter((call) => call.startsWith("mise ") && call !== "mise --version");
+      expect(mise).toEqual([
+        `mise trust ${result.installDir}/mise.toml`,
+        "mise install",
+        "mise exec -- bun install --frozen-lockfile",
+        "mise run host:setup --non-interactive --domain example.com",
+      ]);
+    },
+    BOOTSTRAP_TIMEOUT_MS,
+  );
+
+  test(
+    "with everything present it installs nothing and fast-forwards nothing when current",
+    () => {
+      const box = sandbox(["docker", "mise", "tailscale", "git", "curl", "snap", "ip", "ss"]);
+      writeFileSync(join(box.state, "installed"), "git\ncurl\nca-certificates\njq\nopenssl\ndocker-ce\n");
+      writeFileSync(join(box.state, "compose"), "");
+      mkdirSync(join(box.dir, "opt", "ark-stack", ".git"), { recursive: true });
+      const result = run(box);
+      expect(result.status).toBe(0);
+      expect(result.calls.filter((call) => call.startsWith("apt-get"))).toEqual([]);
+      expect(
+        result.calls.some((call) => call.startsWith("git clone") || / merge | checkout /.test(call)),
+      ).toBe(false);
+      expect(result.stdout).toContain("Already at main.");
+      expect(result.calls.at(-1)).toBe("mise run host:setup");
+    },
+    BOOTSTRAP_TIMEOUT_MS,
+  );
+
+  test(
+    "updates a clean checkout with a fast-forward only, and refuses a dirty or diverged one",
+    () => {
+      const setup = () => {
+        const box = sandbox(["docker", "mise", "tailscale", "git", "curl"]);
+        writeFileSync(join(box.state, "installed"), "git\ncurl\nca-certificates\njq\nopenssl\n");
+        writeFileSync(join(box.state, "compose"), "");
+        mkdirSync(join(box.dir, "opt", "ark-stack", ".git"), { recursive: true });
+        return box;
+      };
+      const forward = run(setup(), { env: { STUB_GIT_HEAD: "aaa", STUB_GIT_FETCH_HEAD: "bbb" } });
+      expect(forward.status).toBe(0);
+      expect(forward.calls).toContain(`git -C ${forward.installDir} merge --quiet --ff-only bbb`);
+
+      const dirty = run(setup(), { env: { STUB_GIT_STATUS: " M scripts/install.ts\n" } });
+      expect(dirty.status).toBe(1);
+      expect(dirty.stderr).toContain("has local changes");
+      expect(dirty.calls.some((call) => call.startsWith("mise trust"))).toBe(false);
+
+      const untracked = run(setup(), { env: { STUB_GIT_STATUS: "?? mise.local.toml\n" } });
+      expect(untracked.status).toBe(1);
+      expect(untracked.calls.some((call) => / fetch |^mise trust/.test(call))).toBe(false);
+
+      const diverged = run(setup(), {
+        env: { STUB_GIT_HEAD: "aaa", STUB_GIT_FETCH_HEAD: "bbb", STUB_GIT_NOT_ANCESTOR: "1" },
+      });
+      expect(diverged.status).toBe(1);
+      expect(diverged.stderr).toContain("is not a fast-forward");
+      expect(diverged.calls.some((call) => / merge | checkout /.test(call))).toBe(false);
+    },
+    BOOTSTRAP_TIMEOUT_MS,
+  );
+
+  test(
+    "adds only the Compose plugin to Docker's own docker-ce",
+    () => {
+      const box = sandbox(["docker", "mise", "tailscale", "git", "curl"]);
+      writeFileSync(join(box.state, "installed"), "git\ncurl\nca-certificates\njq\nopenssl\ndocker-ce\n");
+      const result = run(box);
+      expect(result.status).toBe(0);
+      expect(result.calls).toContain(
+        "apt-get install -y -q --no-remove --no-install-recommends docker-compose-plugin docker-buildx-plugin",
+      );
+      expect(result.calls.some((call) => call.includes(" docker-ce docker-ce-cli"))).toBe(false);
+    },
+    BOOTSTRAP_TIMEOUT_MS,
+  );
+
+  test(
+    "refuses an install directory that is not a checkout, and a bad ARK_REF",
+    () => {
+      const box = sandbox([]);
+      mkdirSync(join(box.dir, "opt", "ark-stack"), { recursive: true });
+      writeFileSync(join(box.dir, "opt", "ark-stack", "notes.txt"), "mine");
+      const result = run(box);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("is not a git checkout");
+      expect(changed(result.calls)).toEqual([]);
+      const ref = run(sandbox([]), { env: { ARK_REF: "--upload-pack=evil" } });
+      expect(ref.status).toBe(1);
+      expect(changed(ref.calls)).toEqual([]);
+      const local = sandbox([]);
+      mkdirSync(join(local.dir, "scripts"));
+      writeFileSync(join(local.dir, "scripts/host-setup.ts"), "");
+      writeFileSync(join(local.dir, "mise.toml"), "");
+      writeFileSync(join(local.dir, "install.sh"), script);
+      const checkout = run(local, {
+        file: join(local.dir, "install.sh"),
+        env: { ARK_REF: "--upload-pack=evil" },
+      });
+      expect(checkout.status).toBe(0);
+      expect(checkout.stdout).toContain("Using the checkout");
+    },
+    BOOTSTRAP_TIMEOUT_MS,
+  );
 });

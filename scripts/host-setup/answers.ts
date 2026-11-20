@@ -1,7 +1,8 @@
 // The guided setup's questions. Each answer comes from a flag, else its environment variable, else
-// the previous run (state file), else the installed `.env`, else a default; interactive runs then
+// the installed `.env`, else the previous run (state file), else a default; interactive runs then
 // confirm it at a prompt. `--non-interactive` never prompts and fails naming any missing answer.
 import { normalizeHostname, parseSniPorts } from "@ark-stack/shared";
+import { isIP } from "node:net";
 
 import { automaticUpdatesConfig } from "../install-host-hardening.ts";
 import type { StoredAnswers } from "./state.ts";
@@ -10,6 +11,8 @@ import type { Ui } from "./system.ts";
 export type Options = {
   nonInteractive: boolean;
   keepPublicSsh: boolean;
+  sshRecoverySource?: string;
+  verifySshCutover: boolean;
   skipEdge: boolean;
   tailscaleSshConfirmed: boolean;
   providerFirewallApplied: boolean;
@@ -31,11 +34,13 @@ const VALUE_FLAGS = new Set([
   "--sni-ports",
   "--reboot-time",
   "--ssh-user",
+  "--ssh-recovery-source",
   "--provider-firewall",
 ]);
 const BOOLEAN_FLAGS = new Set([
   "--non-interactive",
   "--keep-public-ssh",
+  "--verify-ssh-cutover",
   "--skip-edge",
   "--tailscale-ssh-confirmed",
   "--provider-firewall-applied",
@@ -73,6 +78,8 @@ Steps and safety:
   --tailscale-ssh-confirmed     ARK_SETUP_TAILSCALE_SSH_CONFIRMED=1  You checked Tailscale SSH works
   --skip-edge                   ARK_SETUP_SKIP_EDGE=1                Enrol the edge node later
   --keep-public-ssh             ARK_SETUP_KEEP_PUBLIC_SSH=1          Leave OpenSSH listening
+  --ssh-recovery-source IP      ARK_SETUP_SSH_RECOVERY_SOURCE         IP allowed to reconnect during SSH cutover
+  --verify-ssh-cutover           ARK_SETUP_VERIFY_SSH_CUTOVER=1       Wait for off-host proof in scripted mode
   --provider-firewall ID        ARK_SETUP_PROVIDER_FIREWALL          Firewall adapter (default: manual)
   --provider-firewall-applied   ARK_SETUP_PROVIDER_FIREWALL_APPLIED=1  You applied the printed rules
 `;
@@ -107,9 +114,14 @@ const truthy = (value: string | undefined) => /^(?:1|true|yes)$/i.test(value?.tr
 export function resolveOptions(flags: Flags, env: Record<string, string | undefined>): Options {
   const flag = (name: string, variable: string) => flags.has(name) || truthy(env[variable]);
   const firewall = flags.get("--provider-firewall") ?? env.ARK_SETUP_PROVIDER_FIREWALL;
+  const recovery = flags.get("--ssh-recovery-source") ?? env.ARK_SETUP_SSH_RECOVERY_SOURCE;
+  if (typeof recovery === "string" && (!isIP(recovery) || recovery.includes("%")))
+    throw new Error("--ssh-recovery-source needs a single IP address.");
   return {
     nonInteractive: flag("--non-interactive", "ARK_SETUP_NON_INTERACTIVE"),
     keepPublicSsh: flag("--keep-public-ssh", "ARK_SETUP_KEEP_PUBLIC_SSH"),
+    sshRecoverySource: typeof recovery === "string" ? recovery : undefined,
+    verifySshCutover: flag("--verify-ssh-cutover", "ARK_SETUP_VERIFY_SSH_CUTOVER"),
     skipEdge: flag("--skip-edge", "ARK_SETUP_SKIP_EDGE"),
     tailscaleSshConfirmed: flag("--tailscale-ssh-confirmed", "ARK_SETUP_TAILSCALE_SSH_CONFIRMED"),
     providerFirewallApplied: flag("--provider-firewall-applied", "ARK_SETUP_PROVIDER_FIREWALL_APPLIED"),
@@ -137,7 +149,9 @@ export function validateRebootTime(value: string) {
 
 export function validateSshUser(value: string) {
   const user = value.trim();
-  if (user && !/^[a-z_][a-z0-9_-]{0,31}$/.test(user)) throw new Error(`"${user}" is not a local user name.`);
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(user) || user === "root") {
+    throw new Error("Supply a non-root local SSH user (--ssh-user or ARK_SETUP_SSH_USER).");
+  }
   return user;
 }
 
@@ -223,8 +237,8 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
   const adminHost = await text(
     "Admin hostname",
     given("--admin-host", "ARK_SETUP_ADMIN_HOST"),
-    (previous.domain === domain ? previous.adminHost : undefined) ??
-      [adminHostFromEnv(dotenv)].find((host) => host?.endsWith(`.${domain}`)) ??
+    [adminHostFromEnv(dotenv)].find((host) => host?.endsWith(`.${domain}`)) ??
+      (previous.domain === domain ? previous.adminHost : undefined) ??
       `admin.${domain}`,
     validateDomain,
     "the admin hostname (--admin-host or ARK_SETUP_ADMIN_HOST)",
@@ -232,11 +246,10 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
   const acmeEmail = await text(
     "Let's Encrypt account email (empty: certificates cannot be issued yet)",
     given("--acme-email", "ARK_ACME_EMAIL"),
-    previous.acmeEmail ?? dotenv.ARK_ACME_EMAIL,
+    dotenv.ARK_ACME_EMAIL ?? previous.acmeEmail,
     validateEmail,
   );
 
-  let trustedCertificates: boolean;
   const certFlag = flags.has("--trusted-certificates")
     ? true
     : flags.has("--staging-certificates")
@@ -244,25 +257,32 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
       : env.ARK_ACME_STAGING?.trim()
         ? !parseBool(env.ARK_ACME_STAGING, "ARK_ACME_STAGING")
         : undefined;
-  if (!acmeEmail) trustedCertificates = false;
-  else if (!interactive) trustedCertificates = certFlag ?? previous.trustedCertificates ?? true;
-  else {
-    trustedCertificates = await text(
+  const installedPreference = dotenv.ARK_ACME_EMAIL?.trim()
+    ? !parseBool(dotenv.ARK_ACME_STAGING?.trim() || "1", "ARK_ACME_STAGING")
+    : undefined;
+  let certificatePreference =
+    certFlag ??
+    installedPreference ??
+    previous.certificatePreference ??
+    (dotenv.ARK_ACME_EMAIL === undefined && previous.acmeEmail ? previous.trustedCertificates : undefined);
+  if (acmeEmail && interactive) {
+    certificatePreference = await text(
       "Issue trusted Let's Encrypt certificates? (no: staging, untrusted, for testing)",
       certFlag === undefined ? undefined : certFlag ? "yes" : "no",
-      (previous.trustedCertificates ?? true) ? "yes" : "no",
+      (certificatePreference ?? true) ? "yes" : "no",
       (value) => parseBool(value, "Trusted certificates"),
     );
   }
+  const trustedCertificates = Boolean(acmeEmail && (certificatePreference ?? true));
 
   const mailFlag = flags.has("--mail")
     ? "yes"
     : flags.has("--no-mail")
       ? "no"
       : env.ARK_MAIL_ENABLED?.trim() || undefined;
-  const previousMail =
-    previous.mailEnabled ??
-    (dotenv.ARK_MAIL_ENABLED === undefined ? undefined : dotenv.ARK_MAIL_ENABLED !== "0");
+  const previousMail = dotenv.ARK_MAIL_ENABLED?.trim()
+    ? parseBool(dotenv.ARK_MAIL_ENABLED, "ARK_MAIL_ENABLED")
+    : previous.mailEnabled;
   const mailEnabled = await text(
     "Enable incoming mail (Stalwart on TCP 25, 465, 587 and 993)?",
     mailFlag,
@@ -273,7 +293,7 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
   const sniPorts = await text(
     "Shared SNI ports for TLS-TCP routes, comma-separated from 8883, 5671, 636, 6380 (empty: 443 only)",
     given("--sni-ports", "ARK_EDGE_SNI_PORTS"),
-    previous.sniPorts?.join(",") ?? dotenv.ARK_EDGE_SNI_PORTS ?? "",
+    dotenv.ARK_EDGE_SNI_PORTS ?? previous.sniPorts?.join(",") ?? "",
     (value) => parseSniPorts(value),
   );
 
@@ -300,7 +320,7 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
   const rebootTime = await text(
     "Daily automatic reboot time for security updates (HH:MM, server time)",
     given("--reboot-time", "ARK_HOST_REBOOT_TIME"),
-    previous.rebootTime ?? dotenv.ARK_HOST_REBOOT_TIME ?? "04:00",
+    dotenv.ARK_HOST_REBOOT_TIME ?? previous.rebootTime ?? "04:00",
     validateRebootTime,
   );
 
@@ -310,6 +330,7 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
     given("--ssh-user", "ARK_SETUP_SSH_USER"),
     previous.sshUser ?? sudoUser,
     validateSshUser,
+    "the local SSH user (--ssh-user or ARK_SETUP_SSH_USER)",
   );
 
   return {
@@ -317,6 +338,7 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
     adminHost,
     acmeEmail,
     trustedCertificates,
+    certificatePreference,
     mailEnabled,
     sniPorts,
     rebootTime,

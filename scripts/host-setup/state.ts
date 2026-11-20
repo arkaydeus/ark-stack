@@ -1,16 +1,6 @@
 // The guided setup's root-only state file: which steps finished, with what inputs, so a re-run
 // verifies and skips them and resumes at the first unfinished one. It never holds a secret.
-import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export const STEP_IDS = [
@@ -43,6 +33,7 @@ export type StoredAnswers = {
   adminHost: string;
   acmeEmail: string;
   trustedCertificates: boolean;
+  certificatePreference?: boolean;
   mailEnabled: boolean;
   sniPorts: number[];
   rebootTime: string;
@@ -52,10 +43,12 @@ export type StoredAnswers = {
 export type SetupState = {
   version: 1;
   answers: Partial<StoredAnswers>;
-  /** When the owner confirmed a working Tailscale SSH session (the gate before hardening). */
-  sshConfirmedAt?: string;
+  /** The node and account for which the operator confirmed a working Tailscale SSH session. */
+  sshConfirmation?: { target: string; at: string };
+  sshCutoverPending?: boolean;
   /** The admin origin this setup last wrote, so a changed hostname replaces it. */
   adminOrigin?: string;
+  edgeKeyRetry?: boolean;
   steps: Partial<Record<StepId, StepRecord>>;
 };
 
@@ -84,36 +77,5 @@ export class StateStore {
     writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
     chmodSync(temporary, 0o600);
     renameSync(temporary, this.path);
-  }
-}
-
-/** One setup at a time. A lock left by a process that no longer exists is taken over. */
-export function acquireSetupLock(directory: string) {
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const path = join(directory, "setup.lock");
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(path, "wx", 0o600);
-      writeFileSync(fd, `${process.pid}\n`);
-      closeSync(fd);
-      return () => rmSync(path, { force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const pid = Number(readFileSync(path, "utf8").trim());
-      if (Number.isInteger(pid) && pid > 0 && pidAlive(pid)) {
-        throw new Error(`Another host:setup (pid ${pid}) is running. Wait for it to finish.`, { cause: error });
-      }
-      rmSync(path, { force: true });
-    }
-  }
-  throw new Error(`Could not take the setup lock ${path}.`);
-}
-
-function pidAlive(pid: number) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }

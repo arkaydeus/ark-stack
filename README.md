@@ -96,7 +96,7 @@ On the VPS, run one command as a user with `sudo`:
 curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh | sudo bash
 ```
 
-It installs whatever is missing (Docker Engine with Compose v2, `git`, `curl`, `jq`, OpenSSL, mise and Tailscale), clones the repository into `/opt/ark-stack` and starts the guided setup. Without `sudo` it changes nothing and prints what it would do. The setup first asks:
+It installs whatever is missing (Docker Engine with Compose v2, `git`, `curl`, `jq`, OpenSSL, `iproute2`, mise and Tailscale), clones the repository into `/opt/ark-stack` and starts the guided setup. Without `sudo` it changes nothing and prints what it would do. The setup first asks:
 
 - your domain and the admin hostname (default `admin.<domain>`);
 - the Let's Encrypt email, and whether certificates should be trusted (the default) or staging;

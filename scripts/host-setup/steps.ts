@@ -2,15 +2,26 @@
 // verifies whether it is already complete and skips itself, so a re-run resumes where it stopped.
 // The existing installer phases do the work: `install.ts --enroll-vps`, `install.ts --harden-vps`,
 // `edge-namespace.ts` (edge:rejoin) and `host-audit.ts`.
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { join } from "node:path";
 
-import { ARK_EDGE_TAG, ARK_VPS_TAG, applyEdgeAuthKey, parseEnvFile } from "@ark-stack/shared";
+import {
+  ARK_EDGE_TAG,
+  ARK_VPS_TAG,
+  applyEdgeAuthKey,
+  assertHostFirewall,
+  parseEnvFile,
+  readHostSshAccess,
+  replaceHostSshAccess,
+  updateHostSshAccess,
+  type HostPortConfig,
+  type HostSshAccess,
+} from "@ark-stack/shared";
 
 import { vpsNodeReady, type TailscaleState } from "../install-host-hardening.ts";
 import type { Answers, Options } from "./answers.ts";
-import { desiredConfiguration, readEnv, setEnvValues, writeEnv } from "./env-file.ts";
+import { desiredConfiguration, readEnv, setEnvValues, writeEnv, writeHostFile } from "./env-file.ts";
 import {
   selectProviderFirewall,
   type FirewallContext,
@@ -26,12 +37,18 @@ export const SUPPORTED_UBUNTU = ["22.04", "24.04", "26.04"];
 export type HostPaths = {
   osRelease: string;
   hostFirewall: string;
+  ufwDirectory?: string;
 };
 
-export type SessionOrigin = { via: "tailscale" | "openssh" | "local" | "unknown"; detail?: string };
+export type SessionOrigin = {
+  via: "tailscale" | "openssh" | "local" | "unknown";
+  detail?: string;
+  source?: string;
+};
 
 export type Context = {
   root: string;
+  stateDir: string;
   envPath: string;
   /** The Bun executable that runs the existing installer scripts. */
   bun: string;
@@ -102,6 +119,7 @@ export function childEnv(context: Context, extra: Record<string, string> = {}) {
   for (const key of Object.keys(parseEnvFile(readEnv(context.envPath)))) delete env[key];
   for (const key of ["TS_EDGE_AUTHKEY", "TS_VPS_AUTHKEY", "TS_VPS_AUTHKEY_FILE", "DNS_API_TOKEN"])
     delete env[key];
+  if (context.env.ARK_HOST_DEPLOYMENT_LOCK_HELD === "1") env.ARK_HOST_DEPLOYMENT_LOCK_HELD = "1";
   return { ...env, ...extra };
 }
 
@@ -120,6 +138,7 @@ function compose(context: Context, ...args: string[]) {
 export async function tailscaleStatus(context: Context): Promise<TailscaleState | undefined> {
   const result = await exec(context, ["tailscale", "status", "--json"]);
   try {
+    // NeedsLogin can still produce usable status JSON with a non-zero exit.
     return JSON.parse(result.stdout) as TailscaleState;
   } catch {
     return undefined;
@@ -150,7 +169,24 @@ function magicDnsName(status: TailscaleState | undefined) {
 }
 
 function sshTarget(context: Context, status: TailscaleState | undefined) {
-  return `${context.answers.sshUser || "<user>"}@${magicDnsName(status)}`;
+  return `${context.answers.sshUser}@${magicDnsName(status)}`;
+}
+
+function confirmationTarget(context: Context, status?: TailscaleState) {
+  const node = status?.Self?.ID ?? status?.Self?.PublicKey;
+  if (!status || !vpsNodeReady(status) || !node || !status.Self?.DNSName) {
+    throw new Error("Cannot identify the enrolled Tailscale node and its SSH target.");
+  }
+  return JSON.stringify([node, sshTarget(context, status)]);
+}
+
+async function requireSshConfirmation(context: Context) {
+  const target = confirmationTarget(context, await tailscaleStatus(context));
+  if (context.state.sshConfirmation?.target !== target) {
+    throw new SetupPaused("The current Tailscale node and local user need a fresh SSH confirmation.");
+  }
+  const problem = await tailscaleSshReady(context);
+  if (problem) throw new Error(`Tailscale SSH is unavailable: ${problem}.`);
 }
 
 async function apiHealthy(context: Context) {
@@ -188,13 +224,14 @@ export async function publicAddresses(context: Context) {
         if (address.temporary || address.deprecated) continue;
         if (
           address.family === "inet" &&
-          !/^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(
-            address.local,
-          )
+          isIP(address.local) === 4 &&
+          Number(address.local.split(".")[0]) < 224 &&
+          sshIngressSource(address.local) === "public"
         ) {
           ipv4.push(address.local);
         }
-        if (address.family === "inet6" && /^[23]/.test(address.local)) ipv6.push(address.local);
+        if (address.family === "inet6" && isIP(address.local) === 6 && /^[23]/.test(address.local))
+          ipv6.push(address.local);
       }
     }
   } catch {
@@ -211,8 +248,8 @@ export function publicSshListeners(ss: string, tailnet: Set<string>) {
     if (!match) continue;
     const address = match[1]!.replace(/^\[|\]$/g, "").split("%")[0]!;
     const port = Number(match[2]);
-    if (port !== 22 && !/"sshd"/.test(line)) continue;
-    if (address === "::1" || address.startsWith("127.") || tailnet.has(address)) continue;
+    if (port !== 22 && !/"sshd(?:-session)?"/.test(line)) continue;
+    if (localBind(address, tailnet)) continue;
     found.push(`${address.includes(":") ? `[${address}]` : address}:${port}`);
   }
   return found;
@@ -253,6 +290,8 @@ async function prerequisites(context: Context): Promise<StepResult> {
     "ss",
     "ip",
     "flock",
+    "getent",
+    "systemd-run",
   ]) {
     const found = await exec(context, ["sh", "-c", 'command -v "$1"', "sh", command]);
     if (found.status !== 0) missing.push(command);
@@ -276,41 +315,67 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
   if (!(await tailscaleSshReady(context))) {
     return { status: "done", message: `already enrolled as ${ARK_VPS_TAG} with Tailscale SSH` };
   }
+  const status = await tailscaleStatus(context);
+  if (status && vpsNodeReady(status)) {
+    await must(context, [context.bun, "scripts/install.ts", "--enroll-vps"], { env: childEnv(context) });
+    const problem = await tailscaleSshReady(context);
+    if (problem) throw new Error(`Enrolment finished but ${problem}.`);
+    return { status: "done", message: `resumed enrolment with the existing ${ARK_VPS_TAG} node` };
+  }
+  if (status?.BackendState === "Running") {
+    throw new Error(`The running Tailscale node must use the host TUN interface and only ${ARK_VPS_TAG}.`);
+  }
+  delete context.state.sshConfirmation;
+  context.save();
   for (const line of context.keys.policyInstructions()) context.ui.print(`      ${line}`);
   if (context.interactive) await context.ui.ask("Press Enter once the policy is saved", "");
   const key = await context.keys.acquire({ tag: ARK_VPS_TAG, variable: "TS_VPS_AUTHKEY", optional: false });
-  if (!key) throw new Error(`A ${ARK_VPS_TAG} key is required.`);
-  let directory: string | undefined;
-  let file = key.file;
-  try {
-    if (!file) {
-      context.redactor.add(key.key);
-      directory = mkdtempSync(join(tmpdir(), "ark-vps-key-"));
-      chmodSync(directory, 0o700);
-      file = join(directory, "authkey");
-      writeFileSync(file, `${key.key}\n`, { mode: 0o600, flag: "wx" });
-    }
-    await must(context, [context.bun, "scripts/install.ts", "--enroll-vps"], {
-      env: childEnv(context, { TS_VPS_AUTHKEY_FILE: file }),
-    });
-  } finally {
-    if (directory) rmSync(directory, { recursive: true, force: true });
+  if (!key?.file && !key?.key) throw new Error(`A ${ARK_VPS_TAG} key is required.`);
+  context.redactor.add(key.key);
+  const command = [context.bun, "scripts/install.ts", "--enroll-vps"];
+  if (key.file) {
+    await must(context, command, { env: childEnv(context, { TS_VPS_AUTHKEY_FILE: key.file }) });
+  } else {
+    await must(context, [...command, "--key-stdin"], { env: childEnv(context), stdin: key.key });
   }
   const problem = await tailscaleSshReady(context);
   if (problem) throw new Error(`Enrolment finished but ${problem}.`);
   await key.release?.();
   return {
     status: "done",
-    message: `enrolled as ${ARK_VPS_TAG}${key.file ? `; delete ${key.file} and revoke the key` : "; the key file was deleted"}`,
+    message: `enrolled as ${ARK_VPS_TAG}${key.file ? `; delete ${key.file} and revoke the key` : ""}`,
   };
 }
 
 async function sshGate(context: Context): Promise<StepResult> {
-  if (context.state.sshConfirmedAt) {
-    return { status: "done", message: `Tailscale SSH confirmed ${context.state.sshConfirmedAt}` };
+  const rollback = await exec(context, [
+    "systemctl",
+    "is-active",
+    SSH_ROLLBACK_TIMER + ".timer",
+    SSH_ROLLBACK_TIMER + ".service",
+  ]);
+  if (/^(?:active|activating)$/m.test(rollback.stdout)) {
+    throw new SetupPaused(
+      "An earlier OpenSSH cutover is awaiting automatic recovery. Wait for its rollback timer to finish and retry.",
+    );
   }
   const status = await tailscaleStatus(context);
-  const command = `tailscale ssh ${sshTarget(context, status)}`;
+  const target = confirmationTarget(context, status);
+  const account = await exec(context, ["getent", "passwd", context.answers.sshUser]);
+  if (account.status !== 0 || /\/(?:nologin|false)$/.test(account.stdout.trim())) {
+    throw new Error(
+      `Set --ssh-user to an existing non-root account with a login shell. ${context.answers.sshUser} is unavailable.`,
+    );
+  }
+  if (!context.state.sshCutoverPending && context.state.sshConfirmation?.target === target) {
+    return { status: "done", message: `Tailscale SSH confirmed ${context.state.sshConfirmation.at}` };
+  }
+  const changed = Boolean(
+    context.state.sshConfirmation ||
+    context.state.sshCutoverPending ||
+    context.state.steps["ssh-gate"]?.status === "done",
+  );
+  const command = freshSshCommand(context, status);
   context.ui.print(
     "      From your own device (not this session), open a new Tailscale SSH session and keep it open:",
   );
@@ -324,14 +389,20 @@ async function sshGate(context: Context): Promise<StepResult> {
     context.ui.print(
       "      This session arrives over public OpenSSH. Hardening keeps established connections, but",
     );
-    context.ui.print("      new public SSH connections will be refused, so check Tailscale SSH works first.");
+    context.ui.print(
+      "      a scoped recovery rule preserves new connections from your client during cutover.",
+    );
   }
-  let confirmed = context.options.tailscaleSshConfirmed;
+  let confirmed = !changed && context.options.tailscaleSshConfirmed;
   if (!confirmed && context.interactive) {
     const answer = await context.ui.ask("Type yes once that session works (anything else stops here)", "");
     confirmed = /^yes$/i.test(answer.trim());
   }
   if (!confirmed) {
+    delete context.state.sshConfirmation;
+    delete context.state.sshCutoverPending;
+    delete context.state.steps["ssh-gate"];
+    context.save();
     throw new SetupPaused(
       `Stopped before hardening: Tailscale SSH has not been confirmed. Nothing on the firewall or OpenSSH changed.
 Check that \`${command}\` works from your own device, then resume with:
@@ -339,20 +410,37 @@ Check that \`${command}\` works from your own device, then resume with:
   ${context.resumeCommand}${context.interactive ? "" : " --tailscale-ssh-confirmed"}`,
     );
   }
-  context.state.sshConfirmedAt = new Date().toISOString();
+  delete context.state.sshCutoverPending;
+  context.state.sshConfirmation = { target, at: new Date().toISOString() };
   context.save();
   return { status: "done", message: "Tailscale SSH confirmed by the owner" };
 }
 
 async function install(context: Context): Promise<StepResult> {
-  if (!context.state.sshConfirmedAt) throw new SetupPaused("Tailscale SSH has not been confirmed.");
+  await requireSshConfirmation(context);
+  const { ports } = await inspectSsh(context);
+  const existing = readHostSshAccess(readEnv(context.paths.hostFirewall));
+  const origin = await context.sessionOrigin();
+  const source =
+    context.options.sshRecoverySource ??
+    (origin.via === "openssh" ? origin.source : undefined) ??
+    existing.source;
+  if (ports.length && !source && !context.options.keepPublicSsh) {
+    throw new SetupPaused(
+      `Public OpenSSH needs a recovery source before hardening. Resume with --ssh-recovery-source IP using the IP of your OpenSSH client, or use --keep-public-ssh to explicitly retain public access.\n  ${context.resumeCommand}`,
+    );
+  }
+  const ssh: HostSshAccess = {
+    ports,
+    source: ports.length && !context.options.keepPublicSsh ? source : undefined,
+  };
   const { mailEnabled, sniPorts, rebootTime } = context.answers;
   const fingerprint = JSON.stringify({ mailEnabled, sniPorts, rebootTime, commit: await gitCommit(context) });
   const record = context.state.steps.install;
   if (
     record?.status === "done" &&
     record.fingerprint === fingerprint &&
-    existsSync(context.paths.hostFirewall) &&
+    (await hardeningMatches(context, ssh)) &&
     (await apiHealthy(context))
   ) {
     return { status: "done", fingerprint, message: "already hardened and installed with these settings" };
@@ -364,12 +452,37 @@ async function install(context: Context): Promise<StepResult> {
     ARK_HOST_REBOOT_TIME: rebootTime,
     // The edge key is handled by the edge step, never prompted for by the installer.
     ARK_INSTALL_NONINTERACTIVE: "1",
+    ARK_SETUP_HOST_SSH_ACCESS: JSON.stringify(ssh),
   });
   await must(context, [context.bun, "scripts/install.ts", "--harden-vps"], { env });
   context.redactor.addEnv(readEnv(context.envPath));
   if (!(await apiHealthy(context)))
     throw new Error("The install finished but http://127.0.0.1:3000/api/health does not answer.");
   return { status: "done", fingerprint, message: "host hardened, platform installed and healthy" };
+}
+
+async function hardeningMatches(context: Context, ssh: HostSshAccess) {
+  try {
+    const boot = readEnv(context.paths.hostFirewall);
+    if (!boot || replaceHostSshAccess(boot, ssh) !== boot) return false;
+    const active = await exec(context, ["systemctl", "is-active", "ark-host-firewall.service"]);
+    if (active.status !== 0 || active.stdout.trim() !== "active") return false;
+    const enabled = await exec(context, ["systemctl", "is-enabled", "ark-host-firewall.service"]);
+    if (enabled.stdout.trim() !== "enabled") return false;
+    const inventory = await must(context, [context.bun, "scripts/host-audit.ts", "--inventory"], {
+      env: childEnv(context),
+    });
+    const { config } = JSON.parse(inventory) as { config: HostPortConfig };
+    const tableStart = boot.indexOf("table inet ark_host {");
+    if (tableStart < 0) return false;
+    assertHostFirewall(boot.slice(tableStart), { ...config, routes: [] }, ssh);
+    const rules = await must(context, ["nft", "-s", "-y", "list", "table", "inet", "ark_host"]);
+    assertHostFirewall(rules, config, ssh);
+    return true;
+  } catch (error) {
+    context.log.write(`Hardening needs reconciliation: ${String(error)}`);
+    return false;
+  }
 }
 
 async function edgeTags(context: Context) {
@@ -387,10 +500,14 @@ async function edgeTags(context: Context) {
     ),
     { env: childEnv(context) },
   );
-  if (result.status !== 0) return undefined;
   try {
-    const status = JSON.parse(result.stdout) as TailscaleState;
-    return { running: status.BackendState === "Running", tags: status.Self?.Tags ?? [] };
+    const status = JSON.parse(result.stdout) as TailscaleState & { Health?: string[] };
+    const rejected = status.Health?.some((notice) =>
+      /(?:invalid|expired|revoked) (?:auth(?:orization)? )?key|auth key.*(?:expired|revoked|not found)/i.test(
+        notice,
+      ),
+    );
+    return { running: status.BackendState === "Running", tags: status.Self?.Tags ?? [], rejected };
   } catch {
     return undefined;
   }
@@ -410,6 +527,7 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
   const exact = (tags: string[]) => tags.length === 1 && tags[0] === ARK_EDGE_TAG;
   const before = await edgeTags(context);
   if (before?.running && exact(before.tags)) {
+    await rejoinEdge(context);
     emptyEdgeKey(context);
     return { status: "done", message: `edge-ts already joined as ${ARK_EDGE_TAG}` };
   }
@@ -428,7 +546,8 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
   const current = readEnv(context.envPath);
   const kept = parseEnvFile(current).TS_EDGE_AUTHKEY?.trim();
   let release: (() => Promise<void>) | undefined;
-  if (!kept) {
+  const retiring = context.state.edgeKeyRetry;
+  if (!kept || context.env.TS_EDGE_AUTHKEY?.trim() || (retiring && context.interactive)) {
     context.ui.print(
       `      The edge node needs its own one-off key tagged ${ARK_EDGE_TAG} (never the VPS key).`,
     );
@@ -437,36 +556,93 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
       variable: "TS_EDGE_AUTHKEY",
       optional: true,
     });
-    if (!key?.key) {
+    if (!key?.key && !kept) {
       return {
         status: "skipped",
         note: "The edge node (edge-ts) has not joined the tailnet.",
         finish: EDGE_FINISH,
       };
     }
-    context.redactor.add(key.key);
-    release = key.release;
-    writeEnv(context.envPath, applyEdgeAuthKey(current, key.key).env);
+    if (key?.key) {
+      context.redactor.add(key.key);
+      release = key.release;
+      writeEnv(context.envPath, applyEdgeAuthKey(current, key.key).env);
+    }
   } else context.redactor.add(kept);
+  // A timeout may be transient. Keep the key but allow a replacement on the next run.
+  context.state.edgeKeyRetry = true;
+  context.save();
   await must(context, compose(context, "up", "-d", "edge-ts", "edge", "edge-l4"), { env: childEnv(context) });
-  await must(context, [context.bun, `--env-file=${context.envPath}`, "scripts/edge-namespace.ts"], {
-    env: childEnv(context),
-  });
   let after = await edgeTags(context);
-  for (let attempt = 0; attempt < 24 && !after?.running; attempt++) {
+  for (let attempt = 0; attempt < 24 && !after?.running && !after?.rejected; attempt++) {
     await context.sleep(5000);
     after = await edgeTags(context);
+  }
+  if (after?.rejected) {
+    emptyEdgeKey(context);
+    throw new Error("Tailscale rejected the edge auth key. Retry with a fresh one-off tag:ark-edge key.");
   }
   if (!after?.running)
     throw new Error("edge-ts did not join the tailnet within two minutes. Check the key and the policy.");
   if (!exact(after.tags)) {
+    emptyEdgeKey(context);
     throw new Error(
       `edge-ts joined with tags ${JSON.stringify(after.tags)}, not exactly ["${ARK_EDGE_TAG}"]. Remove that device in the admin console and re-enrol it (docs/operating.md#edge-tailscale-node).`,
     );
   }
+  await rejoinEdge(context);
   emptyEdgeKey(context);
+  delete context.state.edgeKeyRetry;
   await release?.();
   return { status: "done", message: `edge-ts joined as ${ARK_EDGE_TAG}; TS_EDGE_AUTHKEY emptied in .env` };
+}
+
+async function rejoinEdge(context: Context) {
+  await must(context, [context.bun, `--env-file=${context.envPath}`, "scripts/edge-namespace.ts"], {
+    env: childEnv(context),
+  });
+  delete context.state.edgeKeyRetry;
+}
+
+const configuredServices = ["api", "domain-worker"];
+
+async function configurationReady(context: Context, env: ReturnType<typeof childEnv>) {
+  const expected = new Map(
+    (await must(context, compose(context, "config", "--hash=*"), { env }))
+      .trim()
+      .split("\n")
+      .map((line) => line.trim().split(/\s+/) as [string, string]),
+  );
+  for (const service of configuredServices) {
+    const id = (await must(context, compose(context, "ps", "-a", "-q", service), { env })).trim();
+    if (!id || !expected.get(service)) return false;
+    const observed = await exec(
+      context,
+      [
+        "docker",
+        "inspect",
+        "--format",
+        '{{.State.Status}} {{index .Config.Labels "com.docker.compose.config-hash"}}',
+        id,
+      ],
+      { env },
+    );
+    if (observed.status !== 0 || observed.stdout.trim() !== `running ${expected.get(service)}`) return false;
+  }
+  const worker = await exec(
+    context,
+    compose(
+      context,
+      "exec",
+      "-T",
+      "domain-worker",
+      "bun",
+      "-e",
+      'const response = await fetch("http://127.0.0.1:3102/", {signal: AbortSignal.timeout(3000)}); if (response.status !== 404) process.exit(1);',
+    ),
+    { env, timeoutMs: 5000 },
+  );
+  return worker.status === 0 && (await apiHealthy(context));
 }
 
 async function configuration(context: Context): Promise<StepResult> {
@@ -483,14 +659,30 @@ async function configuration(context: Context): Promise<StepResult> {
     dns: Boolean(desired.DNS_API_TOKEN ?? parseEnvFile(current).DNS_API_TOKEN),
   });
   const record = context.state.steps.configuration;
-  if (!changed && record?.status === "done" && record.fingerprint === fingerprint) {
+  const env = childEnv(context);
+  if (
+    !changed &&
+    record?.status === "done" &&
+    record.fingerprint === fingerprint &&
+    (await configurationReady(context, env))
+  ) {
     return { status: "done", fingerprint, message: "admin origin and ACME settings already in .env" };
   }
   if (changed) {
     writeEnv(context.envPath, setEnvValues(current, desired));
     context.redactor.addEnv(readEnv(context.envPath));
   }
-  await must(context, compose(context, "up", "-d", "api", "domain-worker"), { env: childEnv(context) });
+  const appliedEnv = childEnv(context);
+  await must(context, compose(context, "up", "--wait", "--wait-timeout", "120", ...configuredServices), {
+    env: appliedEnv,
+  });
+  let ready = false;
+  for (let attempt = 0; attempt < 12 && !ready; attempt++) {
+    if (attempt) await context.sleep(2000);
+    ready = await configurationReady(context, appliedEnv);
+  }
+  if (!ready)
+    throw new Error("The API and domain worker did not become ready with the desired Compose configuration.");
   context.state.adminOrigin = adminOrigin;
   context.save();
   return {
@@ -500,87 +692,294 @@ async function configuration(context: Context): Promise<StepResult> {
   };
 }
 
+type SshUnit = { name: string; enabled: string; active: boolean };
 const SSH_UNITS = ["ssh.socket", "ssh.service"];
+const SSH_ROLLBACK_TIMER = "ark-ssh-rollback";
+
+function localBind(address: string, tailnet: Set<string>) {
+  const ip = address
+    .replace(/^\[|\]$/g, "")
+    .split("%")[0]!
+    .replace(/^::ffff:(?=\d+\.)/, "");
+  return ip === "::1" || ip.startsWith("127.") || tailnet.has(ip);
+}
+
+async function inspectSsh(context: Context) {
+  const ss = await must(context, ["ss", "-H", "-ltnp"]);
+  const tailnet = new Set((await tailscaleStatus(context))?.Self?.TailscaleIPs ?? []);
+  const listeners = publicSshListeners(ss, tailnet);
+  const ports = new Set<number>();
+  const units: SshUnit[] = [];
+  for (const name of SSH_UNITS) {
+    const listed = await must(context, ["systemctl", "list-unit-files", "--no-legend", name]);
+    if (!listed.trim()) continue;
+    const enabled = (await exec(context, ["systemctl", "is-enabled", name])).stdout.trim();
+    const active = (await exec(context, ["systemctl", "is-active", name])).stdout.trim() === "active";
+    if (!active && enabled !== "enabled" && enabled !== "enabled-runtime") continue;
+    const socket = name === "ssh.socket";
+    const owner = socket ? /"systemd",pid=1,/ : /"sshd(?:-session)?",pid=\d+,/;
+    const running = ss
+      .split("\n")
+      .filter((line) => owner.test(line))
+      .join("\n");
+    const binds = publicSshListeners(running, tailnet);
+    if (socket || !active) {
+      const settings = socket
+        ? await must(context, ["systemctl", "show", "--property=Listen", "--value", name])
+        : await must(context, ["/usr/sbin/sshd", "-T"]);
+      const addresses = socket
+        ? [...settings.matchAll(/(\S+) \(Stream\)/g)].map((match) => match[1]!)
+        : [...settings.matchAll(/^listenaddress (\S+)$/gm)].map((match) => match[1]!);
+      if (!addresses.length) throw new Error("Cannot determine the effective listeners for " + name + ".");
+      if (socket) binds.length = 0; // PID 1 may also own unrelated sockets.
+      for (const address of addresses) {
+        const endpoint = /^(.*):(\d+)$/.exec(address);
+        if (endpoint && !localBind(endpoint[1]!, tailnet)) binds.push(address);
+      }
+    }
+    if (!binds.length) continue;
+    units.push({ name, enabled, active });
+    for (const bind of binds) ports.add(Number(bind.split(":").at(-1)));
+  }
+  return { listeners, units, ports: [...ports].toSorted((a, b) => a - b) };
+}
+
+function sshIngressSource(source: string) {
+  if (/^Anywhere(?: \(v6\))?$/.test(source)) return "public";
+  const [address, prefix] = source.split("/");
+  if (!address || !isIP(address) || (prefix && !/^\d+$/.test(prefix))) return "ambiguous";
+  if (prefix === "0") return "public";
+  if (isIP(address) === 4) {
+    return /^(?:0\.|10\.|127\.|169\.254\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(
+      address,
+    )
+      ? "private"
+      : "public";
+  }
+  if (/^[23]/.test(address)) return "public";
+  return /^(?:fc|fd|fe[89ab]|::1$)/i.test(address) ? "private" : "ambiguous";
+}
+
+export function publicUfwSshRules(status: string) {
+  const remove: number[] = [];
+  let ambiguous = 0;
+  for (const match of status.matchAll(/^\[\s*(\d+)\]\s+(.+?)\s{2,}ALLOW( IN| OUT| FWD)?\s{2,}(.+?)\s*$/gm)) {
+    const [, number, to, direction, from] = match;
+    if (!/^(?:22(?:\/tcp)?|OpenSSH)(?:\s|$)/.test(to!) || direction === " OUT" || direction === " FWD")
+      continue;
+    if (/^(?:22(?:\/tcp)?|OpenSSH)(?: \(v6\))?$/.test(to!)) {
+      const source = sshIngressSource(from!.split(/\s+#/)[0]!.trim());
+      if (source === "public") remove.push(Number(number));
+      if (source === "ambiguous") ambiguous++;
+    } else {
+      ambiguous++;
+    }
+  }
+  return { remove: remove.toSorted((a, b) => b - a), ambiguous };
+}
+
+async function setSshAccess(context: Context, access: HostSshAccess) {
+  const path = context.paths.hostFirewall;
+  const boot = readFileSync(path, "utf8");
+  const next = replaceHostSshAccess(boot, access);
+  if (next !== boot) writeHostFile(path, next, 0o644);
+  await must(context, ["nft", "-f", "-"], { stdin: updateHostSshAccess(access) });
+  const live = await must(context, ["nft", "-s", "-y", "list", "table", "inet", "ark_host"]);
+  const actual = readHostSshAccess(live);
+  const address = (source?: string) =>
+    source && isIP(source) === 6 ? new URL("http://[" + source + "]/").hostname : source;
+  if (String(actual.ports) !== String(access.ports) || address(actual.source) !== address(access.source)) {
+    throw new Error("The live firewall's SSH access differs from the requested policy.");
+  }
+}
 
 async function closePublicSsh(context: Context): Promise<StepResult> {
-  if (context.options.keepPublicSsh) {
+  const { keepPublicSsh, verifySshCutover } = context.options;
+  if (keepPublicSsh) {
     return {
       status: "skipped",
       note: "Public OpenSSH was left running (--keep-public-ssh).",
       finish: "Re-run host:setup without --keep-public-ssh to close it.",
     };
   }
-  if (!context.state.sshConfirmedAt) throw new SetupPaused("Tailscale SSH has not been confirmed.");
-  const units: { unit: string; enabled: boolean; active: boolean }[] = [];
-  for (const unit of SSH_UNITS) {
-    const listed = await exec(context, ["systemctl", "list-unit-files", "--no-legend", unit]);
-    if (!listed.stdout.trim()) continue;
-    const enabled = (await exec(context, ["systemctl", "is-enabled", unit])).stdout.trim() === "enabled";
-    const active = (await exec(context, ["systemctl", "is-active", unit])).stdout.trim() === "active";
-    units.push({ unit, enabled, active });
+  const { units, listeners, ports } = await inspectSsh(context);
+  if (listeners.length && !units.length) {
+    throw new Error("Public TCP listeners remain outside the managed OpenSSH units: " + listeners.join(", "));
   }
-  const listening = await sshListeners(context);
-  const notes: string[] = [];
-  if (listening.length || units.some((item) => item.active || item.enabled)) {
-    const before = await tailscaleSshReady(context);
-    if (before) throw new Error(`Not closing public SSH: ${before}. OpenSSH was left running.`);
-    const restore = async () => {
-      for (const item of units) {
-        if (item.enabled) await exec(context, ["systemctl", "enable", item.unit]);
-        if (item.active) await exec(context, ["systemctl", "start", item.unit]);
-      }
-    };
-    const present = units.map((item) => item.unit);
-    if (present.length) {
-      const stopped = await exec(context, ["systemctl", "disable", "--now", ...present]);
-      if (stopped.status !== 0) {
-        await restore();
-        throw new Error("Stopping OpenSSH failed; it was left running. See the log.");
-      }
-    }
-    const after = await tailscaleSshReady(context);
-    if (after) {
-      await restore();
-      throw new Error(
-        `After stopping OpenSSH, ${after}. OpenSSH was started again; public SSH is still open.`,
-      );
-    }
-    if (context.interactive) {
-      const status = await tailscaleStatus(context);
-      context.ui.print(
-        `      Open one more new session from your device: tailscale ssh ${sshTarget(context, status)}`,
-      );
-      const answer = await context.ui.ask("Type yes if it works (anything else restores OpenSSH)", "");
-      if (!/^yes$/i.test(answer.trim())) {
-        await restore();
-        throw new Error("Tailscale SSH was not confirmed after closing OpenSSH. OpenSSH was started again.");
-      }
-    }
-    const remaining = await sshListeners(context);
-    if (remaining.length) {
-      throw new Error(
-        `OpenSSH is still listening on ${remaining.join(", ")} (started outside ssh.service or ssh.socket). It was left as it is; stop it or bind it to a private address.`,
-      );
-    }
-  }
-  // UFW: remove only the rules that keep public SSH open; anything else is reported, never changed.
-  const ufw = await exec(context, ["ufw", "status", "numbered"]);
-  if (ufw.status === 0 && /Status: active/.test(ufw.stdout)) {
-    const numbers = [
-      ...ufw.stdout.matchAll(/^\[\s*(\d+)\]\s+(?:22(?:\/tcp)?|OpenSSH)(?:\s+\(v6\))?\s+ALLOW/gm),
-    ]
-      .map((match) => Number(match[1]))
-      .toSorted((a, b) => b - a);
-    for (const number of numbers) await must(context, ["ufw", "--force", "delete", String(number)]);
-    if (numbers.length) notes.push(`removed ${numbers.length} UFW SSH rule(s)`);
+  if (units.length && !context.interactive && !verifySshCutover) {
     return {
-      status: "done",
-      message: ["public OpenSSH closed", ...notes].join("; "),
-      note: "UFW is active. Ark's host firewall is nftables (ark_host); UFW's default policy can block Ark's public ports.",
-      finish: "Review `sudo ufw status verbose`; if nothing else depends on it, run `sudo ufw disable`.",
+      status: "pending",
+      note: "OpenSSH is retained while a fresh off-host Tailscale SSH login is pending.",
+      finish: "Re-run interactively or with --verify-ssh-cutover to close public SSH.",
     };
   }
-  return { status: "done", message: "public OpenSSH is not listening; Tailscale SSH answers" };
+  const status = await exec(context, ["ufw", "status", "numbered"]);
+  const ufwActive = status.status === 0 && /^Status: active$/m.test(status.stdout);
+  // Leave a private service's UFW profile alone.
+  const { remove, ambiguous } = publicUfwSshRules(ufwActive && units.length ? status.stdout : "");
+  if (!units.length) return sshClosed(ufwActive, ambiguous, 0);
+
+  await requireSshConfirmation(context);
+  const access = readHostSshAccess(readFileSync(context.paths.hostFirewall, "utf8"));
+  if (ports.length && (!access.source || ports.some((port) => !access.ports.includes(port)))) {
+    throw new Error(
+      "The scoped OpenSSH recovery path is missing. Re-run host setup from the recovery client.",
+    );
+  }
+  const directory = mkdtempSync(join(context.stateDir, "ssh-cutover-"));
+  const ufwDirectory = context.paths.ufwDirectory ?? "/etc/ufw";
+  const lock = join(directory, "lock");
+  const helper = join(context.root, "scripts", "host-setup", "restore-ssh.sh");
+  const restore = (mode: "timed" | "force") => [
+    "flock",
+    lock,
+    "/bin/sh",
+    helper,
+    directory,
+    mode,
+    ufwDirectory,
+    ...units.map(({ name, enabled, active }) => [name, enabled, active].join(":")),
+  ];
+  let armed = false;
+  let accessChanged = false;
+  let finished = false;
+  try {
+    if (remove.length) {
+      for (const file of ["user.rules", "user6.rules"]) {
+        if (existsSync(join(ufwDirectory, file))) {
+          await must(context, ["cp", "-p", "--", join(ufwDirectory, file), join(directory, file)]);
+        }
+      }
+    }
+    // Reassert the recovery rule before touching systemd, in case live rules drifted.
+    if (access.ports.length) await setSshAccess(context, access);
+    context.state.sshCutoverPending = true;
+    context.save();
+    await must(context, [
+      "systemd-run",
+      "--collect",
+      "--unit=" + SSH_ROLLBACK_TIMER,
+      "--on-active=5min",
+      "--timer-property=AccuracySec=1s",
+      ...restore("timed"),
+    ]);
+    armed = true;
+    if (units.length) {
+      await must(context, ["systemctl", "stop", ...units.map((unit) => unit.name)]);
+      await requireSshConfirmation(context);
+      const remaining = await sshListeners(context);
+      if (remaining.length) throw new Error("OpenSSH is still listening on " + remaining.join(", ") + ".");
+
+      const command = freshSshCommand(context, await tailscaleStatus(context));
+      if (context.interactive) {
+        context.ui.print("      Open a fresh session from your own device: " + command);
+        const answer = await context.ui.ask("Type yes if it works (anything else restores OpenSSH)", "");
+        if (!/^yes$/i.test(answer.trim()))
+          throw new Error("The fresh Tailscale SSH login was not confirmed.");
+      } else {
+        const proof = join(directory, "proof");
+        const remote = "sudo touch -- " + quoteShell(proof);
+        context.ui.print(
+          "      Verify from an off-host client within four minutes: " + command + " " + quoteShell(remote),
+        );
+        for (let attempt = 0; attempt < 120 && !existsSync(proof); attempt++) await context.sleep(2000);
+        if (!existsSync(proof))
+          throw new Error("Timed out waiting for a fresh off-host Tailscale SSH login.");
+      }
+    }
+
+    // Claim the transaction only if the independent rollback has not fired.
+    await must(context, [
+      "flock",
+      lock,
+      "/bin/sh",
+      "-ec",
+      'test ! -e "$1/restored"; touch "$1/verified"',
+      "sh",
+      directory,
+    ]);
+    for (const { name, enabled } of units) {
+      if (enabled === "enabled" || enabled === "enabled-runtime") {
+        await must(context, [
+          "systemctl",
+          "disable",
+          ...(enabled === "enabled-runtime" ? ["--runtime"] : []),
+          name,
+        ]);
+      }
+    }
+    if (remove.length) writeFileSync(join(directory, "ufw-changed"), "");
+    for (const number of remove) await must(context, ["ufw", "--force", "delete", String(number)]);
+    if (access.ports.length) {
+      accessChanged = true;
+      await setSshAccess(context, { ports: [] });
+    }
+    delete context.state.sshCutoverPending;
+    context.save();
+    finished = true;
+  } catch (error) {
+    delete context.state.sshConfirmation;
+    if (!armed) throw error;
+    const rollbackErrors: unknown[] = [];
+    if (accessChanged) {
+      try {
+        await setSshAccess(context, access);
+      } catch (failure) {
+        rollbackErrors.push(failure);
+      }
+    }
+    try {
+      await must(context, restore("force"));
+      const restored = await sshListeners(context);
+      if (listeners.some((listener) => !restored.includes(listener)))
+        throw new Error("The original public SSH listeners did not return.", { cause: error });
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    if (rollbackErrors.length) {
+      throw new Error(
+        String(error) +
+          " SSH restoration failed: " +
+          rollbackErrors.map(String).join(", ") +
+          ". Recovery files: " +
+          directory,
+        { cause: error },
+      );
+    }
+    finished = true;
+    throw new Error(String(error) + " The prior OpenSSH listener and firewall configuration were restored.", {
+      cause: error,
+    });
+  } finally {
+    if (!armed || finished) {
+      const stopped =
+        !armed || (await exec(context, ["systemctl", "stop", SSH_ROLLBACK_TIMER + ".timer"])).status === 0;
+      if (stopped) rmSync(directory, { recursive: true, force: true });
+    }
+  }
+  return sshClosed(ufwActive, ambiguous, remove.length);
+}
+
+function quoteShell(value: string) {
+  return "'" + value.replaceAll("'", "'\\''") + "'";
+}
+
+function freshSshCommand(context: Context, status: TailscaleState | undefined) {
+  return `tailscale ssh ${sshTarget(context, status)} -o ControlPath=none`;
+}
+
+function sshClosed(ufwActive: boolean, ambiguous: number, removed: number): StepResult {
+  return {
+    status: "done",
+    message: removed
+      ? "public OpenSSH closed; removed " + removed + " public UFW SSH rule(s)"
+      : "public OpenSSH is not listening",
+    note: ufwActive
+      ? "UFW is active; its policy can block Ark's public ports." +
+        (ambiguous ? " Retained " + ambiguous + " scoped or ambiguous SSH rule(s)." : "")
+      : undefined,
+    finish: ufwActive ? "Review the remaining rules with sudo ufw status verbose." : undefined,
+  };
 }
 
 async function providerFirewall(context: Context): Promise<StepResult> {
@@ -590,23 +989,48 @@ async function providerFirewall(context: Context): Promise<StepResult> {
   const parsed = JSON.parse(inventory) as { config: unknown; providerRules: ProviderRule[] };
   const inventoryPath = join(context.root, "tmp", "ark-host-inventory.json");
   writeFileSync(inventoryPath, inventory.endsWith("\n") ? inventory : `${inventory}\n`, { mode: 0o644 });
-  const fingerprint = JSON.stringify(parsed.providerRules);
   const addresses = await publicAddresses(context);
-  const record = context.state.steps["provider-firewall"];
-  const alreadyApplied = record?.status === "done" && record.fingerprint === fingerprint;
+  const status = await tailscaleStatus(context);
+  const retainSsh = context.state.steps["public-ssh"]?.status !== "done";
+  const access = readHostSshAccess(readEnv(context.paths.hostFirewall));
+  const rules = [...parsed.providerRules];
+  if (retainSsh && access.ports.length) {
+    rules.push({
+      protocol: "tcp",
+      ports: access.ports,
+      sourceCidrs: access.source
+        ? [`${access.source}/${isIP(access.source) === 4 ? 32 : 128}`]
+        : ["0.0.0.0/0", "::/0"],
+    });
+  }
   const firewallContext: FirewallContext = {
     ui: context.ui,
     interactive: context.interactive,
     env: context.env,
     publicAddresses: addresses,
-    confirmed: context.options.providerFirewallApplied || alreadyApplied,
+    confirmed: context.options.providerFirewallApplied,
+    retainSsh,
   };
   const adapter = await selectProviderFirewall(
     context.firewalls,
     firewallContext,
     context.options.providerFirewall,
   );
-  const plan = await adapter.plan(parsed.providerRules, firewallContext);
+  const fingerprint = JSON.stringify({
+    adapter: adapter.id,
+    node: status?.Self?.ID ?? status?.Self?.PublicKey,
+    addresses,
+    rules,
+    retainSsh,
+  });
+  const record = context.state.steps["provider-firewall"];
+  const alreadyApplied =
+    adapter.id === "manual" && record?.status === "done" && record.fingerprint === fingerprint;
+  if (alreadyApplied) firewallContext.confirmed = true;
+  const plan = await adapter.plan(rules, firewallContext);
+  await must(context, [context.bun, "scripts/host-audit.ts", ...(retainSsh ? ["--retain-ssh"] : [])], {
+    env: childEnv(context),
+  });
   let result: StepResult = { status: "done", fingerprint, message: `rules applied (${adapter.label})` };
   if (alreadyApplied) {
     result = { status: "done", fingerprint, message: "rules unchanged since they were applied" };
@@ -618,13 +1042,20 @@ async function providerFirewall(context: Context): Promise<StepResult> {
     if (applied.status === "pending")
       result = { status: "pending", note: applied.note, finish: applied.finish };
   }
-  await must(context, [context.bun, "scripts/host-audit.ts"], { env: childEnv(context) });
   const ips = [...addresses.ipv4, ...addresses.ipv6];
-  context.ui.print("      Local audit passed. Scan from another machine with Nmap (in a checkout, as root):");
-  context.ui.print(`        scp ${sshTarget(context, await tailscaleStatus(context))}:${inventoryPath} .`);
-  context.ui.print(
-    `        sudo mise run host:audit --external ark-host-inventory.json ${ips.length ? ips.join(" ") : "<public-ipv4> <public-ipv6>"}`,
-  );
+  if (retainSsh && access.ports.length) {
+    context.ui.print(
+      "      Local audit passed with OpenSSH retained. Run the standard external scan after closing public SSH.",
+    );
+  } else {
+    context.ui.print(
+      "      Local audit passed. Scan from another machine with Nmap (in a checkout, as root):",
+    );
+    context.ui.print(`        scp ${sshTarget(context, status)}:${inventoryPath} .`);
+    context.ui.print(
+      `        sudo mise run host:audit --external ark-host-inventory.json ${ips.length ? ips.join(" ") : "<public-ipv4> <public-ipv6>"}`,
+    );
+  }
   if (result.status === "done") result.message = `${result.message}; local audit passed`;
   return result;
 }
@@ -708,27 +1139,42 @@ export async function summary(context: Context) {
 }
 
 /** Where the session that started setup came from, by walking the process ancestry in /proc. */
-export async function detectSessionOrigin(env: Record<string, string | undefined>): Promise<SessionOrigin> {
+export async function detectSessionOrigin(
+  env: Record<string, string | undefined>,
+  proc = "/proc",
+  parent = process.ppid,
+): Promise<SessionOrigin> {
   const fromConnection = (value: string | undefined): SessionOrigin | undefined => {
-    const server = value?.trim().split(/\s+/)[2];
-    if (!server) return undefined;
+    const [client, clientPort, target, serverPort, extra] = value?.trim().split(/\s+/) ?? [];
+    const source = client?.replace(/^::ffff:(?=\d+\.)/, "").split("%")[0];
+    const server = target?.replace(/^::ffff:(?=\d+\.)/, "").split("%")[0];
+    if (
+      !source ||
+      !server ||
+      !isIP(source) ||
+      !isIP(server) ||
+      !/^\d+$/.test(clientPort ?? "") ||
+      !/^\d+$/.test(serverPort ?? "") ||
+      extra
+    )
+      return undefined;
     const tailnet =
       /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(server) || /^fd7a:115c:a1e0:/i.test(server);
-    return { via: tailnet ? "tailscale" : "openssh", detail: server };
+    return { via: tailnet ? "tailscale" : "openssh", detail: server, source };
   };
   const direct = fromConnection(env.SSH_CONNECTION);
   if (direct) return direct;
-  let pid = process.ppid;
+  let pid = parent;
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
     try {
-      const comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+      const comm = readFileSync(join(proc, String(pid), "comm"), "utf8").trim();
       if (comm === "tailscaled") return { via: "tailscale" };
-      const environ = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
+      const environ = readFileSync(join(proc, String(pid), "environ"), "utf8").split("\0");
       const found = fromConnection(environ.find((item) => item.startsWith("SSH_CONNECTION="))?.slice(15));
       if (found) return found;
       if (comm === "sshd") return { via: "openssh" };
       pid = Number(
-        readFileSync(`/proc/${pid}/stat`, "utf8")
+        readFileSync(join(proc, String(pid), "stat"), "utf8")
           .replace(/^.*\)\s+\S+\s+/, "")
           .split(" ")[0],
       );

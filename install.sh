@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh | sudo bash
 #   sudo ./install.sh            (from a checkout)
 #
-# It installs the prerequisites that are missing (git, curl, ca-certificates, jq, OpenSSL, Docker
+# It installs the prerequisites that are missing (git, curl, ca-certificates, jq, OpenSSL, iproute2, Docker
 # Engine with the Compose v2 plugin, mise and the Tailscale package), clones or fast-forwards the
 # repository in /opt/ark-stack, runs `mise trust` and `mise install`, then hands off to the guided
 # setup (`mise run host:setup`, scripts/host-setup.ts). Arguments are passed to the guided setup:
@@ -16,7 +16,7 @@
 # it would do and the exact sudo command. It never removes packages, Docker resources or users, and
 # it refuses a conflicting Docker install (snap, or a distribution docker.io without Compose v2).
 #
-# The whole script is one function called on the last line, so a truncated download never runs.
+# The final brace group must parse in full before Bash can run the bootstrap.
 
 ark_bootstrap() {
   set -euo pipefail
@@ -38,6 +38,7 @@ ark_bootstrap() {
     exit 1
   }
   have() { command -v "$1" >/dev/null 2>&1; }
+  installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
   quote_args() {
     local out="" arg
     for arg in "$@"; do out+=" $(printf '%q' "$arg")"; done
@@ -104,7 +105,7 @@ ark_bootstrap() {
     say "Ark Stack installer: nothing has been changed. It needs root."
     say ""
     say "Run as root, it will:"
-    say "  1. install whatever is missing of git, curl, ca-certificates, jq and OpenSSL (apt),"
+    say "  1. install whatever is missing of git, curl, ca-certificates, jq, OpenSSL and iproute2 (apt),"
     say "     Docker Engine with the Compose v2 plugin (Docker's signed apt repository),"
     say "     mise (its signed apt repository) and Tailscale (its signed apt repository);"
     if [[ -n "$checkout" ]]; then
@@ -169,7 +170,7 @@ Docker's apt repository."
   if have docker; then
     if docker compose version >/dev/null 2>&1; then
       docker_state="ready"
-    elif dpkg-query -W -f='${Status}' docker-ce 2>/dev/null | grep -q "install ok installed"; then
+    elif installed docker-ce; then
       # Docker's own package without its Compose plugin: add the plugin from the same repository.
       docker_state="needs-compose"
     else
@@ -180,13 +181,21 @@ yourself after checking nothing else needs them and let this installer add Docke
 repository. See https://docs.docker.com/engine/install/ubuntu/."
     fi
   fi
+  if [[ "$docker_state" == "absent" ]]; then
+    local conflict
+    for conflict in docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc; do
+      if installed "$conflict"; then
+        die "The installed $conflict package conflicts with Docker Engine. Nothing was changed. Review your workloads and resolve the conflict before retrying."
+      fi
+    done
+  fi
 
   # ---- Code location: validate before any change ---------------------------------------------
-  [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "ARK_REF must be a branch or tag name, not '$ref'."
   local root
   if [[ -n "$checkout" ]]; then
     root="$checkout"
   else
+    [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "ARK_REF must be a branch or tag name, not '$ref'."
     [[ "$install_dir" == /* ]] || die "ARK_INSTALL_DIR must be an absolute path."
     root="$install_dir"
     if [[ -e "$root" && ! -d "$root/.git" ]]; then
@@ -206,9 +215,21 @@ repository. See https://docs.docker.com/engine/install/ubuntu/."
   }
   apt_install() {
     apt_update
-    apt-get install -y -q --no-install-recommends "$@" </dev/null
+    apt-get install -y -q --no-remove --no-install-recommends "$@" </dev/null
   }
-  installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
+
+  # Hold the host-wide lock before the first clone, and the checkout lock when it exists.
+  # Keep both descriptors open for the lifetime of the commands below.
+  local lock_dir="$rootfs/run/ark-stack"
+  install -m 0700 -d "$lock_dir"
+  exec 9>>"$lock_dir/deployment.lock"
+  flock --nonblock 9 || die "Another Ark host setup, install or signed maintenance run is in progress."
+  lock_checkout() {
+    mkdir -p "$root/tmp"
+    exec 8>>"$root/tmp/host-deployment.lock"
+    flock --nonblock 8 || die "Another Ark host setup, install or signed maintenance run is in progress."
+  }
+  if [[ -n "$checkout" || -d "$root/.git" ]]; then lock_checkout; fi
 
   # ---- Base packages ------------------------------------------------------------------------------
   step "Checking base packages"
@@ -217,6 +238,9 @@ repository. See https://docs.docker.com/engine/install/ubuntu/."
   for package in git curl ca-certificates jq openssl; do
     installed "$package" || missing+=("$package")
   done
+  if ! have ip || ! have ss; then
+    missing+=(iproute2)
+  fi
   if ((${#missing[@]})); then
     step "Installing ${missing[*]}"
     apt_install "${missing[@]}"
@@ -252,12 +276,15 @@ EOF
       step "Installing Docker Engine and the Compose v2 plugin"
       apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     fi
-    if [[ -d /run/systemd/system ]]; then
+    docker compose version >/dev/null 2>&1 || die "docker compose version still fails after installing Docker."
+  fi
+  if ! docker info --format '{{.ServerVersion}}' >/dev/null 2>&1; then
+    if [[ -d "$rootfs/run/systemd/system" ]]; then
       systemctl enable --now docker.service </dev/null
+      docker info --format '{{.ServerVersion}}' >/dev/null 2>&1 || die "The Docker daemon is unavailable after starting docker.service."
     else
       warn "systemd is not running, so docker.service was not started."
     fi
-    docker compose version >/dev/null 2>&1 || die "docker compose version still fails after installing Docker."
   fi
 
   # ---- mise ---------------------------------------------------------------------------------------
@@ -296,9 +323,12 @@ EOF
     step "Cloning $repo_url ($ref) into $root"
     install -m 0755 -d "$(dirname "$root")"
     git clone --quiet --branch "$ref" -- "$repo_url" "$root"
+    lock_checkout
   else
     step "Updating the checkout at $root to $ref (fast-forward only)"
-    if [[ -n "$(git -C "$root" status --porcelain --untracked-files=no)" ]]; then
+    local changes
+    changes="$(git -C "$root" status --porcelain --untracked-files=normal)"
+    if [[ -n "$changes" ]]; then
       die "$root has local changes. Nothing in it was changed. Commit or discard them, then run this again."
     fi
     git -C "$root" fetch --quiet --tags origin "$ref"
@@ -328,14 +358,15 @@ ref you want there yourself, then run this again."
   mise exec -- bun install --frozen-lockfile </dev/null
 
   step "Starting the guided setup (mise run host:setup)"
+  export ARK_HOST_DEPLOYMENT_LOCK_HELD=1
   # The script itself arrived on stdin when piped, so prompts read the terminal instead.
   if [[ -t 0 ]]; then
-    exec mise run host:setup ${setup_args[@]+"${setup_args[@]}"}
+    mise run host:setup ${setup_args[@]+"${setup_args[@]}"}
   elif { : </dev/tty; } 2>/dev/null; then
-    exec mise run host:setup ${setup_args[@]+"${setup_args[@]}"} </dev/tty
+    mise run host:setup ${setup_args[@]+"${setup_args[@]}"} </dev/tty
   else
-    exec mise run host:setup ${setup_args[@]+"${setup_args[@]}"} </dev/null
+    mise run host:setup ${setup_args[@]+"${setup_args[@]}"} </dev/null
   fi
 }
 
-ark_bootstrap "$@"
+{ ark_bootstrap "$@"; }

@@ -10,12 +10,11 @@
 //   ARK_TEST_INSTALL_EDGE_AUTHKEY optional one-off key for tag:ark-edge (the edge step is skipped without it)
 //   ARK_TEST_INSTALL_ACME_EMAIL   optional; ARK_TEST_INSTALL_REF optional branch or tag (default main)
 //
-// Phases: (1) piped install.sh without the Tailscale SSH confirmation must stop with exit 2 before
-// hardening, with OpenSSH still running and no ark_host table; (2) the resumed setup over Tailscale
-// SSH must finish; (3) public SSH must refuse new connections while Tailscale SSH answers, the
-// local audit must pass and the setup log must hold no auth key; (4) a re-run must skip every step.
+// Test the pre-hardening gate, a timed-out cutover that restores fresh public SSH, a successful
+// cutover with a fresh off-host proof, and an idempotent rerun.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { join } from "node:path";
 
 const required = [
@@ -57,6 +56,8 @@ const sshOptions = [
   "ConnectTimeout=15",
   "-o",
   "StrictHostKeyChecking=accept-new",
+  "-o",
+  "ControlPath=none",
 ];
 
 function sh(args: string[], stdin?: Uint8Array | string) {
@@ -71,7 +72,8 @@ function sh(args: string[], stdin?: Uint8Array | string) {
 }
 const publicSsh = (command: string, stdin?: Uint8Array | string) =>
   sh(["ssh", ...sshOptions, vps, command], stdin);
-const tailnetSsh = (command: string) => sh(["tailscale", "ssh", tsSsh, command]);
+const tailnetArgs = ["tailscale", "ssh", tsSsh, "-o", "ControlPath=none"];
+const tailnetSsh = (command: string) => sh([...tailnetArgs, command]);
 const secretCheck = (output: string) => {
   for (const secret of [vpsKey, edgeKey].filter(Boolean))
     assert.ok(!output.includes(secret!), "a key reached the output");
@@ -93,7 +95,7 @@ if (edgeKey) assert.equal(publicSsh("umask 077; cat > /root/ark-test-edge-key", 
 
 console.log("1. piped install without the Tailscale SSH confirmation must pause before hardening");
 const first = publicSsh(
-  `ARK_REF=${ref} TS_VPS_AUTHKEY_FILE=/root/ark-test-vps-key bash -s -- ${answers}`,
+  `ARK_REF=${ref} TS_VPS_AUTHKEY="$(cat /root/ark-test-vps-key)" bash -s -- ${answers}`,
   script,
 );
 secretCheck(first.output);
@@ -102,22 +104,60 @@ assert.match(first.output, /Stopped before hardening/);
 assert.notEqual(publicSsh("nft list table inet ark_host").status, 0, "ark_host must not exist yet");
 assert.equal(publicSsh("systemctl is-active ssh.service ssh.socket | grep -q '^active'").status, 0);
 
-console.log("2. Tailscale SSH works, so resume over it");
-assert.equal(tailnetSsh("true").status, 0, "tailscale ssh to the scratch VPS failed");
-const resume = tailnetSsh(
-  `cd /opt/ark-stack && sudo -n bash -c 'rm -f /root/ark-test-vps-key; ${edgeKey ? "TS_EDGE_AUTHKEY=$(cat /root/ark-test-edge-key) " : ""}mise run host:setup ${answers} --tailscale-ssh-confirmed --provider-firewall-applied; status=$?; rm -f /root/ark-test-edge-key; exit $status'`,
+console.log(
+  "2. Resume over Tailscale. Withhold the fresh proof and check the original client can reconnect.",
 );
-secretCheck(resume.output);
-assert.equal(resume.status, 0, resume.output.slice(-3000));
-assert.match(resume.output, /Ark Stack is installed/);
+assert.equal(tailnetSsh("true").status, 0, "tailscale ssh to the scratch VPS failed");
+const recoverySource = publicSsh('printf "%s\\n" "$SSH_CONNECTION"').output.trim().split(/\s+/)[0]!;
+assert.ok(isIP(recoverySource), "Could not determine the public SSH client's recovery IP");
+const setup = `mise run host:setup ${answers} --ssh-recovery-source ${recoverySource} --provider-firewall-applied`;
+const resume = `cd /opt/ark-stack && sudo -n bash -c 'rm -f /root/ark-test-vps-key; ${edgeKey ? "TS_EDGE_AUTHKEY=$(cat /root/ark-test-edge-key) " : ""}${setup} --tailscale-ssh-confirmed --verify-ssh-cutover; status=$?; rm -f /root/ark-test-edge-key; exit $status'`;
+const denied = tailnetSsh(resume);
+secretCheck(denied.output);
+assert.equal(denied.status, 1, denied.output.slice(-3000));
+assert.match(denied.output, /Timed out waiting for a fresh off-host Tailscale SSH login/);
+assert.equal(
+  publicSsh("true").status,
+  0,
+  "OpenSSH was not reachable from its original client after rollback",
+);
 
-console.log("3. public SSH refuses new connections; Tailscale SSH answers; audit passes; log is clean");
+const paused = tailnetSsh(`cd /opt/ark-stack && sudo -n ${setup} --tailscale-ssh-confirmed`);
+assert.equal(paused.status, 2, paused.output.slice(-3000));
+
+console.log("3. Supply a fresh off-host proof while OpenSSH is stopped.");
+const closing = Bun.spawn(
+  [...tailnetArgs, `cd /opt/ark-stack && sudo -n ${setup} --tailscale-ssh-confirmed --verify-ssh-cutover`],
+  { stdout: "pipe", stderr: "pipe", timeout: 10 * 60_000 },
+);
+const stderr = new Response(closing.stderr).text();
+let output = "";
+let proofSeen = false;
+const reader = closing.stdout.pipeThrough(new TextDecoderStream()).getReader();
+for (;;) {
+  const chunk = await reader.read();
+  if (chunk.done) break;
+  output += chunk.value;
+  const proof = /\/opt\/ark-stack\/tmp\/host-setup\/ssh-cutover-[A-Za-z0-9]+\/proof/.exec(output)?.[0];
+  if (!proofSeen && proof) {
+    proofSeen = true;
+    assert.notEqual(publicSsh("true").status, 0, "OpenSSH was listening during verification");
+    assert.equal(tailnetSsh(`sudo -n touch -- ${proof}`).status, 0, "Could not provide fresh proof");
+  }
+}
+output += await stderr;
+secretCheck(output);
+assert.equal(await closing.exited, 0, output.slice(-3000));
+assert.ok(proofSeen);
+assert.match(output, /Ark Stack is installed/);
+
+console.log("4. Public SSH refuses new connections, Tailscale SSH answers, and the audit passes.");
 assert.notEqual(publicSsh("true").status, 0, "public SSH still accepts connections");
 assert.equal(tailnetSsh("true").status, 0);
 assert.equal(tailnetSsh("cd /opt/ark-stack && sudo -n mise run host:audit").status, 0);
 assert.equal(tailnetSsh("sudo -n grep -c tskey- /opt/ark-stack/tmp/host-setup/setup.log").output.trim(), "0");
 
-console.log("4. a re-run verifies and skips");
+console.log("5. A rerun verifies and skips.");
 const again = tailnetSsh(
   `cd /opt/ark-stack && sudo -n mise run host:setup ${answers} --provider-firewall-applied`,
 );

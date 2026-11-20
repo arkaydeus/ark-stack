@@ -2,11 +2,14 @@ import { expect, test } from "bun:test";
 
 import {
   hostRoutesFromFront,
+  assertHostFirewall,
   providerFirewallRules,
   publicHostPorts,
+  readHostSshAccess,
   renderHostFirewall,
   renderEdgeL4Generation,
   renderFrontIngress,
+  updateHostFirewallPorts,
 } from "@ark-stack/shared";
 import { unexpectedPorts } from "../../scripts/host-audit.ts";
 import { assertAutomaticUpdates, vpsAuthKeyFile } from "../../scripts/install-host-hardening.ts";
@@ -36,6 +39,33 @@ test("DHCPv6 replies are allowed only to the link-local client, outside the publ
   const config = { mailEnabled: false, sniPorts: [] };
   expect(renderHostFirewall(config)).toContain("ip6 daddr fe80::/10 udp sport 547 udp dport 546 accept");
   expect(publicHostPorts(config).udp).not.toContain(546);
+});
+
+test("edge reconciliation updates public sets independently of the guided SSH allowance", () => {
+  const config = { mailEnabled: false, sniPorts: [8883] };
+  const access = { ports: [22], source: "2001:db8:0:0:0:0:0:1" };
+  const rules = renderHostFirewall(config, access)
+    .split("\n")
+    .slice(2)
+    .join("\n")
+    .replace(access.source, "2001:db8::1");
+  expect(readHostSshAccess(rules)).toEqual({ ports: [22], source: "2001:db8::1" });
+  expect(() => assertHostFirewall(rules, config, access)).not.toThrow();
+  expect(() => assertHostFirewall(rules, config)).toThrow();
+  expect(updateHostFirewallPorts(config)).not.toMatch(/ssh_access|delete table/);
+});
+
+test("retained SSH only exempts the matching host SSH socket from the local audit", () => {
+  const config = { mailEnabled: false, sniPorts: [] };
+  const sockets = [
+    'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=911,fd=3))',
+    'tcp LISTEN 0 128 [::]:22 [::]:* users:(("docker-proxy",pid=123,fd=5))',
+    'tcp LISTEN 0 128 0.0.0.0:12345 0.0.0.0:* users:(("sshd",pid=911,fd=4))',
+  ].join("\n");
+  expect(unexpectedPorts(config, sockets, [], new Set(), [22])).toEqual([
+    "Unexpected TCP [::]:22 listening on the host.",
+    "Unexpected TCP 0.0.0.0:12345 listening on the host.",
+  ]);
 });
 
 test("host ss audit allows DHCP client sockets and resolver stubs but rejects unrelated owners", () => {

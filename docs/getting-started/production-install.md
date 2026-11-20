@@ -26,8 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh
 
 `install.sh` is one function called on its last line, so a truncated download runs nothing. Run without root it changes nothing: it explains what it will do, prints the exact `sudo` command and checks the operating system, architecture and `sudo`. As root it:
 
-1. refuses an unsupported OS, snap Docker, or a distribution `docker.io` without Compose v2, before changing anything (it never removes packages, Docker resources or users);
-2. installs whatever is missing of `git`, `curl`, `ca-certificates`, `jq` and `openssl`; Docker Engine with the Compose v2 and buildx plugins from Docker's apt repository and its signed key; mise from its signed repository (enabled with `extrepo`); and the Tailscale package from Tailscale's signed repository;
+1. refuses an unsupported OS, snap Docker, a distribution `docker.io` without Compose v2, or standalone distribution runtimes such as `containerd` and `runc` that conflict with a fresh Docker Engine install. Package installation refuses removals;
+2. installs whatever is missing of `git`, `curl`, `ca-certificates`, `jq`, `openssl` and `iproute2`; Docker Engine with the Compose v2 and buildx plugins from Docker's apt repository and its signed key; mise from its signed repository (enabled with `extrepo`); and the Tailscale package from Tailscale's signed repository. It starts Docker if its daemon is stopped;
 3. clones the repository into `/opt/ark-stack`, or fast-forwards a clean checkout there (it refuses local changes or a non-fast-forward). `ARK_REF` picks a branch or tag (default `main`) and `ARK_INSTALL_DIR` another directory, for example `curl … | sudo ARK_REF=v1.2.0 bash`. Run as `sudo ./install.sh` from a checkout, it uses that checkout instead;
 4. runs `mise trust`, `mise install` and `bun install`, then starts the guided setup, `mise run host:setup`, passing on any arguments (`curl … | sudo bash -s -- --keep-public-ssh`).
 
@@ -47,17 +47,17 @@ The guided setup asks everything up front, with defaults in brackets, and shows 
 | Automatic reboot time             | `--reboot-time`                                    | `ARK_HOST_REBOOT_TIME` | `04:00`                                               |
 | Your local user for Tailscale SSH | `--ssh-user`                                       | `ARK_SETUP_SSH_USER`   | the user who ran `sudo`                               |
 
-On a re-run, the previous answers and the values already in `.env` are the defaults; they change only if you change them.
+On a rerun, installed `.env` values take precedence over saved answers. Flags and environment variables can override both. Adding your first ACME email enables trusted certificates unless you selected staging.
 
 ### What you do during the install
 
 You never edit a file. The installer stops for you only at these points:
 
-1. **Tailnet policy and the host key.** It prints the policy you need (the `tag:ark-vps` and `tag:ark-edge` tag owners and the owner-only Tailscale SSH rule in `check` mode; see [Plan the Tailscale identities](#plan-the-tailscale-identities)) and asks you to paste a one-off `tag:ark-vps` auth key. It writes the key to a private temporary file, runs the existing enrolment phase and deletes the file.
+1. **Tailnet policy and the host key.** It prints the policy you need (the `tag:ark-vps` and `tag:ark-edge` tag owners and the owner-only Tailscale SSH rule in `check` mode; see [Plan the Tailscale identities](#plan-the-tailscale-identities)) and asks you to paste a one-off `tag:ark-vps` auth key. The key is passed to enrolment through stdin.
 2. **The Tailscale SSH check.** It prints `tailscale ssh <user>@<vps-magicdns-name>`. Open that from your own device, keep it open, and type `yes` once it works. If you do not, it stops **before** hardening, with nothing on the firewall or OpenSSH changed, and prints the command to resume. It also says whether the current session already arrives over Tailscale.
 3. **The edge key.** It asks for a one-off `tag:ark-edge` key (Enter skips this step, and the summary says how to finish it), brings up `edge-ts`, `edge` and `edge-l4`, rejoins the namespace, checks the node is tagged exactly `["tag:ark-edge"]` and then empties `TS_EDGE_AUTHKEY` in `.env`.
-4. **Closing public SSH.** Before stopping OpenSSH it checks the host node and Tailscale SSH, then disables `ssh.socket` and `ssh.service` and checks again, asking you to open one more new Tailscale SSH session. If anything fails, OpenSSH is started again and the failure is reported. It removes only UFW rules that allow SSH and reports, but does not change, any other active UFW configuration. `--keep-public-ssh` skips this step.
-5. **The provider firewall.** It prints the exact inbound rules from `host:audit --inventory` and waits for you to confirm that they are applied at your provider, then runs the local audit and prints the external scan command to run from another machine.
+4. **Closing public SSH.** Hardening preserves OpenSSH access from your current OpenSSH client's IP. From a console or Tailscale session, give that client's IP with `--ssh-recovery-source IP` if public OpenSSH is active. Setup arms a five-minute systemd rollback timer, stops the units serving public listeners, and asks you to test a fresh Tailscale SSH login from your device. After confirmation, it disables those units and removes the recovery rule and unambiguously public UFW SSH allowances. If verification fails or the session drops before confirmation, rollback restores the OpenSSH units and preserves the scoped firewall path. With `--keep-public-ssh`, setup retains OpenSSH and its audit and provider allowances.
+5. **The provider firewall.** Setup checks the local firewall and listeners, then prints the inbound rules for your provider and asks you to confirm them. Keep the listed OpenSSH allowance while cutover is pending. After cutover, setup prints the external scan command to run from another machine.
 
 Then it prints the summary: the SSH tunnel command, `http://localhost:3000` and the setup token, the DNS records to create (or the Cloudflare review), every skipped or pending step with the command that finishes it, and the recovery material to copy off the host. Continue with [First login and the domain wizard](#first-login-and-the-domain-wizard).
 
@@ -68,18 +68,18 @@ Then it prints the summary: the SSH tunnel command, `http://localhost:3000` and 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh \
   | sudo TS_VPS_AUTHKEY_FILE=/root/ark-vps-authkey bash -s -- --non-interactive \
-      --domain example.com --acme-email ops@example.com --skip-edge
+      --domain example.com --ssh-user alice --acme-email ops@example.com --skip-edge
 ```
 
-Without `--tailscale-ssh-confirmed` (or `ARK_SETUP_TAILSCALE_SSH_CONFIRMED=1`) a non-interactive run stops before hardening and exits with status 2; check Tailscale SSH and re-run with the flag. Without `--provider-firewall-applied` (`ARK_SETUP_PROVIDER_FIREWALL_APPLIED=1`) it prints the provider rules, runs the audit and lists the step as pending. `--skip-edge` (`ARK_SETUP_SKIP_EDGE=1`) and `--keep-public-ssh` (`ARK_SETUP_KEEP_PUBLIC_SSH=1`) skip those steps. `mise run host:setup --help` lists every option.
+Without `--tailscale-ssh-confirmed` (or `ARK_SETUP_TAILSCALE_SSH_CONFIRMED=1`), a first non-interactive run stops before hardening with status 2. Check Tailscale SSH and rerun with the flag. A changed Tailscale node or SSH account requires a new confirmation. Scripted setup leaves public SSH cutover pending unless you opt in with `--verify-ssh-cutover`. Run its printed command from a separate tailnet client while setup waits for proof. The target user needs sudo access to write the proof on the VPS. Without `--provider-firewall-applied` (`ARK_SETUP_PROVIDER_FIREWALL_APPLIED=1`), setup prints the provider rules and lists confirmation as pending. `mise run host:setup --help` lists every option.
 
 ### Re-running and resuming
 
-Run the same command again, or `cd /opt/ark-stack && sudo mise run host:setup`. Each step is recorded in a root-only state file, `tmp/host-setup/state.json` in the install directory: finished steps are verified and skipped, and the run resumes at the step that failed. Secrets in `.env` are never rotated. The install step runs again only when its settings (mail, SNI ports, reboot time) or the checked-out commit changed. Progress is one line per step; the detail is in `tmp/host-setup/setup.log`. Neither the log nor the terminal ever shows an auth key, token or secret, except the setup token in the final summary.
+Run the same command again, or `cd /opt/ark-stack && sudo mise run host:setup`. Setup records progress in the root-only `tmp/host-setup/state.json` file and verifies completed steps on rerun. The install step runs again if its settings or Git commit changed, or if the live firewall or platform health check fails. Configuration checks that both the API and the domain worker are ready with the expected Compose configuration. Secrets in `.env` are never rotated. Progress is one line per step, and details are in `tmp/host-setup/setup.log`. The setup token appears only in the final terminal summary.
 
 ### Provider firewall adapters
 
-The firewall step is provider-agnostic. It passes the inventory's `providerRules` to the first `ProviderFirewall` adapter in `scripts/host-setup/provider-firewall.ts` whose `detect` succeeds (or the one named by `--provider-firewall`). An adapter implements `detect`, `plan` (the changes, or a diff against the provider's current rules) and `apply`. The built-in `manual` adapter works with every provider: it prints the rules and waits for your confirmation. An API adapter for a specific provider is added to the list in front of it without changing the setup flow. Tailscale keys come from a `TailscaleKeySource` (`scripts/host-setup/tailscale-keys.ts`) in the same way: the built-in source asks for each key, and an API source can mint and revoke them instead.
+The firewall step passes the inventory's `providerRules` and any retained OpenSSH allowance to the first `ProviderFirewall` adapter in `scripts/host-setup/provider-firewall.ts` whose `detect` succeeds, or to the named `--provider-firewall` adapter. The built-in `manual` adapter reuses an earlier confirmation for the same VPS and rules. API adapters apply their current plan when they detect drift. Tailscale keys come from a `TailscaleKeySource` (`scripts/host-setup/tailscale-keys.ts`). The built-in source asks for each key, and an API source can mint and revoke them.
 
 ## What the installer does / manual install
 
@@ -167,13 +167,13 @@ With the Tailscale SSH session open, run the hardening install as root:
 sudo mise run host:install --harden-vps
 ```
 
-`host:install` accepts no flag, `--enroll-vps` or `--harden-vps`. On Ubuntu it holds a lock, so an overlapping install or signed maintenance run is refused. Once a host is hardened (`/etc/nftables.d/ark-host.nft` exists), every later `sudo mise run host:install` re-applies the hardening without the flag.
+`host:install` accepts no flag, `--enroll-vps [--key-stdin]` or `--harden-vps`. On Ubuntu it holds a lock, so an overlapping install or signed maintenance run is refused. Once a host is hardened (`/etc/nftables.d/ark-host.nft` exists), every later `sudo mise run host:install` re-applies the hardening without the flag.
 
 #### What hardening does
 
 Hardening refuses to run unless the host node is enrolled with `tag:ark-vps` and Tailscale SSH is enabled. It then:
 
-- installs `nftables`, `iproute2` and `unattended-upgrades`, writes `/etc/apt/apt.conf.d/52ark-unattended-upgrades` (daily package lists and upgrades, automatic reboot at `ARK_HOST_REBOOT_TIME`), checks the effective `apt-config` (daily schedule, the Ubuntu security origin, reboot settings), runs `unattended-upgrades --dry-run` and enables the apt timers;
+- installs `nftables`, `iproute2`, `netbase` and `unattended-upgrades`, writes `/etc/apt/apt.conf.d/52ark-unattended-upgrades` (daily package lists and upgrades, automatic reboot at `ARK_HOST_REBOOT_TIME`), checks the effective `apt-config` (daily schedule, the Ubuntu security origin, reboot settings), runs `unattended-upgrades --dry-run` and enables the apt timers;
 - installs a reboot-required metric (`ark-host-reboot-metric.timer`, every 30 seconds) that the API exports as `ark_host_reboot_required` and Prometheus alerts on as `ArkHostRebootRequired`;
 - installs the `ark_host` nftables baseline in `/etc/nftables.d/ark-host.nft` and `ark-host-firewall.service`, which loads it before `network-pre.target` and before Docker (a Docker drop-in requires it). Incoming connections are accepted on loopback and `tailscale0`; public traffic is limited to the enabled service ports, with the necessary ICMP, neighbour discovery and DHCPv6 control traffic. The forward chain checks the original destination port of Docker's DNAT, so a stray Docker publication is not exposed. The baseline boots with dedicated route ports closed; the `database-ingress` reconciler restores them from the verified front policy.
 

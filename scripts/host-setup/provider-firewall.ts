@@ -18,6 +18,7 @@ export type FirewallContext = {
   publicAddresses: { ipv4: string[]; ipv6: string[] };
   /** The owner already said the rules are applied (--provider-firewall-applied). */
   confirmed: boolean;
+  retainSsh?: boolean;
 };
 
 export type FirewallPlan = {
@@ -43,7 +44,7 @@ export interface ProviderFirewall {
   apply(plan: FirewallPlan, context: FirewallContext): Promise<FirewallResult>;
 }
 
-export function describeProviderRules(rules: ProviderRule[]) {
+export function describeProviderRules(rules: ProviderRule[], retainSsh = false) {
   const lines = ["Inbound rules for this VPS (IPv4 and IPv6; everything else inbound denied):"];
   for (const rule of rules) {
     if (!rule.ports.length) continue;
@@ -52,7 +53,11 @@ export function describeProviderRules(rules: ProviderRule[]) {
     );
   }
   lines.push("  keep the provider's required ICMP and ICMPv6 allowances");
-  lines.push("  remove any inbound TCP 22 (SSH) rule: administration is over Tailscale SSH");
+  lines.push(
+    retainSsh
+      ? "  keep the listed OpenSSH allowance until the Tailscale SSH cutover is complete"
+      : "  remove inbound public OpenSSH allowances: administration is over Tailscale SSH",
+  );
   return lines;
 }
 
@@ -62,8 +67,8 @@ export const manualProviderFirewall: ProviderFirewall = {
   async detect() {
     return true;
   },
-  async plan(rules) {
-    return { adapter: "manual", inSync: false, changes: describeProviderRules(rules) };
+  async plan(rules, context) {
+    return { adapter: "manual", inSync: false, changes: describeProviderRules(rules, context.retainSsh) };
   },
   async apply(_plan, context) {
     if (context.confirmed) return { status: "applied" };

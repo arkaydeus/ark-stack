@@ -1,12 +1,14 @@
-import { chmod, mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import {
   ARK_VPS_TAG,
   HOST_FIREWALL_TABLE,
   assertHostFirewall,
+  readHostSshAccess,
   renderHostFirewall,
   type HostPortConfig,
+  type HostSshAccess,
 } from "@ark-stack/shared";
 
 export const hostFirewallPath = "/etc/nftables.d/ark-host.nft";
@@ -39,13 +41,20 @@ function requireLinuxRoot() {
 
 async function aptInstall(packages: string[]) {
   await hostCommand("apt-get", ["update"]);
-  await hostCommand("apt-get", ["install", "-y", "--no-install-recommends", ...packages]);
+  await hostCommand("apt-get", ["install", "-y", "--no-remove", "--no-install-recommends", ...packages]);
 }
 
 export type TailscaleState = {
   BackendState: string;
   TUN: boolean;
-  Self?: { Online: boolean; Tags?: string[]; DNSName?: string; TailscaleIPs?: string[] };
+  Self?: {
+    ID?: string;
+    PublicKey?: string;
+    Online: boolean;
+    Tags?: string[];
+    DNSName?: string;
+    TailscaleIPs?: string[];
+  };
 };
 
 async function tailscaleState() {
@@ -63,7 +72,7 @@ export function vpsNodeReady(state: TailscaleState) {
   );
 }
 
-export async function enrollVps() {
+export async function enrollVps(readKey?: () => Promise<string>) {
   requireLinuxRoot();
   if (!Bun.which("tailscale")) await aptInstall(["tailscale"]);
   await hostCommand("systemctl", ["enable", "--now", "tailscaled.service"]);
@@ -72,13 +81,21 @@ export async function enrollVps() {
     if (state.BackendState === "Running") {
       throw new Error(`The running Tailscale node must use the host TUN interface and only ${ARK_VPS_TAG}.`);
     }
-    const keyFile = await vpsAuthKeyFile(process.env.TS_VPS_AUTHKEY_FILE);
-    await hostCommand("tailscale", [
+    const keyFile = readKey ? "/dev/stdin" : await vpsAuthKeyFile(process.env.TS_VPS_AUTHKEY_FILE);
+    const args = [
       "up",
       `--auth-key=file:${keyFile}`,
       `--advertise-tags=${ARK_VPS_TAG}`,
       "--accept-dns=false",
-    ]);
+    ];
+    if (readKey) {
+      // Give Tailscale an anonymous pipe it can reopen. Bun's stdin may be backed by a socket.
+      const key = (await readKey()).trim();
+      if (!/^tskey-[A-Za-z0-9-]+$/.test(key)) throw new Error("Expected a Tailscale auth key on stdin.");
+      await hostCommand("sh", ["-c", 'cat | tailscale "$@"', "sh", ...args], key);
+    } else {
+      await hostCommand("tailscale", args);
+    }
   }
   if (!vpsNodeReady(await tailscaleState()))
     throw new Error(`The host Tailscale node must be running with ${ARK_VPS_TAG}.`);
@@ -164,7 +181,7 @@ export function rebootMetricCommands(directory: string) {
   ];
 }
 
-export async function installHostHardening(getConfig: () => Promise<HostPortConfig>) {
+export async function installHostHardening(getConfig: (ssh: HostSshAccess) => Promise<HostPortConfig>) {
   requireLinuxRoot();
   if (
     !vpsNodeReady(await tailscaleState()) ||
@@ -174,7 +191,8 @@ export async function installHostHardening(getConfig: () => Promise<HostPortConf
   }
   const rebootTime = process.env.ARK_HOST_REBOOT_TIME ?? "04:00";
   const updates = automaticUpdatesConfig(rebootTime);
-  await aptInstall(["nftables", "iproute2", "unattended-upgrades"]);
+  // nftables resolves ipv6-icmp through /etc/protocols, absent on some minimal Ubuntu images.
+  await aptInstall(["nftables", "iproute2", "netbase", "unattended-upgrades"]);
   await installFile("/etc/apt/apt.conf.d/52ark-unattended-upgrades", updates);
   const codename = /^VERSION_CODENAME="?([a-z]+)"?$/m.exec(await Bun.file("/etc/os-release").text())?.[1];
   if (!codename) throw new Error("Could not determine the Ubuntu release codename from /etc/os-release.");
@@ -233,8 +251,16 @@ After=${firewallService}
 `,
   );
   // Boot starts with dedicated routes closed. The reconciler restores them with verified ark_front.
-  const config = await getConfig();
-  const baseline = renderHostFirewall({ ...config, routes: [] });
+  const saved = await readFile(hostFirewallPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+    return "";
+  });
+  const ssh =
+    process.env.ARK_SETUP_HOST_SSH_ACCESS === undefined
+      ? readHostSshAccess(saved)
+      : (JSON.parse(process.env.ARK_SETUP_HOST_SSH_ACCESS) as HostSshAccess);
+  const config = await getConfig(ssh);
+  const baseline = renderHostFirewall({ ...config, routes: [] }, ssh);
   await hostCommand("nft", ["-c", "-f", "-"], baseline);
   await installFile(hostFirewallPath, baseline);
   await hostCommand("systemctl", ["daemon-reload"]);
@@ -242,10 +268,11 @@ After=${firewallService}
   await hostCommand("systemctl", ["enable", "--now", "ark-host-reboot-metric.timer"]);
   await hostCommand("systemctl", ["enable", "--now", firewallService]);
   // Preserve acknowledged routes on an update. The new reconciler will replay the full policy.
-  const active = renderHostFirewall(config);
+  const active = renderHostFirewall(config, ssh);
   await hostCommand("nft", ["-f", "-"], active);
   assertHostFirewall(
     await hostCommand("nft", ["-s", "-y", "list", "table", "inet", HOST_FIREWALL_TABLE]),
     config,
+    ssh,
   );
 }
