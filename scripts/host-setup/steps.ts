@@ -54,6 +54,7 @@ export type HostPaths = {
   hostFirewall: string;
   ufwDirectory?: string;
   sshHomeBase?: string;
+  sshdConfigDir?: string;
 };
 
 export type SessionOrigin = {
@@ -418,9 +419,13 @@ function requireFreshHome(home: string) {
   }
 }
 
-async function requireSafeOpenSshPassword(context: Context, user: string) {
+/**
+ * What OpenSSH would allow `user`: `safe` (no sshd, or the user is denied or both password methods
+ * are off), `passwords-allowed` (a plain config that still accepts passwords) or `unverified`.
+ */
+async function openSshPasswordCheck(context: Context, user: string) {
   const result = await exec(context, ["/usr/sbin/sshd", "-ddd", "-T", "-C", `user=${user}`]);
-  if (result.status === 127 && !(await sshListeners(context)).length) return;
+  if (result.status === 127 && !(await sshListeners(context)).length) return "safe";
   // sshd evaluates Match User before the account exists. Group and connection-specific criteria
   // can produce a different result after useradd or for a remote client. Refuse those configs.
   const matches = [...result.stderr.matchAll(/^debug3: checking syntax for 'Match (.*)'\r?$/gim)];
@@ -433,12 +438,57 @@ async function requireSafeOpenSshPassword(context: Context, user: string) {
   );
   const disablesPasswords =
     policy.includes("passwordauthentication no") && policy.includes("kbdinteractiveauthentication no");
-  if (result.status === 0 && userOnly && (deniesUser || disablesPasswords)) return;
-  throw new Error(
-    `Cannot verify that OpenSSH blocks password login for ${user}. Keep your current recovery session open. ` +
+  if (result.status !== 0 || !userOnly) return "unverified";
+  return deniesUser || disablesPasswords ? "safe" : "passwords-allowed";
+}
+
+function openSshPasswordError(user: string, prefix = "") {
+  return new Error(
+    `${prefix}Cannot verify that OpenSSH blocks password login for ${user}. Keep your current recovery session open. ` +
       `Apply and reload a policy that denies ${user} or disables PasswordAuthentication and KbdInteractiveAuthentication for ${user}, then retry. ` +
       `For a custom OpenSSH configuration, provision a protected local account manually and pass it with --ssh-user.`,
   );
+}
+
+async function requireSafeOpenSshPassword(context: Context, user: string) {
+  if ((await openSshPasswordCheck(context, user)) !== "safe") throw openSshPasswordError(user);
+}
+
+/** Scoped to `user` only: a Match block in an Included file ends at the end of that file. */
+export function sshUserPolicy(user: string) {
+  return [
+    "# Written by Ark Stack host:setup. The account's password is for sudo, not for OpenSSH.",
+    `Match User ${user}`,
+    "    PasswordAuthentication no",
+    "    KbdInteractiveAuthentication no",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Before a password account is created, OpenSSH must refuse password login for it. A stock Ubuntu
+ * VPS image often allows passwords (cloud-init's `PasswordAuthentication yes`), so setup adds a
+ * `Match User` drop-in for this account only, verifies the effective policy and reloads OpenSSH.
+ * Any other login, root included, keeps its current settings.
+ */
+async function blockOpenSshPasswords(context: Context, user: string) {
+  const check = await openSshPasswordCheck(context, user);
+  if (check === "safe") return;
+  const directory = context.paths.sshdConfigDir ?? "/etc/ssh/sshd_config.d";
+  if (check === "unverified" || !existsSync(directory)) throw openSshPasswordError(user);
+  const path = join(directory, `10-ark-ssh-user-${user}.conf`);
+  writeHostFile(path, sshUserPolicy(user), 0o644);
+  const syntax = await exec(context, ["/usr/sbin/sshd", "-t"]);
+  if (syntax.status !== 0 || (await openSshPasswordCheck(context, user)) !== "safe") {
+    rmSync(path, { force: true });
+    throw openSshPasswordError(
+      user,
+      `Setup wrote ${path}, but OpenSSH ${syntax.status === 0 ? "still allows password login" : "rejected the configuration"}; the file was removed. `,
+    );
+  }
+  const active = await exec(context, ["systemctl", "is-active", "ssh.service"]);
+  if (active.stdout.trim() === "active") await must(context, ["systemctl", "reload", "ssh.service"]);
+  context.ui.print(`      Turned off OpenSSH password login for ${user} only (${path}).`);
 }
 
 async function reconcileSshUserProvisioning(context: Context) {
@@ -511,7 +561,7 @@ async function ensureSshUser(context: Context) {
   if (!/^yes$/i.test(answer.trim())) throw new Error(`The local user ${user} does not exist. ${manual}`);
   const home = join(context.paths.sshHomeBase ?? "/home", user);
   requireFreshHome(home);
-  await requireSafeOpenSshPassword(context, user);
+  await blockOpenSshPasswords(context, user);
   let password: string;
   for (;;) {
     password = await context.ui.askPassword(`Password for ${user} (used for sudo)`);

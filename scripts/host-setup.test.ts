@@ -46,7 +46,12 @@ import {
   type HetznerFirewall,
   type HetznerRule,
 } from "./host-setup/provider-firewalls/hetzner.ts";
-import { detectSessionOrigin, publicSshListeners, publicUfwSshRules } from "./host-setup/steps.ts";
+import {
+  detectSessionOrigin,
+  publicSshListeners,
+  publicUfwSshRules,
+  sshUserPolicy,
+} from "./host-setup/steps.ts";
 import {
   Redactor,
   runCommand,
@@ -125,6 +130,11 @@ class FakeHost {
   userShell = "/bin/bash";
   passwdLookupError?: RunResult;
   opensshConfig = ok("passwordauthentication no\nkbdinteractiveauthentication no\n");
+  sshdConfigDir = "";
+  /** Whether the effective policy honours setup's per-user drop-in (false: something else wins). */
+  sshdHonoursDropIn = true;
+  sshdSyntax = ok();
+  sshReloads = 0;
   failUseradd?: "before-create" | "after-create";
   passwords = new Map<string, string>();
   failChpasswd = false;
@@ -160,7 +170,23 @@ class FakeHost {
       const uid = home ? statSync(home).uid : 1000;
       return ok(`${user}:x:${uid}:1000::${home ?? `/home/${user}`}:${this.userShell}\n`);
     }
-    if (argv[0] === "/usr/sbin/sshd") return this.opensshConfig;
+    if (argv[0] === "/usr/sbin/sshd") {
+      if (line === "/usr/sbin/sshd -t") return this.sshdSyntax;
+      const user = /^user=(.+)$/.exec(argv.at(-1) ?? "")?.[1];
+      const dropIn = user && join(this.sshdConfigDir, `10-ark-ssh-user-${user}.conf`);
+      if (dropIn && this.sshdHonoursDropIn && existsSync(dropIn)) {
+        expect(readFileSync(dropIn, "utf8")).toContain(`Match User ${user}\n`);
+        return {
+          ...this.opensshConfig,
+          stdout: "passwordauthentication no\nkbdinteractiveauthentication no\n",
+        };
+      }
+      return this.opensshConfig;
+    }
+    if (line === "systemctl reload ssh.service") {
+      this.sshReloads++;
+      return ok();
+    }
     if (argv[0] === "useradd") {
       if (this.failUseradd === "before-create") return fail("useradd: group 'sudo' does not exist", 6);
       const user = argv.at(-1)!;
@@ -494,8 +520,11 @@ function fixture() {
   );
   const host = new FakeHost(root, join(hostDir, "ark-host.nft"));
   const homeBase = join(hostDir, "home");
+  const sshdConfigDir = join(hostDir, "sshd_config.d");
+  mkdirSync(sshdConfigDir);
+  host.sshdConfigDir = sshdConfigDir;
   const stateDir = join(root, "tmp", "host-setup");
-  return { root, host, stateDir, osRelease, homeBase };
+  return { root, host, stateDir, osRelease, homeBase, sshdConfigDir };
 }
 
 type Fixture = ReturnType<typeof fixture>;
@@ -514,7 +543,12 @@ async function setup(
     env: { PATH: "/usr/bin", SUDO_USER: "alice", ...env },
     run: f.host.run,
     stateDir: f.stateDir,
-    paths: { osRelease: f.osRelease, hostFirewall: f.host.firewallPath, sshHomeBase: f.homeBase },
+    paths: {
+      osRelease: f.osRelease,
+      hostFirewall: f.host.firewallPath,
+      sshHomeBase: f.homeBase,
+      sshdConfigDir: f.sshdConfigDir,
+    },
     isRoot: true,
     platform: "linux",
     bun: BUN,
@@ -913,20 +947,78 @@ describe("host:setup missing SSH user", () => {
   });
 
   test.each([
-    { password: "yes", keyboard: "no", match: "" },
-    { password: "no", keyboard: "yes", match: "" },
-    { password: "no", keyboard: "no", match: "debug3: checking syntax for 'Match Address 203.0.113.2'\n" },
-  ])("refuses an unsafe or unverified OpenSSH policy while retaining public SSH", async (policy) => {
+    { password: "yes", keyboard: "no" },
+    { password: "no", keyboard: "yes" },
+  ])(
+    "turns off OpenSSH password login for the new user only (password $password, keyboard $keyboard)",
+    async (policy) => {
+      const f = fixture();
+      f.host.missingUsers.add("alice");
+      f.host.opensshConfig = ok(
+        `passwordauthentication ${policy.password}\nkbdinteractiveauthentication ${policy.keyboard}\n`,
+      );
+      const result = await setup(f, [], {}, { scripted: interactiveUi("yes") });
+      expect(result.code).toBe(2);
+      const dropIn = join(f.sshdConfigDir, "10-ark-ssh-user-alice.conf");
+      expect(readFileSync(dropIn, "utf8")).toBe(sshUserPolicy("alice"));
+      expect((statSync(dropIn).mode & 0o777).toString(8)).toBe("644");
+      expect(result.text).toContain(`Turned off OpenSSH password login for alice only (${dropIn}).`);
+      const index = (call: string) => f.host.calls.indexOf(call);
+      expect(index("/usr/sbin/sshd -t")).toBeGreaterThan(-1);
+      expect(index("/usr/sbin/sshd -t")).toBeLessThan(index("systemctl reload ssh.service"));
+      expect(index("systemctl reload ssh.service")).toBeLessThan(
+        f.host.calls.findIndex((call) => call.startsWith("useradd")),
+      );
+      expect(f.host.sshReloads).toBe(1);
+      expect(f.host.passwords.get("alice")).toBe(PASSWORD);
+    },
+  );
+
+  test("writes the drop-in without a reload while ssh.service is socket-activated and idle", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    f.host.ssh.service.active = false;
+    f.host.opensshConfig = ok("passwordauthentication yes\nkbdinteractiveauthentication no\n");
+    const result = await setup(f, [], {}, { scripted: interactiveUi("yes") });
+    expect(result.code).toBe(2);
+    expect(existsSync(join(f.sshdConfigDir, "10-ark-ssh-user-alice.conf"))).toBe(true);
+    expect(f.host.sshReloads).toBe(0);
+  });
+
+  test("leaves an existing user's OpenSSH policy alone", async () => {
+    const f = fixture();
+    f.host.opensshConfig = ok("passwordauthentication yes\nkbdinteractiveauthentication no\n");
+    await setup(f, FULL, KEYS);
+    expect(readdirSync(f.sshdConfigDir)).toEqual([]);
+    expect(f.host.sshReloads).toBe(0);
+  });
+
+  test.each([
+    {
+      name: "a connection-specific Match",
+      match: "debug3: checking syntax for 'Match Address 203.0.113.2'\n",
+    },
+    { name: "a drop-in that does not take effect", honoured: false },
+    { name: "a configuration sshd -t rejects", syntax: fail("sshd: bad configuration", 255) },
+    { name: "no sshd_config.d directory", noDirectory: true },
+  ])("refuses $name, removes its drop-in and keeps public SSH", async (policy) => {
     const f = fixture();
     f.host.missingUsers.add("alice");
     f.host.opensshConfig = {
-      ...ok(`passwordauthentication ${policy.password}\nkbdinteractiveauthentication ${policy.keyboard}\n`),
-      stderr: policy.match,
+      ...ok("passwordauthentication yes\nkbdinteractiveauthentication no\n"),
+      stderr: policy.match ?? "",
     };
+    if (policy.honoured === false) f.host.sshdHonoursDropIn = false;
+    if (policy.syntax) f.host.sshdSyntax = policy.syntax;
+    if (policy.noDirectory) rmSync(f.sshdConfigDir, { recursive: true });
     const result = await setup(f, ["--keep-public-ssh"], {}, { scripted: interactiveUi("yes", []) });
     expect(result.code).toBe(1);
     expect(result.text).toContain("Cannot verify that OpenSSH blocks password login for alice");
     expect(f.host.calls).toContain("/usr/sbin/sshd -ddd -T -C user=alice");
+    if (policy.honoured === false) expect(result.text).toContain("still allows password login");
+    if (policy.syntax) expect(result.text).toContain("rejected the configuration");
+    if (!policy.noDirectory) expect(readdirSync(f.sshdConfigDir)).toEqual([]);
+    expect(f.host.sshReloads).toBe(0);
     expect(f.host.calls.some((call) => /^(useradd|chpasswd)|--harden-vps/.test(call))).toBe(false);
     expect(f.host.ssh.service.active).toBe(true);
   });
