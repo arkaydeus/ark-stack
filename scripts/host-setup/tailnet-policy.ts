@@ -220,17 +220,20 @@ export type ArkPolicyRequest = {
   requiredOwner?: string;
 };
 
-type SshRule = { action?: string; src?: string[]; dst?: string[]; users?: string[] };
+type SshRule = { action?: string; src?: string[]; dst?: string[]; users?: string[]; srcPosture?: string[] };
 type Policy = {
   tagOwners?: Record<string, string[]>;
-  grants?: TailnetGrant[];
+  grants?: (TailnetGrant & { srcPosture?: string[]; via?: string[] })[];
   ssh?: SshRule[];
+  defaultSrcPosture?: string[];
   acls?: { action?: string; src?: string[]; dst?: string[] }[];
   [key: string]: unknown;
 };
 
 function sshEntries() {
-  const example = parseHujson(sshPolicyExample()) as { grants: TailnetGrant[]; ssh: SshRule[] };
+  const example = parseHujson(
+    sshPolicyExample({ admin: "autogroup:owner", useDefaultCheckPeriod: true }),
+  ) as { grants: TailnetGrant[]; ssh: SshRule[] };
   return { grant: example.grants[0]!, rule: example.ssh[0]! };
 }
 
@@ -241,18 +244,28 @@ const sameSet = (a: unknown, b: unknown) =>
   [...a].map(String).toSorted().join("\n") === [...b].map(String).toSorted().join("\n");
 
 function hasGrant(policy: Policy, grant: TailnetGrant) {
-  return (policy.grants ?? []).some(
+  const matches = (policy.grants ?? []).filter(
     (item) => sameSet(item?.src, grant.src) && sameSet(item?.dst, grant.dst) && sameSet(item?.ip, grant.ip),
   );
+  if (matches.some((item) => !item.srcPosture?.length && !item.via?.length)) return true;
+  if (matches.length) throw sshPolicyConflict("TCP 22 grant", "a source posture or routing restriction");
+  return false;
 }
 
 function hasSshRule(policy: Policy, rule: SshRule) {
-  return (policy.ssh ?? []).some(
+  const matches = (policy.ssh ?? []).filter(
     (item) =>
-      (item?.action === "check" || item?.action === "accept") &&
-      sameSet(item.src, rule.src) &&
-      sameSet(item.dst, rule.dst) &&
-      sameSet(item.users, rule.users),
+      sameSet(item?.src, rule.src) && sameSet(item?.dst, rule.dst) && sameSet(item?.users, rule.users),
+  );
+  if (matches.some((item) => item.action === "check" && !item.srcPosture?.length)) return true;
+  if (matches.some((item) => item.srcPosture?.length))
+    throw sshPolicyConflict("SSH rule", "a source posture restriction");
+  return false;
+}
+
+function sshPolicyConflict(entry: string, constraint: string) {
+  return new Error(
+    `The tailnet policy has ${constraint} on the owner path to tag:ark-vps (${entry}). Review that path in Access controls and use the manual setup flow with a compliant device.`,
   );
 }
 
@@ -275,6 +288,9 @@ function plannedAdditions(policy: Policy, request: ArkPolicyRequest) {
     }
   }
   const { grant, rule } = sshEntries();
+  if (policy.defaultSrcPosture?.length) {
+    throw sshPolicyConflict("TCP 22 grant", "a default source posture restriction");
+  }
   return {
     newTags,
     newOwners,

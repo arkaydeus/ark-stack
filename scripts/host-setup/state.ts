@@ -22,9 +22,9 @@ export type StepRecord = {
   at: string;
   /** Inputs the step completed with; a different fingerprint makes the step run again. */
   fingerprint?: string;
-  /** Why the step was skipped or is pending. */
+  /** Follow-up needed after a skipped, pending or completed step. */
   note?: string;
-  /** The command or action that finishes a skipped or pending step. */
+  /** The command or action that completes the follow-up. */
   finish?: string;
   error?: string;
 };

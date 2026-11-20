@@ -29,7 +29,7 @@ For local development, `mise run db:up` adds `infra/platform/docker-compose.dev.
 
 The guided setup (`mise run host:setup`, started by `install.sh`) runs these steps in order, refuses to harden until the owner confirms a working Tailscale SSH session, and closes public OpenSSH only after checking Tailscale SSH again, restarting OpenSSH if that check fails. With a Tailscale API credential it also makes the policy change and mints and revokes the auth keys, and on Hetzner Cloud with an API token it applies the provider firewall ([Tailscale API automation](getting-started/production-install.md#tailscale-api-automation), [Provider firewall adapters](getting-started/production-install.md#provider-firewall-adapters)). The manual procedure:
 
-1. Keep the provider console or rescue access working. Configure the [Tailscale Ubuntu package source](https://tailscale.com/kb/1347/installation) so the installer can install the host package. In the tailnet policy, declare `tag:ark-vps` and merge the owner-only grant for TCP 22 and the SSH rule in `check` mode from [Front door ACL](#tailnet-policy-snippet). Use the owner's untagged device for SSH.
+1. Keep the provider console or rescue access working. Configure the [Tailscale Ubuntu package source](https://tailscale.com/kb/1347/installation) so the installer can install the host package. In the tailnet policy, declare `tag:ark-vps` and apply the [owner TCP 22 grant and SSH rule](getting-started/production-install.md#plan-the-tailscale-identities). Use the owner's untagged device for SSH.
 2. Create a one-off, pre-approved, non-ephemeral key tagged `tag:ark-vps`. Put it in a private file on the VPS with mode `0600`, then run the enrollment phase as root. After enrollment, remove the key file and revoke the key.
 
    ```sh
@@ -499,6 +499,8 @@ mise run test:db:down <container>
 For `test:e2e` and `test:e2e-gate`, install Chromium with `bunx playwright install chromium`. In a fresh checkout these tasks and `test:upgrade` expect a root `.env` file. `touch .env` creates an empty one so the task uses the disposable shell exports. Start a fresh disposable database for each isolated acceptance run if you need a clean baseline.
 
 The local Docker harnesses need no external credentials:
+
+Run `ARK_TEST_SETUP_DOCKER=1 bun --no-env-file test scripts/host-setup.test.ts` to check that the real Docker container configuration and process arguments stay free of minted keys during and after interrupted edge and backup enrolment. The test uses isolated containers and dummy keys.
 
 - `mise run test:edge`
 - `mise run test:db-ingress`

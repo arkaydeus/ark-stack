@@ -32,7 +32,8 @@ import {
 } from "./provider-firewall.ts";
 import type { SetupState, StepId } from "./state.ts";
 import {
-  SECRET_VARIABLES,
+  withoutSetupSecrets,
+  withoutApiCredentials,
   type Redactor,
   type RunOptions,
   type Runner,
@@ -102,6 +103,7 @@ export async function exec(context: Context, argv: string[], options: RunOptions
   const result = await context.run(argv, {
     cwd: context.root,
     ...options,
+    env: options.env ? withoutApiCredentials(options.env) : withoutSetupSecrets(context.env),
     onLine: (line) => context.log.write(`  | ${line}`),
   });
   if (result.status !== 0) context.log.write(`  (exit ${result.status})`);
@@ -124,9 +126,8 @@ export async function must(context: Context, argv: string[], options: RunOptions
  * the installer read the file (an exported stale value would otherwise win over `--env-file`).
  */
 export function childEnv(context: Context, extra: Record<string, string> = {}) {
-  const env: Record<string, string | undefined> = { ...context.env };
+  const env = withoutSetupSecrets(context.env);
   for (const key of Object.keys(parseEnvFile(readEnv(context.envPath)))) delete env[key];
-  for (const key of [...SECRET_VARIABLES, "TS_VPS_AUTHKEY_FILE", "TS_OAUTH_CLIENT_ID"]) delete env[key];
   if (context.env.ARK_HOST_DEPLOYMENT_LOCK_HELD === "1") env.ARK_HOST_DEPLOYMENT_LOCK_HELD = "1";
   return { ...env, ...extra };
 }
@@ -320,11 +321,14 @@ async function prerequisites(context: Context): Promise<StepResult> {
 }
 
 async function tailscaleEnrolment(context: Context): Promise<StepResult> {
+  const enrolled = { enrolled: true, offerCredential: !context.state.sshConfirmation };
   if (!(await tailscaleSshReady(context))) {
+    await context.keys.preparePolicy?.(enrolled);
     return { status: "done", message: `already enrolled as ${ARK_VPS_TAG} with Tailscale SSH` };
   }
   const status = await tailscaleStatus(context);
   if (status && vpsNodeReady(status)) {
+    await context.keys.preparePolicy?.(enrolled);
     await must(context, [context.bun, "scripts/install.ts", "--enroll-vps"], { env: childEnv(context) });
     const problem = await tailscaleSshReady(context);
     if (problem) throw new Error(`Enrolment finished but ${problem}.`);
@@ -343,6 +347,7 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
   const key = await context.keys.acquire({ tag: ARK_VPS_TAG, variable: "TS_VPS_AUTHKEY", optional: false });
   if (!key?.file && !key?.key) throw new Error(`A ${ARK_VPS_TAG} key is required.`);
   context.redactor.add(key.key);
+  let revoked: boolean | undefined;
   try {
     const command = [context.bun, "scripts/install.ts", "--enroll-vps"];
     if (key.file) {
@@ -354,11 +359,12 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
     if (problem) throw new Error(`Enrolment finished but ${problem}.`);
   } finally {
     // The node joined, or the attempt failed: a minted key is revoked either way.
-    await key.release?.();
+    revoked = await key.release?.();
   }
   return {
     status: "done",
     message: `enrolled as ${ARK_VPS_TAG}${key.file ? `; delete ${key.file} and revoke the key` : ""}`,
+    ...keyCleanupNote(revoked, ARK_VPS_TAG),
   };
 }
 
@@ -581,11 +587,12 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
     if (key?.key) {
       context.redactor.add(key.key);
       acquired = key;
-      // A minted key never touches .env: Compose gets it from the environment for this one start.
+      // API-minted keys are sent to the running daemon on stdin.
       if (!key.inMemoryOnly) writeEnv(context.envPath, applyEdgeAuthKey(current, key.key).env);
     }
   } else context.redactor.add(kept);
   const transient = acquired?.inMemoryOnly ? acquired.key : undefined;
+  let revoked: boolean | undefined;
   try {
     if (!transient) {
       // A timeout may be transient. Keep the key but allow a replacement on the next run.
@@ -593,21 +600,22 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
       context.save();
     }
     await must(context, compose(context, "up", "-d", "edge-ts", "edge", "edge-l4"), {
-      env: childEnv(context, transient ? { TS_EDGE_AUTHKEY: transient } : {}),
+      env: childEnv(context, transient ? { TS_EDGE_AUTHKEY: "" } : {}),
     });
+    if (transient) await enrolContainer(context, "edge-ts", "ark-edge", transient);
     await waitForNode(context, "edge-ts", ARK_EDGE_TAG);
-    if (transient) await restartWithoutKey(context, "edge-ts", ARK_EDGE_TAG);
     await rejoinEdge(context);
     emptyEdgeKey(context);
     delete context.state.edgeKeyRetry;
   } finally {
-    await acquired?.release?.();
+    revoked = await acquired?.release?.();
   }
   return {
     status: "done",
     message: transient
-      ? `edge-ts joined as ${ARK_EDGE_TAG}; its minted key was never stored and is revoked`
+      ? `edge-ts joined as ${ARK_EDGE_TAG}`
       : `edge-ts joined as ${ARK_EDGE_TAG}; TS_EDGE_AUTHKEY emptied in .env`,
+    ...keyCleanupNote(revoked, ARK_EDGE_TAG),
   };
 }
 
@@ -635,13 +643,33 @@ async function waitForNode(context: Context, service: string, tag: string) {
   return after;
 }
 
-/**
- * Recreates a node that joined with a minted key from the environment, now without it, so the key
- * does not stay in the container's configuration. The node keeps its identity in its state volume.
- */
-async function restartWithoutKey(context: Context, service: string, tag: string) {
-  await must(context, compose(context, "up", "-d", service), { env: childEnv(context) });
-  await waitForNode(context, service, tag);
+function keyCleanupNote(revoked: boolean | undefined, tag: string) {
+  if (revoked !== false) return {};
+  return {
+    note: `Tailscale did not confirm revocation of the one-off ${tag} key.`,
+    finish: "Revoke the key under Settings > Keys in the Tailscale admin console.",
+  };
+}
+
+/** The pinned Tailscale CLI reads file:/dev/stdin without placing the key in argv or Docker config. */
+async function enrolContainer(context: Context, service: string, hostname: string, key: string) {
+  const socket = "/var/run/tailscale/tailscaled.sock";
+  await must(
+    context,
+    compose(
+      context,
+      "exec",
+      "-T",
+      service,
+      "sh",
+      "-c",
+      'until [ -S "$1" ]; do sleep 1; done; exec tailscale --socket="$1" up --timeout=90s --auth-key=file:/dev/stdin --accept-dns=false --shields-up --hostname="$2"',
+      "sh",
+      socket,
+      hostname,
+    ),
+    { env: childEnv(context), stdin: key, timeoutMs: 120_000 },
+  );
 }
 
 const BACKUP_FINISH =
@@ -675,17 +703,27 @@ async function backupNode(context: Context): Promise<StepResult> {
     };
   }
   context.redactor.add(key.key);
+  let revoked: boolean | undefined;
   try {
-    // The key goes to Compose in the environment for this one start, never into .env.
     await must(context, compose(context, "up", "-d", "backup-ts"), {
-      env: childEnv(context, { TS_BACKUP_AUTHKEY: key.key }),
+      env: childEnv(context, { TS_BACKUP_AUTHKEY: key.inMemoryOnly ? "" : key.key }),
     });
+    if (key.inMemoryOnly) await enrolContainer(context, "backup-ts", "ark-backup", key.key);
     await waitForNode(context, "backup-ts", ARK_BACKUP_TAG);
-    await restartWithoutKey(context, "backup-ts", ARK_BACKUP_TAG);
+    if (!key.inMemoryOnly) {
+      await must(context, compose(context, "up", "-d", "backup-ts"), {
+        env: childEnv(context, { TS_BACKUP_AUTHKEY: "" }),
+      });
+      await waitForNode(context, "backup-ts", ARK_BACKUP_TAG);
+    }
   } finally {
-    await key.release?.();
+    revoked = await key.release?.();
   }
-  return { status: "done", message: `backup-ts joined as ${ARK_BACKUP_TAG}; its key was never stored` };
+  return {
+    status: "done",
+    message: `backup-ts joined as ${ARK_BACKUP_TAG}`,
+    ...keyCleanupNote(revoked, ARK_BACKUP_TAG),
+  };
 }
 
 async function rejoinEdge(context: Context) {
@@ -1111,39 +1149,46 @@ async function providerFirewall(context: Context): Promise<StepResult> {
     publicAddresses: addresses,
     confirmed: context.options.providerFirewallApplied,
     retainSsh,
-    approved: context.options.approveProviderFirewall,
+    approved: context.options.nonInteractive && context.options.approveProviderFirewall,
     secret: (value) => context.redactor.add(value),
     log: (line) => context.log.write(line),
   };
-  const adapter = await selectProviderFirewall(
-    context.firewalls,
-    firewallContext,
-    context.options.providerFirewall,
-  );
-  const fingerprint = JSON.stringify({
-    adapter: adapter.id,
-    node: status?.Self?.ID ?? status?.Self?.PublicKey,
-    addresses,
-    rules,
-    retainSsh,
-  });
+  const node = status?.Self?.ID ?? status?.Self?.PublicKey;
+  const fingerprintFor = (adapter: string) => JSON.stringify({ adapter, node, addresses, rules, retainSsh });
   const record = context.state.steps["provider-firewall"];
-  const alreadyApplied =
-    adapter.id === "manual" && record?.status === "done" && record.fingerprint === fingerprint;
-  if (alreadyApplied) firewallContext.confirmed = true;
-  const plan = await adapter.plan(rules, firewallContext);
-  let result: StepResult = { status: "done", fingerprint, message: `rules applied (${adapter.label})` };
-  if (alreadyApplied) {
-    result = { status: "done", fingerprint, message: "rules unchanged since they were applied" };
-  } else if (plan.inSync) {
-    result = { status: "done", fingerprint, message: `provider already matches (${adapter.label})` };
+  const requested = context.options.providerFirewall;
+  const useRecordedHetzner =
+    node &&
+    !context.env.HCLOUD_TOKEN?.trim() &&
+    (!requested || requested === "hetzner") &&
+    record?.status === "done" &&
+    record.fingerprint === fingerprintFor("hetzner");
+  let result: StepResult;
+  if (useRecordedHetzner) {
+    result = {
+      status: "done",
+      fingerprint: record.fingerprint,
+      message:
+        "rules unchanged since the recorded Hetzner apply (HCLOUD_TOKEN needed to re-verify at the provider)",
+    };
   } else {
-    for (const line of plan.changes) context.ui.print(`      ${line}`);
-    const applied = await adapter.apply(plan, firewallContext);
-    if (applied.status === "pending")
-      result = { status: "pending", note: applied.note, finish: applied.finish };
+    const adapter = await selectProviderFirewall(context.firewalls, firewallContext, requested);
+    const fingerprint = fingerprintFor(adapter.id);
+    const plan = await adapter.plan(rules, firewallContext);
+    for (const line of plan.notices ?? []) context.ui.print(`      ${line}`);
+    if (adapter.id === "manual" && record?.status === "done" && record.fingerprint === fingerprint) {
+      result = { status: "done", fingerprint, message: "rules unchanged since they were applied" };
+    } else if (plan.inSync) {
+      result = { status: "done", fingerprint, message: `provider already matches (${adapter.label})` };
+    } else {
+      for (const line of plan.changes) context.ui.print(`      ${line}`);
+      const applied = await adapter.apply(plan, firewallContext);
+      if (applied.status === "pending")
+        return { status: "pending", note: applied.note, finish: applied.finish };
+      result = { status: "done", fingerprint, message: `rules applied (${adapter.label})` };
+    }
   }
-  // The local audit runs once the provider rules are confirmed or applied (or left pending).
+  // The local audit follows confirmation or verified provider application.
   await must(context, [context.bun, "scripts/host-audit.ts", ...(retainSsh ? ["--retain-ssh"] : [])], {
     env: childEnv(context),
   });
@@ -1161,7 +1206,7 @@ async function providerFirewall(context: Context): Promise<StepResult> {
       `        sudo mise run host:audit --external ark-host-inventory.json ${ips.length ? ips.join(" ") : "<public-ipv4> <public-ipv6>"}`,
     );
   }
-  if (result.status === "done") result.message = `${result.message}; local audit passed`;
+  result.message = `${result.message}; local audit passed`;
   return result;
 }
 

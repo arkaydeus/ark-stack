@@ -80,18 +80,19 @@ Questions:
 
 Tailscale (environment only; read without echo otherwise):
   TS_API_KEY                              API access token: setup merges the policy and mints the keys
-  TS_OAUTH_CLIENT_SECRET                  or an OAuth client (scopes policy_file and auth_keys,
-    [TS_OAUTH_CLIENT_ID, TS_OAUTH_TAG]    tag tag:ark-setup); TS_TAILNET picks the tailnet (default -)
+  TS_OAUTH_CLIENT_SECRET                  or an OAuth client (scopes policy_file, auth_keys,
+                                         devices:posture_attributes and devices:core:read)
+    [TS_OAUTH_CLIENT_ID, TS_OAUTH_TAG]    tag tag:ark-setup; TS_TAILNET picks the tailnet (default -)
   TS_VPS_AUTHKEY or TS_VPS_AUTHKEY_FILE   or a one-off key for tag:ark-vps, pasted or given here
   TS_EDGE_AUTHKEY                         one-off key for tag:ark-edge
   TS_BACKUP_AUTHKEY                       one-off key for tag:ark-backup (with --backup-node)
-  --approve-tailnet-policy      ARK_SETUP_APPROVE_TAILNET_POLICY=1   Apply the shown policy change unasked
+  --approve-tailnet-policy      ARK_SETUP_APPROVE_TAILNET_POLICY=1   Preapprove the shown change with --non-interactive
   --backup-node                 ARK_SETUP_BACKUP_NODE=1              Also enrol backup-ts (tag:ark-backup)
 
 Provider firewall:
   --provider-firewall ID        ARK_SETUP_PROVIDER_FIREWALL          Adapter: hetzner or manual (default: detect)
   (environment only)            HCLOUD_TOKEN                         Hetzner Cloud API token (Read & Write)
-  --approve-provider-firewall   ARK_SETUP_APPROVE_PROVIDER_FIREWALL=1  Apply the shown API changes unasked
+  --approve-provider-firewall   ARK_SETUP_APPROVE_PROVIDER_FIREWALL=1  Preapprove the shown change with --non-interactive
   --provider-firewall-applied   ARK_SETUP_PROVIDER_FIREWALL_APPLIED=1  You applied the printed rules (manual)
 
 Steps and safety:

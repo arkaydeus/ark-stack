@@ -21,7 +21,7 @@ export type FirewallContext = {
   /** The owner already said the rules are applied (--provider-firewall-applied). */
   confirmed: boolean;
   retainSsh?: boolean;
-  /** --approve-provider-firewall: an API adapter may apply its plan without asking. */
+  /** Explicit non-interactive mode plus --approve-provider-firewall or its environment equivalent. */
   approved?: boolean;
   /** Registers a credential with the redactor (it stays in memory, never on disk or in the log). */
   secret?: (value: string) => void;
@@ -35,6 +35,8 @@ export type FirewallPlan = {
   inSync: boolean;
   /** Human-readable changes or instructions, printed before `apply`. */
   changes: string[];
+  /** Provider findings that should be shown even if the managed rules match. */
+  notices?: string[];
   /** Adapter-private data from `plan` that `apply` needs (the provider's current state). */
   state?: unknown;
 };

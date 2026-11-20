@@ -40,6 +40,7 @@ import {
   SetupLog,
   TerminalUi,
   runCommand,
+  withoutSetupSecrets,
   type Runner,
   type Ui,
 } from "./host-setup/system.ts";
@@ -174,8 +175,9 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
       ((input) =>
         automaticKeySource({
           ...input,
-          approve: options.approveTailnetPolicy,
+          approve: options.nonInteractive && options.approveTailnetPolicy,
           backup: options.backupNode,
+          sleep: deps.sleep,
           secret: (value) => redactor.add(value),
           log: (line) => log.write(line),
           apiBase: deps.tailscaleApi,
@@ -247,7 +249,7 @@ if (import.meta.main) {
     argv: process.argv.slice(2),
     env: process.env,
     run: runCommand,
-    lock: () => lockHostDeployment(root),
+    lock: () => lockHostDeployment(root, withoutSetupSecrets(process.env)),
     stateDir: process.env.ARK_SETUP_STATE_DIR || join(root, "tmp", "host-setup"),
     paths: { osRelease: "/etc/os-release", hostFirewall: hostFirewallPath },
     isRoot: process.getuid?.() === 0,

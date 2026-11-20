@@ -21,6 +21,12 @@
 ark_bootstrap() {
   set -euo pipefail
 
+  # Keep API credentials in shell memory while provisioning and resolving the Bun executable.
+  local ts_api_key="${TS_API_KEY:-}" ts_oauth_secret="${TS_OAUTH_CLIENT_SECRET:-}"
+  local ts_oauth_id="${TS_OAUTH_CLIENT_ID:-}" hcloud_token="${HCLOUD_TOKEN:-}"
+  export -n ts_api_key ts_oauth_secret ts_oauth_id hcloud_token
+  unset TS_API_KEY TS_OAUTH_CLIENT_SECRET TS_OAUTH_CLIENT_ID HCLOUD_TOKEN
+
   local repo_url="${ARK_REPO_URL:-https://github.com/arkaydeus/ark-stack.git}"
   local one_liner="curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh | sudo bash"
   local ref="${ARK_REF:-main}"
@@ -359,13 +365,22 @@ ref you want there yourself, then run this again."
 
   step "Starting the guided setup (mise run host:setup)"
   export ARK_HOST_DEPLOYMENT_LOCK_HELD=1
+  start_setup() {
+    if [[ -n "$ts_api_key$ts_oauth_secret$hcloud_token" ]]; then
+      local bun
+      bun="$(mise which bun)"
+      TS_API_KEY="$ts_api_key" TS_OAUTH_CLIENT_SECRET="$ts_oauth_secret" TS_OAUTH_CLIENT_ID="$ts_oauth_id" \
+        HCLOUD_TOKEN="$hcloud_token" exec "$bun" --no-env-file scripts/host-setup.ts "$@"
+    fi
+    mise run host:setup "$@"
+  }
   # The script itself arrived on stdin when piped, so prompts read the terminal instead.
   if [[ -t 0 ]]; then
-    mise run host:setup ${setup_args[@]+"${setup_args[@]}"}
+    start_setup ${setup_args[@]+"${setup_args[@]}"}
   elif { : </dev/tty; } 2>/dev/null; then
-    mise run host:setup ${setup_args[@]+"${setup_args[@]}"} </dev/tty
+    start_setup ${setup_args[@]+"${setup_args[@]}"} </dev/tty
   else
-    mise run host:setup ${setup_args[@]+"${setup_args[@]}"} </dev/null
+    start_setup ${setup_args[@]+"${setup_args[@]}"} </dev/null
   fi
 }
 

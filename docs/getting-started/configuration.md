@@ -180,7 +180,7 @@ Instead of the keys, `host:setup` accepts one Tailscale API credential in its en
 | Variable                 | Purpose                                                                                                                                                     |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TS_API_KEY`             | An API access token (`tskey-api-…`) of a tailnet admin.                                                                                                     |
-| `TS_OAUTH_CLIENT_SECRET` | Or an OAuth client secret (`tskey-client-…`) with the `policy_file` and `auth_keys` scopes.                                                                 |
+| `TS_OAUTH_CLIENT_SECRET` | Or an OAuth client secret (`tskey-client-…`) with `policy_file`, `auth_keys`, `devices:posture_attributes` and `devices:core:read`.                         |
 | `TS_OAUTH_CLIENT_ID`     | The OAuth client's ID, when it cannot be read from the secret.                                                                                              |
 | `TS_OAUTH_TAG`           | The OAuth client's tag (default `tag:ark-setup`), made an owner of the Ark tags.                                                                            |
 | `TS_TAILNET`             | The tailnet the credential manages (default `-`).                                                                                                           |

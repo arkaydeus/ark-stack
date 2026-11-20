@@ -1,13 +1,12 @@
 // The Tailscale API key source for the guided setup (part 2 of the automated installer).
 //
-// With one API credential (an API access token, or an OAuth client with the `policy_file` and
-// `auth_keys` scopes), setup merges the Ark entries into the tailnet policy after showing the diff
+// With one API credential, setup merges the Ark entries into the tailnet policy after showing the diff
 // and getting a yes, then mints one single-use, pre-approved, one-hour key per node and revokes it
 // once the node has joined. Without a credential the manual source (tailscale-keys.ts) is used.
 //
 // The credential, the OAuth access token and every minted key live only in this process's memory:
 // they are registered with the redactor, never written to disk, `.env`, the state file or the log,
-// and never passed to a child process except the one key a node needs, on stdin or in its env.
+// and only the one key a node needs is passed to its enrolment process, on stdin.
 import { ARK_BACKUP_TAG, ARK_EDGE_TAG, ARK_VPS_TAG } from "@ark-stack/shared";
 
 import type { Ui } from "./system.ts";
@@ -25,6 +24,7 @@ export const TAILSCALE_API = "https://api.tailscale.com";
 export const DEFAULT_OAUTH_TAG = "tag:ark-setup";
 /** Minted keys expire within the hour even if setup is interrupted before revoking them. */
 export const KEY_EXPIRY_SECONDS = 3600;
+const SETUP_OAUTH_SCOPES = ["policy_file", "devices:posture_attributes", "devices:core:read", "auth_keys"];
 
 export type TailscaleCredential =
   | { kind: "access-token"; token: string }
@@ -107,6 +107,7 @@ export class TailscaleApi {
         client_id: this.credential.clientId,
         client_secret: this.credential.clientSecret,
         grant_type: "client_credentials",
+        scope: SETUP_OAUTH_SCOPES.join(" "),
       }),
       signal: AbortSignal.timeout(30_000),
     });
@@ -114,7 +115,7 @@ export class TailscaleApi {
     const body = (await response.json().catch(() => ({}))) as { access_token?: string; expires_in?: number };
     if (!response.ok || !body.access_token) {
       throw new TailscaleApiError(
-        `Tailscale refused the OAuth client (HTTP ${response.status}). Check TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET.`,
+        `Tailscale refused the OAuth client (HTTP ${response.status}). Check TS_OAUTH_CLIENT_ID, TS_OAUTH_CLIENT_SECRET and the scopes ${SETUP_OAUTH_SCOPES.join(", ")}.`,
         response.status,
       );
     }
@@ -153,7 +154,7 @@ export class TailscaleApi {
     }
     const scopes =
       response.status === 401 || response.status === 403
-        ? ` The credential needs ${this.credential.kind === "oauth" ? "the policy_file and auth_keys scopes" : "an admin's API access token"}.`
+        ? ` The credential needs ${this.credential.kind === "oauth" ? `the OAuth scopes ${SETUP_OAUTH_SCOPES.join(", ")}` : "an admin's API access token"}.`
         : "";
     throw new TailscaleApiError(
       `Tailscale API: ${what} failed (HTTP ${response.status}${message ? `: ${message}` : ""}).${scopes}${hint}`,
@@ -240,10 +241,11 @@ export class TailscaleApi {
 export type ApiKeySourceOptions = {
   ui: Ui;
   interactive: boolean;
-  /** --approve-tailnet-policy: apply a policy change without asking (scripted installs). */
+  /** Explicit non-interactive mode plus --approve-tailnet-policy or its environment equivalent. */
   approve: boolean;
   /** Also declare tag:ark-backup (the optional backup node). */
   backup: boolean;
+  sleep?: (ms: number) => Promise<void>;
 };
 
 /** Mints the keys through the Tailscale API after merging the Ark entries into the policy. */
@@ -277,7 +279,7 @@ export function apiKeySource(
     if (problem) throw new Error(`Tailscale rejected the merged policy, so nothing was applied: ${problem}`);
     ui.print("      Tailscale validated the merged policy.");
     let approved = options.approve;
-    if (!approved && options.interactive) {
+    if (options.interactive) {
       const answer = await ui.ask("Apply this change to the tailnet policy? (yes/no)", "");
       approved = /^y(?:es)?$/i.test(answer.trim());
     }
@@ -285,7 +287,7 @@ export function apiKeySource(
       throw new Error(
         options.interactive
           ? "The tailnet policy change was declined, so nothing was applied. Re-run host:setup to review it again, or run it without a Tailscale credential to make the change by hand."
-          : "The tailnet policy needs the change shown above. Re-run with --approve-tailnet-policy to apply it, or interactively to review it.",
+          : "The tailnet policy needs the change shown above. Re-run with --non-interactive and --approve-tailnet-policy to apply it, or interactively to review it.",
       );
     }
     await api.setPolicy(merge.text, current.etag);
@@ -307,22 +309,30 @@ export function apiKeySource(
       await source.preparePolicy!();
       const minted = await api.createKey(request.tag, `ark-stack setup ${request.tag.slice(4)}`);
       ui.print(
-        `      Minted a one-off ${request.tag} key through the Tailscale API (pre-approved, expires in one hour).`,
+        `      Minted a one-off ${request.tag} key through the Tailscale API (ID ${minted.id}, expires in one hour).`,
       );
       let released = false;
       return {
         key: minted.key,
         inMemoryOnly: true,
         release: async () => {
-          if (released) return;
-          released = true;
-          try {
-            await api.deleteKey(minted.id);
-            ui.print(`      Revoked the ${request.tag} key.`);
-          } catch (error) {
-            ui.print(
-              `      Could not revoke the ${request.tag} key (${error instanceof Error ? error.message : String(error)}). It expires within the hour; revoke it under Settings > Keys.`,
-            );
+          if (released) return true;
+          for (let attempt = 0; ; attempt++) {
+            try {
+              await api.deleteKey(minted.id);
+              released = true;
+              ui.print(`      Revoked the ${request.tag} key.`);
+              return true;
+            } catch (error) {
+              const status = error instanceof TailscaleApiError ? error.status : undefined;
+              if (attempt === 2 || (status && status !== 408 && status !== 429 && status < 500)) {
+                ui.print(
+                  `      Could not revoke the ${request.tag} key (ID ${minted.id}). Revoke it under Settings > Keys. It expires within one hour of creation.`,
+                );
+                return false;
+              }
+              await (options.sleep ?? Bun.sleep)(250 * 2 ** attempt);
+            }
           }
         },
       };
@@ -337,6 +347,7 @@ export type AutomaticKeySourceOptions = {
   interactive: boolean;
   approve: boolean;
   backup: boolean;
+  sleep?: (ms: number) => Promise<void>;
   secret: (value: string) => void;
   log: (line: string) => void;
   apiBase?: string;
@@ -395,9 +406,12 @@ export function automaticKeySource(options: AutomaticKeySourceOptions): Tailscal
   const source: TailscaleKeySource = {
     id: "automatic",
     policyInstructions: () => tailnetPolicyInstructions({ backup: options.backup }),
-    async preparePolicy() {
+    async preparePolicy({ enrolled, offerCredential } = {}) {
+      // A manual rerun with an enrolled VPS does not need to review or re-save policy.
+      if (enrolled && !credentialFromEnv(env) && !(interactive && offerCredential)) return;
       const selected = await resolve();
       if (selected.preparePolicy) return selected.preparePolicy();
+      if (enrolled) return;
       for (const line of selected.policyInstructions()) ui.print(`      ${line}`);
       if (interactive) await ui.ask("Press Enter once the policy is saved", "");
     },

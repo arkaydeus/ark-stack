@@ -17,15 +17,15 @@ export type KeyRequest = {
 };
 
 export type AcquiredKey = {
-  /** The key itself, written by the caller to a private file or `.env`. */
+  /** The key itself. API-minted keys are handed to the enrolment command on stdin. */
   key?: string;
   /** Or a private key file the owner already made (`TS_VPS_AUTHKEY_FILE`); it is left in place. */
   file?: string;
   /**
    * Called once the key is no longer needed (the node joined, or the attempt failed): an API source
-   * revokes the key here. It never throws.
+   * revokes the key here. Returns whether revocation was confirmed.
    */
-  release?: () => Promise<void>;
+  release?: () => Promise<boolean>;
   /**
    * Never persist the key (not even in `.env`): hand it only to the process that uses it. Set by
    * the API source, whose keys are revoked after the join.
@@ -41,7 +41,7 @@ export interface TailscaleKeySource {
    * Gets the tailnet policy ready before the first key is used (an API source shows the change,
    * asks and applies it). Without it, setup prints `policyInstructions` and waits for the owner.
    */
-  preparePolicy?(): Promise<void>;
+  preparePolicy?(options?: { enrolled?: boolean; offerCredential?: boolean }): Promise<void>;
   /** Returns a key, or `undefined` when an optional key was declined. */
   acquire(request: KeyRequest): Promise<AcquiredKey | undefined>;
 }
@@ -58,7 +58,7 @@ export function tailnetPolicyInstructions({ backup = false }: { backup?: boolean
     "",
     "and the owner-only Tailscale SSH access to the VPS (merge it with your own grants and ssh rules):",
     "",
-    ...sshPolicyExample()
+    ...sshPolicyExample({ admin: "autogroup:owner", useDefaultCheckPeriod: true })
       .trimEnd()
       .split("\n")
       .map((line) => `  ${line}`),

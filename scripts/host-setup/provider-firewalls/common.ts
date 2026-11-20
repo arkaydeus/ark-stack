@@ -9,9 +9,9 @@ export async function approveProviderChange(
   context: FirewallContext,
   provider: string,
 ): Promise<FirewallResult | undefined> {
-  if (context.approved) return undefined;
-  const finish = `Re-run host:setup interactively, or with --approve-provider-firewall, to apply the ${provider} firewall changes above.`;
+  const finish = `Re-run host:setup interactively, or with --non-interactive and --approve-provider-firewall, to apply the ${provider} firewall changes above.`;
   if (!context.interactive) {
+    if (context.approved) return undefined;
     return {
       status: "pending",
       note: `The ${provider} firewall changes were shown but not approved.`,
