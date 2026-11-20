@@ -21,7 +21,12 @@ import {
   type HostSshAccess,
 } from "@ark-stack/shared";
 
-import { vpsNodeReady, type TailscaleState } from "../install-host-hardening.ts";
+import {
+  settledVpsNode,
+  vpsNodeProblem,
+  vpsNodeReady,
+  type TailscaleState,
+} from "../install-host-hardening.ts";
 import type { Answers, Options } from "./answers.ts";
 import { desiredConfiguration, readEnv, setEnvValues, writeEnv, writeHostFile } from "./env-file.ts";
 import {
@@ -155,6 +160,11 @@ export async function tailscaleStatus(context: Context): Promise<TailscaleState 
   }
 }
 
+/** The status, after a short wait if the node is correctly enrolled but not online yet. */
+function vpsTailscaleStatus(context: Context) {
+  return settledVpsNode(() => tailscaleStatus(context), context.sleep);
+}
+
 async function tailscaleSshEnabled(context: Context) {
   const result = await exec(context, ["tailscale", "debug", "prefs"]);
   try {
@@ -166,8 +176,9 @@ async function tailscaleSshEnabled(context: Context) {
 
 /** Host node enrolled as tag:ark-vps, tailscaled active and Tailscale SSH on. */
 async function tailscaleSshReady(context: Context) {
-  const status = await tailscaleStatus(context);
-  if (!status || !vpsNodeReady(status)) return "the host node is not running with exactly tag:ark-vps";
+  const status = await vpsTailscaleStatus(context);
+  const problem = status ? vpsNodeProblem(status) : "tailscale status is unavailable";
+  if (problem) return `the host node is not ready as ${ARK_VPS_TAG} (${problem})`;
   if (!(await tailscaleSshEnabled(context))) return "Tailscale SSH is not enabled (tailscale set --ssh)";
   const active = await exec(context, ["systemctl", "is-active", "tailscaled.service"]);
   if (active.stdout.trim() !== "active") return "tailscaled.service is not active";
@@ -191,7 +202,7 @@ function confirmationTarget(context: Context, status?: TailscaleState) {
 }
 
 async function requireSshConfirmation(context: Context) {
-  const target = confirmationTarget(context, await tailscaleStatus(context));
+  const target = confirmationTarget(context, await vpsTailscaleStatus(context));
   if (
     context.state.sshUserProvisioning ||
     context.state.sshUserNeedsConfirmation ||
@@ -331,7 +342,7 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
     await context.keys.preparePolicy?.(enrolled);
     return { status: "done", message: `already enrolled as ${ARK_VPS_TAG} with Tailscale SSH` };
   }
-  const status = await tailscaleStatus(context);
+  const status = await vpsTailscaleStatus(context);
   if (status && vpsNodeReady(status)) {
     await context.keys.preparePolicy?.(enrolled);
     await must(context, [context.bun, "scripts/install.ts", "--enroll-vps"], { env: childEnv(context) });
@@ -340,7 +351,9 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
     return { status: "done", message: `resumed enrolment with the existing ${ARK_VPS_TAG} node` };
   }
   if (status?.BackendState === "Running") {
-    throw new Error(`The running Tailscale node must use the host TUN interface and only ${ARK_VPS_TAG}.`);
+    throw new Error(
+      `The running Tailscale node must use the host TUN interface and only ${ARK_VPS_TAG}: ${vpsNodeProblem(status)}.`,
+    );
   }
   delete context.state.sshConfirmation;
   context.save();
@@ -560,7 +573,7 @@ async function sshGate(context: Context): Promise<StepResult> {
       "An earlier OpenSSH cutover is awaiting automatic recovery. Wait for its rollback timer to finish and retry.",
     );
   }
-  const status = await tailscaleStatus(context);
+  const status = await vpsTailscaleStatus(context);
   const target = confirmationTarget(context, status);
   await ensureSshUser(context);
   if (

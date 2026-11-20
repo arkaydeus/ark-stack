@@ -88,6 +88,9 @@ const fail = (stderr = "", status = 1): RunResult => ({ status, stdout: "", stde
 class FakeHost {
   calls: string[] = [];
   enrolled = false;
+  /** Status reads that report the enrolled node as not online yet. */
+  offlineReads = 0;
+  vpsTags?: string[];
   runSsh = false;
   healthy = false;
   ssh = { service: { enabled: true, active: true }, socket: { enabled: false, active: false } };
@@ -182,14 +185,19 @@ class FakeHost {
       return ok();
     }
     if (line === "tailscale status --json") {
+      let online = this.enrolled;
+      if (online && this.offlineReads > 0) {
+        this.offlineReads--;
+        online = false;
+      }
       return ok(
         JSON.stringify({
           BackendState: this.enrolled ? "Running" : "NeedsLogin",
           TUN: true,
           Self: {
             ID: this.nodeId,
-            Online: this.enrolled,
-            Tags: this.enrolled ? ["tag:ark-vps"] : [],
+            Online: online,
+            Tags: this.vpsTags ?? (this.enrolled ? ["tag:ark-vps"] : []),
             DNSName: "ark-vps.tail1234.ts.net.",
             TailscaleIPs: ["100.100.1.2", "fd7a:115c:a1e0::1"],
           },
@@ -587,6 +595,32 @@ describe("host:setup Tailscale SSH gate", () => {
     expect(f.host.calls).toContain(`${BUN} scripts/install.ts --enroll-vps`);
     expect(f.host.vpsKeyFromStdin).toBe(false);
     expect(f.host.runSsh).toBe(true);
+  });
+
+  test("waits for an enrolled node that is briefly offline instead of refusing it", async () => {
+    const f = fixture();
+    f.host.enrolled = true;
+    f.host.runSsh = true;
+    f.host.offlineReads = 3;
+    const result = await setup(f, BASE);
+    expect(result.code).toBe(2);
+    expect(result.text).not.toContain("host TUN interface");
+    expect(f.host.offlineReads).toBe(0);
+  });
+
+  test.each([
+    ["stays offline", { offlineReads: 1000 }, "not online with the Tailscale control server"],
+    ["has another tag", { vpsTags: ["tag:ark-vps", "tag:other"] }, "tagged tag:ark-vps, tag:other"],
+    ["is owned by a user", { vpsTags: [] }, "untagged (owned by a user)"],
+  ])("a running node that %s is refused with the reason", async (_, change, reason) => {
+    const f = fixture();
+    f.host.enrolled = true;
+    Object.assign(f.host, change);
+    const result = await setup(f, BASE, KEYS);
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("host TUN interface");
+    expect(result.text).toContain(reason);
+    expect(f.host.calls.some((call) => call.includes("--enroll-vps"))).toBe(false);
   });
 
   test("requires a local SSH user before mutating the host", async () => {

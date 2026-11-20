@@ -61,25 +61,60 @@ async function tailscaleState() {
   return JSON.parse(await hostCommand("tailscale", ["status", "--json"])) as TailscaleState;
 }
 
+export const VPS_NODE_OFFLINE = "the node is not online with the Tailscale control server yet";
+
+/** Why the host node is not up on the host TUN interface, online and tagged exactly `tag:ark-vps`. */
+export function vpsNodeProblem(state: TailscaleState): string | undefined {
+  if (state.BackendState !== "Running") return `Tailscale is ${state.BackendState || "not running"}`;
+  if (!state.TUN) return "tailscaled uses userspace networking, not the host TUN interface";
+  const tags = state.Self?.Tags ?? [];
+  if (tags.length !== 1 || tags[0] !== ARK_VPS_TAG) {
+    const current = tags.length ? `tagged ${tags.join(", ")}` : "untagged (owned by a user)";
+    return `the node is ${current}; it must be tagged exactly ${ARK_VPS_TAG}`;
+  }
+  if (!state.Self?.Online) return VPS_NODE_OFFLINE;
+  return undefined;
+}
+
 /** The host node is up on the host TUN interface, online and tagged exactly `tag:ark-vps`. */
 export function vpsNodeReady(state: TailscaleState) {
-  return (
-    state.BackendState === "Running" &&
-    state.TUN &&
-    state.Self?.Online &&
-    state.Self.Tags?.length === 1 &&
-    state.Self.Tags[0] === ARK_VPS_TAG
-  );
+  return vpsNodeProblem(state) === undefined;
+}
+
+const ONLINE_POLL_MS = 2000;
+const ONLINE_POLL_ATTEMPTS = 15;
+
+/**
+ * Reads the status again for up to ~30 s while the node is otherwise correct but not yet online:
+ * `Self.Online` briefly reads false right after tailscaled starts or reconnects.
+ */
+export async function settledVpsNode<T extends TailscaleState | undefined>(
+  read: () => Promise<T>,
+  sleep: (ms: number) => Promise<void> = Bun.sleep,
+): Promise<T> {
+  let state = await read();
+  for (
+    let attempt = 1;
+    attempt < ONLINE_POLL_ATTEMPTS && state && vpsNodeProblem(state) === VPS_NODE_OFFLINE;
+    attempt++
+  ) {
+    await sleep(ONLINE_POLL_MS);
+    state = await read();
+  }
+  return state;
 }
 
 export async function enrollVps(readKey?: () => Promise<string>) {
   requireLinuxRoot();
   if (!Bun.which("tailscale")) await aptInstall(["tailscale"]);
   await hostCommand("systemctl", ["enable", "--now", "tailscaled.service"]);
-  const state = await tailscaleState();
-  if (!vpsNodeReady(state)) {
+  const state = await settledVpsNode(tailscaleState);
+  const problem = vpsNodeProblem(state);
+  if (problem) {
     if (state.BackendState === "Running") {
-      throw new Error(`The running Tailscale node must use the host TUN interface and only ${ARK_VPS_TAG}.`);
+      throw new Error(
+        `The running Tailscale node must use the host TUN interface and only ${ARK_VPS_TAG}: ${problem}.`,
+      );
     }
     const keyFile = readKey ? "/dev/stdin" : await vpsAuthKeyFile(process.env.TS_VPS_AUTHKEY_FILE);
     const args = [
@@ -97,8 +132,8 @@ export async function enrollVps(readKey?: () => Promise<string>) {
       await hostCommand("tailscale", args);
     }
   }
-  if (!vpsNodeReady(await tailscaleState()))
-    throw new Error(`The host Tailscale node must be running with ${ARK_VPS_TAG}.`);
+  const enrolled = vpsNodeProblem(await settledVpsNode(tailscaleState));
+  if (enrolled) throw new Error(`The host Tailscale node must be running with ${ARK_VPS_TAG}: ${enrolled}.`);
   await hostCommand("tailscale", ["set", "--ssh"]);
   console.log("Verify Tailscale SSH as the owner before running host:install --harden-vps.");
 }
@@ -184,7 +219,7 @@ export function rebootMetricCommands(directory: string) {
 export async function installHostHardening(getConfig: (ssh: HostSshAccess) => Promise<HostPortConfig>) {
   requireLinuxRoot();
   if (
-    !vpsNodeReady(await tailscaleState()) ||
+    !vpsNodeReady(await settledVpsNode(tailscaleState)) ||
     !JSON.parse(await hostCommand("tailscale", ["debug", "prefs"])).RunSSH
   ) {
     throw new Error("Run host:install --enroll-vps and verify owner Tailscale SSH first.");
