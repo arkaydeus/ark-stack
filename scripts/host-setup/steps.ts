@@ -872,8 +872,12 @@ async function closePublicSsh(context: Context): Promise<StepResult> {
 
       const command = freshSshCommand(context, await tailscaleStatus(context));
       if (context.interactive) {
-        context.ui.print("      Open a fresh session from your own device: " + command);
-        const answer = await context.ui.ask("Type yes if it works (anything else restores OpenSSH)", "");
+        context.ui.print("      Open a fresh session from your own device within four minutes: " + command);
+        const answer = await context.ui.ask(
+          "Type yes if it works (anything else restores OpenSSH)",
+          "",
+          AbortSignal.timeout(240_000),
+        );
         if (!/^yes$/i.test(answer.trim()))
           throw new Error("The fresh Tailscale SSH login was not confirmed.");
       } else {
@@ -894,7 +898,7 @@ async function closePublicSsh(context: Context): Promise<StepResult> {
       lock,
       "/bin/sh",
       "-ec",
-      'test ! -e "$1/restored"; touch "$1/verified"',
+      'test ! -e "$1/rollback-started"; touch "$1/verified"',
       "sh",
       directory,
     ]);

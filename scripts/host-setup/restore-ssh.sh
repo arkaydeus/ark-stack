@@ -7,6 +7,7 @@ ufw_directory=$3
 shift 3
 if [ "$mode" = timed ] && [ -e "$directory/verified" ]; then exit 0; fi
 if [ -e "$directory/restored" ]; then exit 0; fi
+touch "$directory/rollback-started"
 
 failed=0
 if [ -e "$directory/ufw-changed" ]; then

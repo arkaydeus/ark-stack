@@ -269,11 +269,11 @@ description = "Opt-in scan and owner Tailscale SSH against a scratch VPS and scr
 run = "bun --no-env-file scripts/test-host-hardening-live.ts"
 
 [tasks."test:install-bootstrap"]
-description = "Run install.sh in disposable Ubuntu containers: refusals (non-root, unsupported OS, distribution docker.io without Compose v2) and the full apt path for Docker, mise and Tailscale up to the guided setup (requires Docker and network access)"
+description = "Test bootstrap on supported Ubuntu releases, Docker conflict and repair paths, deployment lock contention, and scoped SSH recovery in disposable Linux containers"
 run = "bun --no-env-file scripts/test-install-bootstrap.ts"
 
 [tasks."test:install-live"]
-description = "Opt-in: run the one-command installer on a scratch Ubuntu VPS and check the SSH gate, hardening, closed public SSH and the audit (skips without ARK_TEST_INSTALL_* variables)"
+description = "Opt-in: check the SSH gate, failed and successful cutovers, hardening and audit on a scratch VPS and tailnet (skips without ARK_TEST_INSTALL_* variables)"
 run = "bun --no-env-file scripts/test-install-live.ts"
 
 [tasks.import]
