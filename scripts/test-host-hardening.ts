@@ -603,6 +603,9 @@ EOF`,
   await host("nft", "add", "rule", "inet", "test_provider", "input", "udp", "dport", "41641", "drop");
   await docker("exec", "-d", vps, "bun", fixture, "unexpected-udp");
   await host("nft", "insert", "rule", "inet", "ark_host", "input", "udp", "dport", "161", "accept");
+  const input = await host("nft", "-a", "-n", "list", "chain", "inet", "ark_host", "input");
+  const udpRule = /udp dport 161 accept\s+# handle (\d+)/.exec(input)?.[1];
+  assert.ok(udpRule, input);
   const udpPid = await ready(async () => {
     const sockets = await host("ss", "-H", "-lunp", "sport", "=", ":161");
     const pid = /:161\s[^\n]*pid=(\d+)/.exec(sockets)?.[1];
@@ -616,6 +619,7 @@ EOF`,
     );
   } finally {
     await host("nft", "delete", "table", "inet", "test_provider");
+    await host("nft", "delete", "rule", "inet", "ark_host", "input", "handle", udpRule);
   }
   await host("kill", udpPid);
   await applyPolicy("on");

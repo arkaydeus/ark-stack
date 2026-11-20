@@ -1,5 +1,5 @@
-// The guided setup against a simulated Ubuntu host. The opt-in Docker tests also run disposable,
-// network-isolated containers to check the metadata stored during enrolment.
+// The guided setup against a simulated Ubuntu host. The opt-in Docker tests verify live OpenSSH
+// and enrolment in disposable, network-isolated containers.
 import assert from "node:assert/strict";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  chmodSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -135,6 +136,13 @@ class FakeHost {
   sshdHonoursDropIn = true;
   sshdSyntax = ok();
   sshReloads = 0;
+  failSshReloads = 0;
+  delayedSshReload = false;
+  liveSshBlocked = new Set<string>();
+  alternateSshConfig = false;
+  unmanagedSshListener = false;
+  sshHandshakePending = false;
+  sleeps: number[] = [];
   failUseradd?: "before-create" | "after-create";
   passwords = new Map<string, string>();
   failChpasswd = false;
@@ -147,6 +155,18 @@ class FakeHost {
 
   get envPath() {
     return join(this.root, ".env");
+  }
+
+  finishSshReload() {
+    this.sshReloads++;
+    this.liveSshBlocked.clear();
+    if (!this.sshdHonoursDropIn || !existsSync(this.sshdConfigDir)) return;
+    for (const file of readdirSync(this.sshdConfigDir)) {
+      const user = /^10-ark-ssh-user-(.+)\.conf$/.exec(file)?.[1];
+      if (user && readFileSync(join(this.sshdConfigDir, file), "utf8") === sshUserPolicy(user)) {
+        this.liveSshBlocked.add(user);
+      }
+    }
   }
 
   run = async (argv: string[], options: RunOptions = {}): Promise<RunResult> => {
@@ -174,8 +194,12 @@ class FakeHost {
       if (line === "/usr/sbin/sshd -t") return this.sshdSyntax;
       const user = /^user=(.+)$/.exec(argv.at(-1) ?? "")?.[1];
       const dropIn = user && join(this.sshdConfigDir, `10-ark-ssh-user-${user}.conf`);
-      if (dropIn && this.sshdHonoursDropIn && existsSync(dropIn)) {
-        expect(readFileSync(dropIn, "utf8")).toContain(`Match User ${user}\n`);
+      if (
+        dropIn &&
+        this.sshdHonoursDropIn &&
+        existsSync(dropIn) &&
+        readFileSync(dropIn, "utf8") === sshUserPolicy(user!)
+      ) {
         return {
           ...this.opensshConfig,
           stdout: "passwordauthentication no\nkbdinteractiveauthentication no\n",
@@ -183,10 +207,50 @@ class FakeHost {
       }
       return this.opensshConfig;
     }
+    if (line.startsWith("systemctl show --property=LoadState") && argv.at(-1) === "ssh.service") {
+      return ok(
+        [
+          "LoadState=loaded",
+          `ActiveState=${this.ssh.service.active ? "active" : "inactive"}`,
+          `MainPID=${this.ssh.service.active ? 900 : 0}`,
+          "FragmentPath=/usr/lib/systemd/system/ssh.service",
+          "NeedDaemonReload=no",
+          "ExecStart={ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D $SSHD_OPTS ; ignore_errors=no ; }",
+          "EnvironmentFiles=/etc/default/ssh (ignore_errors=yes)",
+        ].join("\n"),
+      );
+    }
+    if (line.startsWith("systemctl show --property=ActiveState") && argv.at(-1) === "ssh.socket") {
+      return ok(
+        this.ssh.socket.active
+          ? "ActiveState=active\nTriggers=ssh.service\nAccept=no\nListen=0.0.0.0:22 (Stream) [::]:22 (Stream)\n"
+          : "ActiveState=inactive\n",
+      );
+    }
+    if (line.startsWith("sh -ec if [ -e /etc/default/ssh ]")) return ok("SSHD_OPTS=\n");
+    if (line.startsWith('sh -ec readlink "/proc/$1/exe";')) {
+      const flags = this.alternateSshConfig ? " -f /opt/ssh/sshd_config" : "";
+      return ok(
+        `/usr/sbin/sshd\nsshd: /usr/sbin/sshd -D${flags} [listener] 0 of 10-100 startups\n` +
+          `${this.sshReloads.toString(16).padStart(64, "0")}  /proc/900/auxv\n`,
+      );
+    }
     if (line === "systemctl reload ssh.service") {
-      this.sshReloads++;
+      if (this.failSshReloads > 0) {
+        this.failSshReloads--;
+        return fail("reload failed");
+      }
+      if (!this.delayedSshReload) this.finishSshReload();
       return ok();
     }
+    if (line === "ss -H -tnp state connected") {
+      return ok(
+        this.sshHandshakePending
+          ? 'ESTAB 0 0 203.0.113.10:22 198.51.100.23:49152 users:(("sshd",pid=899,fd=4))\n'
+          : "",
+      );
+    }
+    if (line === "ps -ww -p 899 -o pid=,args=") return ok("899 sshd: example@notty [priv]\n");
     if (argv[0] === "useradd") {
       if (this.failUseradd === "before-create") return fail("useradd: group 'sudo' does not exist", 6);
       const user = argv.at(-1)!;
@@ -198,6 +262,10 @@ class FakeHost {
       return ok();
     }
     if (argv[0] === "chpasswd") {
+      const user = options.stdin?.split(":", 1)[0];
+      if (this.ssh.service.active && this.opensshConfig.stdout.includes("authentication yes")) {
+        expect(this.liveSshBlocked.has(user!)).toBe(true);
+      }
       if (this.failChpasswd) return fail(`Rejected input: ${options.stdin}`);
       const record = options.stdin ?? "";
       const separator = record.indexOf(":");
@@ -419,12 +487,16 @@ class FakeHost {
     }
     if (line === "ss -H -ltnp") {
       if (!this.ssh.service.active && this.failListenersAfterStop) return fail("ss failed");
+      if (this.unmanagedSshListener)
+        return ok('LISTEN 0 128 127.0.0.1:2222 0.0.0.0:* users:(("sshd",pid=901,fd=3))\n');
       if (this.ssh.service.active && this.privateSsh)
         return ok('LISTEN 0 128 127.0.0.1:22 0.0.0.0:* users:(("sshd",pid=900,fd=3))\n');
       return ok(
         this.ssh.service.active
           ? 'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=900,fd=3))\nLISTEN 0 4096 [::]:22 [::]:* users:(("sshd",pid=900,fd=4))\n'
-          : 'LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:* users:(("docker-proxy",pid=1,fd=4))\n',
+          : this.ssh.socket.active
+            ? 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("systemd",pid=1,fd=3))\n'
+            : 'LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:* users:(("docker-proxy",pid=1,fd=4))\n',
       );
     }
     if (line === "ufw status numbered")
@@ -553,7 +625,9 @@ async function setup(
     platform: "linux",
     bun: BUN,
     stdinIsTty: Boolean(ui?.interactive),
-    sleep: async () => {
+    sleep: async (ms) => {
+      f.host.sleeps.push(ms);
+      if (ms === 250 && f.host.delayedSshReload) f.host.finishSshReload();
       if (!f.host.denyProof && existsSync(f.stateDir)) {
         const transaction = readdirSync(f.stateDir).find((name) => name.startsWith("ssh-cutover-"));
         if (transaction) writeFileSync(join(f.stateDir, transaction, "proof"), "");
@@ -646,7 +720,7 @@ describe("host:setup Tailscale SSH gate", () => {
     ["stays offline", { offlineReads: 1000 }, "not online with the Tailscale control server"],
     ["has another tag", { vpsTags: ["tag:ark-vps", "tag:other"] }, "tagged tag:ark-vps, tag:other"],
     ["is owned by a user", { vpsTags: [] }, "untagged (owned by a user)"],
-  ])("a running node that %s is refused with the reason", async (_, change, reason) => {
+  ])("a running node that %s is refused with the reason", async (scenario, change, reason) => {
     const f = fixture();
     f.host.enrolled = true;
     Object.assign(f.host, change);
@@ -655,6 +729,7 @@ describe("host:setup Tailscale SSH gate", () => {
     expect(result.text).toContain("host TUN interface");
     expect(result.text).toContain(reason);
     expect(f.host.calls.some((call) => call.includes("--enroll-vps"))).toBe(false);
+    expect(f.host.sleeps).toEqual(scenario === "stays offline" ? Array(14).fill(2000) : []);
   });
 
   test("requires a local SSH user before mutating the host", async () => {
@@ -963,6 +1038,8 @@ describe("host:setup missing SSH user", () => {
       expect(readFileSync(dropIn, "utf8")).toBe(sshUserPolicy("alice"));
       expect((statSync(dropIn).mode & 0o777).toString(8)).toBe("644");
       expect(result.text).toContain(`Turned off OpenSSH password login for alice only (${dropIn}).`);
+      expect(result.text).toContain("Stopped before firewall hardening and the public SSH cutover.");
+      expect(result.text).toContain(`OpenSSH password login remains disabled for alice in ${dropIn}.`);
       const index = (call: string) => f.host.calls.indexOf(call);
       expect(index("/usr/sbin/sshd -t")).toBeGreaterThan(-1);
       expect(index("/usr/sbin/sshd -t")).toBeLessThan(index("systemctl reload ssh.service"));
@@ -978,11 +1055,88 @@ describe("host:setup missing SSH user", () => {
     const f = fixture();
     f.host.missingUsers.add("alice");
     f.host.ssh.service.active = false;
+    f.host.ssh.socket.active = true;
     f.host.opensshConfig = ok("passwordauthentication yes\nkbdinteractiveauthentication no\n");
     const result = await setup(f, [], {}, { scripted: interactiveUi("yes") });
     expect(result.code).toBe(2);
     expect(existsSync(join(f.sshdConfigDir, "10-ark-ssh-user-alice.conf"))).toBe(true);
     expect(f.host.sshReloads).toBe(0);
+  });
+
+  test.each([false, true])("retries a failed SSH reload with an existing drop-in: %s", async (existing) => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    f.host.opensshConfig = ok("passwordauthentication yes\nkbdinteractiveauthentication no\n");
+    const path = join(f.sshdConfigDir, "10-ark-ssh-user-alice.conf");
+    if (existing) {
+      writeFileSync(path, sshUserPolicy("alice"));
+      chmodSync(path, 0o644);
+    }
+    f.host.failSshReloads = 1;
+    const failed = await setup(f, [], {}, { scripted: interactiveUi("yes", []) });
+    expect(failed.code).toBe(1);
+    expect(failed.text).toContain("systemctl reload ssh.service failed");
+    expect(existsSync(path)).toBe(existing);
+    expect(f.host.liveSshBlocked.has("alice")).toBe(false);
+    expect(f.host.calls.some((call) => /^(useradd|chpasswd)/.test(call))).toBe(false);
+
+    f.host.calls.length = 0;
+    f.host.delayedSshReload = true;
+    const retry = await setup(f, [], {}, { scripted: interactiveUi("yes") });
+    expect(retry.code).toBe(2);
+    expect(f.host.sleeps).toEqual([250]);
+    expect(f.host.liveSshBlocked.has("alice")).toBe(true);
+    expect(f.host.calls.indexOf("systemctl reload ssh.service")).toBeLessThan(
+      f.host.calls.findIndex((call) => call.startsWith("useradd")),
+    );
+    expect(f.host.passwords.get("alice")).toBe(PASSWORD);
+  });
+
+  test("preserves the administrator's SSH file and metadata when refusing provisioning", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    f.host.opensshConfig = ok("passwordauthentication yes\nkbdinteractiveauthentication no\n");
+    f.host.sshdSyntax = fail("sshd: bad configuration", 255);
+    const path = join(f.sshdConfigDir, "10-ark-ssh-user-alice.conf");
+    const content = "Match User existing\n    PasswordAuthentication no\n";
+    writeFileSync(path, content, { mode: 0o640 });
+    const before = statSync(path);
+    const result = await setup(f, [], {}, { scripted: interactiveUi("yes", []) });
+    const after = statSync(path);
+    expect(result.code).toBe(1);
+    expect(result.text).toContain(`Setup will preserve the existing file at ${path}.`);
+    expect(readFileSync(path, "utf8")).toBe(content);
+    for (const key of ["ino", "mode", "uid", "gid", "mtimeMs"] as const) expect(after[key]).toBe(before[key]);
+    expect(f.host.calls.some((call) => /^(useradd|chpasswd)/.test(call))).toBe(false);
+  });
+
+  test("waits for stale OpenSSH handshakes before creating a password account", async () => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    f.host.opensshConfig = ok("passwordauthentication yes\nkbdinteractiveauthentication no\n");
+    f.host.sshHandshakePending = true;
+    const first = await setup(f, [], {}, { scripted: interactiveUi("yes", []) });
+    expect(first.code).toBe(1);
+    expect(first.text).toContain("Wait for pending OpenSSH logins to finish, then retry.");
+    expect(f.host.calls.some((call) => /^(useradd|chpasswd)/.test(call))).toBe(false);
+    f.host.sshHandshakePending = false;
+    expect((await setup(f, [], {}, { scripted: interactiveUi("yes") })).code).toBe(2);
+    expect(f.host.passwords.get("alice")).toBe(PASSWORD);
+  });
+
+  test.each(["alternate config", "unmanaged listener"])("refuses an %s before provisioning", async (kind) => {
+    const f = fixture();
+    f.host.missingUsers.add("alice");
+    if (kind === "alternate config") f.host.alternateSshConfig = true;
+    else {
+      f.host.ssh.service.active = false;
+      f.host.unmanagedSshListener = true;
+    }
+    const result = await setup(f, [], {}, { scripted: interactiveUi("yes", []) });
+    expect(result.code).toBe(1);
+    expect(result.text).toContain("provision a protected local account manually");
+    expect(f.host.calls.some((call) => /^(useradd|chpasswd)/.test(call))).toBe(false);
+    expect(readdirSync(f.sshdConfigDir)).toEqual([]);
   });
 
   test("leaves an existing user's OpenSSH policy alone", async () => {
@@ -2064,6 +2218,85 @@ describe("host:setup with a Tailscale API credential", () => {
     },
   );
 });
+
+test.skipIf(process.env.ARK_TEST_SETUP_DOCKER !== "1")(
+  "Ubuntu applies the new user's live OpenSSH policy and waits for enrolled nodes",
+  async () => {
+    const name = `ark-setup-ssh-${crypto.randomUUID().slice(0, 12)}`;
+    const directory = mkdtempSync(join(tmpdir(), `${name}-`));
+    const image = `${name}:fixture`;
+    const docker = async (...args: string[]) => {
+      const result = await runCommand(["docker", ...args]);
+      assert.equal(result.status, 0, `${args[0]}: ${result.stdout}\n${result.stderr}`);
+    };
+    try {
+      const bundle = await Bun.build({
+        entrypoints: [join(import.meta.dir, "host-hardening-test/ssh.ts")],
+        target: "bun",
+        outdir: directory,
+        sourcemap: "inline",
+      });
+      assert.ok(bundle.success, bundle.logs.join("\n"));
+      await docker(
+        "build",
+        "--quiet",
+        "--target",
+        "ssh",
+        "-t",
+        image,
+        join(import.meta.dir, "host-hardening-test"),
+      );
+      await docker(
+        "run",
+        "-d",
+        "--name",
+        name,
+        "--network",
+        "none",
+        "--privileged",
+        "--cgroupns",
+        "private",
+        "--tmpfs",
+        "/run",
+        "--tmpfs",
+        "/run/lock",
+        image,
+        "/sbin/init",
+      );
+      for (let attempt = 0; ; attempt++) {
+        const ready = await runCommand([
+          "docker",
+          "exec",
+          name,
+          "systemctl",
+          "show",
+          "--property=SystemState",
+          "--value",
+        ]);
+        if (ready.status === 0 && /^(?:running|degraded)\s*$/.test(ready.stdout)) break;
+        assert.ok(attempt < 100, `Ubuntu systemd did not start: ${ready.stderr}`);
+        await Bun.sleep(100);
+      }
+      await docker("exec", name, "mkdir", "/work");
+      await docker("cp", join(directory, "ssh.js"), `${name}:/work/ssh.js`);
+      await docker("exec", name, "bun", "/work/ssh.js", "ssh");
+      await docker(
+        "exec",
+        "-e",
+        "PATH=/work/bin:/usr/local/bin:/usr/bin:/bin",
+        name,
+        "bun",
+        "/work/ssh.js",
+        "tailscale",
+      );
+    } finally {
+      await runCommand(["docker", "rm", "-f", name]);
+      await runCommand(["docker", "image", "rm", image]);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+  240_000,
+);
 
 // Uses the real Tailscale image and Docker metadata, in a unique Compose project with no network,
 // host mounts or published ports. The simulated API hands off dummy keys only.

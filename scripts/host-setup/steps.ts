@@ -3,7 +3,16 @@
 // The existing installer phases do the work: `install.ts --enroll-vps`, `install.ts --harden-vps`,
 // `edge-namespace.ts` (edge:rejoin) and `host-audit.ts`. Keys come from the context's
 // TailscaleKeySource and the provider firewall from the first ProviderFirewall that detects the VPS.
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
 
@@ -176,8 +185,7 @@ async function tailscaleSshEnabled(context: Context) {
 }
 
 /** Host node enrolled as tag:ark-vps, tailscaled active and Tailscale SSH on. */
-async function tailscaleSshReady(context: Context) {
-  const status = await vpsTailscaleStatus(context);
+async function tailscaleSshReady(context: Context, status: TailscaleState | undefined) {
   const problem = status ? vpsNodeProblem(status) : "tailscale status is unavailable";
   if (problem) return `the host node is not ready as ${ARK_VPS_TAG} (${problem})`;
   if (!(await tailscaleSshEnabled(context))) return "Tailscale SSH is not enabled (tailscale set --ssh)";
@@ -203,7 +211,8 @@ function confirmationTarget(context: Context, status?: TailscaleState) {
 }
 
 async function requireSshConfirmation(context: Context) {
-  const target = confirmationTarget(context, await vpsTailscaleStatus(context));
+  const status = await vpsTailscaleStatus(context);
+  const target = confirmationTarget(context, status);
   if (
     context.state.sshUserProvisioning ||
     context.state.sshUserNeedsConfirmation ||
@@ -211,7 +220,7 @@ async function requireSshConfirmation(context: Context) {
   ) {
     throw new SetupPaused("The current Tailscale node and local user need a fresh SSH confirmation.");
   }
-  const problem = await tailscaleSshReady(context);
+  const problem = await tailscaleSshReady(context, status);
   if (problem) throw new Error(`Tailscale SSH is unavailable: ${problem}.`);
 }
 
@@ -339,15 +348,15 @@ async function prerequisites(context: Context): Promise<StepResult> {
 
 async function tailscaleEnrolment(context: Context): Promise<StepResult> {
   const enrolled = { enrolled: true, offerCredential: !context.state.sshConfirmation };
-  if (!(await tailscaleSshReady(context))) {
+  const status = await vpsTailscaleStatus(context);
+  if (!(await tailscaleSshReady(context, status))) {
     await context.keys.preparePolicy?.(enrolled);
     return { status: "done", message: `already enrolled as ${ARK_VPS_TAG} with Tailscale SSH` };
   }
-  const status = await vpsTailscaleStatus(context);
   if (status && vpsNodeReady(status)) {
     await context.keys.preparePolicy?.(enrolled);
     await must(context, [context.bun, "scripts/install.ts", "--enroll-vps"], { env: childEnv(context) });
-    const problem = await tailscaleSshReady(context);
+    const problem = await tailscaleSshReady(context, await vpsTailscaleStatus(context));
     if (problem) throw new Error(`Enrolment finished but ${problem}.`);
     return { status: "done", message: `resumed enrolment with the existing ${ARK_VPS_TAG} node` };
   }
@@ -374,7 +383,7 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
     } else {
       await must(context, [...command, "--key-stdin"], { env: childEnv(context), stdin: key.key });
     }
-    const problem = await tailscaleSshReady(context);
+    const problem = await tailscaleSshReady(context, await vpsTailscaleStatus(context));
     if (problem) throw new Error(`Enrolment finished but ${problem}.`);
   } finally {
     // The node joined, or the attempt failed: a minted key is revoked either way.
@@ -419,13 +428,9 @@ function requireFreshHome(home: string) {
   }
 }
 
-/**
- * What OpenSSH would allow `user`: `safe` (no sshd, or the user is denied or both password methods
- * are off), `passwords-allowed` (a plain config that still accepts passwords) or `unverified`.
- */
+/** Effective password policy for the default OpenSSH configuration on disk. */
 async function openSshPasswordCheck(context: Context, user: string) {
   const result = await exec(context, ["/usr/sbin/sshd", "-ddd", "-T", "-C", `user=${user}`]);
-  if (result.status === 127 && !(await sshListeners(context)).length) return "safe";
   // sshd evaluates Match User before the account exists. Group and connection-specific criteria
   // can produce a different result after useradd or for a remote client. Refuse those configs.
   const matches = [...result.stderr.matchAll(/^debug3: checking syntax for 'Match (.*)'\r?$/gim)];
@@ -442,16 +447,209 @@ async function openSshPasswordCheck(context: Context, user: string) {
   return deniesUser || disablesPasswords ? "safe" : "passwords-allowed";
 }
 
-function openSshPasswordError(user: string, prefix = "") {
+function openSshPasswordError(user: string, prefix = "", cause?: unknown) {
   return new Error(
     `${prefix}Cannot verify that OpenSSH blocks password login for ${user}. Keep your current recovery session open. ` +
       `Apply and reload a policy that denies ${user} or disables PasswordAuthentication and KbdInteractiveAuthentication for ${user}, then retry. ` +
       `For a custom OpenSSH configuration, provision a protected local account manually and pass it with --ssh-user.`,
+    { cause },
   );
 }
 
-async function requireSafeOpenSshPassword(context: Context, user: string) {
-  if ((await openSshPasswordCheck(context, user)) !== "safe") throw openSshPasswordError(user);
+async function sshUnitProperties(context: Context, unit: string, ...properties: string[]) {
+  const result = await exec(
+    context,
+    ["systemctl", "show", ...properties.map((p) => `--property=${p}`), unit],
+    {
+      onLine: undefined,
+    },
+  );
+  const values = new Map<string, string>();
+  if (result.status !== 0) return values;
+  for (const [, key, value] of result.stdout.matchAll(/^(\w+)=(.*)$/gm)) {
+    values.set(key!, [values.get(key!), value].filter(Boolean).join(" "));
+  }
+  return values;
+}
+
+const sshdProcess = /^sshd(?:-session|-auth)?$/;
+const socketOwner = /\("([^"]+)",pid=(\d+),fd=\d+\)/g;
+
+/** Which OpenSSH listener can use the default configuration, and which daemon image is running. */
+async function openSshService(context: Context, user: string) {
+  const refuse = () =>
+    openSshPasswordError(
+      user,
+      "Could not establish that every SSH listener uses the default Ubuntu service and configuration. ",
+    );
+  const service = await sshUnitProperties(
+    context,
+    "ssh.service",
+    "LoadState",
+    "ActiveState",
+    "MainPID",
+    "FragmentPath",
+    "DropInPaths",
+    "NeedDaemonReload",
+    "ExecStart",
+    "Environment",
+    "PassEnvironment",
+    "EnvironmentFiles",
+  );
+  const state = service.get("ActiveState");
+  const pid = service.get("MainPID");
+  let generation: string | undefined;
+  const installed = service.get("LoadState") !== "not-found";
+  if (installed) {
+    if (
+      !["loaded", "masked"].includes(service.get("LoadState") ?? "") ||
+      (state !== "active" && state !== "inactive" && state !== "failed")
+    )
+      throw refuse();
+    if (service.get("LoadState") === "loaded") {
+      // Ubuntu starts sshd with the default config and optional flags from /etc/default/ssh.
+      // Limit provisioning to that service, including when it is waiting for socket activation.
+      if (
+        !/^\/(?:usr\/)?lib\/systemd\/system\/ssh\.service$/.test(service.get("FragmentPath") ?? "") ||
+        service.get("NeedDaemonReload") !== "no" ||
+        (service.get("DropInPaths") ?? "") !== "" ||
+        !/^\{ path=\/usr\/sbin\/sshd ; argv\[\]=\/usr\/sbin\/sshd -D(?: \$SSHD_OPTS)? ; [^{}]*\}$/.test(
+          service.get("ExecStart") ?? "",
+        ) ||
+        service.get("Environment") ||
+        service.get("PassEnvironment") ||
+        !/^(?:\/etc\/default\/ssh \(ignore_errors=yes\))?$/.test(service.get("EnvironmentFiles") ?? "")
+      )
+        throw refuse();
+      if (service.get("EnvironmentFiles")) {
+        const defaults = await exec(
+          context,
+          ["sh", "-ec", "if [ -e /etc/default/ssh ]; then cat /etc/default/ssh; fi"],
+          { onLine: undefined },
+        );
+        if (
+          defaults.status !== 0 ||
+          !defaults.stdout
+            .split("\n")
+            .every((line) => /^\s*(?:#.*|SSHD_OPTS\s*=\s*(?:""|'')?\s*)?$/.test(line))
+        )
+          throw refuse();
+      }
+    }
+    if (state === "active") {
+      if (!/^[1-9]\d+$/.test(pid ?? "") || service.get("LoadState") !== "loaded") throw refuse();
+      // sshd rewrites its title with its original arguments. The image's auxv changes on
+      // re-exec even though SIGHUP keeps the PID. Keep both proc values out of the setup log.
+      const process = await exec(
+        context,
+        [
+          "sh",
+          "-ec",
+          'readlink "/proc/$1/exe"; tr "\\000" "\\n" < "/proc/$1/cmdline"; ' +
+            'mount=$(readlink /proc/self/ns/mnt); daemon_mount=$(readlink "/proc/$1/ns/mnt"); ' +
+            'root=$(stat -Lc %d:%i /); daemon_root=$(stat -Lc %d:%i "/proc/$1/root"); ' +
+            'test "$mount" = "$daemon_mount"; test "$root" = "$daemon_root"; sha256sum "/proc/$1/auxv"',
+          "sh",
+          pid!,
+        ],
+        { onLine: undefined },
+      );
+      const [executable, title] = process.stdout.split("\n");
+      generation = /^([0-9a-f]{64})  \/proc\/\d+\/auxv$/m.exec(process.stdout)?.[1];
+      if (
+        process.status !== 0 ||
+        executable !== "/usr/sbin/sshd" ||
+        !generation ||
+        !/^sshd: \/usr\/sbin\/sshd -D \[listener\](?: |$)/.test(title ?? "")
+      )
+        throw refuse();
+    } else if (pid !== "0") throw refuse();
+  }
+
+  const socket = await sshUnitProperties(
+    context,
+    "ssh.socket",
+    "ActiveState",
+    "Triggers",
+    "Accept",
+    "Listen",
+  );
+  const socketEndpoints = new Set<string>();
+  if (socket.get("ActiveState") === "active") {
+    if (!installed || socket.get("Triggers") !== "ssh.service" || socket.get("Accept") !== "no")
+      throw refuse();
+    for (const [, endpoint] of (socket.get("Listen") ?? "").matchAll(/(\S+) \(Stream\)/g)) {
+      socketEndpoints.add(endpoint);
+    }
+    if (!socketEndpoints.size) throw refuse();
+  } else if (!["inactive", "failed"].includes(socket.get("ActiveState") ?? "")) throw refuse();
+
+  const result = await exec(context, ["ss", "-H", "-ltnp"]);
+  if (result.status !== 0) throw refuse();
+  let listening = false;
+  for (const line of result.stdout.trim().split("\n").filter(Boolean)) {
+    const endpoint = /^(?:tcp\s+)?LISTEN\s+\d+\s+\d+\s+(\S+:\d+)\s/.exec(line.trim())?.[1];
+    if (!endpoint) throw refuse();
+    const owners = [...line.matchAll(socketOwner)];
+    const manager = (name: string, owner: string) => name === "systemd" && owner === "1";
+    const knownSocket = socketEndpoints.has(endpoint.replace(/^\*:/, "[::]:"));
+    if (
+      !endpoint.endsWith(":22") &&
+      !owners.some(([, name, owner]) => sshdProcess.test(name!) || manager(name!, owner!))
+    ) {
+      continue;
+    }
+    if (
+      !owners.length ||
+      !owners.every(
+        ([, name, owner]) =>
+          (sshdProcess.test(name!) && owner === pid && generation) || (manager(name!, owner!) && knownSocket),
+      )
+    )
+      throw refuse();
+    if (owners.some(([, name]) => sshdProcess.test(name!))) listening = true;
+  }
+  if (generation && !listening) throw refuse();
+  return { installed, generation };
+}
+
+async function requireSshHandshakesFinished(context: Context, user: string) {
+  // Children that were already negotiating can retain the pre-reload policy.
+  // A logged-in session has an owner titled `sshd: user@...` and can stay open.
+  const sockets = await exec(context, ["ss", "-H", "-tnp", "state", "connected"]);
+  if (sockets.status !== 0) throw openSshPasswordError(user);
+  const connections = sockets.stdout
+    .split("\n")
+    .map((line) =>
+      [...line.matchAll(socketOwner)].filter(([, name]) => sshdProcess.test(name!)).map(([, , pid]) => pid!),
+    )
+    .filter((owners) => owners.length);
+  if (!connections.length) return;
+  const pids = [...new Set(connections.flat())].join(",");
+  const processes = await exec(context, ["ps", "-ww", "-p", pids, "-o", "pid=,args="], { onLine: undefined });
+  const loggedIn = new Set(
+    [...processes.stdout.matchAll(/^[ \t]*(\d+)\s+sshd(?:-session)?: [^\s@]+@\S+[ \t]*$/gm)].map(
+      ([, pid]) => pid,
+    ),
+  );
+  if (connections.some((owners) => !owners.some((pid) => loggedIn.has(pid)))) {
+    throw openSshPasswordError(user, "Wait for pending OpenSSH logins to finish, then retry. ");
+  }
+}
+
+async function reloadOpenSsh(context: Context, user: string, generation: string) {
+  await must(context, ["systemctl", "reload", "ssh.service"]);
+  // Ubuntu's reload command sends SIGHUP. Wait for the replacement image to listen.
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      const service = await openSshService(context, user);
+      if (service.generation && service.generation !== generation) return service;
+    } catch {
+      // The process and sockets may briefly be between re-exec and listen.
+    }
+    await context.sleep(250);
+  }
+  throw new Error("ssh.service did not return with a verified listening daemon after reload.");
 }
 
 /** Scoped to `user` only: a Match block in an Included file ends at the end of that file. */
@@ -472,23 +670,74 @@ export function sshUserPolicy(user: string) {
  * Any other login, root included, keeps its current settings.
  */
 async function blockOpenSshPasswords(context: Context, user: string) {
+  const service = await openSshService(context, user);
+  if (!service.installed) {
+    // An installed binary without the stock service is a custom setup.
+    if ((await exec(context, ["test", "-x", "/usr/sbin/sshd"])).status !== 1)
+      throw openSshPasswordError(user);
+    return { ...service, policyPath: undefined };
+  }
   const check = await openSshPasswordCheck(context, user);
-  if (check === "safe") return;
   const directory = context.paths.sshdConfigDir ?? "/etc/ssh/sshd_config.d";
-  if (check === "unverified" || !existsSync(directory)) throw openSshPasswordError(user);
   const path = join(directory, `10-ark-ssh-user-${user}.conf`);
-  writeHostFile(path, sshUserPolicy(user), 0o644);
-  const syntax = await exec(context, ["/usr/sbin/sshd", "-t"]);
-  if (syntax.status !== 0 || (await openSshPasswordCheck(context, user)) !== "safe") {
-    rmSync(path, { force: true });
+  const policy = sshUserPolicy(user);
+  const existing = lstatSync(path, { throwIfNoEntry: false });
+  if (
+    existing &&
+    (!existing.isFile() ||
+      existing.uid !== process.getuid?.() ||
+      existing.gid !== process.getgid?.() ||
+      (existing.mode & 0o7777) !== 0o644 ||
+      readFileSync(path, "utf8") !== policy)
+  )
+    throw openSshPasswordError(user, `Setup will preserve the existing file at ${path}. `);
+  if (check === "unverified" || (check === "passwords-allowed" && (existing || !existsSync(directory)))) {
+    throw openSshPasswordError(user);
+  }
+
+  let created: ReturnType<typeof lstatSync> | undefined;
+  try {
+    if (check === "passwords-allowed") {
+      // Publish the complete file atomically without replacing an entry created by an administrator.
+      const temp = mkdtempSync(join(directory, ".ark-ssh-user-"));
+      try {
+        const draft = join(temp, "policy");
+        writeFileSync(draft, policy);
+        chmodSync(draft, 0o644);
+        const info = lstatSync(draft);
+        linkSync(draft, path);
+        created = info;
+      } finally {
+        rmSync(temp, { recursive: true, force: true });
+      }
+      if ((await exec(context, ["/usr/sbin/sshd", "-t"])).status !== 0) {
+        throw new Error("OpenSSH rejected the configuration.");
+      }
+      if ((await openSshPasswordCheck(context, user)) !== "safe") {
+        throw new Error("OpenSSH still allows password login or the effective policy could not be verified.");
+      }
+    }
+    // Refresh even a safe on-disk policy. A previous attempt or administrator may have left
+    // it on disk without loading it in the daemon.
+    const current = await openSshService(context, user);
+    const verified = current.generation ? await reloadOpenSsh(context, user, current.generation) : current;
+    if (created) context.ui.print(`      Turned off OpenSSH password login for ${user} only (${path}).`);
+    return { ...verified, policyPath: created || existing ? path : undefined };
+  } catch (error) {
+    const current = created && lstatSync(path, { throwIfNoEntry: false });
+    const ours =
+      current &&
+      current.dev === created?.dev &&
+      current.ino === created?.ino &&
+      readFileSync(path, "utf8") === policy;
+    if (ours) rmSync(path);
+    const message = error instanceof Error ? error.message : String(error);
     throw openSshPasswordError(
       user,
-      `Setup wrote ${path}, but OpenSSH ${syntax.status === 0 ? "still allows password login" : "rejected the configuration"}; the file was removed. `,
+      `${message} ${ours ? `Setup removed its new file at ${path}. ` : ""}`,
+      error,
     );
   }
-  const active = await exec(context, ["systemctl", "is-active", "ssh.service"]);
-  if (active.stdout.trim() === "active") await must(context, ["systemctl", "reload", "ssh.service"]);
-  context.ui.print(`      Turned off OpenSSH password login for ${user} only (${path}).`);
 }
 
 async function reconcileSshUserProvisioning(context: Context) {
@@ -561,7 +810,8 @@ async function ensureSshUser(context: Context) {
   if (!/^yes$/i.test(answer.trim())) throw new Error(`The local user ${user} does not exist. ${manual}`);
   const home = join(context.paths.sshHomeBase ?? "/home", user);
   requireFreshHome(home);
-  await blockOpenSshPasswords(context, user);
+  const protectedSsh = await blockOpenSshPasswords(context, user);
+  await requireSshHandshakesFinished(context, user);
   let password: string;
   for (;;) {
     password = await context.ui.askPassword(`Password for ${user} (used for sudo)`);
@@ -603,12 +853,21 @@ async function ensureSshUser(context: Context) {
   ) {
     throw new Error(`Could not verify the new login account ${user} and its home directory ${home}.`);
   }
-  await requireSafeOpenSshPassword(context, user);
+  if (protectedSsh.installed && (await openSshPasswordCheck(context, user)) !== "safe") {
+    throw openSshPasswordError(user);
+  }
+  const current = await openSshService(context, user);
+  if (
+    current.installed !== protectedSsh.installed ||
+    (protectedSsh.generation && current.generation && current.generation !== protectedSsh.generation)
+  )
+    throw openSshPasswordError(user, "The OpenSSH service changed during account provisioning. ");
   const set = await exec(context, ["chpasswd"], { stdin: `${user}:${password}\n`, onLine: undefined });
   if (set.status !== 0) await rollbackSshUser(context, user, set.status);
   delete context.state.sshUserProvisioning;
   context.save();
   context.ui.print(`      Created ${user} (member of sudo).`);
+  return protectedSsh.policyPath;
 }
 
 async function sshGate(context: Context): Promise<StepResult> {
@@ -625,7 +884,7 @@ async function sshGate(context: Context): Promise<StepResult> {
   }
   const status = await vpsTailscaleStatus(context);
   const target = confirmationTarget(context, status);
-  await ensureSshUser(context);
+  const policyPath = await ensureSshUser(context);
   if (
     !context.state.sshUserNeedsConfirmation &&
     !context.state.sshCutoverPending &&
@@ -669,7 +928,8 @@ async function sshGate(context: Context): Promise<StepResult> {
     delete context.state.steps["ssh-gate"];
     context.save();
     throw new SetupPaused(
-      `Stopped before hardening: Tailscale SSH has not been confirmed. Nothing on the firewall or OpenSSH changed.
+      `Stopped before firewall hardening and the public SSH cutover. Tailscale SSH has not been confirmed.
+${policyPath ? `OpenSSH password login remains disabled for ${context.answers.sshUser} in ${policyPath}.\n` : ""}
 Check that \`${command}\` works from your own device, then resume with:
 
   ${context.resumeCommand}${context.interactive ? "" : " --tailscale-ssh-confirmed"}`,
