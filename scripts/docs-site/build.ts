@@ -33,6 +33,19 @@ const ROOT = join(import.meta.dir, "..", "..");
 const ASSETS = import.meta.dir;
 const MERMAID = "https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.esm.min.mjs";
 
+/**
+ * Ark Stack icon files copied into the site (output path → repository file), all derived from
+ * assets/brand/ark-stack-icon.png by `mise run brand:icons`. Markdown images of these repository
+ * files (the README's icon) use the copy, so the site does not depend on GitHub for them.
+ */
+export const BRAND_FILES: Record<string, string> = {
+  "favicon.ico": "web/public/favicon.ico",
+  "assets/brand/icon-32.png": "web/public/brand/icon-32.png",
+  "assets/brand/icon-96.png": "web/public/brand/icon-96.png",
+  "assets/brand/ark-stack-icon-256.png": "assets/brand/ark-stack-icon-256.png",
+};
+const BRAND_COPIES = new Map(Object.entries(BRAND_FILES).map(([out, source]) => [source, out]));
+
 /** Output path of a source file, relative to the site root: docs/a/b.md → a/b.html, README.md → readme.html. */
 export function pageUrl(file: string) {
   if (file === "README.md") return "readme.html";
@@ -155,7 +168,13 @@ export function renderMarkdown(ctx: RenderContext, file: string, markdown: strin
     return `<a href="${escapeHtml(target)}"${external}`;
   });
   html = html.replace(/<img src="([^"]*)"/g, (_, src: string) => {
-    const target = rewriteHref(ctx, file, url, decodeEntities(src)).replace("/blob/", "/raw/");
+    const decoded = decodeEntities(src);
+    const copy = /^[\w./-]+$/.test(decoded)
+      ? BRAND_COPIES.get(normalize(join(dirname(file), decoded)).replace(/\\/g, "/"))
+      : undefined;
+    const target = copy
+      ? relativeUrl(url, copy)
+      : rewriteHref(ctx, file, url, decoded).replace("/blob/", "/raw/");
     return `<img src="${escapeHtml(target)}"`;
   });
 
@@ -251,6 +270,8 @@ export function layout(nav: Nav, pages: Page[], index: number) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(page.title)} · ${escapeHtml(nav.title)} docs</title>
 <meta name="description" content="${escapeHtml(searchEntries(page)[0]?.text.slice(0, 160) ?? page.title)}">
+<link rel="icon" href="${base}favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="icon" href="${base}assets/brand/icon-32.png" type="image/png" sizes="32x32">
 <link rel="stylesheet" href="${base}assets/style.css">
 <script>try{var t=localStorage.getItem("ark-docs-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
 </head>
@@ -258,7 +279,7 @@ export function layout(nav: Nav, pages: Page[], index: number) {
 <a class="skip" href="#content">Skip to content</a>
 <header class="topbar">
   <button class="menu-toggle" type="button" aria-label="Toggle navigation" aria-controls="sidebar" aria-expanded="false"><span></span></button>
-  <a class="brand" href="${base}index.html"><span class="brand-mark" aria-hidden="true">A</span>${escapeHtml(nav.title)} <span class="brand-docs">Docs</span></a>
+  <a class="brand" href="${base}index.html"><img class="brand-mark" src="${base}assets/brand/icon-96.png" alt="" width="28" height="28">${escapeHtml(nav.title)} <span class="brand-docs">Docs</span></a>
   <div class="search">
     <input id="search" type="search" placeholder="Search the docs" aria-label="Search the docs" autocomplete="off" spellcheck="false">
     <kbd class="search-key" aria-hidden="true">/</kbd>
@@ -314,6 +335,7 @@ export function buildSite(out: string, root = ROOT) {
   );
   files.set("assets/style.css", readFileSync(join(ASSETS, "style.css")));
   files.set("assets/site.js", readFileSync(join(ASSETS, "site.js")));
+  for (const [path, source] of Object.entries(BRAND_FILES)) files.set(path, readFileSync(join(ROOT, source)));
   // Loaded on first search, as a script rather than JSON so the site also works from file://.
   const index = pages.flatMap(searchEntries);
   files.set("assets/search-index.js", `window.ARK_DOCS_INDEX=${JSON.stringify(index)};\n`);

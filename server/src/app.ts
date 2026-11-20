@@ -193,7 +193,14 @@ import {
   type GateResponse,
 } from "./modules/gate.ts";
 import { edgeLeaseDocument } from "./modules/gate-revocations.ts";
-import { enrollPage, gateMessagePage, gateNonce, gatePageHeaders, loginPage } from "./gate-pages.ts";
+import {
+  enrollPage,
+  gateBrandAsset,
+  gateMessagePage,
+  gateNonce,
+  gatePageHeaders,
+  loginPage,
+} from "./gate-pages.ts";
 import {
   createGateUser,
   deleteGateUser,
@@ -4279,6 +4286,15 @@ app.post("/gate/logout", async (c) => {
     for (const cookie of signedOut.headers.getSetCookie()) headers.append("Set-Cookie", cookie);
   }
   return new Response(null, { status: 303, headers });
+});
+
+// The gate pages' icon (favicon and page mark): fixed, cacheable paths on the login origin only, so
+// the pages' CSP needs just `img-src 'self'`.
+app.get("/gate/brand/:file", (c) => {
+  if (c.get("requestOrigin")?.origin !== "gate") return c.json({ error: "Not found." }, 404);
+  const asset = gateBrandAsset(new URL(c.req.url).pathname);
+  if (!asset) return c.json({ error: "Not found." }, 404);
+  return c.body(asset.body, 200, asset.headers);
 });
 
 app.all("/gate/*", (c) => c.json({ error: "Not found." }, 404));

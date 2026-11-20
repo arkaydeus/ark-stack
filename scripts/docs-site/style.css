@@ -126,16 +126,12 @@ a:hover {
   text-decoration: none;
 }
 
+/* The Ark Stack icon (assets/brand/icon-96.png): its rounded corners are in the image itself. */
 .brand-mark {
-  display: grid;
-  place-items: center;
+  display: block;
+  flex: none;
   width: 28px;
   height: 28px;
-  border-radius: 7px;
-  background: var(--accent);
-  color: var(--bg);
-  font-size: 15px;
-  font-weight: 750;
 }
 
 .brand-docs {

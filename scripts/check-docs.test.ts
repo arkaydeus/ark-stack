@@ -100,6 +100,11 @@ describe("documentation check", () => {
       "Set `ARK_DB_*_B64`, `ARK_TEST_S3_*` or `ARK_DB_*_NOT_REAL`.",
       "env var: ARK_DB_*_NOT_REAL",
     ],
+    [
+      "inline HTML images",
+      '<img src="../../assets/brand/ark-stack-icon-256.png" alt=""> <img alt="" src="../../assets/brand/missing.png"> <img src="https://example.com/x.png">',
+      "image: ../../assets/brand/missing.png",
+    ],
   ])("checks %s", (_, doc, diagnostic) => {
     expect(
       checkMarkdown(ctx, "docs/guides/fixture.md", doc, "full").map(

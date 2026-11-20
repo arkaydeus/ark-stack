@@ -62,7 +62,7 @@ The dev override `infra/platform/docker-compose.dev.yml` binds the control-plane
 | `lint:fix`     | `bunx oxlint --fix .`                                                             |
 | `typecheck`    | `bunx tsc --noEmit` for each workspace and each `scripts/tsconfig.*.json` project |
 
-`typecheck` covers `shared`, `server`, `web` and `workers`, plus the script projects for the image publisher (`scripts/tsconfig.publish.json`), the PgBouncer probes (`scripts/tsconfig.pgbouncer.json`), the disposable test database (`scripts/tsconfig.test-db.json`), the backup harnesses (`scripts/tsconfig.backups.json`) and the docs check and site generator (`scripts/tsconfig.docs.json`). CI runs `oxlint` with `--deny-warnings`, which `mise run lint` does not.
+`typecheck` covers `shared`, `server`, `web` and `workers`, plus the script projects for the image publisher (`scripts/tsconfig.publish.json`), the PgBouncer probes (`scripts/tsconfig.pgbouncer.json`), the disposable test database (`scripts/tsconfig.test-db.json`), the backup harnesses (`scripts/tsconfig.backups.json`) and the docs check, site generator and icon generator (`scripts/tsconfig.docs.json`). CI runs `oxlint` with `--deny-warnings`, which `mise run lint` does not.
 
 ## Documentation
 
@@ -71,6 +71,8 @@ The dev override `infra/platform/docker-compose.dev.yml` binds the control-plane
 | `docs:check` | `bun scripts/check-docs.ts`            | Fails on any documentation drift                                          |
 | `docs:build` | `bun scripts/docs-site/build.ts build` | Writes the static site to `dist/docs`, or `--out dir`                     |
 | `docs:serve` | `bun scripts/docs-site/build.ts serve` | Serves on `http://127.0.0.1:4321/` (or `--port n`) and rebuilds on change |
+
+| `brand:icons` | `bun scripts/brand-icons.ts` | Regenerates the committed icons from `assets/brand/ark-stack-icon.png`; dev only |
 
 `docs:build` requires an empty output directory or one that holds a docs build manifest from an earlier build. If you have an older unmarked `dist/docs`, move it aside or choose a fresh directory with `--out`. What the docs check verifies is described in [Testing](../development/testing.md).
 

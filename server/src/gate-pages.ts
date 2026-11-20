@@ -6,8 +6,13 @@
 // `next`, which must be a relative `/gate/authorize?…` path. Pages send a strict CSP, no referrer
 // and no caching, and cannot be framed. `/gate/enroll` makes a signed-in user without TOTP enroll an
 // authenticator before any route is reachable.
+//
+// The Ark Stack icon (favicon and the mark above each page's heading) is served by this origin from
+// `/gate/brand/`, a fixed path in the namespace the gate already owns, so the CSP needs only
+// `img-src 'self'`; script and style stay nonce-bound.
 
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 const escapeHtml = (value: string) =>
   value.replace(
@@ -18,6 +23,7 @@ const escapeHtml = (value: string) =>
 const STYLE = `
   body { font: 16px/1.5 system-ui, sans-serif; margin: 0; background: #f6f6f7; color: #18181b; }
   main { max-width: 22rem; margin: 12vh auto; padding: 2rem; background: #fff; border: 1px solid #e4e4e7; border-radius: 0.5rem; }
+  .mark { display: block; width: 2.5rem; height: 2.5rem; margin: 0 0 1rem; }
   h1 { font-size: 1.25rem; margin: 0 0 1rem; }
   label { display: block; margin: 0.75rem 0 0.25rem; font-size: 0.875rem; }
   input { width: 100%; box-sizing: border-box; padding: 0.5rem; font: inherit; border: 1px solid #a1a1aa; border-radius: 0.25rem; }
@@ -33,7 +39,38 @@ export function gatePageHeaders(nonce: string): Record<string, string> {
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+    "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+  };
+}
+
+/**
+ * The icon files the gate serves, by request path. They are the admin UI's copies
+ * (web/public/brand/, derived from assets/brand/ark-stack-icon.png by `mise run brand:icons`).
+ */
+export const GATE_BRAND_ASSETS: Record<string, string> = {
+  "/gate/brand/icon-32.png": "icon-32.png",
+  "/gate/brand/icon-96.png": "icon-96.png",
+};
+
+const brandFiles = new Map<string, Uint8Array<ArrayBuffer>>();
+
+/** The response for a gate icon path, or null when `path` is not one. Long-lived and public. */
+export function gateBrandAsset(path: string) {
+  const name = Object.hasOwn(GATE_BRAND_ASSETS, path) ? GATE_BRAND_ASSETS[path]! : null;
+  if (!name) return null;
+  let body = brandFiles.get(name);
+  if (!body) {
+    body = new Uint8Array(readFileSync(new URL(`../../web/public/brand/${name}`, import.meta.url)));
+    brandFiles.set(name, body);
+  }
+  return {
+    body,
+    headers: {
+      "Content-Type": "image/png",
+      "Cache-Control": "public, max-age=604800",
+      "X-Content-Type-Options": "nosniff",
+      "Cross-Origin-Resource-Policy": "same-origin",
+    },
   };
 }
 
@@ -49,10 +86,12 @@ function page(nonce: string, title: string, body: string, script = "") {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>${escapeHtml(title)}</title>
+<link rel="icon" href="/gate/brand/icon-32.png" type="image/png" sizes="32x32">
 <style nonce="${nonce}">${STYLE}</style>
 </head>
 <body>
 <main>
+<img class="mark" src="/gate/brand/icon-96.png" alt="Ark Stack" width="40" height="40">
 ${body}
 </main>
 ${script || body.includes(SIGN_OUT_FORM) ? `<script nonce="${nonce}">${body.includes(SIGN_OUT_FORM) ? SIGN_OUT_SCRIPT : ""}${script}</script>` : ""}

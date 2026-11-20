@@ -16,6 +16,7 @@ This page is a guided tour of the source tree for contributors: what lives in ea
 | `scripts/`             | Operator CLIs (install, audit, maintenance, recovery, import, publishing), the docs check and site generator, and the Docker test harnesses |
 | `tests/`               | Cross-cutting Bun tests: `tests/security` (static manifest and policy checks) and `tests/browser` (HTTP flows)                              |
 | `e2e/`                 | Playwright browser specs                                                                                                                    |
+| `assets/brand/`        | The Ark Stack icon: the supplied master (`assets/brand/ark-stack-icon.png`) and the README's 256px copy                                     |
 | `docs/`                | This documentation, the runbooks, guides, design history and reviews                                                                        |
 | `.github/`             | CI workflows and the Dependabot configuration                                                                                               |
 | `mise.toml`            | Pinned tool versions and every project task ([Commands](../reference/commands.md))                                                          |
@@ -99,7 +100,8 @@ Each worker is a small entry point that imports the coordinator's `executeClaime
 - `web/src/main.tsx` mounts the app; `web/src/App.tsx` holds the sign-in, MFA and wizard gates and the navigation. Views are selected by the URL hash (`#/domains`, `#/front-routes` and so on); owner-only entries are flagged `ownerOnly`.
 - `web/src/pages/Views.tsx` holds most views (overview, domains and endpoints, projects, databases, email, services, activity, backups, updates, settings). Larger views have their own files: `web/src/pages/FrontRoutes.tsx`, `web/src/pages/FrontAcl.tsx`, `web/src/pages/GateUsers.tsx`, `web/src/pages/DnsReview.tsx`, `web/src/pages/BackupTargets.tsx`, `web/src/pages/PoolerPolicy.tsx`, `web/src/pages/VercelRollover.tsx`, `web/src/pages/Auth.tsx` and `web/src/pages/Wizard.tsx`.
 - `web/src/lib/utils.ts` has the `api` fetch helper (credentials included, JSON content type, `ApiError` on non-2xx) and `act` for fire-and-forget mutations that surface errors in the global banner. `web/src/lib/auth-client.ts` is the Better Auth client and `web/src/lib/types.ts` the API types.
-- `web/src/components/ui` holds the small set of shadcn-style primitives (button, card, badge, input) on Radix UI.
+- `web/src/components/ui` holds the small set of shadcn-style primitives (button, card, badge, input) on Radix UI. `web/src/components/brand-mark.tsx` is the icon beside the "Ark Stack" wordmark.
+- `web/public/` holds the favicon, the web app manifest and the sized icons in `web/public/brand/`. Every icon is derived from `assets/brand/ark-stack-icon.png` by `mise run brand:icons` (`scripts/brand-icons.ts`, Bun only) and committed; the gate pages and the docs site serve copies of the same files.
 
 In development Vite proxies `/api` to `127.0.0.1:3000`. In production the API serves the built UI (Vite's `dist` output in `web/`) itself.
 
@@ -132,7 +134,7 @@ In development Vite proxies `/api` to `127.0.0.1:3000`. In production the API se
 
 ## scripts, tests and e2e
 
-`scripts/` mixes three kinds of file: operator CLIs wrapped by mise tasks (`scripts/install.ts`, `scripts/host-audit.ts`, `scripts/maintain.ts`, `scripts/recover-mfa.ts`, `scripts/recover-host.ts`, `scripts/import.ts`, `scripts/publish-images.ts`, `scripts/pin-edge-caddy.ts`, `scripts/edge-namespace.ts`), the modules they import (`scripts/install-*.ts`, `scripts/host-inventory.ts` and others), and the test harnesses (`scripts/test-*.ts`, `scripts/edge-test/`, `scripts/backup-test/` and the other `*-test/` folders). `scripts/check-docs.ts` is the documentation drift check and `scripts/docs-site/build.ts` builds this site from `docs/nav.json`. [Commands](../reference/commands.md) lists every script and [Testing](../development/testing.md) every harness.
+`scripts/` mixes three kinds of file: operator CLIs wrapped by mise tasks (`scripts/install.ts`, `scripts/host-audit.ts`, `scripts/maintain.ts`, `scripts/recover-mfa.ts`, `scripts/recover-host.ts`, `scripts/import.ts`, `scripts/publish-images.ts`, `scripts/pin-edge-caddy.ts`, `scripts/edge-namespace.ts`), the modules they import (`scripts/install-*.ts`, `scripts/host-inventory.ts` and others), and the test harnesses (`scripts/test-*.ts`, `scripts/edge-test/`, `scripts/backup-test/` and the other `*-test/` folders). `scripts/check-docs.ts` is the documentation drift check, `scripts/docs-site/build.ts` builds this site from `docs/nav.json` and `scripts/brand-icons.ts` derives the icons. [Commands](../reference/commands.md) lists every script and [Testing](../development/testing.md) every harness.
 
 ## Tech stack
 

@@ -14,6 +14,7 @@ import { join } from "node:path";
 
 import { anchors } from "../check-docs.ts";
 import {
+  BRAND_FILES,
   buildSite,
   loadNav,
   navProblems,
@@ -210,9 +211,19 @@ describe("the documentation site", () => {
       for (const file of files) expect(existsSync(join(out, file))).toBe(true);
       for (const asset of ["assets/style.css", "assets/site.js", "assets/search-index.js"])
         expect(existsSync(join(out, asset))).toBe(true);
+      for (const [asset, source] of Object.entries(BRAND_FILES))
+        expect(readFileSync(join(out, asset))).toEqual(readFileSync(join(root, source)));
       const home = readFileSync(join(out, "index.html"), "utf8");
       expect(home).toContain('<aside class="sidebar"');
       expect(home).toContain('aria-current="page"');
+      expect(home).toContain('<link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">');
+      expect(home).toContain('<img class="brand-mark" src="assets/brand/icon-96.png" alt=""');
+      const nested = readFileSync(join(out, pageUrl("docs/guides/front-door.md")), "utf8");
+      expect(nested).toContain('<link rel="icon" href="../favicon.ico"');
+      expect(nested).toContain('<img class="brand-mark" src="../assets/brand/icon-96.png"');
+      // The README's icon uses the site's copy rather than GitHub.
+      const readme = readFileSync(join(out, "readme.html"), "utf8");
+      expect(readme).toContain('<img src="assets/brand/ark-stack-icon-256.png" alt="Ark Stack icon"');
       const index = readFileSync(join(out, "assets/search-index.js"), "utf8");
       expect(index.startsWith("window.ARK_DOCS_INDEX=")).toBe(true);
     } finally {

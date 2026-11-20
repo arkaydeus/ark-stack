@@ -33,7 +33,11 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts scripts/brand-icons.test.ts"
+
+[tasks."brand:icons"]
+description = "Regenerate the committed Ark Stack icons (favicons, app and manifest icons, logos, README icon) from assets/brand/ark-stack-icon.png (dev only)"
+run = "bun scripts/brand-icons.ts"
 
 [tasks."docs:check"]
 description = "Check that the operator docs and guides name only existing files, links, anchors, mise tasks, API endpoints, env vars and ports"
@@ -153,7 +157,7 @@ run = "ARK_DOCKER_INTEGRATION=1 go test -run TestDisposableDockerDeploymentAndDu
 dir = "agent"
 
 [tasks.typecheck]
-description = "Typecheck every TypeScript workspace, the image publisher, PgBouncer probes, the docs check and the docs site"
+description = "Typecheck every TypeScript workspace, the image publisher, PgBouncer probes, the docs check, the docs site and the icon generator"
 run = [
   "bunx tsc --noEmit -p shared/tsconfig.json",
   "bunx tsc --noEmit -p server/tsconfig.json",
