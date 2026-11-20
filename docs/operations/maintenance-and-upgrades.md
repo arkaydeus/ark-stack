@@ -52,7 +52,7 @@ If `edge-ts` was restarted under `edge` and `edge-l4` by anything other than Com
 
 ## Upgrading Ark
 
-There are two supported ways to move a host to a new Ark release. Both refuse to run concurrently with each other: on Linux they take `tmp/host-deployment.lock` with `flock` and stop with `Another Ark host install or signed maintenance run is in progress.` if it is held.
+There are two supported ways to move a host to a new Ark release. On Linux, both use `flock` on the checkout's `tmp/host-deployment.lock`. Root runs also hold `/run/ark-stack/deployment.lock`. Guided setup and the bootstrap share those locks and refuse concurrent deployment changes.
 
 ### With the installer
 

@@ -167,25 +167,28 @@ Copy `ARK_ROOT_KEY`, `ARK_ROOT_KEY_ID`, `ARK_MFA_RECOVERY_TOKEN`, both cipher pa
 
 Each key is one-off, pre-approved, non-ephemeral and tagged for exactly one node. Remove it after the node has joined and revoke it.
 
-| Variable              | Read by                         | Node and tag                                                                               |
-| --------------------- | ------------------------------- | ------------------------------------------------------------------------------------------ |
-| `TS_VPS_AUTHKEY_FILE` | `host:install --enroll-vps`     | Absolute path to a private file holding the host key, `tag:ark-vps`.                       |
-| `TS_EDGE_AUTHKEY`     | installer, `edge-ts`            | `edge-ts`, `tag:ark-edge`. The installer prompts for it on a terminal and never prints it. |
-| `TS_BACKUP_AUTHKEY`   | `backup-ts`                     | `backup-ts`, `tag:ark-backup`. Never reuse the edge key.                                   |
-| `TS_AUTHKEY`          | `tailscale` (profile `tailnet`) | The tailnet admin node, `tag:ark-stack-admin`.                                             |
+| Variable              | Read by                         | Node and tag                                                                                                        |
+| --------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `TS_VPS_AUTHKEY_FILE` | `host:install --enroll-vps`     | Absolute path to a private file holding the host key, `tag:ark-vps`.                                                |
+| `TS_VPS_AUTHKEY`      | `host:setup`                    | The host key itself, `tag:ark-vps`, for a non-interactive guided setup. Setup passes it to enrolment through stdin. |
+| `TS_EDGE_AUTHKEY`     | installer, `edge-ts`            | `edge-ts`, `tag:ark-edge`. The installer prompts for it on a terminal and never prints it.                          |
+| `TS_BACKUP_AUTHKEY`   | `backup-ts`                     | `backup-ts`, `tag:ark-backup`. Never reuse the edge key.                                                            |
+| `TS_AUTHKEY`          | `tailscale` (profile `tailnet`) | The tailnet admin node, `tag:ark-stack-admin`.                                                                      |
 
 ## Host and installer
 
-| Variable                                 | Default                  | Read by                                                   | Purpose                                                                                    |
-| ---------------------------------------- | ------------------------ | --------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `ARK_MAIL_ENABLED`                       | `1`                      | installer, `mise run maintain`, `api`, `database-ingress` | `0` disables Stalwart, its worker, mail operations and the mail ports. Must be `0` or `1`. |
-| `ARK_HOST_REBOOT_TIME`                   | `04:00`                  | installer (`--harden-vps`)                                | Automatic-reboot time for unattended upgrades, `HH:MM` in the host time zone.              |
-| `ARK_HOST_HARDENING`                     | written by the installer | `database-ingress`                                        | `1` on a hardened host.                                                                    |
-| `ARK_HOST_METRICS_SOURCE`                | written by the installer | Compose (`api` mount)                                     | Host directory of the reboot-required metric (`/var/lib/ark/host-metrics` when hardened).  |
-| `ARK_IPV6_DOCKER_SOURCE`                 | written by the installer | Compose (`domain-worker` mount)                           | Host directory of the Docker IPv6 evidence.                                                |
-| `ARK_INSTALL_NONINTERACTIVE`             | unset                    | installer                                                 | `1` never prompts for `TS_EDGE_AUTHKEY`.                                                   |
-| `ARK_INSTALL_SKIP_DOCKER`                | unset                    | installer                                                 | `1` writes `.env` and the `tmp/` files only: no Docker, no lock, no hardening.             |
-| `ARK_CONTAINER_UID`, `ARK_CONTAINER_GID` | `1000`                   | installer                                                 | Owner given to the `tmp/` bind-mount directories when run as root on Linux.                |
+| Variable                                 | Default                  | Read by                                                   | Purpose                                                                                                                                         |
+| ---------------------------------------- | ------------------------ | --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ARK_MAIL_ENABLED`                       | `1`                      | installer, `mise run maintain`, `api`, `database-ingress` | `0` disables Stalwart, its worker, mail operations and the mail ports. Must be `0` or `1`.                                                      |
+| `ARK_HOST_REBOOT_TIME`                   | `04:00`                  | installer (`--harden-vps`), `host:setup`                  | Automatic-reboot time for unattended upgrades, `HH:MM` in the host time zone. `host:setup` writes it to `.env` so later installer runs keep it. |
+| `ARK_HOST_HARDENING`                     | written by the installer | `database-ingress`                                        | `1` on a hardened host.                                                                                                                         |
+| `ARK_HOST_METRICS_SOURCE`                | written by the installer | Compose (`api` mount)                                     | Host directory of the reboot-required metric (`/var/lib/ark/host-metrics` when hardened).                                                       |
+| `ARK_IPV6_DOCKER_SOURCE`                 | written by the installer | Compose (`domain-worker` mount)                           | Host directory of the Docker IPv6 evidence.                                                                                                     |
+| `ARK_INSTALL_NONINTERACTIVE`             | unset                    | installer                                                 | `1` never prompts for `TS_EDGE_AUTHKEY`.                                                                                                        |
+| `ARK_INSTALL_SKIP_DOCKER`                | unset                    | installer                                                 | `1` writes `.env` and the `tmp/` files only: no Docker, no lock, no hardening.                                                                  |
+| `ARK_CONTAINER_UID`, `ARK_CONTAINER_GID` | `1000`                   | installer                                                 | Owner given to the `tmp/` bind-mount directories when run as root on Linux.                                                                     |
+
+The guided setup (`mise run host:setup`) also reads its answers from `ARK_SETUP_DOMAIN`, `ARK_SETUP_ADMIN_HOST`, `ARK_SETUP_SSH_USER` and the step switches `ARK_SETUP_NON_INTERACTIVE`, `ARK_SETUP_TAILSCALE_SSH_CONFIRMED`, `ARK_SETUP_SKIP_EDGE`, `ARK_SETUP_KEEP_PUBLIC_SSH`, `ARK_SETUP_PROVIDER_FIREWALL` and `ARK_SETUP_PROVIDER_FIREWALL_APPLIED`, besides the settings above; see [Install with one command](production-install.md#install-with-one-command). `install.sh` reads `ARK_REF`, `ARK_INSTALL_DIR` and `ARK_REPO_URL`.
 
 ## Databases, pooler and ingress
 

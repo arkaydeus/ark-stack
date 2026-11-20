@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -7,12 +8,13 @@ import {
   isTcpRoutePort,
   providerFirewallRules,
   publicHostPorts,
+  readHostSshAccess,
   type HostPortConfig,
 } from "@ark-stack/shared";
 
 import { auditExternal, readExternalInventory } from "./host-audit-external.ts";
 import { appliedHostConfig } from "./host-inventory.ts";
-import { hostCommand } from "./install-host-hardening.ts";
+import { hostCommand, hostFirewallPath } from "./install-host-hardening.ts";
 
 type Protocol = "tcp" | "udp";
 type PublishedPort = {
@@ -55,6 +57,7 @@ export function unexpectedPorts(
   sockets: string,
   published: PublishedPort[],
   tailnet = new Set<string>(),
+  retainedSsh: number[] = [],
 ) {
   const expected = publicHostPorts(config);
   const problems = [];
@@ -81,6 +84,14 @@ export function unexpectedPorts(
     const protocol = match[1] as Protocol;
     const address = unbracket(match[2]!);
     const port = Number(match[3]);
+    const owners = [...line.matchAll(/\("([^"]+)",pid=(\d+),fd=\d+\)/g)];
+    const retainedOpenSsh =
+      protocol === "tcp" &&
+      retainedSsh.includes(port) &&
+      owners.length > 0 &&
+      owners.every(
+        ([, owner, pid]) => /^sshd(?:-session)?$/.test(owner!) || (owner === "systemd" && pid === "1"),
+      );
     const dockerReservation =
       protocol === "tcp" &&
       /"(?:dockerd|docker-proxy)"/.test(line) &&
@@ -89,6 +100,7 @@ export function unexpectedPorts(
       !privateBind(address, tailnet) &&
       !expected[protocol].includes(port) &&
       !dockerReservation &&
+      !retainedOpenSsh &&
       !dhcpClientSocket(protocol, address, port, line)
     ) {
       problems.push(`Unexpected ${protocol.toUpperCase()} ${endpoint(address, port)} listening on the host.`);
@@ -142,7 +154,7 @@ async function tailscaleAddresses() {
   return new Set(links.find((link) => link.ifname === "tailscale0")?.addr_info.map((addr) => addr.local));
 }
 
-export async function auditLocal(config: HostPortConfig) {
+export async function auditLocal(config: HostPortConfig, retainSsh = false) {
   if (process.platform !== "linux" || process.getuid?.() !== 0) {
     throw new Error("Run the local audit as root on the Linux VPS.");
   }
@@ -152,8 +164,9 @@ export async function auditLocal(config: HostPortConfig) {
     dockerPublications(),
     tailscaleAddresses(),
   ]);
-  assertHostFirewall(rules, config);
-  const problems = unexpectedPorts(config, sockets, publications, tailnet);
+  const access = retainSsh ? readHostSshAccess(await readFile(hostFirewallPath, "utf8")) : undefined;
+  assertHostFirewall(rules, config, access);
+  const problems = unexpectedPorts(config, sockets, publications, tailnet, access?.ports);
   if (problems.length) throw new Error(problems.join("\n"));
 }
 
@@ -163,15 +176,15 @@ async function main(args: string[]) {
     await Promise.all(args.slice(2).map((address) => auditExternal(config, address)));
     return;
   }
-  if (args.length > 1 || (args.length === 1 && args[0] !== "--inventory")) {
-    throw new Error("Usage: host:audit [--inventory | --external INVENTORY.json IP [IP...]]");
+  if (args.length > 1 || (args.length === 1 && !["--inventory", "--retain-ssh"].includes(args[0]!))) {
+    throw new Error("Usage: host:audit [--inventory | --retain-ssh | --external INVENTORY.json IP [IP...]]");
   }
   const config = await appliedHostConfig(join(import.meta.dir, ".."));
   if (args[0] === "--inventory") {
     console.log(JSON.stringify({ config, providerRules: providerFirewallRules(config) }, null, 2));
     return;
   }
-  await auditLocal(config);
+  await auditLocal(config, args[0] === "--retain-ssh");
   console.log("Host listeners, Docker publications and ark_host match the public inventory.");
 }
 

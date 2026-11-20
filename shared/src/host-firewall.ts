@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+
 import { POSTGRES_ROUTER_PORT, TCP_ROUTE_PORTS, isTcpRoutePort } from "./edge-l4.ts";
 import { frontPortPolicies, frontSharedPorts } from "./front-nft.ts";
 
@@ -12,6 +14,34 @@ export type HostPortConfig = {
   sniPorts: number[];
   routes?: { port: number; policy: RawPortPolicy }[];
 };
+export type HostSshAccess = { ports: number[]; source?: string };
+
+function sshAccessRules(access?: HostSshAccess) {
+  const family = access?.source ? isIP(access.source) : undefined;
+  if (family === 0 || access?.source?.includes("%"))
+    throw new Error("SSH recovery source must be a single IP address.");
+  return (access?.ports ?? []).map((port) => {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid SSH listener port.");
+    const source = access?.source ? `${family === 4 ? "ip" : "ip6"} saddr ${access.source} ` : "";
+    return `${source}tcp dport ${port} accept`;
+  });
+}
+
+/** The SSH chain is administered by host setup, independently of the edge port sets. */
+export function readHostSshAccess(rules: string): HostSshAccess {
+  const body = /^\s*chain ssh_access \{\n([\s\S]*?)^[ \t]*}/m.exec(rules)?.[1]?.trim();
+  const access: HostSshAccess = { ports: [] };
+  for (const line of body ? body.split("\n") : []) {
+    const entry = /^(?:(ip6?) saddr ([\da-f:.]+) )?tcp dport (\d+) accept$/i.exec(line.trim());
+    if (!entry || (entry[2] && isIP(entry[2]) !== (entry[1] === "ip" ? 4 : 6))) {
+      throw new Error("Unexpected rule in the host SSH access chain.");
+    }
+    if (access.ports.length && access.source !== entry[2]) throw new Error("Mixed SSH recovery sources.");
+    access.source = entry[2];
+    access.ports.push(Number(entry[3]));
+  }
+  return access;
+}
 
 export function mailEnabled(value: string | undefined) {
   if (value === undefined || value === "" || value === "1") return true;
@@ -59,8 +89,11 @@ export function providerFirewallRules(config: HostPortConfig) {
   }));
 }
 
-function hostFirewallTable(config: HostPortConfig) {
+function hostFirewallTable(config: HostPortConfig, ssh?: HostSshAccess, legacy = false) {
   const { tcp, udp } = publicHostPorts(config);
+  const sshRules = sshAccessRules(ssh)
+    .map((rule) => `    ${rule}\n`)
+    .join("");
   return `table inet ${HOST_FIREWALL_TABLE} {
   set public_tcp {
     type inet_service
@@ -70,14 +103,14 @@ function hostFirewallTable(config: HostPortConfig) {
     type inet_service
     elements = { ${udp.join(", ")} }
   }
-  chain input {
+  ${legacy ? "" : `chain ssh_access {\n${sshRules}  }\n  `}chain input {
     type filter hook input priority -5; policy drop;
     ct state established,related accept
     iifname "lo" accept
     iifname "tailscale0" accept
     meta l4proto { icmp, ipv6-icmp } accept
     ip6 daddr fe80::/10 udp sport 547 udp dport 546 accept
-    tcp dport @public_tcp accept
+    ${legacy ? "" : "jump ssh_access\n    "}tcp dport @public_tcp accept
     udp dport @public_udp accept
   }
   chain forward {
@@ -93,8 +126,40 @@ function hostFirewallTable(config: HostPortConfig) {
 `;
 }
 
-export function renderHostFirewall(config: HostPortConfig) {
-  return `table inet ${HOST_FIREWALL_TABLE}\ndelete table inet ${HOST_FIREWALL_TABLE}\n${hostFirewallTable(config)}`;
+export function renderHostFirewall(config: HostPortConfig, ssh?: HostSshAccess) {
+  return `table inet ${HOST_FIREWALL_TABLE}\ndelete table inet ${HOST_FIREWALL_TABLE}\n${hostFirewallTable(config, ssh)}`;
+}
+
+export function updateHostFirewallPorts(config: HostPortConfig) {
+  const ports = publicHostPorts(config);
+  return (["tcp", "udp"] as const)
+    .map((protocol) => {
+      const set = `inet ${HOST_FIREWALL_TABLE} public_${protocol}`;
+      return `flush set ${set}\nadd element ${set} { ${ports[protocol].join(", ")} }\n`;
+    })
+    .join("");
+}
+
+export function updateHostSshAccess(access: HostSshAccess) {
+  const chain = `inet ${HOST_FIREWALL_TABLE} ssh_access`;
+  return (
+    `flush chain ${chain}\n` +
+    sshAccessRules(access)
+      .map((rule) => `add rule ${chain} ${rule}\n`)
+      .join("")
+  );
+}
+
+/** Update just the inputs for the SSH chain in the boot rules, leaving the baseline policy intact. */
+export function replaceHostSshAccess(rules: string, access: HostSshAccess) {
+  const replacement = sshAccessRules(access)
+    .map((rule) => `    ${rule}\n`)
+    .join("");
+  const updated = rules.replace(/(^[ \t]*chain ssh_access \{\n)[\s\S]*?(^[ \t]*})/m, `$1${replacement}$2`);
+  if (updated === rules && !/^[ \t]*chain ssh_access \{/m.test(rules)) {
+    throw new Error("Missing SSH access chain in the boot firewall.");
+  }
+  return updated;
 }
 
 function normalizeFirewall(rules: string) {
@@ -109,11 +174,20 @@ function normalizeFirewall(rules: string) {
           .toSorted()
           .join(",")}}`,
     )
+    .replace(
+      /\b(ip6?) saddr ([\da-f:.]+)(?=\s)/gi,
+      (_match, family: string, address: string) =>
+        `${family} saddr ${family === "ip6" ? new URL(`http://[${address}]/`).hostname.slice(1, -1) : address}`,
+    )
     .replace(/\s+/g, "");
 }
 
-export function assertHostFirewall(installed: string, config: HostPortConfig) {
-  if (normalizeFirewall(installed) !== normalizeFirewall(hostFirewallTable(config))) {
+export function assertHostFirewall(installed: string, config: HostPortConfig, ssh?: HostSshAccess) {
+  const actual = normalizeFirewall(installed);
+  if (
+    actual !== normalizeFirewall(hostFirewallTable(config, ssh)) &&
+    !(ssh === undefined && actual === normalizeFirewall(hostFirewallTable(config, undefined, true)))
+  ) {
     throw new Error("Installed ark_host rules differ from the enabled-service inventory or baseline.");
   }
 }

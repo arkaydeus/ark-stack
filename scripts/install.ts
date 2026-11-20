@@ -34,12 +34,16 @@ import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 
 const root = join(import.meta.dir, "..");
 const flags = process.argv.slice(2);
-if (flags.length === 1 && flags[0] === "--enroll-vps") {
-  await enrollVps();
+if (
+  flags[0] === "--enroll-vps" &&
+  (flags.length === 1 || (flags.length === 2 && flags[1] === "--key-stdin"))
+) {
+  await lockHostDeployment(root);
+  await enrollVps(flags[1] === "--key-stdin" ? () => Bun.stdin.text() : undefined);
   process.exit(0);
 }
 if (flags.length && (flags.length !== 1 || flags[0] !== "--harden-vps")) {
-  throw new Error("Usage: host:install [--enroll-vps | --harden-vps]");
+  throw new Error("Usage: host:install [--enroll-vps [--key-stdin] | --harden-vps]");
 }
 const useDocker = process.env.ARK_INSTALL_SKIP_DOCKER !== "1";
 if (useDocker) await lockHostDeployment(root);
@@ -105,8 +109,12 @@ values.ARK_HOST_HARDENING = hardened ? "1" : "0";
 values.ARK_HOST_METRICS_SOURCE = hardened ? hostMetricsPath : "../../tmp/host-metrics";
 values.ARK_IPV6_DOCKER_SOURCE = hardened ? dockerIpv6EvidenceDir : "../../tmp/ipv6";
 if (hardened) {
-  await installHostHardening(async () => {
+  await installHostHardening(async (ssh) => {
     await stopDisabledMail();
+    if (enableMail && useDocker && ssh.ports.length) {
+      // An earlier reconciler replaces all of ark_host and could erase the recovery path.
+      await run("docker", [...compose, "stop", "database-ingress"]);
+    }
     return appliedHostConfig(root, values).catch((error) => {
       console.warn(
         `Could not reuse the previous front policy. Dedicated ports stay closed until reconciliation. ${String(error)}`,
