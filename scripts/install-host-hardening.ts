@@ -42,15 +42,18 @@ async function aptInstall(packages: string[]) {
   await hostCommand("apt-get", ["install", "-y", "--no-install-recommends", ...packages]);
 }
 
+export type TailscaleState = {
+  BackendState: string;
+  TUN: boolean;
+  Self?: { Online: boolean; Tags?: string[]; DNSName?: string; TailscaleIPs?: string[] };
+};
+
 async function tailscaleState() {
-  return JSON.parse(await hostCommand("tailscale", ["status", "--json"])) as {
-    BackendState: string;
-    TUN: boolean;
-    Self?: { Online: boolean; Tags?: string[] };
-  };
+  return JSON.parse(await hostCommand("tailscale", ["status", "--json"])) as TailscaleState;
 }
 
-function vpsNodeReady(state: Awaited<ReturnType<typeof tailscaleState>>) {
+/** The host node is up on the host TUN interface, online and tagged exactly `tag:ark-vps`. */
+export function vpsNodeReady(state: TailscaleState) {
   return (
     state.BackendState === "Running" &&
     state.TUN &&

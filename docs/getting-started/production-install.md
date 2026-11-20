@@ -1,38 +1,106 @@
 # Production install
 
-This page takes you from a fresh Ubuntu VPS to a hardened, running Ark Stack: Tailscale tags and keys, host enrolment, hardening and installation, the edge node, the provider firewall and audit, certificate settings and the switch to public HTTPS. It summarises each step and links to the [operator runbooks](../operating.md) for the full detail.
+This page takes you from a fresh Ubuntu VPS to a hardened, running Ark Stack. One command does the whole install: prerequisites, Tailscale enrolment, a Tailscale SSH safety check, hardening and installation, the edge node, the admin origin and certificate settings, closing public SSH, the provider firewall rules and the local audit. The [manual phases](#what-the-installer-does--manual-install) it runs are documented below, with links to the [operator runbooks](../operating.md) for the full detail.
 
 ## Before you start
 
 You need:
 
-| Item             | Requirement                                                                                                                                                                                                                            |
-| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| VPS              | An Ubuntu VPS with a public IPv4 address (a global IPv6 address is optional) and a provider firewall you control. Keep the provider's console or rescue access working throughout.                                                     |
-| Operating system | Ubuntu with `apt`, systemd and a `VERSION_CODENAME` in `/etc/os-release`. Hardening installs `nftables`, `iproute2` and `unattended-upgrades`, and requires the `<codename>-security` origin in the unattended-upgrades configuration. |
-| Docker           | Docker Engine with the Compose v2 plugin, installed before you start. The installer does not install Docker.                                                                                                                           |
-| Tools            | `git`, OpenSSL, and [mise](https://mise.jdx.dev) available to root (`sudo mise …`). The repository checked out on the VPS, with `mise trust` and `mise install` run in it.                                                             |
-| Tailscale        | A tailnet where you can edit the policy file and create auth keys, the [Tailscale Ubuntu package source](https://tailscale.com/kb/1347/installation) configured on the VPS, and an untagged owner device for SSH.                      |
-| Domain           | A domain whose DNS you control, at Cloudflare (for reviewed automatic publishing) or any other provider (manual records).                                                                                                              |
-| Let's Encrypt    | An email address for the ACME account.                                                                                                                                                                                                 |
-| Optional         | An Amazon SES account for outbound mail, an S3-compatible bucket and a home machine for off-VPS backups, and an independent HTTPS host for the off-host heartbeat.                                                                     |
+| Item             | Requirement                                                                                                                                                                                                      |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| VPS              | An Ubuntu VPS with a public IPv4 address (a global IPv6 address is optional) and a provider firewall you control. Keep the provider's console or rescue access working throughout.                               |
+| Operating system | Ubuntu 22.04, 24.04 or 26.04 LTS on x86_64 or aarch64, with `apt` and systemd. Anything else is refused before any change.                                                                                       |
+| Access           | Root, or a user with `sudo`. The installer installs Docker Engine with Compose v2, `git`, `curl`, `jq`, OpenSSL, mise and the Tailscale package itself, from their signed apt repositories, if they are missing. |
+| Tailscale        | A tailnet where you can edit the policy file and create auth keys, and an untagged owner device with Tailscale for SSH. A local non-root user with `sudo` on the VPS to log in as over Tailscale SSH.            |
+| Domain           | A domain whose DNS you control, at Cloudflare (for reviewed automatic publishing) or any other provider (manual records).                                                                                        |
+| Let's Encrypt    | An email address for the ACME account.                                                                                                                                                                           |
+| Optional         | An Amazon SES account for outbound mail, an S3-compatible bucket and a home machine for off-VPS backups, and an independent HTTPS host for the off-host heartbeat.                                               |
 
-The overall sequence:
+## Install with one command
+
+On the VPS, as a user with `sudo` (or as root, without `sudo`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh | sudo bash
+```
+
+`install.sh` is one function called on its last line, so a truncated download runs nothing. Run without root it changes nothing: it explains what it will do, prints the exact `sudo` command and checks the operating system, architecture and `sudo`. As root it:
+
+1. refuses an unsupported OS, snap Docker, or a distribution `docker.io` without Compose v2, before changing anything (it never removes packages, Docker resources or users);
+2. installs whatever is missing of `git`, `curl`, `ca-certificates`, `jq` and `openssl`; Docker Engine with the Compose v2 and buildx plugins from Docker's apt repository and its signed key; mise from its signed repository (enabled with `extrepo`); and the Tailscale package from Tailscale's signed repository;
+3. clones the repository into `/opt/ark-stack`, or fast-forwards a clean checkout there (it refuses local changes or a non-fast-forward). `ARK_REF` picks a branch or tag (default `main`) and `ARK_INSTALL_DIR` another directory, for example `curl … | sudo ARK_REF=v1.2.0 bash`. Run as `sudo ./install.sh` from a checkout, it uses that checkout instead;
+4. runs `mise trust`, `mise install` and `bun install`, then starts the guided setup, `mise run host:setup`, passing on any arguments (`curl … | sudo bash -s -- --keep-public-ssh`).
+
+### The questions
+
+The guided setup asks everything up front, with defaults in brackets, and shows the settings for a final yes. Secrets are read without echo. Every answer can also be given as a flag or an environment variable:
+
+| Question                          | Flag                                               | Variable               | Default                                               |
+| --------------------------------- | -------------------------------------------------- | ---------------------- | ----------------------------------------------------- |
+| Your domain                       | `--domain`                                         | `ARK_SETUP_DOMAIN`     | none (required)                                       |
+| Admin hostname                    | `--admin-host`                                     | `ARK_SETUP_ADMIN_HOST` | `admin.<domain>`                                      |
+| Let's Encrypt account email       | `--acme-email`                                     | `ARK_ACME_EMAIL`       | empty (no certificates can be issued without it)      |
+| Trusted or staging certificates   | `--trusted-certificates`, `--staging-certificates` | `ARK_ACME_STAGING`     | trusted (`ARK_ACME_STAGING=0`) when an email is given |
+| Incoming mail                     | `--mail`, `--no-mail`                              | `ARK_MAIL_ENABLED`     | on                                                    |
+| Shared SNI ports                  | `--sni-ports`                                      | `ARK_EDGE_SNI_PORTS`   | none (443 only)                                       |
+| Cloudflare DNS token              | (environment only)                                 | `DNS_API_TOKEN`        | none (manual DNS records)                             |
+| Automatic reboot time             | `--reboot-time`                                    | `ARK_HOST_REBOOT_TIME` | `04:00`                                               |
+| Your local user for Tailscale SSH | `--ssh-user`                                       | `ARK_SETUP_SSH_USER`   | the user who ran `sudo`                               |
+
+On a re-run, the previous answers and the values already in `.env` are the defaults; they change only if you change them.
+
+### What you do during the install
+
+You never edit a file. The installer stops for you only at these points:
+
+1. **Tailnet policy and the host key.** It prints the policy you need (the `tag:ark-vps` and `tag:ark-edge` tag owners and the owner-only Tailscale SSH rule in `check` mode; see [Plan the Tailscale identities](#plan-the-tailscale-identities)) and asks you to paste a one-off `tag:ark-vps` auth key. It writes the key to a private temporary file, runs the existing enrolment phase and deletes the file.
+2. **The Tailscale SSH check.** It prints `tailscale ssh <user>@<vps-magicdns-name>`. Open that from your own device, keep it open, and type `yes` once it works. If you do not, it stops **before** hardening, with nothing on the firewall or OpenSSH changed, and prints the command to resume. It also says whether the current session already arrives over Tailscale.
+3. **The edge key.** It asks for a one-off `tag:ark-edge` key (Enter skips this step, and the summary says how to finish it), brings up `edge-ts`, `edge` and `edge-l4`, rejoins the namespace, checks the node is tagged exactly `["tag:ark-edge"]` and then empties `TS_EDGE_AUTHKEY` in `.env`.
+4. **Closing public SSH.** Before stopping OpenSSH it checks the host node and Tailscale SSH, then disables `ssh.socket` and `ssh.service` and checks again, asking you to open one more new Tailscale SSH session. If anything fails, OpenSSH is started again and the failure is reported. It removes only UFW rules that allow SSH and reports, but does not change, any other active UFW configuration. `--keep-public-ssh` skips this step.
+5. **The provider firewall.** It prints the exact inbound rules from `host:audit --inventory` and waits for you to confirm that they are applied at your provider, then runs the local audit and prints the external scan command to run from another machine.
+
+Then it prints the summary: the SSH tunnel command, `http://localhost:3000` and the setup token, the DNS records to create (or the Cloudflare review), every skipped or pending step with the command that finishes it, and the recovery material to copy off the host. Continue with [First login and the domain wizard](#first-login-and-the-domain-wizard).
+
+### Scripted installs
+
+`--non-interactive` never prompts. A missing required answer fails with a message that names its flag or variable. Supply the Tailscale keys in the environment (`TS_VPS_AUTHKEY` or a private `TS_VPS_AUTHKEY_FILE`, and `TS_EDGE_AUTHKEY`) and confirm the two human checks with flags:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh \
+  | sudo TS_VPS_AUTHKEY_FILE=/root/ark-vps-authkey bash -s -- --non-interactive \
+      --domain example.com --acme-email ops@example.com --skip-edge
+```
+
+Without `--tailscale-ssh-confirmed` (or `ARK_SETUP_TAILSCALE_SSH_CONFIRMED=1`) a non-interactive run stops before hardening and exits with status 2; check Tailscale SSH and re-run with the flag. Without `--provider-firewall-applied` (`ARK_SETUP_PROVIDER_FIREWALL_APPLIED=1`) it prints the provider rules, runs the audit and lists the step as pending. `--skip-edge` (`ARK_SETUP_SKIP_EDGE=1`) and `--keep-public-ssh` (`ARK_SETUP_KEEP_PUBLIC_SSH=1`) skip those steps. `mise run host:setup --help` lists every option.
+
+### Re-running and resuming
+
+Run the same command again, or `cd /opt/ark-stack && sudo mise run host:setup`. Each step is recorded in a root-only state file, `tmp/host-setup/state.json` in the install directory: finished steps are verified and skipped, and the run resumes at the step that failed. Secrets in `.env` are never rotated. The install step runs again only when its settings (mail, SNI ports, reboot time) or the checked-out commit changed. Progress is one line per step; the detail is in `tmp/host-setup/setup.log`. Neither the log nor the terminal ever shows an auth key, token or secret, except the setup token in the final summary.
+
+### Provider firewall adapters
+
+The firewall step is provider-agnostic. It passes the inventory's `providerRules` to the first `ProviderFirewall` adapter in `scripts/host-setup/provider-firewall.ts` whose `detect` succeeds (or the one named by `--provider-firewall`). An adapter implements `detect`, `plan` (the changes, or a diff against the provider's current rules) and `apply`. The built-in `manual` adapter works with every provider: it prints the rules and waits for your confirmation. An API adapter for a specific provider is added to the list in front of it without changing the setup flow. Tailscale keys come from a `TailscaleKeySource` (`scripts/host-setup/tailscale-keys.ts`) in the same way: the built-in source asks for each key, and an API source can mint and revoke them instead.
+
+## What the installer does / manual install
+
+The guided setup drives the phases below in this order. You can also run each one yourself, for example to install step by step or to repair a single phase.
 
 ```mermaid
 flowchart TD
   A[Tailnet policy: tags and owner SSH grant] --> B[host:install --enroll-vps<br/>host joins as tag:ark-vps]
   B --> C[Verify Tailscale SSH from the owner device]
   C --> D[host:install --harden-vps<br/>firewall, updates, secrets, images, containers]
-  D --> E[Close public SSH at the provider]
-  E --> F[Provider firewall from host:audit --inventory, then audits]
-  F --> G[Enrol the edge node, tag:ark-edge]
+  D --> G[Enrol the edge node, tag:ark-edge]
   G --> H[Admin origin and ACME settings]
-  H --> I[First owner, MFA and domain wizard]
+  H --> E[Close public SSH]
+  E --> F[Provider firewall from host:audit --inventory, then audits]
+  F --> I[First owner, MFA and domain wizard]
   I --> J[Certificates issued, public HTTPS]
 ```
 
-## Plan the Tailscale identities
+For a manual install, first install Docker Engine with the Compose v2 plugin, `git`, OpenSSL, `jq` and [mise](https://mise.jdx.dev) (available to root as `sudo mise …`), configure the [Tailscale Ubuntu package source](https://tailscale.com/kb/1347/installation), check out the repository and run `mise trust` and `mise install` in it.
+
+### Plan the Tailscale identities
 
 The VPS carries up to four Tailscale identities. Each has its own tag and its own one-off auth key, and none is ever reused for another purpose.
 
@@ -51,7 +119,7 @@ In the tailnet policy file:
 
 Create each auth key when you need it, under **Settings → Keys → Generate auth key**: **Reusable** off, **Ephemeral** off, **Pre-approved** on, the single tag for that node, and a short expiry (1 day). Revoke each key after its node has joined.
 
-## Enrol the host
+### Enrol the host
 
 Create the `tag:ark-vps` key, write it to a private file on the VPS, and run the enrolment phase as root:
 
@@ -75,7 +143,7 @@ From the owner's device, open a new session and keep it open for the rest of the
 tailscale ssh <user>@<vps-magicdns-name>
 ```
 
-## Decide the install-time settings
+### Decide the install-time settings
 
 A few settings are read when the installer runs. Set them in the installer's environment or, on later runs, in `.env`:
 
@@ -91,7 +159,7 @@ A few settings are read when the installer runs. Set them in the installer's env
 >
 > Exported variables in the installer process take precedence, including values that mise loaded from an existing file when the task started. Avoid starting from a copy of `.env.example` in production. If stale exports or example values caused a failure, remove the stale exports and retry with the generated file. Use `--env-file .env` when running Compose manually to select the file explicitly.
 
-## Harden the host and install
+### Harden the host and install
 
 With the Tailscale SSH session open, run the hardening install as root:
 
@@ -101,7 +169,7 @@ sudo mise run host:install --harden-vps
 
 `host:install` accepts no flag, `--enroll-vps` or `--harden-vps`. On Ubuntu it holds a lock, so an overlapping install or signed maintenance run is refused. Once a host is hardened (`/etc/nftables.d/ark-host.nft` exists), every later `sudo mise run host:install` re-applies the hardening without the flag.
 
-### What hardening does
+#### What hardening does
 
 Hardening refuses to run unless the host node is enrolled with `tag:ark-vps` and Tailscale SSH is enabled. It then:
 
@@ -111,7 +179,7 @@ Hardening refuses to run unless the host node is enrolled with `tag:ark-vps` and
 
 [VPS hardening](../operating.md#vps-hardening) has the full description, including disabling mail on an existing install.
 
-### What the install does
+#### What the install does
 
 Every run, hardened or not:
 
@@ -130,7 +198,7 @@ docker compose --env-file .env -f infra/platform/docker-compose.yml ps
 curl -fsS http://127.0.0.1:3000/api/health
 ```
 
-## Close public SSH
+### Close public SSH
 
 After confirming a new Tailscale SSH session works with the baseline active:
 
@@ -139,7 +207,7 @@ After confirming a new Tailscale SSH session works with the baseline active:
 - remove UFW rules that conflict with nftables;
 - keep the provider's required ICMP and ICMPv6 allowances.
 
-## Provider firewall and audit
+### Provider firewall and audit
 
 Generate the inbound rules from the VPS after the front policy has reconciled, apply the generated `providerRules` in your provider's firewall, then audit:
 
@@ -158,7 +226,7 @@ sudo mise run host:audit --external ark-host-inventory.json <public-ipv4> <publi
 
 Keep the provider firewall in step whenever mail, the shared SNI ports or raw routes change. [Provider firewall and audit](../operating.md#provider-firewall-and-audit) explains the results.
 
-## Enrol the edge node
+### Enrol the edge node
 
 The edge serves ACME challenges and public HTTPS without a Tailscale key, but it cannot reach tailnet services until `edge-ts` joins as `tag:ark-edge`:
 
@@ -181,7 +249,7 @@ The edge serves ACME challenges and public HTTPS without a Tailscale key, but it
 
 After any restart or replacement of `edge-ts`, run `sudo mise run edge:rejoin`. [Edge Tailscale node](../operating.md#edge-tailscale-node) covers re-enrolment and upgrades. The backup node is enrolled the same way with `TS_BACKUP_AUTHKEY`; see [Home machine over the tailnet](../guides/backups.md#home-machine-over-the-tailnet-fd-30).
 
-## Set the admin origin and ACME
+### Set the admin origin and ACME
 
 After setting the admin origin, ACME and any Cloudflare credentials in `.env`, recreate the services that read them:
 

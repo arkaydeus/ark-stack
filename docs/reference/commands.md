@@ -14,8 +14,8 @@ mise run test:db -- server/src/coordinator.test.ts   # pass arguments to a task
 
 Three details affect how a task behaves:
 
-- **Environment.** Some tasks load the root `.env` through mise (`env = { _.file = ".env" }`): `dev`, `dev:server`, `dev:web`, `start`, `db:generate`, `db:migrate`, `db:studio`, `recover` and `host:install`. Others pass it to Bun with `bun --env-file=.env`: `test`, `test:e2e`, `test:e2e-gate`, `test:upgrade`, `recover:mfa`, `import`, `recover-host`, `maintain` and `edge:rejoin`. The disposable-database and host-hardening harnesses deliberately run with `bun --no-env-file` so a developer's real secrets never reach tests. Create `.env` with `cp .env.example .env`; `touch .env` is enough for harnesses that take their settings from shell exports.
-- **Arguments.** Tasks marked `raw_args` in `mise.toml` pass every following argument through unchanged, flags included: `install`, `test:db`, `test:db:down`, `recover`, `recover:mfa`, `images:publish`, `images:pin-edge-caddy`, `host:install`, `host:audit`, `import`, `maintain`, `docs:build` and `docs:serve`. That is why `sudo mise run host:install --harden-vps` works without `--`.
+- **Environment.** Some tasks load the root `.env` through mise (`env = { _.file = ".env" }`): `dev`, `dev:server`, `dev:web`, `start`, `db:generate`, `db:migrate`, `db:studio`, `recover` and `host:install`. Others pass it to Bun with `bun --env-file=.env`: `test`, `test:e2e`, `test:e2e-gate`, `test:upgrade`, `recover:mfa`, `import`, `recover-host`, `maintain` and `edge:rejoin`. `host:setup` also runs with `bun --no-env-file`, so values exported from an old `.env` can never override the file it edits. The disposable-database and host-hardening harnesses deliberately run with `bun --no-env-file` so a developer's real secrets never reach tests. Create `.env` with `cp .env.example .env`; `touch .env` is enough for harnesses that take their settings from shell exports.
+- **Arguments.** Tasks marked `raw_args` in `mise.toml` pass every following argument through unchanged, flags included: `install`, `test:db`, `test:db:down`, `recover`, `recover:mfa`, `images:publish`, `images:pin-edge-caddy`, `host:install`, `host:setup`, `host:audit`, `import`, `maintain`, `docs:build` and `docs:serve`. That is why `sudo mise run host:install --harden-vps` works without `--`.
 - **Working directory.** `test:agent`, `test:agent-integration`, `agent:test` and `agent:build` run in `agent/`. Everything else runs from the repository root.
 
 ## Setup and dependencies
@@ -94,38 +94,41 @@ Each test task is described in depth, with its prerequisites, in [Testing](../de
 
 These need Docker and no external credentials.
 
-| Task                   | Covers                                                                                                          | Also needs                                                                 |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `test:e2e`             | Fresh-volume browser onboarding in Chromium                                                                     | `.env`; loopback `DATABASE_URL`; Playwright Chromium                       |
-| `test:e2e-gate`        | The login gate end to end through the containerised edge (FD-11)                                                | `.env`; loopback `DATABASE_URL`; Playwright Chromium                       |
-| `test:upgrade`         | Schema upgrade and startup nft policy activation                                                                | `.env`; loopback `DATABASE_URL`                                            |
-| `test:stalwart`        | Native mail lifecycle against a pinned Stalwart container                                                       | Unsets `STALWART_URL`, `STALWART_ADMIN_ADDRESS`, `STALWART_ADMIN_PASSWORD` |
-| `test:edge`            | Edge harness, Caddy configs, HAProxy, observer, L4 routes, 5432 router, gate routing, HTTP rate limits and mTLS | Loopback `DATABASE_URL` for the observer and database-backed checks        |
-| `test:db-ingress`      | Public port nftables rules, fail-closed recovery, counters and alerts                                           | Privileged containers                                                      |
-| `test:pgbouncer`       | Public PgBouncer mTLS, SCRAM, reloads, database clients and rollover                                            | Loopback `DATABASE_URL` (migrated)                                         |
-| `test:backups`         | Off-VPS backups against MinIO, including full PITR (FD-21)                                                      | —                                                                          |
-| `test:backups-tailnet` | Home-machine backups through `backup-ts` on a simulated tailnet (FD-30)                                         | —                                                                          |
-| `test:host-hardening`  | VPS hardening (FD-20) in isolated containers with an external scanner                                           | —                                                                          |
-| `test:ipv6-preflight`  | IPv6 and AAAA preflight on IPv4-only and dual-stack networks (FD-27)                                            | — (runs through `test:db`)                                                 |
+| Task                     | Covers                                                                                                          | Also needs                                                                 |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `test:e2e`               | Fresh-volume browser onboarding in Chromium                                                                     | `.env`; loopback `DATABASE_URL`; Playwright Chromium                       |
+| `test:e2e-gate`          | The login gate end to end through the containerised edge (FD-11)                                                | `.env`; loopback `DATABASE_URL`; Playwright Chromium                       |
+| `test:upgrade`           | Schema upgrade and startup nft policy activation                                                                | `.env`; loopback `DATABASE_URL`                                            |
+| `test:stalwart`          | Native mail lifecycle against a pinned Stalwart container                                                       | Unsets `STALWART_URL`, `STALWART_ADMIN_ADDRESS`, `STALWART_ADMIN_PASSWORD` |
+| `test:edge`              | Edge harness, Caddy configs, HAProxy, observer, L4 routes, 5432 router, gate routing, HTTP rate limits and mTLS | Loopback `DATABASE_URL` for the observer and database-backed checks        |
+| `test:db-ingress`        | Public port nftables rules, fail-closed recovery, counters and alerts                                           | Privileged containers                                                      |
+| `test:pgbouncer`         | Public PgBouncer mTLS, SCRAM, reloads, database clients and rollover                                            | Loopback `DATABASE_URL` (migrated)                                         |
+| `test:backups`           | Off-VPS backups against MinIO, including full PITR (FD-21)                                                      | —                                                                          |
+| `test:backups-tailnet`   | Home-machine backups through `backup-ts` on a simulated tailnet (FD-30)                                         | —                                                                          |
+| `test:host-hardening`    | VPS hardening (FD-20) in isolated containers with an external scanner                                           | —                                                                          |
+| `test:ipv6-preflight`    | IPv6 and AAAA preflight on IPv4-only and dual-stack networks (FD-27)                                            | — (runs through `test:db`)                                                 |
+| `test:install-bootstrap` | `install.sh` in disposable Ubuntu and Debian containers: refusals and the real apt path                         | Network access                                                             |
 
 ### Opt-in live suites
 
 Each prints a skip message and exits 0 unless its credentials are set. CI never runs them. The required variables are listed in [Opt-in live test suites](../operating.md#opt-in-live-test-suites).
 
-| Task                        | Against                                                             |
-| --------------------------- | ------------------------------------------------------------------- |
-| `test:edge-tailnet`         | A real test tailnet (`ARK_TEST_TS_EDGE_AUTHKEY`)                    |
-| `test:tailnet-acl`          | Tailscale's policy validate endpoint (`ARK_TEST_TS_POLICY_API_KEY`) |
-| `test:backups-tailnet-live` | A real home `rest-server` over a tailnet                            |
-| `test:backups-hosted`       | AWS S3, Backblaze B2 or Cloudflare R2 (`ARK_TEST_S3_*`)             |
-| `test:host-hardening-live`  | A scratch VPS and scratch tailnet                                   |
-| `test:ipv6-preflight-live`  | A scratch VPS and Let's Encrypt staging                             |
+| Task                        | Against                                                               |
+| --------------------------- | --------------------------------------------------------------------- |
+| `test:edge-tailnet`         | A real test tailnet (`ARK_TEST_TS_EDGE_AUTHKEY`)                      |
+| `test:tailnet-acl`          | Tailscale's policy validate endpoint (`ARK_TEST_TS_POLICY_API_KEY`)   |
+| `test:backups-tailnet-live` | A real home `rest-server` over a tailnet                              |
+| `test:backups-hosted`       | AWS S3, Backblaze B2 or Cloudflare R2 (`ARK_TEST_S3_*`)               |
+| `test:host-hardening-live`  | A scratch VPS and scratch tailnet                                     |
+| `test:ipv6-preflight-live`  | A scratch VPS and Let's Encrypt staging                               |
+| `test:install-live`         | The one-command installer on a scratch Ubuntu VPS and scratch tailnet |
 
 ## Host install and operation
 
 | Task           | Runs                                                          | Needs                                                                  |
 | -------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | `host:install` | `scripts/install.ts`                                          | Docker; `.env` (created and filled if missing); root on a hardened VPS |
+| `host:setup`   | `scripts/host-setup.ts` (started by `install.sh`)             | Root on an Ubuntu VPS; the prerequisites `install.sh` installs         |
 | `host:audit`   | `scripts/host-audit.ts`                                       | Root on the VPS; Nmap for `--external`                                 |
 | `mail:up`      | `scripts/install-mail-submission.ts`                          | Docker                                                                 |
 | `monitor:up`   | `docker compose -f infra/monitoring/docker-compose.yml up -d` | Docker                                                                 |
@@ -133,6 +136,8 @@ Each prints a skip message and exits 0 unless its credentials are set. CI never 
 | `edge:rejoin`  | `scripts/edge-namespace.ts`                                   | `.env`; Docker                                                         |
 
 `host:install` accepts no arguments, or exactly one of `--enroll-vps` and `--harden-vps`; anything else is rejected with `Usage: host:install [--enroll-vps | --harden-vps]`. Without a flag it generates missing secrets (existing `.env` values are kept), builds the images, runs the `migrate` service and starts the platform, the pinned Stalwart engine (unless `ARK_MAIL_ENABLED=0`) and Prometheus. `--enroll-vps` only joins the VPS to the tailnet as `tag:ark-vps` from the key file named by `TS_VPS_AUTHKEY_FILE`, then exits. `--harden-vps` runs the install as a hardened host: it also installs the `ark_host` nftables baseline and the unattended-upgrades configuration. Once a host is hardened, later runs without a flag are treated as hardened too. The order of the phases is in [VPS hardening](../operating.md#vps-hardening) and [production install](../getting-started/production-install.md).
+
+`host:setup` is the guided production install that `install.sh` starts after installing the prerequisites. It asks its questions up front (or takes them from flags and environment variables; `--non-interactive` never prompts), then runs `host:install --enroll-vps`, a Tailscale SSH confirmation gate, `host:install --harden-vps`, the edge enrolment with `edge:rejoin`, the admin-origin and ACME settings in `.env`, closing public OpenSSH, the provider firewall rules from `host:audit --inventory` and the local audit, and prints a summary. It records each step in `tmp/host-setup/state.json`, so running it again verifies finished steps and resumes; the detail log is `tmp/host-setup/setup.log`. It exits 2 when it stops at the Tailscale SSH gate. `mise run host:setup --help` lists every option; [production install](../getting-started/production-install.md#install-with-one-command) describes them.
 
 `host:audit` takes no arguments (local audit of nftables, `ss` and Docker publications), `--inventory` (print the expected inbound rules as JSON) or `--external INVENTORY.json IP [IP...]` (scan the VPS from another machine). See [Provider firewall and audit](../operating.md#provider-firewall-and-audit).
 

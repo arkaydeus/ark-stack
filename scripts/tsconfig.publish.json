@@ -1,5 +1,16 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": { "types": ["bun"] },
-  "include": ["publish-images.ts", "publish-images.test.ts", "check-image-plan.ts", "test-ghcr-publish.ts"]
+  "include": [
+    "publish-images.ts",
+    "publish-images.test.ts",
+    "check-image-plan.ts",
+    "test-ghcr-publish.ts",
+    "host-setup.ts",
+    "host-setup/*.ts",
+    "host-setup.test.ts",
+    "install-sh.test.ts",
+    "test-install-bootstrap.ts",
+    "test-install-live.ts"
+  ]
 }

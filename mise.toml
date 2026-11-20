@@ -33,7 +33,7 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts"
 
 [tasks."docs:check"]
 description = "Check that the operator docs and guides name only existing files, links, anchors, mise tasks, API endpoints, env vars and ports"
@@ -250,6 +250,11 @@ run = "bun scripts/install.ts"
 env = { _.file = ".env" }
 raw_args = true
 
+[tasks."host:setup"]
+description = "Guided production install on an Ubuntu VPS (run as root; started by install.sh): questions, Tailscale enrolment, SSH safety check, hardening and install, edge node, admin origin and ACME, closing public SSH, provider firewall and audit, summary"
+run = "bun --no-env-file scripts/host-setup.ts"
+raw_args = true
+
 [tasks."host:audit"]
 description = "Audit VPS listeners and published ports, export provider firewall rules or scan from off-host"
 run = "bun scripts/host-audit.ts"
@@ -262,6 +267,14 @@ run = "bun --no-env-file scripts/test-host-hardening.ts"
 [tasks."test:host-hardening-live"]
 description = "Opt-in scan and owner Tailscale SSH against a scratch VPS and scratch tailnet"
 run = "bun --no-env-file scripts/test-host-hardening-live.ts"
+
+[tasks."test:install-bootstrap"]
+description = "Run install.sh in disposable Ubuntu containers: refusals (non-root, unsupported OS, distribution docker.io without Compose v2) and the full apt path for Docker, mise and Tailscale up to the guided setup (requires Docker and network access)"
+run = "bun --no-env-file scripts/test-install-bootstrap.ts"
+
+[tasks."test:install-live"]
+description = "Opt-in: run the one-command installer on a scratch Ubuntu VPS and check the SSH gate, hardening, closed public SSH and the audit (skips without ARK_TEST_INSTALL_* variables)"
+run = "bun --no-env-file scripts/test-install-live.ts"
 
 [tasks.import]
 description = "Compare an Orkmail or PgStack inventory without importing owners"

@@ -85,69 +85,42 @@ Locally, DNS checks are stubbed and certificates are self-signed, so endpoints e
 
 You need:
 
-- an Ubuntu VPS with a public IPv4 address (IPv6 optional), a provider firewall you control, and working console or rescue access;
-- Docker Engine with the Compose v2 plugin, installed beforehand (the installer does not install Docker);
-- `git`, OpenSSL and mise available to root, with this repository checked out on the VPS and `mise trust` and `mise install` run in it;
-- a Tailscale tailnet where you can edit the policy file and create auth keys, the Tailscale Ubuntu package source configured on the VPS, and an untagged owner device for SSH;
+- an Ubuntu 22.04, 24.04 or 26.04 LTS VPS with a public IPv4 address (IPv6 optional), a provider firewall you control, and working console or rescue access;
+- a Tailscale tailnet where you can edit the policy file and create auth keys, and your own (untagged) device on it for SSH;
 - a domain whose DNS you control, at Cloudflare (reviewed automatic publishing) or any other provider such as Namecheap (manual records);
 - an email address for the Let's Encrypt account.
 
-[Production install](docs/getting-started/production-install.md) is the complete procedure. The steps, in order:
+On the VPS, run one command as a user with `sudo`:
 
-1. **[Plan the tailnet tags and keys.](docs/getting-started/production-install.md#plan-the-tailscale-identities)** In the tailnet policy file, declare `tag:ark-vps` and `tag:ark-edge` in `tagOwners`, add an owner-only grant for TCP 22 to `tag:ark-vps` with a Tailscale SSH rule in `check` mode, and give `tag:ark-edge` no grants yet. Before enrolling the edge, remove or narrow any existing catch-all rule that lets `tag:ark-edge` reach tailnet peers. Create each auth key only when you need it: not reusable, not ephemeral, pre-approved, a single tag, a 1-day expiry. Revoke it once its node has joined.
+```sh
+curl -fsSL https://raw.githubusercontent.com/arkaydeus/ark-stack/main/install.sh | sudo bash
+```
 
-2. **[Enrol the host](docs/getting-started/production-install.md#enrol-the-host)** with a `tag:ark-vps` key, then delete the key file and revoke the key:
+It installs whatever is missing (Docker Engine with Compose v2, `git`, `curl`, `jq`, OpenSSL, mise and Tailscale), clones the repository into `/opt/ark-stack` and starts the guided setup. Without `sudo` it changes nothing and prints what it would do. The setup first asks:
 
-   ```sh
-   sudo install -m 600 /dev/null /root/ark-vps-authkey   # then paste the key into this file
-   sudo TS_VPS_AUTHKEY_FILE=/root/ark-vps-authkey mise run host:install --enroll-vps
-   ```
+- your domain and the admin hostname (default `admin.<domain>`);
+- the Let's Encrypt email, and whether certificates should be trusted (the default) or staging;
+- whether to enable incoming mail, and any shared SNI ports;
+- an optional Cloudflare DNS token (read without echo);
+- the daily automatic reboot time for security updates, and your local user for Tailscale SSH.
 
-   From your owner device, open `tailscale ssh <user>@<vps-magicdns-name>` and keep that session open for the rest of the install.
+Then it enrols the host in your tailnet, hardens it and installs the platform, enrols the edge node, sets the admin origin and ACME settings, closes public SSH and audits the host firewall. You never edit a file. It stops only to let you paste the one-off `tag:ark-vps` and `tag:ark-edge` auth keys, to have you check that `tailscale ssh <user>@<vps-magicdns-name>` works from your own device (it will not harden the host until you confirm), and to have you apply the provider firewall rules it prints. The final summary gives the SSH tunnel command, the setup token, the DNS records to create and the recovery material to copy off the host.
 
-3. **[Harden the host and install.](docs/getting-started/production-install.md#harden-the-host-and-install)** Let the installer create `.env`; do not start from a copy of `.env.example` in production. It generates every secret, installs the host firewall and unattended upgrades, builds the images and starts the platform, then prints the setup URL and token. [Decide the install-time settings](docs/getting-started/production-install.md#decide-the-install-time-settings) first, such as `ARK_MAIL_ENABLED=0` to install without mail. Edit the generated `.env` as root and keep its permissions at `0600`.
+Re-running the same command is safe: finished steps are checked and skipped, and no secret is rotated. Every answer can also be a flag or environment variable for a scripted `--non-interactive` install. [Production install](docs/getting-started/production-install.md#install-with-one-command) describes the questions, flags and safety checks, and [what the installer does](docs/getting-started/production-install.md#what-the-installer-does--manual-install) documents each phase for a manual install.
 
-   ```sh
-   sudo mise run host:install --harden-vps
-   curl -fsS http://127.0.0.1:3000/api/health
-   ```
+When it finishes:
 
-4. **[Close public SSH.](docs/getting-started/production-install.md#close-public-ssh)** After confirming a new Tailscale SSH session works, remove public TCP 22 at the provider and stop or rebind Ubuntu's public OpenSSH listener.
-
-5. **[Set the provider firewall and audit it.](docs/getting-started/production-install.md#provider-firewall-and-audit)** Apply the generated `providerRules` at your provider, run the local audit, then scan from another machine with Nmap:
-
-   ```sh
-   sudo mise run host:audit --inventory > ark-host-inventory.json
-   sudo mise run host:audit
-   sudo mise run host:audit --external ark-host-inventory.json <public-ipv4> <public-ipv6>
-   ```
-
-6. **[Enrol the edge node.](docs/getting-started/production-install.md#enrol-the-edge-node)** Give the installer a one-off `tag:ark-edge` key when it asks, or set `TS_EDGE_AUTHKEY` in `.env`, then start the node and rejoin its dependents:
-
-   ```sh
-   sudo docker compose --env-file .env -f infra/platform/docker-compose.yml up -d edge-ts edge edge-l4
-   sudo mise run edge:rejoin
-   ```
-
-   Check that the node is tagged `["tag:ark-edge"]`, empty `TS_EDGE_AUTHKEY` and revoke the key, and allow UDP 41642 at the provider for direct WireGuard paths.
-
-7. **[Set the admin origin and ACME.](docs/getting-started/production-install.md#set-the-admin-origin-and-acme)** In `.env`, set `BETTER_AUTH_URL=https://admin.<domain>` and add that origin to `BETTER_AUTH_TRUSTED_ORIGINS`, keeping `http://localhost:3000` there while you still sign in through the tunnel. Set `ARK_ACME_EMAIL` and `ARK_ACME_STAGING=0` for publicly trusted certificates. For Cloudflare publishing, also set `DNS_API_TOKEN` with [the required permissions for your zones](docs/getting-started/configuration.md#dns-providers). Then recreate the services that read these settings:
-
-   ```sh
-   sudo docker compose --env-file .env -f infra/platform/docker-compose.yml up -d api domain-worker
-   ```
-
-8. **[Create the first owner, enrol MFA and run the domain wizard.](docs/getting-started/production-install.md#first-login-and-the-domain-wizard)** The API listens only on `127.0.0.1:3000` on the VPS, so open a tunnel over the tailnet and browse to `http://localhost:3000`:
+1. **[Create the first owner, enrol MFA and run the domain wizard.](docs/getting-started/production-install.md#first-login-and-the-domain-wizard)** The API listens only on `127.0.0.1:3000` on the VPS, so open the tunnel from the summary and browse to `http://localhost:3000`:
 
    ```sh
    ssh -L 3000:127.0.0.1:3000 <user>@<vps-magicdns-name>
    ```
 
-   Create the owner with `ARK_SETUP_TOKEN`, enrol TOTP MFA, then run the wizard with **Public HTTPS**, your base domain, the VPS's public IPv4 (and IPv6, if it has one) and your DNS provider. If you installed with `ARK_MAIL_ENABLED=0`, clear **Incoming mail** before submitting. [First run and domain wizard](docs/getting-started/first-run.md) walks through each screen and the records it plans.
+   Create the owner with the setup token, enrol TOTP MFA, then run the wizard with **Public HTTPS**, your base domain, the VPS's public IPv4 (and IPv6, if it has one) and your DNS provider. If you installed without mail, clear **Incoming mail** before submitting. [First run and domain wizard](docs/getting-started/first-run.md) walks through each screen and the records it plans.
 
-9. **[Go public over HTTPS.](docs/getting-started/production-install.md#going-public)** Create the planned DNS records at your provider, or review and publish the Cloudflare diff, and select **Recheck DNS** until the endpoints leave `awaiting_dns`. The domain worker then issues the certificates, and once the admin certificate is `issued` the edge serves `https://admin.<domain>`. Keep the tunnel until you have signed in there.
+2. **[Go public over HTTPS.](docs/getting-started/production-install.md#going-public)** Create the planned DNS records at your provider, or review and publish the Cloudflare diff, and select **Recheck DNS** until the endpoints leave `awaiting_dns`. The domain worker then issues the certificates, and once the admin certificate is `issued` the edge serves `https://admin.<domain>`. Keep the tunnel until you have signed in there.
 
-Afterwards, copy the recovery material (`ARK_ROOT_KEY`, `ARK_ROOT_KEY_ID`, `ARK_MFA_RECOVERY_TOKEN`, the pgBackRest cipher passes and every backup target's restic password) off the host, as [After the install](docs/getting-started/production-install.md#after-the-install) describes. Re-running the installer is safe: it keeps every existing secret.
+3. **Copy the recovery material** (`ARK_ROOT_KEY`, `ARK_ROOT_KEY_ID`, `ARK_MFA_RECOVERY_TOKEN`, the pgBackRest cipher passes and, later, every backup target's restic password) off the host, as [After the install](docs/getting-started/production-install.md#after-the-install) describes.
 
 ## Next steps
 
