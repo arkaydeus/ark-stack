@@ -73,7 +73,11 @@ const generated = generateInstallSecrets();
 await Bun.write(envPath, mergeInstallEnv(hasEnv ? existing : template, generated, { template: !hasEnv }));
 // `.env` holds every platform secret and `Bun.write` creates it 0644.
 await chmod(envPath, 0o600);
-const edgeAuthKey = await configureEdgeAuthKey(envPath);
+// Guided setup applies the selected name before using the key. Leave a retained key on disk
+// for that step, but keep it out of every Compose invocation during hardening.
+const deferEdgeEnrolment = flags[0] === "--harden-vps" && process.env.ARK_SETUP_DEFER_EDGE_ENROLMENT === "1";
+const edgeAuthKey = deferEdgeEnrolment ? undefined : await configureEdgeAuthKey(envPath);
+if (deferEdgeEnrolment) process.env.TS_EDGE_AUTHKEY = "";
 // Shared SNI ports for tls routes (FD-14): ARK_EDGE_SNI_PORTS from the environment, else from .env.
 // Each enabled port is published on edge-ts; the API and domain worker accept tls routes only there.
 const sni = applyEdgeSniPorts(await Bun.file(envPath).text(), process.env.ARK_EDGE_SNI_PORTS);

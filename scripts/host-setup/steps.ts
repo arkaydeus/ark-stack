@@ -32,6 +32,7 @@ import {
 
 import {
   assignedTailscaleName,
+  describeTailscaleName,
   nameDifference,
   settledTailscaleName,
   settledVpsNode,
@@ -223,12 +224,21 @@ async function recordTailscaleName(
   changed: boolean,
 ) {
   const status = changed ? await settledTailscaleName(read, requested, context.sleep) : await read();
+  return saveTailscaleName(context, node, requested, status);
+}
+
+function saveTailscaleName(
+  context: Context,
+  node: TailscaleNode,
+  requested: string,
+  status: TailscaleState | undefined,
+) {
   const assigned = assignedTailscaleName(status);
   context.state.tailscaleNames = { ...context.state.tailscaleNames, [node]: { requested, assigned } };
   context.save();
   const difference = nameDifference(requested, assigned);
   if (difference) context.ui.print(`      ${difference}`);
-  return assigned ?? requested;
+  return describeTailscaleName(requested, assigned);
 }
 
 function confirmationTarget(context: Context, status?: TailscaleState) {
@@ -391,7 +401,7 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
     return {
       status: "done",
       message: rename
-        ? `already enrolled as ${ARK_VPS_TAG} with Tailscale SSH; renamed to ${name}`
+        ? `already enrolled as ${ARK_VPS_TAG} with Tailscale SSH. Tailscale machine name: ${name}`
         : `already enrolled as ${ARK_VPS_TAG} with Tailscale SSH (${name})`,
     };
   }
@@ -445,7 +455,7 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
   const name = await recordTailscaleName(context, "vps", requested, readName, true);
   return {
     status: "done",
-    message: `enrolled as ${ARK_VPS_TAG} named ${name}${key.file ? `; delete ${key.file} and revoke the key` : ""}`,
+    message: `enrolled as ${ARK_VPS_TAG} (${name})${key.file ? `; delete ${key.file} and revoke the key` : ""}`,
     ...keyCleanupNote(revoked, ARK_VPS_TAG),
   };
 }
@@ -1028,12 +1038,19 @@ async function install(context: Context): Promise<StepResult> {
     return { status: "done", fingerprint, message: "already hardened and installed with these settings" };
   }
   context.ui.print(`      Hardening and installing; this takes several minutes. Detail: ${context.log.path}`);
+  const spec = edgeName(context);
+  if (existsSync(context.envPath) && !parseEnvFile(readEnv(context.envPath))[spec.variable]) {
+    // Hardening can recreate edge-ts. Seed its startup config from an existing identity first.
+    const before = await recoverContainerNode(context, spec);
+    const current = before?.status.Self?.HostName;
+    if (before?.running && current && validName(current)) configureName(context, spec, current);
+  }
   const env = childEnv(context, {
     ARK_MAIL_ENABLED: mailEnabled ? "1" : "0",
     ARK_EDGE_SNI_PORTS: sniPorts.join(","),
     ARK_HOST_REBOOT_TIME: rebootTime,
-    // The edge key is handled by the edge step, never prompted for by the installer.
     ARK_INSTALL_NONINTERACTIVE: "1",
+    ARK_SETUP_DEFER_EDGE_ENROLMENT: "1",
     ARK_SETUP_HOST_SSH_ACCESS: JSON.stringify(ssh),
   });
   await must(context, [context.bun, "scripts/install.ts", "--harden-vps"], { env });
@@ -1095,6 +1112,44 @@ async function edgeTags(context: Context, service = "edge-ts") {
   return { running: status.BackendState === "Running", tags: status.Self?.Tags ?? [], rejected, status };
 }
 
+/** A stopped container may still have an enrolled node in its state volume. */
+async function recoverContainerNode(context: Context, spec: ContainerName) {
+  let node = await edgeTags(context, spec.service);
+  if (node?.running || node?.rejected) return node;
+  const env = childEnv(context);
+  // Discover the existing service without interpolating Compose's required .env values.
+  const id = (
+    await must(
+      context,
+      [
+        "docker",
+        "ps",
+        "-aq",
+        "--filter",
+        "label=com.docker.compose.project=ark-platform",
+        "--filter",
+        `label=com.docker.compose.service=${spec.service}`,
+        "--filter",
+        "label=com.docker.compose.oneoff=False",
+      ],
+      { env },
+    )
+  ).trim();
+  if (!id) return node;
+  // Start with the creation-time configuration. `up` could apply a pending rename here.
+  if (!node) await must(context, ["docker", "start", id], { env });
+  for (let attempt = 0; attempt < 10 && !node?.running && !node?.rejected; attempt++) {
+    await context.sleep(1000);
+    node = await edgeTags(context, spec.service);
+  }
+  if (!node || (!node.running && !node.rejected && node.status.BackendState !== "NeedsLogin")) {
+    throw new Error(
+      `Could not determine whether ${spec.service} is enrolled; check its Tailscale status and rerun setup.`,
+    );
+  }
+  return node;
+}
+
 /** A container node's name: what compose passes to containerboot as TS_HOSTNAME on every start. */
 type ContainerName = {
   node: Exclude<TailscaleNode, "vps">;
@@ -1148,43 +1203,58 @@ function validName(name: string | undefined) {
   }
 }
 
-/**
- * An enrolled container node keeps its name unless the operator gave a different one explicitly;
- * then it is renamed in place with `tailscale set --hostname`, never re-enrolled.
- */
-async function reconcileContainerName(context: Context, spec: ContainerName, status?: TailscaleState) {
-  const current = status?.Self?.HostName;
-  const rename = spec.explicit && current !== spec.desired;
-  let requested: string;
-  if (rename) {
-    configureName(context, spec, spec.desired);
-    await must(
-      context,
-      compose(
-        context,
-        "exec",
-        "-T",
-        spec.service,
-        "tailscale",
-        `--socket=${CONTAINER_SOCKET}`,
-        "set",
-        `--hostname=${spec.desired}`,
-      ),
-      { env: childEnv(context) },
-    );
-    requested = spec.desired;
-  } else if (current && validName(current)) {
-    configureName(context, spec, current);
-    requested = current;
-  } else requested = configuredName(context, spec);
-  const name = await recordTailscaleName(
+/** Apply the startup hostname while retaining the enrolled node's state volume. */
+async function reconcileContainerName(
+  context: Context,
+  spec: ContainerName,
+  tag: string,
+  status: TailscaleState,
+) {
+  const current = status.Self?.HostName;
+  const requested = spec.explicit ? spec.desired : current;
+  if (!requested || !validName(requested)) {
+    if (spec.node === "edge") await rejoinEdge(context);
+    return {
+      name: saveTailscaleName(context, spec.node, configuredName(context, spec), status),
+      renamed: false,
+    };
+  }
+  configureName(context, spec, requested);
+  const env = childEnv(context);
+  const startup = await exec(
     context,
-    spec.node,
-    requested,
-    () => containerStatus(context, spec.service),
-    rename,
+    compose(context, "exec", "-T", spec.service, "printenv", "TS_HOSTNAME"),
+    { env },
   );
-  return { name, renamed: rename };
+  const recreate = startup.stdout.trim() !== requested || current !== requested;
+  if (recreate) {
+    const services = spec.node === "edge" ? [spec.service, "edge", "edge-l4"] : [spec.service];
+    const key = spec.node === "edge" ? "TS_EDGE_AUTHKEY" : "TS_BACKUP_AUTHKEY";
+    const force = startup.stdout.trim() === requested ? ["--force-recreate"] : [];
+    await must(context, compose(context, "up", "-d", ...force, ...services), { env: { ...env, [key]: "" } });
+  }
+  if (spec.node === "edge") await rejoinEdge(context);
+  if (!recreate) return { name: saveTailscaleName(context, spec.node, requested, status), renamed: false };
+  await waitForNode(context, spec.service, tag);
+  const after = await settledTailscaleName(
+    () => containerStatus(context, spec.service),
+    requested,
+    context.sleep,
+  );
+  const tags = after?.Self?.Tags ?? [];
+  const id = status.Self?.ID ?? status.Self?.PublicKey;
+  if (
+    after?.BackendState !== "Running" ||
+    tags.length !== 1 ||
+    tags[0] !== tag ||
+    (id && (after.Self?.ID ?? after.Self?.PublicKey) !== id) ||
+    after.Self?.HostName !== requested
+  ) {
+    throw new Error(
+      `Could not verify the existing ${spec.service} identity and hostname ${requested} after recreation.`,
+    );
+  }
+  return { name: saveTailscaleName(context, spec.node, requested, after), renamed: current !== requested };
 }
 
 function emptyEdgeKey(context: Context) {
@@ -1200,19 +1270,18 @@ const EDGE_FINISH =
 async function edgeEnrolment(context: Context): Promise<StepResult> {
   const exact = (tags: string[]) => tags.length === 1 && tags[0] === ARK_EDGE_TAG;
   const spec = edgeName(context);
-  const before = await edgeTags(context);
+  const before = await recoverContainerNode(context, spec);
   if (before?.running && exact(before.tags)) {
-    const { name, renamed } = await reconcileContainerName(context, spec, before.status);
-    await rejoinEdge(context);
+    const { name, renamed } = await reconcileContainerName(context, spec, ARK_EDGE_TAG, before.status);
     emptyEdgeKey(context);
     return {
       status: "done",
       message: renamed
-        ? `edge-ts already joined as ${ARK_EDGE_TAG}; renamed to ${name}`
+        ? `edge-ts already joined as ${ARK_EDGE_TAG}; Tailscale machine name: ${name}`
         : `edge-ts already joined as ${ARK_EDGE_TAG} (${name})`,
     };
   }
-  if (before?.running && before.tags.length) {
+  if (before?.running) {
     throw new Error(
       `edge-ts is running with tags ${JSON.stringify(before.tags)}, not exactly ["${ARK_EDGE_TAG}"]. Remove that device in the admin console and re-enrol it (docs/operating.md#edge-tailscale-node).`,
     );
@@ -1253,7 +1322,7 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
   } else context.redactor.add(kept);
   const transient = acquired?.inMemoryOnly ? acquired.key : undefined;
   let revoked: boolean | undefined;
-  let name = spec.desired;
+  let name: string;
   try {
     if (!transient) {
       // A timeout may be transient. Keep the key but allow a replacement on the next run.
@@ -1283,8 +1352,8 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
   return {
     status: "done",
     message: transient
-      ? `edge-ts joined as ${ARK_EDGE_TAG} named ${name}`
-      : `edge-ts joined as ${ARK_EDGE_TAG} named ${name}; TS_EDGE_AUTHKEY emptied in .env`,
+      ? `edge-ts joined as ${ARK_EDGE_TAG} (${name})`
+      : `edge-ts joined as ${ARK_EDGE_TAG} (${name}); TS_EDGE_AUTHKEY emptied in .env`,
     ...keyCleanupNote(revoked, ARK_EDGE_TAG),
   };
 }
@@ -1351,17 +1420,17 @@ async function backupNode(context: Context): Promise<StepResult> {
     return { status: "skipped", message: "not requested (--backup-node enrols it for a home backup target)" };
   }
   const spec = backupName(context);
-  const before = await edgeTags(context, "backup-ts");
+  const before = await recoverContainerNode(context, spec);
   if (before?.running && before.tags.length === 1 && before.tags[0] === ARK_BACKUP_TAG) {
-    const { name, renamed } = await reconcileContainerName(context, spec, before.status);
+    const { name, renamed } = await reconcileContainerName(context, spec, ARK_BACKUP_TAG, before.status);
     return {
       status: "done",
       message: renamed
-        ? `backup-ts already joined as ${ARK_BACKUP_TAG}; renamed to ${name}`
+        ? `backup-ts already joined as ${ARK_BACKUP_TAG}; Tailscale machine name: ${name}`
         : `backup-ts already joined as ${ARK_BACKUP_TAG} (${name})`,
     };
   }
-  if (before?.running && before.tags.length) {
+  if (before?.running) {
     throw new Error(
       `backup-ts is running with tags ${JSON.stringify(before.tags)}, not exactly ["${ARK_BACKUP_TAG}"]. Remove that device in the admin console and re-enrol it (docs/operating.md#revocation).`,
     );
@@ -1381,7 +1450,7 @@ async function backupNode(context: Context): Promise<StepResult> {
   }
   context.redactor.add(key.key);
   let revoked: boolean | undefined;
-  let name = spec.desired;
+  let name: string;
   try {
     configureName(context, spec, spec.desired);
     await must(context, compose(context, "up", "-d", "backup-ts"), {
@@ -1407,7 +1476,7 @@ async function backupNode(context: Context): Promise<StepResult> {
   }
   return {
     status: "done",
-    message: `backup-ts joined as ${ARK_BACKUP_TAG} named ${name}`,
+    message: `backup-ts joined as ${ARK_BACKUP_TAG} (${name})`,
     ...keyCleanupNote(revoked, ARK_BACKUP_TAG),
   };
 }
@@ -1919,21 +1988,32 @@ const RECOVERY_KEYS = [
 ];
 
 /** The machine names Tailscale assigned, as read back from each node's status. */
-function tailscaleNameLines(context: Context, status: TailscaleState | undefined) {
+async function tailscaleNameLines(context: Context, status: TailscaleState | undefined) {
+  const format = (requested: string, assigned: string | undefined) =>
+    describeTailscaleName(requested, assigned) +
+    (assigned && assigned !== requested
+      ? ` (requested ${requested}; Tailscale assigned a different name)`
+      : "");
   const requested = context.answers.tailscaleHostname;
-  const assigned = assignedTailscaleName(status) ?? requested;
   const lines = [
     "Tailscale machine names:",
-    `  This VPS:      ${assigned}${assigned === requested ? "" : ` (requested ${requested}; Tailscale assigned a different name)`}`,
+    `  This VPS:      ${format(requested, assignedTailscaleName(status))}`,
   ];
   const labels = { edge: "Edge node:     ", backup: "Backup node:   " } as const;
   for (const node of ["edge", "backup"] as const) {
     const record = context.state.tailscaleNames?.[node];
     if (!record) continue;
-    const name = record.assigned ?? record.requested;
-    lines.push(
-      `  ${labels[node]}${name}${name === record.requested ? "" : ` (requested ${record.requested}; Tailscale assigned a different name)`}`,
-    );
+    const current = await containerStatus(context, `${node}-ts`);
+    const assigned = current?.BackendState === "Running" ? assignedTailscaleName(current) : undefined;
+    if (assigned && assigned !== record.assigned) {
+      record.assigned = assigned;
+      context.save();
+    }
+    const name =
+      current?.BackendState !== "Running" && record.assigned
+        ? `last observed as ${record.assigned}; current name could not be verified`
+        : format(record.requested, assigned);
+    lines.push(`  ${labels[node]}${name}`);
   }
   lines.push(`  Connect with:  tailscale ssh ${sshTarget(context, status)}`);
   return lines;
@@ -1956,7 +2036,7 @@ export async function summary(context: Context) {
     `       ${values.ARK_SETUP_TOKEN ?? "(missing: re-run host:setup)"}`,
     `  3. Enrol MFA, then run the domain wizard for ${answers.domain}: choose Public HTTPS at ${answers.adminHost}.`,
     "",
-    ...tailscaleNameLines(context, status),
+    ...(await tailscaleNameLines(context, status)),
     "",
     "DNS:",
   ];

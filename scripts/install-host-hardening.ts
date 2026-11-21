@@ -65,16 +65,19 @@ export const TAILSCALE_HOSTNAME_RULES =
 
 /** A Tailscale machine name: one DNS label. Uppercase is lowercased; anything else invalid is refused. */
 export function validateTailscaleHostname(value: string, label = "Tailscale machine name") {
-  const name = value.trim().toLowerCase();
-  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name)) {
-    throw new Error(`${label} "${value.trim()}" is not valid: ${TAILSCALE_HOSTNAME_RULES}.`);
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(value)) {
+    throw new Error(`${label} ${JSON.stringify(value)} is not valid: ${TAILSCALE_HOSTNAME_RULES}.`);
   }
-  return name;
+  return value.toLowerCase();
 }
 
 /** The name Tailscale assigned: the first label of the node's MagicDNS name. */
 export function assignedTailscaleName(state: TailscaleState | undefined) {
   return state?.Self?.DNSName?.replace(/\.$/, "").split(".")[0] || undefined;
+}
+
+export function describeTailscaleName(requested: string, assigned: string | undefined) {
+  return assigned ?? `assigned name could not be verified (requested ${requested})`;
 }
 
 /** The assigned name is the requested one, or Tailscale's `-<n>` suffix for a taken name. */
@@ -190,7 +193,7 @@ export async function enrollVps(
   };
   const readState = async () => JSON.parse(await io.run("tailscale", ["status", "--json"])) as TailscaleState;
   io.requireRoot();
-  const hostname = requestedHostname?.trim()
+  const hostname = requestedHostname
     ? validateTailscaleHostname(requestedHostname, "TS_VPS_HOSTNAME")
     : undefined;
   if (!io.which("tailscale")) {
@@ -230,9 +233,12 @@ export async function enrollVps(
     // Rename in place: `tailscale set` changes only the name, never the login or the tags.
     const renaming = joined.Self?.HostName !== hostname;
     if (renaming) await io.run("tailscale", ["set", `--hostname=${hostname}`]);
-    const named = renaming ? await settledTailscaleName(readState, hostname, io.sleep) : joined;
+    const named =
+      renaming || problem
+        ? await settledTailscaleName(() => readState().catch(() => undefined), hostname, io.sleep)
+        : joined;
     const assigned = assignedTailscaleName(named);
-    io.log(`Tailscale machine name: ${assigned ?? hostname}`);
+    io.log(`Tailscale machine name: ${describeTailscaleName(hostname, assigned)}`);
     const difference = nameDifference(hostname, assigned);
     if (difference) io.log(difference);
   }

@@ -261,6 +261,10 @@ function adminHostFromEnv(dotenv: Record<string, string>) {
 /** Resolves every answer. In non-interactive mode a missing required answer fails, naming it. */
 export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
   const { flags, env, previous, dotenv, interactive, ui } = sources;
+  const hostnameOverride = (flag: string, variable: string) => {
+    const fromFlag = flags.get(flag);
+    return typeof fromFlag === "string" ? fromFlag : env[variable] || undefined;
+  };
   const given = (flag: string | undefined, variable: string | undefined) => {
     const fromFlag = flag ? flags.get(flag) : undefined;
     if (typeof fromFlag === "string") return fromFlag;
@@ -403,26 +407,55 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
     "the local SSH user (--ssh-user or ARK_SETUP_SSH_USER)",
   );
 
-  const tailscaleHostname = await text(
-    "Tailscale machine name for this VPS (lowercase letters, digits and hyphens)",
-    given("--tailscale-hostname", "ARK_SETUP_TAILSCALE_HOSTNAME"),
-    previous.tailscaleHostname ?? sanitizeHostname(sources.hostname),
-    (value) => validateTailscaleHostname(value),
-  );
+  const hostnameDefault = previous.tailscaleHostname ?? sanitizeHostname(sources.hostname);
+  let tailscaleHostname: string | undefined;
+  let hostnameInput = hostnameOverride("--tailscale-hostname", "ARK_SETUP_TAILSCALE_HOSTNAME");
+  while (tailscaleHostname === undefined) {
+    const value =
+      hostnameInput ??
+      (interactive
+        ? await ui.ask(
+            "Tailscale machine name for this VPS (lowercase letters, digits and hyphens)",
+            hostnameDefault,
+            undefined,
+            { preserveWhitespace: true },
+          )
+        : hostnameDefault);
+    try {
+      tailscaleHostname = validateTailscaleHostname(
+        value === "" && hostnameInput === undefined ? hostnameDefault : value,
+      );
+    } catch (error) {
+      if (!interactive) throw error;
+      ui.print(`  ${error instanceof Error ? error.message : String(error)}`);
+      hostnameInput = undefined;
+    }
+  }
   // The edge and backup names are not asked: they follow the machine name unless given explicitly.
-  const override = (flag: string, variable: string, kept: string | undefined, label: string) => {
-    const value = given(flag, variable);
-    return value === undefined ? kept : validateTailscaleHostname(value, `${label} (${flag} or ${variable})`);
+  const override = (
+    flag: string,
+    variable: string,
+    installedKey: string,
+    kept: string | undefined,
+    label: string,
+  ) => {
+    const value = hostnameOverride(flag, variable);
+    if (value !== undefined) return validateTailscaleHostname(value, `${label} (${flag} or ${variable})`);
+    const installed = dotenv[installedKey];
+    if (installed) return validateTailscaleHostname(installed, installedKey);
+    return kept;
   };
   const tailscaleEdgeHostname = override(
     "--tailscale-edge-hostname",
     "ARK_SETUP_TAILSCALE_EDGE_HOSTNAME",
+    "TS_EDGE_HOSTNAME",
     previous.tailscaleEdgeHostname,
     "Edge node name",
   );
   const tailscaleBackupHostname = override(
     "--tailscale-backup-hostname",
     "ARK_SETUP_TAILSCALE_BACKUP_HOSTNAME",
+    "TS_BACKUP_HOSTNAME",
     previous.tailscaleBackupHostname,
     "Backup node name",
   );
