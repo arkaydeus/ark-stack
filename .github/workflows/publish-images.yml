@@ -1,8 +1,8 @@
 name: Publish images
 
 # Publishes every Bake target for linux/amd64 and linux/arm64 on each push to main, tagged with the
-# first 12 characters of the commit and `latest`. `mise run host:install` pulls the tag for its own
-# commit instead of building on the host (scripts/install-images.ts).
+# first 12 characters of the commit. Only the current main tip can advance `latest`.
+# `mise run host:install` pulls the tag for its own commit (scripts/install-images.ts).
 on:
   push:
     branches: [main]
@@ -12,10 +12,10 @@ permissions:
   contents: read
   packages: write
 
-# Queue rather than cancel, so `latest` always moves forward in push order.
+# Keep pending commit publications and serialize promotions.
 concurrency:
   group: publish-images
-  cancel-in-progress: false
+  queue: max
 
 jobs:
   build:
@@ -57,11 +57,22 @@ jobs:
       - uses: docker/setup-buildx-action@v4
       - name: Merge the platform images into multi-platform tags
         run: |
-          export ARK_IMAGE_REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+          registry="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           tag="${GITHUB_SHA::12}"
-          latest=()
-          [[ "$GITHUB_REF" == refs/heads/main ]] || latest=(--no-latest)
-          bun scripts/publish-images.ts --tag "$tag" "${latest[@]}" --merge "$tag-amd64,$tag-arm64"
+          ARK_IMAGE_REGISTRY="$registry" bun scripts/publish-images.ts --tag "$tag" --no-latest --merge "$tag-amd64,$tag-arm64"
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+      - name: Promote the current main tip to latest
+        if: github.ref == 'refs/heads/main'
+        run: |
+          main=$(git ls-remote --exit-code origin refs/heads/main)
+          if [[ "${main%%$'\t'*}" == "$GITHUB_SHA" ]]; then
+            registry="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+            ARK_IMAGE_REGISTRY="$registry" bun scripts/publish-images.ts --tag "${GITHUB_SHA::12}" --promote-latest
+          else
+            echo "This commit has been superseded on main. Its commit tags are published."
+          fi
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}

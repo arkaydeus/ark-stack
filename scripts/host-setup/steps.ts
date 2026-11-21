@@ -22,7 +22,9 @@ import {
   ARK_VPS_TAG,
   applyEdgeAuthKey,
   assertHostFirewall,
+  hostRoutesFromFirewall,
   parseEnvFile,
+  providerFirewallRules,
   readHostSshAccess,
   replaceHostSshAccess,
   updateHostSshAccess,
@@ -30,6 +32,7 @@ import {
   type HostSshAccess,
 } from "@ark-stack/shared";
 
+import { frontPolicyPending } from "../host-inventory.ts";
 import {
   assignedTailscaleName,
   describeTailscaleName,
@@ -133,6 +136,10 @@ export async function exec(context: Context, argv: string[], options: RunOptions
 
 export async function must(context: Context, argv: string[], options: RunOptions = {}) {
   const result = await exec(context, argv, options);
+  return commandOutput(context, argv, result);
+}
+
+function commandOutput(context: Context, argv: string[], result: Awaited<ReturnType<Runner>>) {
   if (result.status !== 0) {
     const tail = context.redactor.redact(`${result.stderr || result.stdout}`.trim().slice(-1500));
     throw new Error(
@@ -1089,7 +1096,7 @@ async function install(context: Context): Promise<StepResult> {
   if (
     record?.status === "done" &&
     record.fingerprint === fingerprint &&
-    (await hardeningMatches(context, ssh)) &&
+    (await hardeningMatches(context, ssh, true)) &&
     (await apiHealthy(context))
   ) {
     return { status: "done", fingerprint, message: "already hardened and installed with these settings" };
@@ -1106,7 +1113,14 @@ async function install(context: Context): Promise<StepResult> {
   return { status: "done", fingerprint, message: "host hardened, platform installed and healthy" };
 }
 
-async function hardeningMatches(context: Context, ssh: HostSshAccess) {
+function baselineConfig(context: Context): HostPortConfig {
+  const { mailEnabled, sniPorts } = context.answers;
+  return { mailEnabled, sniPorts };
+}
+
+const liveHostRules = ["nft", "-s", "-y", "list", "table", "inet", "ark_host"];
+
+async function hardeningMatches(context: Context, ssh: HostSshAccess, requireAcknowledgement = false) {
   try {
     const boot = readEnv(context.paths.hostFirewall);
     if (!boot || replaceHostSshAccess(boot, ssh) !== boot) return false;
@@ -1114,13 +1128,20 @@ async function hardeningMatches(context: Context, ssh: HostSshAccess) {
     if (active.status !== 0 || active.stdout.trim() !== "active") return false;
     const enabled = await exec(context, ["systemctl", "is-enabled", "ark-host-firewall.service"]);
     if (enabled.stdout.trim() !== "enabled") return false;
-    const inventory = await hostInventory(context);
-    const { config } = JSON.parse(inventory) as { config: HostPortConfig };
     const tableStart = boot.indexOf("table inet ark_host {");
     if (tableStart < 0) return false;
-    assertHostFirewall(boot.slice(tableStart), { ...config, routes: [] }, ssh);
-    const rules = await must(context, ["nft", "-s", "-y", "list", "table", "inet", "ark_host"]);
-    assertHostFirewall(rules, config, ssh);
+    const baseline = baselineConfig(context);
+    assertHostFirewall(boot.slice(tableStart), baseline, ssh);
+    const opts = { env: childEnv(context) };
+    const config = requireAcknowledgement
+      ? (
+          JSON.parse(await must(context, [context.bun, "scripts/host-audit.ts", "--inventory"], opts)) as {
+            config: HostPortConfig;
+          }
+        ).config
+      : undefined;
+    const rules = await must(context, liveHostRules);
+    assertHostFirewall(rules, config ?? { ...baseline, routes: hostRoutesFromFirewall(rules) }, ssh);
     return true;
   } catch (error) {
     context.log.write(`Hardening needs reconciliation: ${String(error)}`);
@@ -1130,16 +1151,24 @@ async function hardeningMatches(context: Context, ssh: HostSshAccess) {
 
 /**
  * `host:audit --inventory`, waiting up to a minute for database-ingress to acknowledge a front policy
- * the domain worker has just submitted (a recreated domain worker submits one). A failed
- * acknowledgement is reported at once.
+ * the domain worker has just submitted, including retries of a failed application.
  */
-async function hostInventory(context: Context) {
-  const argv = [context.bun, "scripts/host-audit.ts", "--inventory"];
+async function hostInventory(context: Context, auditArgs: string[] = []) {
+  const argv = [context.bun, "scripts/host-audit.ts", "--inventory", ...auditArgs];
+  let lastRejection: string | undefined;
   for (let attempt = 0; ; attempt++) {
     const result = await exec(context, argv, { env: childEnv(context) });
     if (result.status === 0) return result.stdout;
-    const awaiting = `${result.stderr}${result.stdout}`.includes("awaiting firewall acknowledgement");
-    if (!awaiting || attempt >= 30) return must(context, argv, { env: childEnv(context) });
+    const output = result.stderr || result.stdout;
+    if (!output.includes(frontPolicyPending)) return commandOutput(context, argv, result);
+    const rejection = output.split("\n").find((line) => line.includes("database-ingress could not apply"));
+    if (rejection) lastRejection = rejection.trim().slice(0, 1000);
+    if (attempt >= 30) {
+      const detail = lastRejection ? ` Last reconciler error: ${context.redactor.redact(lastRejection)}` : "";
+      throw new Error(
+        `Timed out after waiting a minute for the front firewall policy.${detail || ` ${frontPolicyPending}.`}`,
+      );
+    }
     if (attempt === 0)
       context.ui.print("      Waiting for database-ingress to apply the current front policy.");
     await context.sleep(2000);
@@ -1342,7 +1371,8 @@ function edgeKeyWanted(context: Context) {
 // Pasted keys are asked for before the long install, so nothing waits for an answer afterwards. They
 // stay in memory until the edge and backup steps use them; an API source mints its keys there itself.
 async function remainingKeys(context: Context): Promise<StepResult> {
-  if (!context.interactive || context.keys.id !== "manual") {
+  const source = context.keys;
+  if (!context.interactive || !source.collect) {
     return { status: "done", message: "nothing to ask" };
   }
   // The same checks the edge and backup steps make: a running node (enrolled or rejected) needs no key.
@@ -1356,26 +1386,28 @@ async function remainingKeys(context: Context): Promise<StepResult> {
     if (!backup?.running)
       requests.push({ tag: ARK_BACKUP_TAG, variable: "TS_BACKUP_AUTHKEY", optional: true });
   }
-  if (!requests.length) return { status: "done", message: "nothing to ask" };
   const ready = new Map<string, AcquiredKey | undefined>();
   for (const request of requests) {
-    context.ui.print(`      Asking for the ${request.tag} key now, so the rest of setup can run unattended.`);
-    const key = await context.keys.acquire(request);
+    const collected = await source.collect(request);
+    if (!collected) continue;
+    const key = collected.acquired;
     if (key?.key) context.redactor.add(key.key);
     ready.set(request.tag, key);
   }
-  const source = context.keys;
   context.keys = {
     id: source.id,
     policyInstructions: () => source.policyInstructions(),
     preparePolicy: source.preparePolicy?.bind(source),
     acquire(request) {
-      if (!ready.has(request.tag)) return source.acquire(request);
+      // If a previously enrolled node loses its identity during install, leave a follow-up.
+      if (!ready.has(request.tag)) return source.acquire(request, { allowPrompt: false });
       const key = ready.get(request.tag);
       ready.delete(request.tag);
       return Promise.resolve(key);
     },
   };
+  if (!requests.length) return { status: "done", message: "nothing to ask" };
+  if (!ready.size) return { status: "done", message: "keys will be acquired at enrolment" };
   const entered = [...ready].filter(([, key]) => key?.key).map(([tag]) => tag);
   return {
     status: "done",
@@ -2002,6 +2034,28 @@ function sshClosed(ufwActive: boolean, ambiguous: number, removed: number): Step
   };
 }
 
+function saveInventory(context: Context, inventory: string) {
+  const path = join(context.root, "tmp", "ark-host-inventory.json");
+  writeFileSync(path, inventory.endsWith("\n") ? inventory : `${inventory}\n`, { mode: 0o644 });
+  return path;
+}
+
+function providerRulesWithSsh(context: Context, rules: ProviderRule[], retainSsh: boolean) {
+  if (!retainSsh) return rules;
+  const access = readHostSshAccess(readEnv(context.paths.hostFirewall));
+  if (!access.ports.length) return rules;
+  return [
+    ...rules,
+    {
+      protocol: "tcp" as const,
+      ports: access.ports,
+      sourceCidrs: access.source
+        ? [`${access.source}/${isIP(access.source) === 4 ? 32 : 128}`]
+        : ["0.0.0.0/0", "::/0"],
+    },
+  ];
+}
+
 async function providerFirewall(context: Context): Promise<StepResult> {
   // Never touch the provider's firewall (which may still carry the only SSH path) before the gate.
   if (context.state.steps["ssh-gate"]?.status !== "done" || !context.state.sshConfirmation) {
@@ -2009,24 +2063,24 @@ async function providerFirewall(context: Context): Promise<StepResult> {
       "The Tailscale SSH safety check has not passed; the provider firewall was not changed.",
     );
   }
-  const inventory = await hostInventory(context);
-  const parsed = JSON.parse(inventory) as { config: unknown; providerRules: ProviderRule[] };
-  const inventoryPath = join(context.root, "tmp", "ark-host-inventory.json");
-  writeFileSync(inventoryPath, inventory.endsWith("\n") ? inventory : `${inventory}\n`, { mode: 0o644 });
+  const argv = [context.bun, "scripts/host-audit.ts", "--inventory"];
+  const preview = await exec(context, argv, { env: childEnv(context) });
+  let inventory: string;
+  if (preview.status !== 0 && (preview.stderr || preview.stdout).includes(frontPolicyPending)) {
+    // The current reconciler may need the platform install before it can acknowledge this policy.
+    // Review the host's live dedicated ports now and check the acknowledged inventory after install.
+    const config = {
+      ...baselineConfig(context),
+      routes: hostRoutesFromFirewall(await must(context, liveHostRules)),
+    };
+    inventory = JSON.stringify({ config, providerRules: providerFirewallRules(config) }, null, 2);
+  } else inventory = commandOutput(context, argv, preview);
+  const parsed = JSON.parse(inventory) as { providerRules: ProviderRule[] };
+  saveInventory(context, inventory);
   const addresses = await publicAddresses(context);
   const status = await tailscaleStatus(context);
   const retainSsh = context.state.steps["public-ssh"]?.status !== "done";
-  const access = readHostSshAccess(readEnv(context.paths.hostFirewall));
-  const rules = [...parsed.providerRules];
-  if (retainSsh && access.ports.length) {
-    rules.push({
-      protocol: "tcp",
-      ports: access.ports,
-      sourceCidrs: access.source
-        ? [`${access.source}/${isIP(access.source) === 4 ? 32 : 128}`]
-        : ["0.0.0.0/0", "::/0"],
-    });
-  }
+  const rules = providerRulesWithSsh(context, parsed.providerRules, retainSsh);
   const firewallContext: FirewallContext = {
     ui: context.ui,
     interactive: context.interactive,
@@ -2076,10 +2130,31 @@ async function providerFirewall(context: Context): Promise<StepResult> {
   return result;
 }
 
+function providerRuleDelta(approved: ProviderRule[], current: ProviderRule[]) {
+  const entries = (rules: ProviderRule[]) =>
+    new Set(
+      rules.flatMap(({ protocol, ports, sourceCidrs }) =>
+        ports.map((port) => `${protocol.toUpperCase()} ${port} from ${sourceCidrs.toSorted().join(" and ")}`),
+      ),
+    );
+  const before = entries(approved);
+  const after = entries(current);
+  return [
+    ...[...after].filter((entry) => !before.has(entry)).map((entry) => `allow ${entry}`),
+    ...[...before].filter((entry) => !after.has(entry)).map((entry) => `remove ${entry}`),
+  ];
+}
+
 // The local audit checks Docker publications too, so it runs once the platform is installed. The
 // provider step above runs before the install so that it can ask its question while you are present.
 async function localAudit(context: Context): Promise<StepResult> {
   const provider = context.state.steps["provider-firewall"];
+  const retainSsh = context.state.steps["public-ssh"]?.status !== "done";
+  const inventory = await hostInventory(
+    context,
+    provider?.status === "done" ? ["--audit", ...(retainSsh ? ["--retain-ssh"] : [])] : [],
+  );
+  const inventoryPath = saveInventory(context, inventory);
   if (provider?.status !== "done") {
     return {
       status: "pending",
@@ -2087,16 +2162,25 @@ async function localAudit(context: Context): Promise<StepResult> {
       finish: provider?.finish ?? "Re-run host:setup to confirm the provider firewall.",
     };
   }
-  const inventory = await hostInventory(context);
-  const inventoryPath = join(context.root, "tmp", "ark-host-inventory.json");
-  writeFileSync(inventoryPath, inventory.endsWith("\n") ? inventory : `${inventory}\n`, { mode: 0o644 });
+  const { rules: approvedRules = [] } = JSON.parse(provider.fingerprint ?? "{}") as {
+    rules?: ProviderRule[];
+  };
+  const { providerRules } = JSON.parse(inventory) as { providerRules: ProviderRule[] };
+  const delta = providerRuleDelta(approvedRules, providerRulesWithSsh(context, providerRules, retainSsh));
+  if (delta.length) {
+    const finish = "Re-run host:setup to review and reconcile the current provider firewall rules.";
+    context.state.steps["provider-firewall"] = {
+      ...provider,
+      status: "pending",
+      at: new Date().toISOString(),
+      note: `The final inventory changed after provider approval. Required changes: ${delta.join("; ")}.`,
+      finish,
+    };
+    return { status: "pending", note: "The local audit is awaiting updated provider verification.", finish };
+  }
   const addresses = await publicAddresses(context);
   const status = await tailscaleStatus(context);
-  const retainSsh = context.state.steps["public-ssh"]?.status !== "done";
   const access = readHostSshAccess(readEnv(context.paths.hostFirewall));
-  await must(context, [context.bun, "scripts/host-audit.ts", ...(retainSsh ? ["--retain-ssh"] : [])], {
-    env: childEnv(context),
-  });
   const ips = [...addresses.ipv4, ...addresses.ipv6];
   if (retainSsh && access.ports.length) {
     context.ui.print(

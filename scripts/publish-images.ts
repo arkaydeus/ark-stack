@@ -105,26 +105,40 @@ export async function isolatedDockerConfig(scratch: string) {
   };
 }
 
-export function digestReferences(metadata: unknown): string[] {
+type PublishedImage = { target: string; name: string; digest: string };
+
+function validDigest(digest: unknown): digest is string {
+  return typeof digest === "string" && /^sha256:[a-f0-9]{64}$/.test(digest);
+}
+
+function bakeImages(metadata: unknown): PublishedImage[] {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
     throw new Error("Bake metadata must be an object.");
   }
-  const references: string[] = [];
+  const images: PublishedImage[] = [];
   for (const [target, entry] of Object.entries(metadata)) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       throw new Error(`Invalid Bake metadata for ${target}.`);
     }
     const digest: unknown = Reflect.get(entry, "containerimage.digest");
     const names: unknown = Reflect.get(entry, "image.name");
-    if (typeof digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(digest) || typeof names !== "string") {
+    if (!validDigest(digest) || typeof names !== "string") {
       throw new Error(`Missing or invalid image name/digest for ${target}.`);
     }
     const name = names.split(",")[0]?.replace(/:[^:/]+$/, "");
     if (!name) throw new Error(`Missing image name for ${target}.`);
-    references.push(`  ${target.padEnd(17)} ${name}@${digest}`);
+    images.push({ target, name, digest });
   }
-  if (!references.length) throw new Error("Bake metadata contains no published images.");
-  return references;
+  if (!images.length) throw new Error("Bake metadata contains no published images.");
+  return images;
+}
+
+function references(images: PublishedImage[]) {
+  return images.map(({ target, name, digest }) => `  ${target.padEnd(17)} ${name}@${digest}`);
+}
+
+export function digestReferences(metadata: unknown) {
+  return references(bakeImages(metadata));
 }
 
 /** Registry repository per Bake target, from `docker buildx bake --print` with a single tag. */
@@ -147,17 +161,35 @@ export function imageNames(plan: unknown, tag: string): [string, string][] {
   return names.toSorted(([a], [b]) => a.localeCompare(b));
 }
 
-async function mergePlatforms(
-  sources: string[],
-  tags: string[],
-  bakeEnv: Record<string, string>,
-  dockerEnv: Record<string, string>,
-) {
+async function plannedImages(tag: string, bakeEnv: Record<string, string>) {
   const plan = JSON.parse(
-    await capture(["docker", "buildx", "bake", "--print"], undefined, { ...bakeEnv, TAGS: sources[0]! }),
+    await capture(["docker", "buildx", "bake", "--print"], undefined, { ...bakeEnv, TAGS: tag }),
   );
-  const references: string[] = [];
-  for (const [target, name] of imageNames(plan, sources[0]!)) {
+  return imageNames(plan, tag);
+}
+
+async function inspectImages(images: [string, string][], tag: string, dockerEnv: Record<string, string>) {
+  const verified: PublishedImage[] = [];
+  for (const [target, name] of images) {
+    const manifest = await capture(
+      ["docker", "buildx", "imagetools", "inspect", `${name}:${tag}`, "--format", "{{json .Manifest}}"],
+      undefined,
+      dockerEnv,
+    );
+    const digest: unknown = JSON.parse(manifest)?.digest;
+    if (!validDigest(digest)) throw new Error(`Missing or invalid digest for ${target}:${tag}.`);
+    verified.push({ target, name, digest });
+  }
+  return verified;
+}
+
+export async function mergePlatforms(
+  images: [string, string][],
+  sources: string[],
+  tag: string,
+  dockerEnv: Record<string, string> = {},
+) {
+  for (const [, name] of images) {
     // The index annotation links the merged package to the repository, as Bake's annotation does.
     await run(
       [
@@ -167,23 +199,43 @@ async function mergePlatforms(
         "create",
         "--annotation",
         `index:org.opencontainers.image.source=${imageSource}`,
-        ...tags.flatMap((tag) => ["--tag", `${name}:${tag}`]),
+        "--tag",
+        `${name}:${tag}`,
         ...sources.map((source) => `${name}:${source}`),
       ],
       dockerEnv,
     );
-    const manifest = await capture(
-      ["docker", "buildx", "imagetools", "inspect", `${name}:${tags[0]}`, "--format", "{{json .Manifest}}"],
-      undefined,
-      dockerEnv,
-    );
-    const digest: unknown = JSON.parse(manifest)?.digest;
-    if (typeof digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(digest)) {
-      throw new Error(`Missing or invalid merged digest for ${target}.`);
-    }
-    references.push(`  ${target.padEnd(17)} ${name}@${digest}`);
   }
-  return references;
+  return inspectImages(images, tag, dockerEnv);
+}
+
+export async function promoteLatest(
+  images: PublishedImage[],
+  tag: string,
+  dockerEnv: Record<string, string> = {},
+) {
+  for (const { name, digest } of images) {
+    try {
+      // A single index source preserves its architecture descriptors and attestations.
+      await run(
+        [
+          "docker",
+          "buildx",
+          "imagetools",
+          "create",
+          "--prefer-index=false",
+          "--tag",
+          `${name}:latest`,
+          `${name}@${digest}`,
+        ],
+        dockerEnv,
+      );
+    } catch (error) {
+      throw new Error(`Could not promote ${name}:latest. Retry with --tag ${tag} --promote-latest.`, {
+        cause: error,
+      });
+    }
+  }
 }
 
 async function main() {
@@ -195,6 +247,7 @@ async function main() {
       "allow-dirty": { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
       merge: { type: "string" },
+      "promote-latest": { type: "boolean", default: false },
     },
   });
   const registry = process.env.ARK_IMAGE_REGISTRY ?? `${registryHost}/arkaydeus`;
@@ -209,26 +262,38 @@ async function main() {
   if (sources && (sources.length < 2 || !sources.every(validTag) || new Set(sources).size !== sources.length))
     throw new Error("--merge needs at least two distinct, valid source tags.");
   if (sources && values["dry-run"]) throw new Error("--merge cannot be combined with --dry-run.");
+  if (
+    values["promote-latest"] &&
+    (!values.tag || values.tag === "latest" || sources || values["dry-run"] || values["no-latest"])
+  ) {
+    throw new Error("--promote-latest needs --tag <published-tag> and runs on its own.");
+  }
   const dirty = (await capture(["git", "status", "--porcelain"])) !== "";
   if (dirty && !values["allow-dirty"] && !values["dry-run"]) {
     throw new Error("Working tree has uncommitted changes; commit them or pass --allow-dirty.");
   }
   if (dirty && values.tag === "latest") throw new Error("Dirty builds cannot publish the latest tag.");
+  if (dirty && values["promote-latest"]) throw new Error("Promoting latest requires a clean checkout.");
+  if (values["promote-latest"] && values.tag?.endsWith("-dirty")) {
+    throw new Error("Dirty builds cannot publish the latest tag.");
+  }
   const revision = await capture(["git", "rev-parse", "HEAD"]);
-  const baseTag = values.tag ?? revision.slice(0, 12);
+  const commitTag = revision.slice(0, 12);
+  const baseTag = values.tag === "latest" ? commitTag : (values.tag ?? commitTag);
   const tag = dirty && !baseTag.endsWith("-dirty") ? `${baseTag}-dirty` : baseTag;
   if (tag.length > 128) throw new Error("Docker tag exceeds 128 characters after the dirty suffix.");
-  const tags = values["no-latest"] || dirty || tag === "latest" ? [tag] : [tag, "latest"];
+  const publishLatest = values.tag === "latest" || (!values["no-latest"] && !dirty);
+  const tags = publishLatest ? [tag, "latest"] : [tag];
   if (sources?.some((source) => tags.includes(source)))
     throw new Error("--merge source tags must differ from the published tags.");
   const bakeEnv = {
     REGISTRY: registry,
-    TAGS: tags.join(","),
+    TAGS: tag,
     PLATFORMS: values.platform ?? process.env.ARK_IMAGE_PLATFORMS ?? "linux/amd64",
     REVISION: `${revision}${dirty ? "-dirty" : ""}`,
   };
   if (values["dry-run"]) {
-    await run(["docker", "buildx", "bake", "--print"], bakeEnv);
+    await run(["docker", "buildx", "bake", "--print"], { ...bakeEnv, TAGS: tags.join(",") });
     return;
   }
 
@@ -241,20 +306,26 @@ async function main() {
       token,
       dockerEnv,
     );
-    if (sources) {
-      const references = await mergePlatforms(sources, tags, bakeEnv, dockerEnv);
+    let images: PublishedImage[];
+    if (values["promote-latest"]) {
+      images = await inspectImages(await plannedImages(tag, bakeEnv), tag, dockerEnv);
+      await promoteLatest(images, tag, dockerEnv);
+      console.log(`\nPromoted :${tag} to :latest:`);
+    } else if (sources) {
+      images = await mergePlatforms(await plannedImages(sources[0]!, bakeEnv), sources, tag, dockerEnv);
+      if (publishLatest) await promoteLatest(images, tag, dockerEnv);
       console.log(`\nMerged ${sources.join(", ")} into ${tags.map((t) => `:${t}`).join(" ")}:`);
-      for (const reference of references) console.log(reference);
-      return;
+    } else {
+      const metadataFile = join(scratch, "metadata.json");
+      await run(["docker", "buildx", "bake", "--push", "--metadata-file", metadataFile], {
+        ...bakeEnv,
+        ...dockerEnv,
+      });
+      images = bakeImages(await Bun.file(metadataFile).json());
+      if (publishLatest) await promoteLatest(images, tag, dockerEnv);
+      console.log(`\nPushed ${tags.map((t) => `:${t}`).join(" ")} for ${bakeEnv.PLATFORMS}:`);
     }
-    const metadataFile = join(scratch, "metadata.json");
-    await run(["docker", "buildx", "bake", "--push", "--metadata-file", metadataFile], {
-      ...bakeEnv,
-      ...dockerEnv,
-    });
-    const references = digestReferences(await Bun.file(metadataFile).json());
-    console.log(`\nPushed ${tags.map((t) => `:${t}`).join(" ")} for ${bakeEnv.PLATFORMS}:`);
-    for (const reference of references) console.log(reference);
+    for (const reference of references(images)) console.log(reference);
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }

@@ -63,6 +63,16 @@ export function hostRoutesFromFront(rules: string): NonNullable<HostPortConfig["
   return routes;
 }
 
+/** The host table gates dedicated ports; their actual policy lives in ark_front. */
+export function hostRoutesFromFirewall(rules: string): NonNullable<HostPortConfig["routes"]> {
+  const elements = /\bset public_tcp\s*\{[^}]*\belements\s*=\s*\{([^}]*)\}/.exec(rules)?.[1];
+  return (elements ?? "")
+    .split(",")
+    .map((port) => Number(port.trim()))
+    .filter(isTcpRoutePort)
+    .map((port) => ({ port, policy: "deny-all" }));
+}
+
 export function publicHostPorts(config: HostPortConfig) {
   const web = frontSharedPorts(config.sniPorts);
   if (typeof config.mailEnabled !== "boolean") throw new Error("Missing mail configuration.");

@@ -255,7 +255,7 @@ env = { _.file = ".env" }
 raw_args = true
 
 [tasks."host:setup"]
-description = "Guided production install on an Ubuntu VPS (run as root; started by install.sh): questions, Tailscale enrolment (manual keys or Tailscale API), SSH safety check, hardening and install, edge and optional backup node, admin origin and ACME, closing public SSH, provider firewall (manual or Hetzner Cloud API) and audit, summary"
+description = "Guided production install on an Ubuntu VPS. Started by install.sh as root. Covers questions, Tailscale enrolment (manual keys or Tailscale API), SSH safety check, hardening, public SSH cutover, provider firewall review (manual or Hetzner Cloud API), remaining keys, platform install, edge and optional backup enrolment, admin origin and ACME, local audit, summary"
 run = "bun --no-env-file scripts/host-setup.ts"
 raw_args = true
 

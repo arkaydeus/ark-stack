@@ -81,6 +81,8 @@ jobs:
       - run: bun run --cwd web build
       # The server suite includes the bounded DER fuzz and OpenSSL CSR differential tests.
       - run: bun test shared server workers tests scripts/publish-images.test.ts scripts/install-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts scripts/brand-icons.test.ts
+        env:
+          ARK_TEST_IMAGE_REGISTRY: "1"
       # install.sh in disposable Ubuntu and Debian containers: refusals and the real apt path.
       - run: bun --no-env-file scripts/test-install-bootstrap.ts
       - run: ARK_DOCKER_INTEGRATION=1 go test ./...

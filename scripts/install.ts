@@ -66,7 +66,7 @@ function capture(argv: string[]) {
     child.stdout.on("data", (chunk) => (stdout += chunk));
     child.stderr.on("data", (chunk) => (stderr += chunk));
     child.on("error", (error) => resolve({ status: 127, stdout, stderr: String(error) }));
-    child.on("exit", (code) => resolve({ status: code ?? 1, stdout, stderr }));
+    child.on("close", (code) => resolve({ status: code ?? 1, stdout, stderr }));
   });
 }
 
@@ -130,19 +130,23 @@ values.ARK_HOST_HARDENING = hardened ? "1" : "0";
 values.ARK_HOST_METRICS_SOURCE = hardened ? hostMetricsPath : "../../tmp/host-metrics";
 values.ARK_IPV6_DOCKER_SOURCE = hardened ? dockerIpv6EvidenceDir : "../../tmp/ipv6";
 if (hardened) {
-  await installHostHardening(async (ssh) => {
-    await stopDisabledMail();
-    if (enableMail && useDocker && ssh.ports.length) {
-      // An earlier reconciler replaces all of ark_host and could erase the recovery path.
-      await run("docker", [...compose, "stop", "database-ingress"]);
-    }
-    return appliedHostConfig(root, values).catch((error) => {
-      console.warn(
-        `Could not reuse the previous front policy. Dedicated ports stay closed until reconciliation. ${String(error)}`,
-      );
-      return { mailEnabled: enableMail, sniPorts: sni.ports };
-    });
-  });
+  await installHostHardening(
+    async (ssh) => {
+      // A full mail-disable install fails closed. The early SSH and provider review keep services up.
+      if (!hardenOnly) {
+        await stopDisabledMail();
+        if (enableMail && useDocker && ssh.ports.length) {
+          // An earlier reconciler replaces all of ark_host and could erase the recovery path.
+          await run("docker", [...compose, "stop", "database-ingress"]);
+        }
+      }
+      return appliedHostConfig(root, values).catch((error) => {
+        console.warn(`Could not read an acknowledged front policy. ${String(error)}`);
+        return { mailEnabled: enableMail, sniPorts: sni.ports };
+      });
+    },
+    { keepLivePorts: hardenOnly },
+  );
 } else await stopDisabledMail();
 await Bun.write(
   envPath,
@@ -274,7 +278,7 @@ if (useDocker) {
   const images = await pullPublishedImages({
     root,
     compose: await Bun.file(join(root, "infra/platform/docker-compose.yml")).text(),
-    version: process.env.ARK_VERSION || values.ARK_VERSION || "local",
+    version: (process.env.ARK_VERSION ?? values.ARK_VERSION) || "local",
     env: process.env,
     exec: capture,
     log: (line) => console.log(line),

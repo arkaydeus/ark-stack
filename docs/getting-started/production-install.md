@@ -1,6 +1,6 @@
 # Production install
 
-This page takes you from a fresh Ubuntu VPS to a hardened, running Ark Stack. One command does the whole install: prerequisites, Tailscale enrolment, a Tailscale SSH safety check, hardening and installation, the edge node, the admin origin and certificate settings, closing public SSH, the provider firewall rules and the local audit. The [manual phases](#what-the-installer-does--manual-install) it runs are documented below, with links to the [operator runbooks](../operating.md) for the full detail.
+This page takes you from a fresh Ubuntu VPS to a hardened, running Ark Stack. One command does the whole install: prerequisites, Tailscale enrolment, a Tailscale SSH safety check, host hardening, public SSH cutover, provider firewall review, remaining manual keys, platform installation, edge and optional backup enrolment, admin origin and certificate settings, and the local audit. The [manual phases](#what-the-installer-does--manual-install) it runs are documented below, with links to the [operator runbooks](../operating.md) for the full detail.
 
 ## Before you start
 

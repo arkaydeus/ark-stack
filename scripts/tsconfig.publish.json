@@ -5,6 +5,8 @@
     "publish-images.ts",
     "publish-images.test.ts",
     "check-image-plan.ts",
+    "install.ts",
+    "install-edge-auth.test.ts",
     "install-images.ts",
     "install-images.test.ts",
     "test-ghcr-publish.ts",
