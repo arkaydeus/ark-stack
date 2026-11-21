@@ -4,7 +4,7 @@
 import { normalizeHostname, parseSniPorts } from "@ark-stack/shared";
 import { isIP } from "node:net";
 
-import { automaticUpdatesConfig } from "../install-host-hardening.ts";
+import { automaticUpdatesConfig, validateTailscaleHostname } from "../install-host-hardening.ts";
 import type { StoredAnswers } from "./state.ts";
 import type { Ui } from "./system.ts";
 
@@ -42,6 +42,9 @@ const VALUE_FLAGS = new Set([
   "--ssh-user",
   "--ssh-recovery-source",
   "--provider-firewall",
+  "--tailscale-hostname",
+  "--tailscale-edge-hostname",
+  "--tailscale-backup-hostname",
 ]);
 const BOOLEAN_FLAGS = new Set([
   "--non-interactive",
@@ -77,6 +80,13 @@ Questions:
   (environment only)            DNS_API_TOKEN               Optional Cloudflare DNS token
   --reboot-time HH:MM           ARK_HOST_REBOOT_TIME        Automatic reboot time (default 04:00)
   --ssh-user NAME               ARK_SETUP_SSH_USER          Your local user for Tailscale SSH
+  --tailscale-hostname NAME     ARK_SETUP_TAILSCALE_HOSTNAME
+                                Tailscale machine name of this VPS (default: the OS hostname,
+                                sanitised): 1-63 lowercase letters, digits and hyphens
+  --tailscale-edge-hostname NAME
+                                ARK_SETUP_TAILSCALE_EDGE_HOSTNAME    Edge node (default <name>-edge)
+  --tailscale-backup-hostname NAME
+                                ARK_SETUP_TAILSCALE_BACKUP_HOSTNAME  Backup node (default <name>-backup)
 
 Tailscale (environment only; read without echo otherwise):
   TS_API_KEY                              API access token: setup merges the policy and mints the keys
@@ -186,6 +196,41 @@ export function validateDnsToken(value: string) {
   return token;
 }
 
+/**
+ * A default machine name from the OS hostname: its first label, lowercased, with every run of other
+ * characters turned into one hyphen and trimmed to a valid DNS label (`ark-vps` if nothing is left).
+ */
+export function sanitizeHostname(value: string | undefined) {
+  const label = (value ?? "")
+    .trim()
+    .toLowerCase()
+    .split(".")[0]!
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+/, "")
+    .slice(0, 63)
+    .replace(/-+$/, "");
+  return label || "ark-vps";
+}
+
+/** `<base>-<suffix>`, with the base shortened so the whole name stays one 63-character DNS label. */
+export function derivedNodeName(base: string, suffix: string) {
+  const stem = base.slice(0, 63 - suffix.length - 1).replace(/-+$/, "");
+  return validateTailscaleHostname(`${stem}-${suffix}`, `The derived ${suffix} node name`);
+}
+
+/** The edge node's machine name: the explicit answer, else `<name>-edge`. */
+export function edgeHostname(answers: Pick<StoredAnswers, "tailscaleHostname" | "tailscaleEdgeHostname">) {
+  return answers.tailscaleEdgeHostname ?? derivedNodeName(answers.tailscaleHostname, "edge");
+}
+
+/** The backup node's machine name: the explicit answer, else `<name>-backup`. */
+export function backupHostname(
+  answers: Pick<StoredAnswers, "tailscaleHostname" | "tailscaleBackupHostname">,
+) {
+  return answers.tailscaleBackupHostname ?? derivedNodeName(answers.tailscaleHostname, "backup");
+}
+
 function parseBool(value: string, name: string) {
   if (/^(?:1|y|yes|true|on)$/i.test(value.trim())) return true;
   if (/^(?:0|n|no|false|off)$/i.test(value.trim())) return false;
@@ -200,6 +245,8 @@ export type AnswerSources = {
   dotenv: Record<string, string>;
   interactive: boolean;
   ui: Ui;
+  /** The OS hostname, the source of the default Tailscale machine name. */
+  hostname?: string;
 };
 
 function adminHostFromEnv(dotenv: Record<string, string>) {
@@ -214,6 +261,10 @@ function adminHostFromEnv(dotenv: Record<string, string>) {
 /** Resolves every answer. In non-interactive mode a missing required answer fails, naming it. */
 export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
   const { flags, env, previous, dotenv, interactive, ui } = sources;
+  const hostnameOverride = (flag: string, variable: string) => {
+    const fromFlag = flags.get(flag);
+    return typeof fromFlag === "string" ? fromFlag : env[variable] || undefined;
+  };
   const given = (flag: string | undefined, variable: string | undefined) => {
     const fromFlag = flag ? flags.get(flag) : undefined;
     if (typeof fromFlag === "string") return fromFlag;
@@ -356,6 +407,63 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
     "the local SSH user (--ssh-user or ARK_SETUP_SSH_USER)",
   );
 
+  const hostnameDefault = previous.tailscaleHostname ?? sanitizeHostname(sources.hostname);
+  let tailscaleHostname: string | undefined;
+  let hostnameInput = hostnameOverride("--tailscale-hostname", "ARK_SETUP_TAILSCALE_HOSTNAME");
+  while (tailscaleHostname === undefined) {
+    const value =
+      hostnameInput ??
+      (interactive
+        ? await ui.ask(
+            "Tailscale machine name for this VPS (lowercase letters, digits and hyphens)",
+            hostnameDefault,
+            undefined,
+            { preserveWhitespace: true },
+          )
+        : hostnameDefault);
+    try {
+      tailscaleHostname = validateTailscaleHostname(
+        value === "" && hostnameInput === undefined ? hostnameDefault : value,
+      );
+    } catch (error) {
+      if (!interactive) throw error;
+      ui.print(`  ${error instanceof Error ? error.message : String(error)}`);
+      hostnameInput = undefined;
+    }
+  }
+  // The edge and backup names are not asked: they follow the machine name unless given explicitly.
+  const override = (
+    flag: string,
+    variable: string,
+    installedKey: string,
+    kept: string | undefined,
+    label: string,
+  ) => {
+    const value = hostnameOverride(flag, variable);
+    if (value !== undefined) return validateTailscaleHostname(value, `${label} (${flag} or ${variable})`);
+    const installed = dotenv[installedKey];
+    if (installed) return validateTailscaleHostname(installed, installedKey);
+    return kept;
+  };
+  const tailscaleEdgeHostname = override(
+    "--tailscale-edge-hostname",
+    "ARK_SETUP_TAILSCALE_EDGE_HOSTNAME",
+    "TS_EDGE_HOSTNAME",
+    previous.tailscaleEdgeHostname,
+    "Edge node name",
+  );
+  const tailscaleBackupHostname = override(
+    "--tailscale-backup-hostname",
+    "ARK_SETUP_TAILSCALE_BACKUP_HOSTNAME",
+    "TS_BACKUP_HOSTNAME",
+    previous.tailscaleBackupHostname,
+    "Backup node name",
+  );
+  const names = { tailscaleHostname, tailscaleEdgeHostname, tailscaleBackupHostname };
+  // Fails early if a derived name cannot be formed.
+  edgeHostname(names);
+  backupHostname(names);
+
   return {
     domain,
     adminHost,
@@ -366,6 +474,9 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
     sniPorts,
     rebootTime,
     sshUser,
+    tailscaleHostname,
+    ...(tailscaleEdgeHostname ? { tailscaleEdgeHostname } : {}),
+    ...(tailscaleBackupHostname ? { tailscaleBackupHostname } : {}),
     dnsApiToken,
   };
 }
@@ -386,5 +497,7 @@ export function describeAnswers(answers: Answers, dotenv: Record<string, string>
     `  Cloudflare DNS:      ${answers.dnsApiToken ? "token supplied" : dotenv.DNS_API_TOKEN?.trim() ? "keep the token in .env" : "none (manual DNS records)"}`,
     `  Reboot time:         ${answers.rebootTime}`,
     `  Tailscale SSH user:  ${answers.sshUser || "(not given)"}`,
+    `  Tailscale names:     ${answers.tailscaleHostname} (this VPS)`,
+    `                       edge ${edgeHostname(answers)}${answers.tailscaleEdgeHostname ? "" : " (a new edge node)"}, backup ${backupHostname(answers)}${answers.tailscaleBackupHostname ? "" : " (a new backup node)"}`,
   ];
 }

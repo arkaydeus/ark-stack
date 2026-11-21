@@ -7,6 +7,7 @@
 // Tailscale API credential the policy change and the auth keys are automated (tailscale-api.ts); a
 // provider firewall adapter (provider-firewall.ts) applies the rules where one detects the provider. Progress is one line per step; the detail goes to
 // a redacted log. A root-only state file records each step, so a re-run verifies and resumes.
+import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 
 import { parseEnvFile } from "@ark-stack/shared";
@@ -59,6 +60,8 @@ export type SetupDependencies = {
   platform: string;
   bun: string;
   stdinIsTty: boolean;
+  /** The OS hostname, the default Tailscale machine name (tests supply one). */
+  hostname?: string;
   /** Builds the UI once the log exists (tests supply a scripted one). */
   ui?: (interactive: boolean, log: SetupLog, redactor: Redactor) => Ui;
   keys?: (context: {
@@ -135,6 +138,7 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
       dotenv: parseEnvFile(readEnv(envPath)),
       interactive,
       ui,
+      hostname: deps.hostname ?? hostname(),
     });
   } catch (error) {
     ui.print(error instanceof Error ? error.message : String(error));
