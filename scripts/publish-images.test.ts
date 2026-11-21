@@ -260,7 +260,8 @@ test("command failures propagate and cleanup runs for login, push, and metadata 
     expect(result.code).toBe(1);
     expect(result.stdout).not.toContain("Pushed");
   }
-});
+  // Eight publisher processes, each with stubbed git, gh and docker: more than the 5 s default.
+}, 20_000);
 
 test("metadata produces immutable references for every target and rejects invalid shapes", () => {
   expect(

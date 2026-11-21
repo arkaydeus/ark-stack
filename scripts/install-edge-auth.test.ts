@@ -44,6 +44,7 @@ async function fixture() {
     "install-edge-auth.ts",
     "install-docker-ipv6.ts",
     "install-edge-l4.ts",
+    "install-images.ts",
     "install-host-hardening.ts",
     "install-mail-submission.ts",
     "host-inventory.ts",
