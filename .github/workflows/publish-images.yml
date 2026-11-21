@@ -1,0 +1,78 @@
+name: Publish images
+
+# Publishes every Bake target for linux/amd64 and linux/arm64 on each push to main, tagged with the
+# first 12 characters of the commit. Only the current main tip can advance `latest`.
+# `mise run host:install` pulls the tag for its own commit (scripts/install-images.ts).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Keep pending commit publications and serialize promotions.
+concurrency:
+  group: publish-images
+  queue: max
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    # Native runners: the edge Caddy is a Go build, far too slow under QEMU.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: docker/setup-buildx-action@v4
+      - run: bun scripts/check-image-plan.ts
+      - name: Build and push linux/${{ matrix.arch }}
+        run: |
+          export ARK_IMAGE_REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+          bun scripts/publish-images.ts --tag "${GITHUB_SHA::12}-${{ matrix.arch }}" --no-latest --platform "linux/${{ matrix.arch }}"
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: docker/setup-buildx-action@v4
+      - name: Merge the platform images into multi-platform tags
+        run: |
+          registry="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          tag="${GITHUB_SHA::12}"
+          ARK_IMAGE_REGISTRY="$registry" bun scripts/publish-images.ts --tag "$tag" --no-latest --merge "$tag-amd64,$tag-arm64"
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+      - name: Promote the current main tip to latest
+        if: github.ref == 'refs/heads/main'
+        run: |
+          main=$(git ls-remote --exit-code origin refs/heads/main)
+          if [[ "${main%%$'\t'*}" == "$GITHUB_SHA" ]]; then
+            registry="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+            ARK_IMAGE_REGISTRY="$registry" bun scripts/publish-images.ts --tag "${GITHUB_SHA::12}" --promote-latest
+          else
+            echo "This commit has been superseded on main. Its commit tags are published."
+          fi
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}

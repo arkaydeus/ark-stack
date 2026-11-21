@@ -87,7 +87,7 @@ These limits are design decisions, not missing work:
 
 ## Deployment model
 
-A production installation is one Ubuntu VPS joined to your Tailscale tailnet. The repository is checked out on the host, and `mise run host:install` generates secrets, builds the images and starts three Compose projects: `ark-platform` (the control plane, databases, workers, agent and front door), `ark-mail` (Stalwart, when mail is enabled) and `ark-monitoring` (Prometheus). A fourth project, `ark-restore-isolated`, is used only during recovery.
+A production installation is one Ubuntu VPS joined to your Tailscale tailnet. The repository is checked out on the host, and `mise run host:install` generates secrets, pulls the prebuilt images for its commit (building them only when they are not published) and starts three Compose projects: `ark-platform` (the control plane, databases, workers, agent and front door), `ark-mail` (Stalwart, when mail is enabled) and `ark-monitoring` (Prometheus). A fourth project, `ark-restore-isolated`, is used only during recovery.
 
 ```mermaid
 flowchart TB

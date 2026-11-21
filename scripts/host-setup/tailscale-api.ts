@@ -364,9 +364,9 @@ export function automaticKeySource(options: AutomaticKeySourceOptions): Tailscal
   const manual = manualKeySource({ env, ui, interactive, backup: options.backup });
   let chosen: Promise<TailscaleKeySource> | undefined;
 
-  async function choose(): Promise<TailscaleKeySource> {
+  async function choose(allowPrompt: boolean): Promise<TailscaleKeySource> {
     let credential = credentialFromEnv(env);
-    if (!credential && interactive) {
+    if (!credential && interactive && allowPrompt) {
       for (;;) {
         const value = (
           await ui.askSecret(
@@ -401,7 +401,7 @@ export function automaticKeySource(options: AutomaticKeySourceOptions): Tailscal
     );
     return apiKeySource(api, credential, options);
   }
-  const resolve = () => (chosen ??= choose());
+  const resolve = (allowPrompt = true) => (chosen ??= choose(allowPrompt));
 
   const source: TailscaleKeySource = {
     id: "automatic",
@@ -415,11 +415,17 @@ export function automaticKeySource(options: AutomaticKeySourceOptions): Tailscal
       for (const line of selected.policyInstructions()) ui.print(`      ${line}`);
       if (interactive) await ui.ask("Press Enter once the policy is saved", "");
     },
-    async acquire(request) {
+    async collect(request) {
+      const selected = await resolve();
+      // Review any API policy change now. Mint keys only when the nodes are ready to enrol.
+      await selected.preparePolicy?.();
+      return selected.collect?.(request);
+    },
+    async acquire(request, { allowPrompt = true } = {}) {
       // An explicitly supplied key (or key file) is used as given.
       if (env[request.variable]?.trim() || (request.tag === ARK_VPS_TAG && env.TS_VPS_AUTHKEY_FILE?.trim()))
         return manual.acquire(request);
-      return (await resolve()).acquire(request);
+      return (await resolve(allowPrompt)).acquire(request, { allowPrompt });
     },
   };
   return source;

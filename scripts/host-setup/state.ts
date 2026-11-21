@@ -7,12 +7,15 @@ export const STEP_IDS = [
   "prerequisites",
   "tailscale",
   "ssh-gate",
+  "harden",
+  "public-ssh",
+  "provider-firewall",
+  "keys",
   "install",
   "edge",
   "backup-node",
   "configuration",
-  "public-ssh",
-  "provider-firewall",
+  "audit",
   "summary",
 ] as const;
 export type StepId = (typeof STEP_IDS)[number];

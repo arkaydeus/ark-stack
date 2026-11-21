@@ -5,8 +5,10 @@ import {
   ARK_VPS_TAG,
   HOST_FIREWALL_TABLE,
   assertHostFirewall,
+  hostRoutesFromFirewall,
   readHostSshAccess,
   renderHostFirewall,
+  updateHostSshAccess,
   type HostPortConfig,
   type HostSshAccess,
 } from "@ark-stack/shared";
@@ -324,7 +326,10 @@ export function rebootMetricCommands(directory: string) {
   ];
 }
 
-export async function installHostHardening(getConfig: (ssh: HostSshAccess) => Promise<HostPortConfig>) {
+export async function installHostHardening(
+  getConfig: (ssh: HostSshAccess) => Promise<HostPortConfig>,
+  { keepLivePorts = false } = {},
+) {
   requireLinuxRoot();
   if (
     !vpsNodeReady(await settledVpsNode(tailscaleState)) ||
@@ -406,16 +411,32 @@ After=${firewallService}
   const baseline = renderHostFirewall({ ...config, routes: [] }, ssh);
   await hostCommand("nft", ["-c", "-f", "-"], baseline);
   await installFile(hostFirewallPath, baseline);
+  const listRules = () => hostCommand("nft", ["-s", "-y", "list", "table", "inet", HOST_FIREWALL_TABLE]);
+  // A running reconciler owns the dedicated port set. On an already compatible table, change
+  // just the SSH chain so a concurrent front-policy acknowledgement cannot be overwritten.
+  const priorRules = keepLivePorts ? await listRules().catch(() => undefined) : undefined;
+  const activeConfig = priorRules ? { ...config, routes: hostRoutesFromFirewall(priorRules) } : config;
+  let keepTable = false;
+  if (priorRules) {
+    try {
+      await hostCommand("systemctl", ["is-active", firewallService]);
+      assertHostFirewall(priorRules, activeConfig, readHostSshAccess(priorRules));
+      keepTable = true;
+    } catch {
+      // Replace an inactive or incompatible baseline, retaining the live dedicated ports.
+    }
+  }
   await hostCommand("systemctl", ["daemon-reload"]);
   await hostCommand("systemctl", ["start", rebootService]);
   await hostCommand("systemctl", ["enable", "--now", "ark-host-reboot-metric.timer"]);
   await hostCommand("systemctl", ["enable", "--now", firewallService]);
   // Preserve acknowledged routes on an update. The new reconciler will replay the full policy.
-  const active = renderHostFirewall(config, ssh);
+  const active = keepTable ? updateHostSshAccess(ssh) : renderHostFirewall(activeConfig, ssh);
   await hostCommand("nft", ["-f", "-"], active);
+  const rules = await listRules();
   assertHostFirewall(
-    await hostCommand("nft", ["-s", "-y", "list", "table", "inet", HOST_FIREWALL_TABLE]),
-    config,
+    rules,
+    keepLivePorts ? { ...config, routes: hostRoutesFromFirewall(rules) } : config,
     ssh,
   );
 }
