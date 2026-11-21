@@ -446,6 +446,9 @@ services:
       # A one-off, pre-approved key for tag:ark-edge (docs/operating.md, "Edge Tailscale node").
       # Without it the node waits for login and the edge still serves.
       TS_AUTHKEY: ${TS_EDGE_AUTHKEY:-}
+      # The Tailscale machine name, passed on every start so a restart never renames the node.
+      # host:setup writes it (<name>-edge by default); empty keeps the original ark-edge.
+      TS_HOSTNAME: ${TS_EDGE_HOSTNAME:-ark-edge}
       TS_STATE_DIR: /var/lib/tailscale
       TS_SOCKET: /var/run/tailscale/tailscaled.sock
       # Keep Docker's resolver so `api` and `edge-admin` resolve; MagicDNS is never needed here.
@@ -510,6 +513,8 @@ services:
       # A one-off, pre-approved key for tag:ark-backup (docs/guides/backups.md, "Home machine").
       # Without it the node waits for login and the home target stays suspended (unhealthy).
       TS_AUTHKEY: ${TS_BACKUP_AUTHKEY:-}
+      # The Tailscale machine name (host:setup writes <name>-backup); empty keeps ark-backup.
+      TS_HOSTNAME: ${TS_BACKUP_HOSTNAME:-ark-backup}
       TS_STATE_DIR: /var/lib/tailscale
       TS_SOCKET: /var/run/tailscale/tailscaled.sock
       TS_ACCEPT_DNS: "false"

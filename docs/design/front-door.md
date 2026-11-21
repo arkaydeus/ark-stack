@@ -989,6 +989,7 @@ edge-ts:
   environment:
     TS_USERSPACE: "false" # kernel mode: tailscale0 inside this netns
     TS_AUTHKEY: ${TS_EDGE_AUTHKEY:-}
+    TS_HOSTNAME: ${TS_EDGE_HOSTNAME:-ark-edge} # the machine name host:setup chose, on every start
     TS_STATE_DIR: /var/lib/tailscale
     TS_ACCEPT_DNS: "false" # keep Docker DNS so `api` resolves; we never need MagicDNS here
     TS_EXTRA_ARGS: "--shields-up" # no inbound tailnet connections to the edge node
@@ -2176,6 +2177,7 @@ services:
     environment:
       TS_USERSPACE: "true"
       TS_AUTHKEY: ${TS_BACKUP_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_BACKUP_HOSTNAME:-ark-backup}
       TS_STATE_DIR: /var/lib/tailscale
       TS_SOCKET: /var/run/tailscale/tailscaled.sock
       TS_SOCKS5_SERVER: 0.0.0.0:1055 # reachable only on the internal backup-tailnet network

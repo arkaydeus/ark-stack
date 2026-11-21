@@ -147,7 +147,12 @@ export interface Ui {
   readonly interactive: boolean;
   /** One line to the terminal; it is also logged, redacted. */
   print(line?: string): void;
-  ask(question: string, fallback?: string, signal?: AbortSignal): Promise<string>;
+  ask(
+    question: string,
+    fallback?: string,
+    signal?: AbortSignal,
+    options?: { preserveWhitespace?: boolean },
+  ): Promise<string>;
   askSecret(question: string): Promise<string>;
   askPassword(question: string): Promise<string>;
 }
@@ -165,13 +170,12 @@ export class TerminalUi implements Ui {
     this.log.write(line);
   }
 
-  async ask(question: string, fallback = "", signal?: AbortSignal) {
+  async ask(question: string, fallback = "", signal?: AbortSignal, { preserveWhitespace = false } = {}) {
     if (!this.interactive) throw new Error(`Cannot ask "${question}" in non-interactive mode.`);
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     try {
-      const answer = (
-        await rl.question(fallback ? `${question} [${fallback}]: ` : `${question}: `, { signal })
-      ).trim();
+      const raw = await rl.question(fallback ? `${question} [${fallback}]: ` : `${question}: `, { signal });
+      const answer = preserveWhitespace ? raw : raw.trim();
       this.log.write(`? ${question} -> ${answer || fallback}`);
       return answer || fallback;
     } finally {

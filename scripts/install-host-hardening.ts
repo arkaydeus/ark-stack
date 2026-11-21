@@ -52,10 +52,49 @@ export type TailscaleState = {
     PublicKey?: string;
     Online: boolean;
     Tags?: string[];
+    /** The requested machine name (`--hostname`, else the OS hostname). */
+    HostName?: string;
+    /** The MagicDNS name Tailscale assigned; its first label may carry a `-1` suffix. */
     DNSName?: string;
     TailscaleIPs?: string[];
   };
 };
+
+export const TAILSCALE_HOSTNAME_RULES =
+  "use 1-63 lowercase letters, digits and hyphens, not starting or ending with a hyphen (no spaces, dots or underscores)";
+
+/** A Tailscale machine name: one DNS label. Uppercase is lowercased; anything else invalid is refused. */
+export function validateTailscaleHostname(value: string, label = "Tailscale machine name") {
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(value)) {
+    throw new Error(`${label} ${JSON.stringify(value)} is not valid: ${TAILSCALE_HOSTNAME_RULES}.`);
+  }
+  return value.toLowerCase();
+}
+
+/** The name Tailscale assigned: the first label of the node's MagicDNS name. */
+export function assignedTailscaleName(state: TailscaleState | undefined) {
+  return state?.Self?.DNSName?.replace(/\.$/, "").split(".")[0] || undefined;
+}
+
+export function describeTailscaleName(requested: string, assigned: string | undefined) {
+  return assigned ?? `assigned name could not be verified (requested ${requested})`;
+}
+
+/** The assigned name is the requested one, or Tailscale's `-<n>` suffix for a taken name. */
+export function assignedNameSettled(state: TailscaleState | undefined, requested: string) {
+  const assigned = assignedTailscaleName(state);
+  if (state?.Self?.HostName !== requested || !assigned) return false;
+  return (
+    assigned === requested ||
+    (assigned.startsWith(requested) && /^-\d+$/.test(assigned.slice(requested.length)))
+  );
+}
+
+/** Says when Tailscale assigned a different name than the one requested, else nothing. */
+export function nameDifference(requested: string, assigned: string | undefined) {
+  if (!assigned || assigned === requested) return undefined;
+  return `Tailscale assigned the name ${assigned}, not the requested ${requested} (the name is taken on the tailnet, or the machine was renamed in the admin console).`;
+}
 
 async function tailscaleState() {
   return JSON.parse(await hostCommand("tailscale", ["status", "--json"])) as TailscaleState;
@@ -104,11 +143,65 @@ export async function settledVpsNode<T extends TailscaleState | undefined>(
   return state;
 }
 
-export async function enrollVps(readKey?: () => Promise<string>) {
-  requireLinuxRoot();
-  if (!Bun.which("tailscale")) await aptInstall(["tailscale"]);
-  await hostCommand("systemctl", ["enable", "--now", "tailscaled.service"]);
-  const state = await settledVpsNode(tailscaleState);
+const NAME_POLL_MS = 1000;
+const NAME_POLL_ATTEMPTS = 10;
+
+/**
+ * Reads the status again for up to ~10 s until the control server reports the requested name (or
+ * its `-<n>` form). A machine renamed in the admin console keeps that name, so this never fails.
+ */
+export async function settledTailscaleName<T extends TailscaleState | undefined>(
+  read: () => Promise<T>,
+  requested: string,
+  sleep: (ms: number) => Promise<void> = Bun.sleep,
+): Promise<T> {
+  let state = await read();
+  for (let attempt = 1; attempt < NAME_POLL_ATTEMPTS && !assignedNameSettled(state, requested); attempt++) {
+    await sleep(NAME_POLL_MS);
+    state = await read();
+  }
+  return state;
+}
+
+/** The host commands enrolVps uses; tests replace them with stubs. */
+export type EnrollIo = {
+  run: (command: string, args: string[], stdin?: string) => Promise<string>;
+  which: (command: string) => string | null;
+  requireRoot: () => void;
+  sleep: (ms: number) => Promise<void>;
+  log: (line: string) => void;
+};
+
+/**
+ * Enrols the host node as `tag:ark-vps`. With `hostname` (TS_VPS_HOSTNAME), a fresh node joins
+ * under that machine name and an enrolled, correctly tagged node is renamed in place with
+ * `tailscale set --hostname`; it is never logged out or re-enrolled and its tags are untouched.
+ * Without it, enrolment is unchanged.
+ */
+export async function enrollVps(
+  readKey?: () => Promise<string>,
+  requestedHostname: string | undefined = process.env.TS_VPS_HOSTNAME,
+  stubs: Partial<EnrollIo> = {},
+) {
+  const io: EnrollIo = {
+    run: hostCommand,
+    which: (command) => Bun.which(command),
+    requireRoot: requireLinuxRoot,
+    sleep: Bun.sleep,
+    log: (line) => console.log(line),
+    ...stubs,
+  };
+  const readState = async () => JSON.parse(await io.run("tailscale", ["status", "--json"])) as TailscaleState;
+  io.requireRoot();
+  const hostname = requestedHostname
+    ? validateTailscaleHostname(requestedHostname, "TS_VPS_HOSTNAME")
+    : undefined;
+  if (!io.which("tailscale")) {
+    await io.run("apt-get", ["update"]);
+    await io.run("apt-get", ["install", "-y", "--no-remove", "--no-install-recommends", "tailscale"]);
+  }
+  await io.run("systemctl", ["enable", "--now", "tailscaled.service"]);
+  const state = await settledVpsNode(readState, io.sleep);
   const problem = vpsNodeProblem(state);
   if (problem) {
     if (state.BackendState === "Running") {
@@ -122,20 +215,35 @@ export async function enrollVps(readKey?: () => Promise<string>) {
       `--auth-key=file:${keyFile}`,
       `--advertise-tags=${ARK_VPS_TAG}`,
       "--accept-dns=false",
+      ...(hostname ? [`--hostname=${hostname}`] : []),
     ];
     if (readKey) {
       // Give Tailscale an anonymous pipe it can reopen. Bun's stdin may be backed by a socket.
       const key = (await readKey()).trim();
       if (!/^tskey-[A-Za-z0-9-]+$/.test(key)) throw new Error("Expected a Tailscale auth key on stdin.");
-      await hostCommand("sh", ["-c", 'cat | tailscale "$@"', "sh", ...args], key);
+      await io.run("sh", ["-c", 'cat | tailscale "$@"', "sh", ...args], key);
     } else {
-      await hostCommand("tailscale", args);
+      await io.run("tailscale", args);
     }
   }
-  const enrolled = vpsNodeProblem(await settledVpsNode(tailscaleState));
+  const joined = await settledVpsNode(readState, io.sleep);
+  const enrolled = vpsNodeProblem(joined);
   if (enrolled) throw new Error(`The host Tailscale node must be running with ${ARK_VPS_TAG}: ${enrolled}.`);
-  await hostCommand("tailscale", ["set", "--ssh"]);
-  console.log("Verify Tailscale SSH as the owner before running host:install --harden-vps.");
+  if (hostname) {
+    // Rename in place: `tailscale set` changes only the name, never the login or the tags.
+    const renaming = joined.Self?.HostName !== hostname;
+    if (renaming) await io.run("tailscale", ["set", `--hostname=${hostname}`]);
+    const named =
+      renaming || problem
+        ? await settledTailscaleName(() => readState().catch(() => undefined), hostname, io.sleep)
+        : joined;
+    const assigned = assignedTailscaleName(named);
+    io.log(`Tailscale machine name: ${describeTailscaleName(hostname, assigned)}`);
+    const difference = nameDifference(hostname, assigned);
+    if (difference) io.log(difference);
+  }
+  await io.run("tailscale", ["set", "--ssh"]);
+  io.log("Verify Tailscale SSH as the owner before running host:install --harden-vps.");
 }
 
 export async function vpsAuthKeyFile(path: string | undefined) {

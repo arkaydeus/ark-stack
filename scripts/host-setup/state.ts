@@ -42,7 +42,14 @@ export type StoredAnswers = {
   sniPorts: number[];
   rebootTime: string;
   sshUser: string;
+  /** The host node's Tailscale machine name. */
+  tailscaleHostname: string;
+  /** Explicit edge and backup node names; without one, `<tailscaleHostname>-edge` / `-backup`. */
+  tailscaleEdgeHostname?: string;
+  tailscaleBackupHostname?: string;
 };
+
+export type TailscaleNode = "vps" | "edge" | "backup";
 
 export type SetupState = {
   version: 1;
@@ -57,6 +64,8 @@ export type SetupState = {
   /** The admin origin this setup last wrote, so a changed hostname replaces it. */
   adminOrigin?: string;
   edgeKeyRetry?: boolean;
+  /** Each node's requested machine name and the name Tailscale assigned (read back from its status). */
+  tailscaleNames?: Partial<Record<TailscaleNode, { requested: string; assigned?: string }>>;
   steps: Partial<Record<StepId, StepRecord>>;
 };
 
