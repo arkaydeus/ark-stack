@@ -3,8 +3,12 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
+import { imageSource } from "./check-image-plan.ts";
+
 // Builds every platform image in docker-bake.hcl and pushes it to GHCR.
 // Explicit tokens require GHCR_USER; otherwise the GitHub CLI token needs write:packages.
+// `--merge <tag>,<tag>` instead combines per-platform tags that were already pushed (one per CI
+// runner) into one multi-platform index per image, tagged with --tag (and latest).
 const root = join(import.meta.dir, "..");
 const registryHost = "ghcr.io";
 
@@ -123,6 +127,65 @@ export function digestReferences(metadata: unknown): string[] {
   return references;
 }
 
+/** Registry repository per Bake target, from `docker buildx bake --print` with a single tag. */
+export function imageNames(plan: unknown, tag: string): [string, string][] {
+  const targets: unknown =
+    plan && typeof plan === "object" && !Array.isArray(plan) ? Reflect.get(plan, "target") : undefined;
+  if (!targets || typeof targets !== "object" || Array.isArray(targets)) {
+    throw new Error("Bake plan has no targets.");
+  }
+  const names: [string, string][] = [];
+  for (const [target, entry] of Object.entries(targets)) {
+    const tags: unknown = entry && typeof entry === "object" ? Reflect.get(entry, "tags") : undefined;
+    const first = Array.isArray(tags) ? tags[0] : undefined;
+    if (typeof first !== "string" || !first.endsWith(`:${tag}`)) {
+      throw new Error(`Bake target ${target} has no :${tag} tag.`);
+    }
+    names.push([target, first.slice(0, -tag.length - 1)]);
+  }
+  if (!names.length) throw new Error("Bake plan has no targets.");
+  return names.toSorted(([a], [b]) => a.localeCompare(b));
+}
+
+async function mergePlatforms(
+  sources: string[],
+  tags: string[],
+  bakeEnv: Record<string, string>,
+  dockerEnv: Record<string, string>,
+) {
+  const plan = JSON.parse(
+    await capture(["docker", "buildx", "bake", "--print"], undefined, { ...bakeEnv, TAGS: sources[0]! }),
+  );
+  const references: string[] = [];
+  for (const [target, name] of imageNames(plan, sources[0]!)) {
+    // The index annotation links the merged package to the repository, as Bake's annotation does.
+    await run(
+      [
+        "docker",
+        "buildx",
+        "imagetools",
+        "create",
+        "--annotation",
+        `index:org.opencontainers.image.source=${imageSource}`,
+        ...tags.flatMap((tag) => ["--tag", `${name}:${tag}`]),
+        ...sources.map((source) => `${name}:${source}`),
+      ],
+      dockerEnv,
+    );
+    const manifest = await capture(
+      ["docker", "buildx", "imagetools", "inspect", `${name}:${tags[0]}`, "--format", "{{json .Manifest}}"],
+      undefined,
+      dockerEnv,
+    );
+    const digest: unknown = JSON.parse(manifest)?.digest;
+    if (typeof digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(digest)) {
+      throw new Error(`Missing or invalid merged digest for ${target}.`);
+    }
+    references.push(`  ${target.padEnd(17)} ${name}@${digest}`);
+  }
+  return references;
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -131,6 +194,7 @@ async function main() {
       "no-latest": { type: "boolean", default: false },
       "allow-dirty": { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
+      merge: { type: "string" },
     },
   });
   const registry = process.env.ARK_IMAGE_REGISTRY ?? `${registryHost}/arkaydeus`;
@@ -139,8 +203,12 @@ async function main() {
       "ARK_IMAGE_REGISTRY must be a ghcr.io/<namespace> prefix (lowercase, no scheme or trailing slash).",
     );
   }
-  if (values.tag !== undefined && !/^[\w][\w.-]{0,127}$/.test(values.tag))
-    throw new Error("Invalid Docker tag.");
+  const validTag = (tag: string) => /^[\w][\w.-]{0,127}$/.test(tag);
+  if (values.tag !== undefined && !validTag(values.tag)) throw new Error("Invalid Docker tag.");
+  const sources = values.merge?.split(",").map((source) => source.trim());
+  if (sources && (sources.length < 2 || !sources.every(validTag) || new Set(sources).size !== sources.length))
+    throw new Error("--merge needs at least two distinct, valid source tags.");
+  if (sources && values["dry-run"]) throw new Error("--merge cannot be combined with --dry-run.");
   const dirty = (await capture(["git", "status", "--porcelain"])) !== "";
   if (dirty && !values["allow-dirty"] && !values["dry-run"]) {
     throw new Error("Working tree has uncommitted changes; commit them or pass --allow-dirty.");
@@ -151,6 +219,8 @@ async function main() {
   const tag = dirty && !baseTag.endsWith("-dirty") ? `${baseTag}-dirty` : baseTag;
   if (tag.length > 128) throw new Error("Docker tag exceeds 128 characters after the dirty suffix.");
   const tags = values["no-latest"] || dirty || tag === "latest" ? [tag] : [tag, "latest"];
+  if (sources?.some((source) => tags.includes(source)))
+    throw new Error("--merge source tags must differ from the published tags.");
   const bakeEnv = {
     REGISTRY: registry,
     TAGS: tags.join(","),
@@ -171,6 +241,12 @@ async function main() {
       token,
       dockerEnv,
     );
+    if (sources) {
+      const references = await mergePlatforms(sources, tags, bakeEnv, dockerEnv);
+      console.log(`\nMerged ${sources.join(", ")} into ${tags.map((t) => `:${t}`).join(" ")}:`);
+      for (const reference of references) console.log(reference);
+      return;
+    }
     const metadataFile = join(scratch, "metadata.json");
     await run(["docker", "buildx", "bake", "--push", "--metadata-file", metadataFile], {
       ...bakeEnv,

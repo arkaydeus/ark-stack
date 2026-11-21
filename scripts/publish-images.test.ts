@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { digestReferences } from "./publish-images";
+import { digestReferences, imageNames } from "./publish-images";
 
 const fixtures: string[] = [];
 afterEach(async () => {
@@ -36,6 +36,12 @@ if (command === "gh") {
     if (env.GH_TOKEN !== "cli-token" || env.GITHUB_TOKEN) throw new Error("wrong API credentials");
     console.log(args.includes("--include") ? "HTTP/2 200\\r\\nX-OAuth-Scopes: " + (env.SCOPES ?? "repo, write:packages") + "\\r\\n\\r\\n{}" : "cli-user");
   }
+}
+if (command === "docker" && args[1] === "bake" && args.includes("--print") && env.PLAN) {
+  console.log(env.PLAN.replaceAll("TAG", env.TAGS));
+}
+if (command === "docker" && args[1] === "imagetools" && args[2] === "inspect") {
+  console.log(JSON.stringify({ mediaType: "application/vnd.oci.image.index.v1+json", digest: "${digest}" }));
 }
 if (command === "docker" && args.includes("--push")) {
   writeFileSync(args[args.indexOf("--metadata-file") + 1], env.METADATA ?? JSON.stringify({ app: {
@@ -104,6 +110,7 @@ async function publish(args: string[] = [], overrides: Record<string, string | u
       SCOPES: undefined,
       FAIL_COMMAND: undefined,
       METADATA: undefined,
+      PLAN: undefined,
       STUB_LOG: log,
       ...overrides,
     },
@@ -324,4 +331,99 @@ test("empty token and empty tag fail directly", async () => {
   expect(result.stderr).toContain("empty token");
   expect(result.records.some((record) => record.args[0] === "api")).toBe(false);
   expect((await publish(["--tag", ""])).stderr).toContain("Invalid Docker tag");
+});
+
+const plan = JSON.stringify({
+  target: {
+    app: { tags: ["ghcr.io/arkaydeus/ark-stack:TAG"] },
+    "edge-caddy": { tags: ["ghcr.io/arkaydeus/ark-edge-caddy:TAG"] },
+  },
+});
+
+test("merge combines per-platform tags into one annotated index per image", async () => {
+  const tag = revision.slice(0, 12);
+  const result = await publish(["--tag", tag, "--merge", `${tag}-amd64,${tag}-arm64`], {
+    GHCR_TOKEN: "token",
+    GHCR_USER: "user",
+    PLAN: plan,
+  });
+  expect(result.code).toBe(0);
+  expect(result.records.some((record) => record.args.includes("--push"))).toBe(false);
+  const print = result.records.find((record) => record.args.includes("--print"))!;
+  expect(print.tags).toBe(`${tag}-amd64`);
+  const creates = result.records.filter((record) => record.args[2] === "create");
+  expect(creates.map((record) => record.args.slice(3))).toEqual([
+    [
+      "--annotation",
+      "index:org.opencontainers.image.source=https://github.com/arkaydeus/ark-stack",
+      "--tag",
+      `ghcr.io/arkaydeus/ark-stack:${tag}`,
+      "--tag",
+      "ghcr.io/arkaydeus/ark-stack:latest",
+      `ghcr.io/arkaydeus/ark-stack:${tag}-amd64`,
+      `ghcr.io/arkaydeus/ark-stack:${tag}-arm64`,
+    ],
+    [
+      "--annotation",
+      "index:org.opencontainers.image.source=https://github.com/arkaydeus/ark-stack",
+      "--tag",
+      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}`,
+      "--tag",
+      "ghcr.io/arkaydeus/ark-edge-caddy:latest",
+      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}-amd64`,
+      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}-arm64`,
+    ],
+  ]);
+  const login = result.records.find((record) => record.args[0] === "login")!;
+  expect(creates.every((record) => record.config === login.config)).toBe(true);
+  expect(result.stdout).toContain(`ghcr.io/arkaydeus/ark-edge-caddy@${digest}`);
+
+  const noLatest = await publish(["--tag", "v1", "--no-latest", "--merge", "v1-a,v1-b"], {
+    GHCR_TOKEN: "token",
+    GHCR_USER: "user",
+    PLAN: plan,
+  });
+  expect(noLatest.code).toBe(0);
+  expect(noLatest.records.find((record) => record.args[2] === "create")!.args).not.toContain(
+    "ghcr.io/arkaydeus/ark-stack:latest",
+  );
+});
+
+test("merge refuses bad source lists before credentials", async () => {
+  for (const args of [
+    ["--merge", "only-one"],
+    ["--merge", "a,a"],
+    ["--merge", "a,bad/tag"],
+    ["--merge", "a,b", "--dry-run"],
+    ["--tag", "v1", "--merge", "v1,v1-arm64"],
+    ["--tag", "v1", "--merge", "latest,v1-arm64"],
+  ]) {
+    const result = await publish(args, { PLAN: plan });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--merge");
+    expect(result.records.some((record) => record.command === "gh" || record.args[0] === "login")).toBe(
+      false,
+    );
+  }
+});
+
+test("image names come from each target's first tag and reject plans without that tag", () => {
+  expect(
+    imageNames(
+      { target: { b: { tags: ["ghcr.io/x/b:t", "ghcr.io/x/b:latest"] }, a: { tags: ["ghcr.io/x/a:t"] } } },
+      "t",
+    ),
+  ).toEqual([
+    ["a", "ghcr.io/x/a"],
+    ["b", "ghcr.io/x/b"],
+  ]);
+  for (const bad of [
+    null,
+    {},
+    { target: {} },
+    { target: { a: { tags: ["ghcr.io/x/a:other"] } } },
+    { target: { a: {} } },
+  ]) {
+    expect(() => imageNames(bad, "t")).toThrow();
+  }
 });

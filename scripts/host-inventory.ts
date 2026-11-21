@@ -16,21 +16,31 @@ export async function appliedHostConfig(root: string, env = process.env) {
   if (rules === null) return config;
   const [requestText, statusText] = await Promise.all([
     readFile(join(dir, "policy.request"), "utf8"),
-    readFile(join(dir, "policy.status"), "utf8"),
+    readFile(join(dir, "policy.status"), "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return "";
+      throw error;
+    }),
   ]);
   const request = JSON.parse(requestText) as { id: string; hash: string };
   const status = new Map(
     statusText
       .trimEnd()
       .split("\n")
-      .map((line) => line.split("=", 2) as [string, string]),
+      .filter(Boolean)
+      .map((line) => {
+        const at = line.indexOf("=");
+        return (at < 0 ? [line, ""] : [line.slice(0, at), line.slice(at + 1)]) as [string, string];
+      }),
   );
-  if (
-    status.get("applied") !== "true" ||
-    status.get("request_id") !== request.id ||
-    status.get("policy_hash") !== request.hash ||
-    sha256Hex(rules) !== request.hash
-  ) {
+  const current = status.get("request_id") === request.id && status.get("policy_hash") === request.hash;
+  if (current && status.get("applied") === "false") {
+    // database-ingress tried this exact request and failed; waiting will not change that.
+    throw new Error(
+      `database-ingress could not apply the front policy (request ${request.id}): ${status.get("error") || "no error recorded"}. ` +
+        "Check docker compose -f infra/platform/docker-compose.yml logs database-ingress.",
+    );
+  }
+  if (!current || status.get("applied") !== "true" || sha256Hex(rules) !== request.hash) {
     throw new Error("The front policy is awaiting firewall acknowledgement. Retry after reconciliation.");
   }
   return { ...config, routes: hostRoutesFromFront(rules) };

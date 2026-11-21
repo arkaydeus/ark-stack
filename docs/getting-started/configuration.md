@@ -197,6 +197,8 @@ Instead of the keys, `host:setup` accepts one Tailscale API credential in its en
 | `ARK_IPV6_DOCKER_SOURCE`                 | written by the installer | Compose (`domain-worker` mount)                           | Host directory of the Docker IPv6 evidence.                                                                                                     |
 | `ARK_INSTALL_NONINTERACTIVE`             | unset                    | installer                                                 | `1` never prompts for `TS_EDGE_AUTHKEY`.                                                                                                        |
 | `ARK_INSTALL_SKIP_DOCKER`                | unset                    | installer                                                 | `1` writes `.env` and the `tmp/` files only: no Docker, no lock, no hardening.                                                                  |
+| `ARK_INSTALL_BUILD_IMAGES`               | unset                    | installer                                                 | `1` builds the first-party images on the host instead of pulling the ones published for the checkout's commit.                                  |
+| `ARK_INSTALL_HARDEN_ONLY`                | unset                    | installer                                                 | With `--harden-vps`, `1` stops after the hardening baseline and `.env`; guided setup uses it before the SSH cutover.                            |
 | `ARK_CONTAINER_UID`, `ARK_CONTAINER_GID` | `1000`                   | installer                                                 | Owner given to the `tmp/` bind-mount directories when run as root on Linux.                                                                     |
 
 The guided setup (`mise run host:setup`) also reads its answers from `ARK_SETUP_DOMAIN`, `ARK_SETUP_ADMIN_HOST`, `ARK_SETUP_SSH_USER` and the step switches `ARK_SETUP_NON_INTERACTIVE`, `ARK_SETUP_TAILSCALE_SSH_CONFIRMED`, `ARK_SETUP_SKIP_EDGE`, `ARK_SETUP_KEEP_PUBLIC_SSH`, `ARK_SETUP_PROVIDER_FIREWALL`, `ARK_SETUP_PROVIDER_FIREWALL_APPLIED`, `ARK_SETUP_APPROVE_PROVIDER_FIREWALL`, `ARK_SETUP_APPROVE_TAILNET_POLICY` and `ARK_SETUP_BACKUP_NODE`, besides the settings above; see [Install with one command](production-install.md#install-with-one-command). `install.sh` reads `ARK_REF`, `ARK_INSTALL_DIR` and `ARK_REPO_URL`.
@@ -282,14 +284,14 @@ Off-VPS targets, their credentials and restic passwords are configured in the UI
 
 ## Maintenance and image publishing
 
-| Variable                  | Default                 | Read by                   | Purpose                                                                                                |
-| ------------------------- | ----------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `ARK_RELEASE_PUBLIC_KEY`  | required                | `mise run maintain`       | Ed25519 publisher key that release bundles must be signed with.                                        |
-| `ARK_MAINTENANCE_EXECUTE` | unset                   | `mise run maintain`       | `1` pulls the approved digests and runs Compose; otherwise the run only validates and prints the plan. |
-| `ARK_MAINTENANCE_JOURNAL` | `tmp/maintenance.jsonl` | `mise run maintain`       | Approval journal.                                                                                      |
-| `ARK_IMAGE_REGISTRY`      | `ghcr.io/arkaydeus`     | `mise run images:publish` | Lowercase `ghcr.io/<namespace>` prefix; other hosts are refused.                                       |
-| `ARK_IMAGE_PLATFORMS`     | `linux/amd64`           | `mise run images:publish` | Default build platforms; `--platform` overrides.                                                       |
-| `GHCR_TOKEN`, `GHCR_USER` | unset                   | `mise run images:publish` | Explicit registry credentials instead of a GitHub CLI login.                                           |
+| Variable                  | Default                 | Read by                          | Purpose                                                                                                |
+| ------------------------- | ----------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `ARK_RELEASE_PUBLIC_KEY`  | required                | `mise run maintain`              | Ed25519 publisher key that release bundles must be signed with.                                        |
+| `ARK_MAINTENANCE_EXECUTE` | unset                   | `mise run maintain`              | `1` pulls the approved digests and runs Compose; otherwise the run only validates and prints the plan. |
+| `ARK_MAINTENANCE_JOURNAL` | `tmp/maintenance.jsonl` | `mise run maintain`              | Approval journal.                                                                                      |
+| `ARK_IMAGE_REGISTRY`      | `ghcr.io/arkaydeus`     | `images:publish`, `host:install` | Lowercase `ghcr.io/<namespace>` prefix; other hosts are refused (the installer then builds locally).   |
+| `ARK_IMAGE_PLATFORMS`     | `linux/amd64`           | `mise run images:publish`        | Default build platforms; `--platform` overrides.                                                       |
+| `GHCR_TOKEN`, `GHCR_USER` | unset                   | `mise run images:publish`        | Explicit registry credentials instead of a GitHub CLI login.                                           |
 
 See [Publishing first-party images](../operations/maintenance-and-upgrades.md#publishing-first-party-images).
 

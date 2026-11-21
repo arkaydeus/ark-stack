@@ -29,6 +29,7 @@ import {
   hostMetricsPath,
   installHostHardening,
 } from "./install-host-hardening.ts";
+import { pullPublishedImages } from "./install-images.ts";
 import { startLocalMail } from "./install-mail-submission.ts";
 import { seedPgbouncerBootstrap } from "./pgbouncer-bootstrap.ts";
 
@@ -45,6 +46,10 @@ if (
 if (flags.length && (flags.length !== 1 || flags[0] !== "--harden-vps")) {
   throw new Error("Usage: host:install [--enroll-vps [--key-stdin] | --harden-vps]");
 }
+// Guided setup hardens first, closes public SSH while the operator is present, then installs unattended.
+const hardenOnly = process.env.ARK_INSTALL_HARDEN_ONLY === "1";
+if (hardenOnly && flags[0] !== "--harden-vps")
+  throw new Error("ARK_INSTALL_HARDEN_ONLY=1 needs --harden-vps.");
 const useDocker = process.env.ARK_INSTALL_SKIP_DOCKER !== "1";
 if (useDocker) await lockHostDeployment(root);
 const hardened =
@@ -52,6 +57,18 @@ const hardened =
   (process.platform === "linux" &&
     existsSync(hostFirewallPath) &&
     process.env.ARK_INSTALL_SKIP_DOCKER !== "1");
+
+function capture(argv: string[]) {
+  return new Promise<{ status: number; stdout: string; stderr: string }>((resolve) => {
+    const child = spawn(argv[0]!, argv.slice(1), { cwd: root, env: process.env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", (error) => resolve({ status: 127, stdout, stderr: String(error) }));
+    child.on("exit", (code) => resolve({ status: code ?? 1, stdout, stderr }));
+  });
+}
 
 function run(command: string, args: string[]) {
   return new Promise<void>((resolve, reject) => {
@@ -130,6 +147,10 @@ await Bun.write(
     .join(""),
 );
 await chmod(envPath, 0o600);
+if (hardenOnly) {
+  console.log("Ark Stack host hardened. The platform install has not run yet.");
+  process.exit(0);
+}
 for (const key of [
   "ARK_MAIL_ENABLED",
   "ARK_HOST_HARDENING",
@@ -245,22 +266,34 @@ if (useDocker) {
       run("docker", ["network", "create", network]),
     );
   }
-  await run("docker", [
-    ...compose,
-    "build",
-    "api",
-    "migrate",
-    "database-worker",
-    ...(enableMail ? ["mail-worker"] : []),
-    "domain-worker",
-    // Custom Caddy with the pinned rate-limit plugin (FD-23); skipped once pinned to a published digest.
-    "edge",
-    "edge-watchdog",
-    "haproxy-validator",
-    "backup-worker",
-    "agent",
-    "database-ingress",
-  ]);
+  // Prefer the images CI published for this commit; building them here is the slow fallback.
+  const images = await pullPublishedImages({
+    root,
+    compose: await Bun.file(join(root, "infra/platform/docker-compose.yml")).text(),
+    version: process.env.ARK_VERSION || values.ARK_VERSION || "local",
+    env: process.env,
+    exec: capture,
+    log: (line) => console.log(line),
+  });
+  if (images.pulled) console.log(`Using the published images for ${images.tag}; skipping the local build.`);
+  else console.log(`Building the images locally: ${images.reason}.`);
+  if (!images.pulled)
+    await run("docker", [
+      ...compose,
+      "build",
+      "api",
+      "migrate",
+      "database-worker",
+      ...(enableMail ? ["mail-worker"] : []),
+      "domain-worker",
+      // Custom Caddy with the pinned rate-limit plugin (FD-23); skipped once pinned to a published digest.
+      "edge",
+      "edge-watchdog",
+      "haproxy-validator",
+      "backup-worker",
+      "agent",
+      "database-ingress",
+    ]);
   const tailnet = await preparePublishedIpv6({
     edge: edgeNetwork,
     mail: enableMail ? mailNetwork : undefined,

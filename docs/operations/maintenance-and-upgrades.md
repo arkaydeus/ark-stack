@@ -64,7 +64,7 @@ sudo mise run host:install      # on a hardened VPS, run as root
 
 `scripts/install.ts` is idempotent. It keeps every existing `.env` value (it replaces only missing values and published placeholders), keeps an existing `TS_EDGE_AUTHKEY`, re-applies the hardening baseline on a hardened host, then:
 
-1. builds the first-party images (`api`, `migrate`, the workers, `edge`, `edge-watchdog`, `haproxy-validator`, `agent`, `database-ingress`);
+1. pulls the first-party images CI published for the checkout's commit, or builds them (`api`, `migrate`, the workers, `edge`, `edge-watchdog`, `haproxy-validator`, `agent`, `database-ingress`) when they are not published (see [Prebuilt images](#prebuilt-images));
 2. prepares native IPv6 publication when the release needs it;
 3. starts `postgres` and `app-postgres` (and Stalwart when mail is enabled), refreshes the runtime role and runs `migrate`;
 4. recreates `database-ingress`, then brings up the API, workers, agent and edge services with `--wait`;
@@ -169,7 +169,7 @@ Migrations are plain SQL files in `server/drizzle/`, applied in file-name order 
 
 ### Publishing first-party images
 
-`mise run images:publish` (`scripts/publish-images.ts`) builds all twelve Bake targets of the default group (`imageTargets` in `scripts/check-image-plan.ts`) for `linux/amd64` by default, tags them with the first 12 characters of `HEAD` and `latest`, pushes them and prints immutable digest references after pushing. Compose builds the `edge` Caddy (`edge-caddy`: Caddy 2.11.9 with the pinned rate-limit plugin) locally until its published digest is pinned with `mise run images:pin-edge-caddy` (see [Third-party image pins](#third-party-image-pins)).
+`mise run images:publish` (`scripts/publish-images.ts`) builds all twelve Bake targets of the default group (`imageTargets` in `scripts/check-image-plan.ts`) for `linux/amd64` by default, tags them with the first 12 characters of `HEAD` and `latest`, pushes them and prints immutable digest references after pushing. CI runs it on every push to `main` (see [Prebuilt images](#prebuilt-images)); run it by hand for a fork's registry or a release tag. Compose builds the `edge` Caddy (`edge-caddy`: Caddy 2.11.9 with the pinned rate-limit plugin) locally until its published digest is pinned with `mise run images:pin-edge-caddy` (see [Third-party image pins](#third-party-image-pins)); the installer uses the published image for its commit either way.
 
 ```sh
 mise run images:publish -- --dry-run
@@ -183,6 +183,7 @@ mise run images:publish -- --platform linux/amd64,linux/arm64
 | `ARK_IMAGE_PLATFORMS`     | Default platforms (default `linux/amd64`); `--platform` overrides it.                                                                                     |
 | `GHCR_TOKEN`, `GHCR_USER` | Use an explicit token. Without both, the publisher uses the `gh` CLI login, which needs `write:packages`.                                                 |
 | `--allow-dirty`           | Allow a dirty tree. Tags and the revision label get `-dirty`, `latest` is omitted and `--tag latest` is refused.                                          |
+| `--merge <tag>,<tag>`     | Build nothing: combine already-pushed per-platform tags into one multi-platform index per image, tagged with `--tag` (and `latest`).                      |
 
 **Credentials.** Set both `GHCR_TOKEN` and `GHCR_USER` to use an explicit token without a GitHub CLI login. Otherwise, log in with `gh` and grant its token package access:
 
@@ -197,6 +198,19 @@ Login and push use a temporary Docker configuration, removed on success or failu
 **Checks.** Before publishing, `bun scripts/check-image-plan.ts` confirms the Bake plan has exactly the expected targets, each with the source label, annotation and minimal provenance. CI runs it, checking the resolved Bake plan for repository source annotations and minimal provenance on every target, and builds every target with `--no-cache` to exercise the filtered build context. The publisher's command tests (`scripts/publish-images.test.ts`) and its dedicated TypeScript check (`scripts/tsconfig.publish.json`) run in CI and in the normal local `mise run test` and `mise run typecheck` tasks.
 
 **GHCR publish check.** The manually dispatched **GHCR publish check** workflow (`.github/workflows/ghcr-publish-check.yml`) uses the repository's Actions token to push a tiny image that inherits Bake's common settings. It verifies the pushed index annotation, SLSA provenance and GitHub package repository linkage, then deletes its uniquely named smoke package and its temporary Docker configuration. Run it in `arkaydeus/ark-stack`, whose source URL is configured in Bake; it needs permission to create and delete packages. It does not publish release tags.
+
+### Prebuilt images
+
+`.github/workflows/publish-images.yml` (**Publish images**) runs on every push to `main` and on manual dispatch. One job per architecture builds every Bake target on a native runner (`ubuntu-24.04` for `linux/amd64`, `ubuntu-24.04-arm` for `linux/arm64`) and pushes it as `<sha12>-amd64` or `<sha12>-arm64`, where `<sha12>` is the first 12 characters of the commit. A merge job then runs `scripts/publish-images.ts --merge` to combine them into one multi-platform index per image, tagged `<sha12>` and, on `main`, `latest`. Runs are queued, never cancelled, so `latest` moves forward in push order. A run takes noticeably longer than a CI cycle; a host that installs a commit before its images exist builds them itself.
+
+`mise run host:install` (`scripts/install-images.ts`) then works pull-first. Before building, it reads the checkout's `HEAD` and, if no tracked file is modified, pulls `<registry>/<name>:<sha12>` for each of the twelve first-party images Compose declares, using the host's architecture. Each image's `org.opencontainers.image.revision` label must equal the full `HEAD`. Only when all of them pull and match does it tag them with the local Compose names (`<name>:${ARK_VERSION:-local}`) and skip `docker compose build`. Otherwise it prints the reason, tags nothing and builds as before. Compose, `mise run maintain` and the rest of the installer see the same image names either way.
+
+| Setting                      | Effect                                                                                                      |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `ARK_IMAGE_REGISTRY`         | Registry to pull from, default `ghcr.io/arkaydeus`. Only lowercase `ghcr.io/<namespace>` prefixes are used. |
+| `ARK_INSTALL_BUILD_IMAGES=1` | Always build on the host, for example to test a Dockerfile change that is committed but not published.      |
+
+The packages must be public for an unauthenticated host to pull them. GitHub creates a container package as private the first time it is pushed, so check each `ark-*` package's visibility once under the account's **Packages** settings. The installer trusts the registry as much as it trusts the checkout: anyone who can push to the repository's packages can also change its code.
 
 ### Third-party image pins
 

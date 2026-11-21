@@ -54,7 +54,7 @@ import {
   type SetupLog,
   type Ui,
 } from "./system.ts";
-import type { AcquiredKey, TailscaleKeySource } from "./tailscale-keys.ts";
+import type { AcquiredKey, KeyRequest, TailscaleKeySource } from "./tailscale-keys.ts";
 
 export const SUPPORTED_UBUNTU = ["22.04", "24.04", "26.04"];
 
@@ -942,8 +942,8 @@ Check that \`${command}\` works from your own device, then resume with:
   return { status: "done", message: "Tailscale SSH confirmed by the owner" };
 }
 
-async function install(context: Context): Promise<StepResult> {
-  await requireSshConfirmation(context);
+/** The OpenSSH access hardening keeps: the scoped recovery rule while OpenSSH still listens. */
+async function hardeningSshAccess(context: Context): Promise<HostSshAccess> {
   const { ports } = await inspectSsh(context);
   const existing = readHostSshAccess(readEnv(context.paths.hostFirewall));
   const origin = await context.sessionOrigin();
@@ -956,10 +956,55 @@ async function install(context: Context): Promise<StepResult> {
       `Public OpenSSH needs a recovery source before hardening. Resume with --ssh-recovery-source IP using the IP of your OpenSSH client, or use --keep-public-ssh to explicitly retain public access.\n  ${context.resumeCommand}`,
     );
   }
-  const ssh: HostSshAccess = {
+  return {
     ports,
     source: ports.length && !context.options.keepPublicSsh ? source : undefined,
   };
+}
+
+function installEnv(context: Context, ssh: HostSshAccess, extra: Record<string, string> = {}) {
+  const { mailEnabled, sniPorts, rebootTime } = context.answers;
+  return childEnv(context, {
+    ARK_MAIL_ENABLED: mailEnabled ? "1" : "0",
+    ARK_EDGE_SNI_PORTS: sniPorts.join(","),
+    ARK_HOST_REBOOT_TIME: rebootTime,
+    // The edge key is handled by the edge step, never prompted for by the installer.
+    ARK_INSTALL_NONINTERACTIVE: "1",
+    ARK_SETUP_HOST_SSH_ACCESS: JSON.stringify(ssh),
+    ...extra,
+  });
+}
+
+// Hardening is quick and is the change that could cut Tailscale SSH off, so it runs before the public
+// SSH cutover. The operator proves a fresh login right after it; the long install then runs unattended.
+async function harden(context: Context): Promise<StepResult> {
+  await requireSshConfirmation(context);
+  const ssh = await hardeningSshAccess(context);
+  const { mailEnabled, sniPorts, rebootTime } = context.answers;
+  const fingerprint = JSON.stringify({ mailEnabled, sniPorts, rebootTime });
+  const record = context.state.steps.harden;
+  if (
+    record?.status === "done" &&
+    record.fingerprint === fingerprint &&
+    (await hardeningMatches(context, ssh))
+  ) {
+    return { status: "done", fingerprint, message: "already hardened with these settings" };
+  }
+  context.ui.print(
+    `      Installing the firewall baseline and automatic updates. Detail: ${context.log.path}`,
+  );
+  await must(context, [context.bun, "scripts/install.ts", "--harden-vps"], {
+    env: installEnv(context, ssh, { ARK_INSTALL_HARDEN_ONLY: "1" }),
+  });
+  context.redactor.addEnv(readEnv(context.envPath));
+  if (!(await hardeningMatches(context, ssh)))
+    throw new Error("Hardening finished but the ark_host firewall does not match the expected baseline.");
+  return { status: "done", fingerprint, message: "firewall baseline and automatic updates installed" };
+}
+
+async function install(context: Context): Promise<StepResult> {
+  await requireSshConfirmation(context);
+  const ssh = await hardeningSshAccess(context);
   const { mailEnabled, sniPorts, rebootTime } = context.answers;
   const fingerprint = JSON.stringify({ mailEnabled, sniPorts, rebootTime, commit: await gitCommit(context) });
   const record = context.state.steps.install;
@@ -971,16 +1016,11 @@ async function install(context: Context): Promise<StepResult> {
   ) {
     return { status: "done", fingerprint, message: "already hardened and installed with these settings" };
   }
-  context.ui.print(`      Hardening and installing; this takes several minutes. Detail: ${context.log.path}`);
-  const env = childEnv(context, {
-    ARK_MAIL_ENABLED: mailEnabled ? "1" : "0",
-    ARK_EDGE_SNI_PORTS: sniPorts.join(","),
-    ARK_HOST_REBOOT_TIME: rebootTime,
-    // The edge key is handled by the edge step, never prompted for by the installer.
-    ARK_INSTALL_NONINTERACTIVE: "1",
-    ARK_SETUP_HOST_SSH_ACCESS: JSON.stringify(ssh),
-  });
-  await must(context, [context.bun, "scripts/install.ts", "--harden-vps"], { env });
+  context.ui.print("      Nothing from here on needs an answer; you can leave this running.");
+  context.ui.print(
+    `      Installing the platform; this can take several minutes. Detail: ${context.log.path}`,
+  );
+  await must(context, [context.bun, "scripts/install.ts", "--harden-vps"], { env: installEnv(context, ssh) });
   context.redactor.addEnv(readEnv(context.envPath));
   if (!(await apiHealthy(context)))
     throw new Error("The install finished but http://127.0.0.1:3000/api/health does not answer.");
@@ -995,9 +1035,7 @@ async function hardeningMatches(context: Context, ssh: HostSshAccess) {
     if (active.status !== 0 || active.stdout.trim() !== "active") return false;
     const enabled = await exec(context, ["systemctl", "is-enabled", "ark-host-firewall.service"]);
     if (enabled.stdout.trim() !== "enabled") return false;
-    const inventory = await must(context, [context.bun, "scripts/host-audit.ts", "--inventory"], {
-      env: childEnv(context),
-    });
+    const inventory = await hostInventory(context);
     const { config } = JSON.parse(inventory) as { config: HostPortConfig };
     const tableStart = boot.indexOf("table inet ark_host {");
     if (tableStart < 0) return false;
@@ -1008,6 +1046,24 @@ async function hardeningMatches(context: Context, ssh: HostSshAccess) {
   } catch (error) {
     context.log.write(`Hardening needs reconciliation: ${String(error)}`);
     return false;
+  }
+}
+
+/**
+ * `host:audit --inventory`, waiting up to a minute for database-ingress to acknowledge a front policy
+ * the domain worker has just submitted (a recreated domain worker submits one). A failed
+ * acknowledgement is reported at once.
+ */
+async function hostInventory(context: Context) {
+  const argv = [context.bun, "scripts/host-audit.ts", "--inventory"];
+  for (let attempt = 0; ; attempt++) {
+    const result = await exec(context, argv, { env: childEnv(context) });
+    if (result.status === 0) return result.stdout;
+    const awaiting = `${result.stderr}${result.stdout}`.includes("awaiting firewall acknowledgement");
+    if (!awaiting || attempt >= 30) return must(context, argv, { env: childEnv(context) });
+    if (attempt === 0)
+      context.ui.print("      Waiting for database-ingress to apply the current front policy.");
+    await context.sleep(2000);
   }
 }
 
@@ -1049,6 +1105,65 @@ function emptyEdgeKey(context: Context) {
 const EDGE_FINISH =
   "Re-run host:setup and paste a one-off tag:ark-edge key when asked (or set TS_EDGE_AUTHKEY), or follow docs/getting-started/production-install.md#enrol-the-edge-node.";
 
+/** Whether the edge step will ask the key source for a new key (none kept, one supplied, or a retry). */
+function edgeKeyWanted(context: Context) {
+  const kept = parseEnvFile(readEnv(context.envPath)).TS_EDGE_AUTHKEY?.trim();
+  return (
+    !kept ||
+    Boolean(context.env.TS_EDGE_AUTHKEY?.trim()) ||
+    Boolean(context.state.edgeKeyRetry && context.interactive)
+  );
+}
+
+// Pasted keys are asked for before the long install, so nothing waits for an answer afterwards. They
+// stay in memory until the edge and backup steps use them; an API source mints its keys there itself.
+async function remainingKeys(context: Context): Promise<StepResult> {
+  if (!context.interactive || context.keys.id !== "manual") {
+    return { status: "done", message: "nothing to ask" };
+  }
+  const requests: KeyRequest[] = [];
+  const edge = await edgeTags(context);
+  const edgeJoined = edge?.running && edge.tags.length === 1 && edge.tags[0] === ARK_EDGE_TAG;
+  if (
+    !context.options.skipEdge &&
+    !edgeJoined &&
+    edgeKeyWanted(context) &&
+    !context.env.TS_EDGE_AUTHKEY?.trim()
+  ) {
+    requests.push({ tag: ARK_EDGE_TAG, variable: "TS_EDGE_AUTHKEY", optional: true });
+  }
+  if (context.options.backupNode && !context.env.TS_BACKUP_AUTHKEY?.trim()) {
+    const backup = await edgeTags(context, "backup-ts");
+    if (!(backup?.running && backup.tags.length === 1 && backup.tags[0] === ARK_BACKUP_TAG))
+      requests.push({ tag: ARK_BACKUP_TAG, variable: "TS_BACKUP_AUTHKEY", optional: true });
+  }
+  if (!requests.length) return { status: "done", message: "nothing to ask" };
+  const ready = new Map<string, AcquiredKey | undefined>();
+  for (const request of requests) {
+    context.ui.print(`      Asking for the ${request.tag} key now, so the rest of setup can run unattended.`);
+    const key = await context.keys.acquire(request);
+    if (key?.key) context.redactor.add(key.key);
+    ready.set(request.tag, key);
+  }
+  const source = context.keys;
+  context.keys = {
+    id: source.id,
+    policyInstructions: () => source.policyInstructions(),
+    preparePolicy: source.preparePolicy?.bind(source),
+    acquire(request) {
+      if (!ready.has(request.tag)) return source.acquire(request);
+      const key = ready.get(request.tag);
+      ready.delete(request.tag);
+      return Promise.resolve(key);
+    },
+  };
+  const entered = [...ready].filter(([, key]) => key?.key).map(([tag]) => tag);
+  return {
+    status: "done",
+    message: entered.length ? `kept ${entered.join(" and ")} for later in this run` : "keys skipped for now",
+  };
+}
+
 async function edgeEnrolment(context: Context): Promise<StepResult> {
   const exact = (tags: string[]) => tags.length === 1 && tags[0] === ARK_EDGE_TAG;
   const before = await edgeTags(context);
@@ -1072,8 +1187,7 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
   const current = readEnv(context.envPath);
   const kept = parseEnvFile(current).TS_EDGE_AUTHKEY?.trim();
   let acquired: AcquiredKey | undefined;
-  const retiring = context.state.edgeKeyRetry;
-  if (!kept || context.env.TS_EDGE_AUTHKEY?.trim() || (retiring && context.interactive)) {
+  if (edgeKeyWanted(context)) {
     context.ui.print(
       `      The edge node needs its own one-off key tagged ${ARK_EDGE_TAG} (never the VPS key).`,
     );
@@ -1506,12 +1620,27 @@ async function closePublicSsh(context: Context): Promise<StepResult> {
 
       const command = freshSshCommand(context, await tailscaleStatus(context));
       if (context.interactive) {
-        context.ui.print("      Open a fresh session from your own device within four minutes: " + command);
-        const answer = await context.ui.ask(
-          "Type yes if it works (anything else restores OpenSSH)",
-          "",
-          AbortSignal.timeout(240_000),
+        const deadline = new Date(Date.now() + 240_000).toTimeString().slice(0, 8);
+        context.ui.print(
+          "      Open a fresh session from your own device before " +
+            deadline +
+            " (four minutes): " +
+            command,
         );
+        context.ui.print("      Then come back to this terminal and answer here.");
+        const answer = await context.ui
+          .ask(
+            "Type yes in this terminal once the new session works (anything else restores OpenSSH)",
+            "",
+            AbortSignal.timeout(240_000),
+          )
+          .catch((error: unknown) => {
+            if (error instanceof Error && error.name === "AbortError")
+              throw new Error(
+                "No answer within four minutes, so the fresh Tailscale SSH login was not confirmed.",
+              );
+            throw error;
+          });
         if (!/^yes$/i.test(answer.trim()))
           throw new Error("The fresh Tailscale SSH login was not confirmed.");
       } else {
@@ -1627,9 +1756,7 @@ async function providerFirewall(context: Context): Promise<StepResult> {
       "The Tailscale SSH safety check has not passed; the provider firewall was not changed.",
     );
   }
-  const inventory = await must(context, [context.bun, "scripts/host-audit.ts", "--inventory"], {
-    env: childEnv(context),
-  });
+  const inventory = await hostInventory(context);
   const parsed = JSON.parse(inventory) as { config: unknown; providerRules: ProviderRule[] };
   const inventoryPath = join(context.root, "tmp", "ark-host-inventory.json");
   writeFileSync(inventoryPath, inventory.endsWith("\n") ? inventory : `${inventory}\n`, { mode: 0o644 });
@@ -1693,7 +1820,27 @@ async function providerFirewall(context: Context): Promise<StepResult> {
       result = { status: "done", fingerprint, message: `rules applied (${adapter.label})` };
     }
   }
-  // The local audit follows confirmation or verified provider application.
+  return result;
+}
+
+// The local audit checks Docker publications too, so it runs once the platform is installed. The
+// provider step above runs before the install so that it can ask its question while you are present.
+async function localAudit(context: Context): Promise<StepResult> {
+  const provider = context.state.steps["provider-firewall"];
+  if (provider?.status !== "done") {
+    return {
+      status: "pending",
+      note: "The local audit waits for the provider firewall rules to be applied or confirmed.",
+      finish: provider?.finish ?? "Re-run host:setup to confirm the provider firewall.",
+    };
+  }
+  const inventory = await hostInventory(context);
+  const inventoryPath = join(context.root, "tmp", "ark-host-inventory.json");
+  writeFileSync(inventoryPath, inventory.endsWith("\n") ? inventory : `${inventory}\n`, { mode: 0o644 });
+  const addresses = await publicAddresses(context);
+  const status = await tailscaleStatus(context);
+  const retainSsh = context.state.steps["public-ssh"]?.status !== "done";
+  const access = readHostSshAccess(readEnv(context.paths.hostFirewall));
   await must(context, [context.bun, "scripts/host-audit.ts", ...(retainSsh ? ["--retain-ssh"] : [])], {
     env: childEnv(context),
   });
@@ -1711,20 +1858,22 @@ async function providerFirewall(context: Context): Promise<StepResult> {
       `        sudo mise run host:audit --external ark-host-inventory.json ${ips.length ? ips.join(" ") : "<public-ipv4> <public-ipv6>"}`,
     );
   }
-  result.message = `${result.message}; local audit passed`;
-  return result;
+  return { status: "done", message: "local audit passed" };
 }
 
 export const STEPS: Step[] = [
   { id: "prerequisites", title: "Prerequisite checks", run: prerequisites },
   { id: "tailscale", title: "Tailscale enrolment (tag:ark-vps)", run: tailscaleEnrolment },
   { id: "ssh-gate", title: "Tailscale SSH safety check", run: sshGate },
-  { id: "install", title: "Harden the host and install", run: install },
+  { id: "harden", title: "Harden the host", run: harden },
+  { id: "public-ssh", title: "Close public SSH", run: closePublicSsh },
+  { id: "provider-firewall", title: "Provider firewall", run: providerFirewall },
+  { id: "keys", title: "Remaining Tailscale keys", run: remainingKeys },
+  { id: "install", title: "Install the platform", run: install },
   { id: "edge", title: "Edge node enrolment (tag:ark-edge)", run: edgeEnrolment },
   { id: "backup-node", title: "Backup node enrolment (tag:ark-backup)", run: backupNode },
   { id: "configuration", title: "Admin origin and ACME settings", run: configuration },
-  { id: "public-ssh", title: "Close public SSH", run: closePublicSsh },
-  { id: "provider-firewall", title: "Provider firewall and local audit", run: providerFirewall },
+  { id: "audit", title: "Local audit", run: localAudit },
 ];
 
 const RECOVERY_KEYS = [

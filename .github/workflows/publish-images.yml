@@ -1,0 +1,67 @@
+name: Publish images
+
+# Publishes every Bake target for linux/amd64 and linux/arm64 on each push to main, tagged with the
+# first 12 characters of the commit and `latest`. `mise run host:install` pulls the tag for its own
+# commit instead of building on the host (scripts/install-images.ts).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Queue rather than cancel, so `latest` always moves forward in push order.
+concurrency:
+  group: publish-images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    # Native runners: the edge Caddy is a Go build, far too slow under QEMU.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: docker/setup-buildx-action@v4
+      - run: bun scripts/check-image-plan.ts
+      - name: Build and push linux/${{ matrix.arch }}
+        run: |
+          export ARK_IMAGE_REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+          bun scripts/publish-images.ts --tag "${GITHUB_SHA::12}-${{ matrix.arch }}" --no-latest --platform "linux/${{ matrix.arch }}"
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: docker/setup-buildx-action@v4
+      - name: Merge the platform images into multi-platform tags
+        run: |
+          export ARK_IMAGE_REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+          tag="${GITHUB_SHA::12}"
+          latest=()
+          [[ "$GITHUB_REF" == refs/heads/main ]] || latest=(--no-latest)
+          bun scripts/publish-images.ts --tag "$tag" "${latest[@]}" --merge "$tag-amd64,$tag-arm64"
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}

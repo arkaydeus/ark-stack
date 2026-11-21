@@ -25,11 +25,13 @@ import {
   parseHujson,
   parseSniPorts,
   readHostSshAccess,
+  sha256Hex,
   renderHostFirewall,
   replaceHostSshAccess,
   type HostSshAccess,
 } from "@ark-stack/shared";
 
+import { appliedHostConfig } from "./host-inventory.ts";
 import { runSetup, type SetupDependencies } from "./host-setup.ts";
 import { parseFlags, resolveOptions } from "./host-setup/answers.ts";
 import { desiredConfiguration, setEnvValues } from "./host-setup/env-file.ts";
@@ -110,6 +112,10 @@ class FakeHost {
   configuredKeys = new Map<string, string>();
   ufw: string | undefined;
   failInstall = 0;
+  /** Fails only the full platform install, after hardening and the SSH cutover succeeded. */
+  failPlatformInstall = 0;
+  /** "harden" or "platform" for each scripts/install.ts --harden-vps run, in order. */
+  installModes: string[] = [];
   failAudit = 0;
   breakTailscaleOnSshStop = false;
   privateSsh = false;
@@ -317,8 +323,14 @@ class FakeHost {
     if (line === `${BUN} scripts/install.ts --harden-vps`) {
       expect(options.env?.ARK_INSTALL_NONINTERACTIVE).toBe("1");
       expect(options.env?.TS_EDGE_AUTHKEY).toBeUndefined();
+      const mode = options.env?.ARK_INSTALL_HARDEN_ONLY === "1" ? "harden" : "platform";
+      this.installModes.push(mode);
       if (this.failInstall > 0) {
         this.failInstall--;
+        return fail("docker build failed\n");
+      }
+      if (mode === "platform" && this.failPlatformInstall > 0) {
+        this.failPlatformInstall--;
         return fail("docker build failed\n");
       }
       const existing = existsSync(this.envPath) ? readFileSync(this.envPath, "utf8") : "";
@@ -1184,16 +1196,23 @@ describe("host:setup full run", () => {
     f.host.ufw = `Status: active\n\n     To                         Action      From\n     --                         ------      ----\n[ 1] 22/tcp                     ALLOW IN    Anywhere\n[ 2] 80/tcp                     ALLOW IN    Anywhere\n[ 3] 22/tcp (v6)                ALLOW IN    Anywhere (v6)\n`;
     const result = await setup(f, [...FULL, "--ssh-user", "alice"], { ...KEYS, DNS_API_TOKEN: DNS_TOKEN });
     expect(result.code).toBe(0);
+    // Hardening, then the public SSH cutover while the operator is present, then the unattended install.
+    const installs = f.host.calls.flatMap((call, index) =>
+      call === `${BUN} scripts/install.ts --harden-vps` ? [index] : [],
+    );
+    expect(f.host.installModes).toEqual(["harden", "platform"]);
     const order = [
-      `${BUN} scripts/install.ts --enroll-vps --key-stdin`,
-      `${BUN} scripts/install.ts --harden-vps`,
-      "up -d edge-ts edge edge-l4",
-      "scripts/edge-namespace.ts",
-      "up --wait --wait-timeout 120 api domain-worker",
-      "systemctl stop ssh.service",
-      `${BUN} scripts/host-audit.ts --inventory`,
-      `${BUN} scripts/host-audit.ts`,
-    ].map((needle) => f.host.calls.findIndex((call) => call === needle || call.endsWith(needle)));
+      f.host.calls.indexOf(`${BUN} scripts/install.ts --enroll-vps --key-stdin`),
+      installs[0]!,
+      f.host.calls.indexOf("systemctl stop ssh.service"),
+      installs[1]!,
+      ...[
+        "up -d edge-ts edge edge-l4",
+        "scripts/edge-namespace.ts",
+        "up --wait --wait-timeout 120 api domain-worker",
+      ].map((needle) => f.host.calls.findIndex((call) => call === needle || call.endsWith(needle))),
+      f.host.calls.lastIndexOf(`${BUN} scripts/host-audit.ts`),
+    ];
     expect(order.every((index) => index >= 0)).toBe(true);
     expect(order).toEqual(order.toSorted((a, b) => a - b));
     // UFW: only the SSH rules are removed, highest number first.
@@ -1270,7 +1289,9 @@ describe("host:setup full run", () => {
     f.host.failAudit = 1;
     const first = await setup(f, FULL, KEYS);
     expect(first.code).toBe(1);
-    expect(first.state.steps["provider-firewall"].status).toBe("failed");
+    // The provider confirmation came before the install; only the final local audit failed.
+    expect(first.state.steps["provider-firewall"].status).toBe("done");
+    expect(first.state.steps.audit.status).toBe("failed");
     expect(first.text).toContain(`cd ${f.root} && sudo mise run host:setup`);
     const secrets = parseEnvFile(readFileSync(f.host.envPath, "utf8"));
     f.host.calls = [];
@@ -1287,15 +1308,31 @@ describe("host:setup full run", () => {
 
   test("a failed install resumes at the install step without enrolling again", async () => {
     const f = fixture();
-    f.host.failInstall = 1;
+    f.host.failPlatformInstall = 1;
     const first = await setup(f, FULL, KEYS);
     expect(first.code).toBe(1);
     expect(first.state.steps.install.status).toBe("failed");
+    expect(first.state.steps.harden.status).toBe("done");
+    expect(first.state.steps["public-ssh"].status).toBe("done");
     expect(first.state.steps.tailscale.status).toBe("done");
     f.host.calls = [];
+    f.host.installModes = [];
     expect((await setup(f, FULL, { TS_EDGE_AUTHKEY: EDGE_KEY })).code).toBe(0);
     expect(f.host.calls).not.toContain(`${BUN} scripts/install.ts --enroll-vps --key-stdin`);
-    expect(f.host.calls).toContain(`${BUN} scripts/install.ts --harden-vps`);
+    // Hardening and the cutover are verified and skipped; only the platform install runs again.
+    expect(f.host.installModes).toEqual(["platform"]);
+    expect(f.host.calls).not.toContain("systemctl stop ssh.service");
+  });
+
+  test("a failed hardening stops before the public SSH cutover and the platform install", async () => {
+    const f = fixture();
+    f.host.failInstall = 1;
+    const first = await setup(f, FULL, KEYS);
+    expect(first.code).toBe(1);
+    expect(first.state.steps.harden.status).toBe("failed");
+    expect(first.state.steps["public-ssh"]).toBeUndefined();
+    expect(f.host.installModes).toEqual(["harden"]);
+    expect(f.host.calls).not.toContain("systemctl stop ssh.service");
   });
 
   test("changed answers re-run the install with the new settings", async () => {
@@ -2925,5 +2962,47 @@ describe("Hetzner Cloud provider firewall", () => {
         description: "Ark Stack ICMP and ICMPv6",
       },
     ]);
+  });
+});
+
+describe("front policy acknowledgement in the host inventory", () => {
+  const id = "0f4c2c1e-7d0b-4f4e-9a55-2d1c1c7b9e01";
+  function front(status?: string) {
+    const root = mkdtempSync(join(tmpdir(), "ark-inventory-"));
+    const dir = join(root, "tmp", "edge-l4", "front-ingress");
+    mkdirSync(dir, { recursive: true });
+    const rules = "table inet ark_front {}\n";
+    writeFileSync(join(dir, "policy.nft"), rules);
+    writeFileSync(join(dir, "policy.request"), JSON.stringify({ id, hash: sha256Hex(rules) }));
+    if (status !== undefined)
+      writeFileSync(join(dir, "policy.status"), status.replaceAll("HASH", sha256Hex(rules)));
+    return root;
+  }
+  const env = { ARK_MAIL_ENABLED: "0", ARK_EDGE_SNI_PORTS: "" };
+
+  test("without a front policy it returns the configured ports", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ark-inventory-"));
+    expect(await appliedHostConfig(root, env)).toEqual({ mailEnabled: false, sniPorts: [] });
+  });
+
+  test("a request without its acknowledgement yet is reported as awaiting", async () => {
+    for (const status of [
+      undefined,
+      `applied=true\npolicy_hash=HASH\nrequest_id=${"1".repeat(36)}\nerror=\n`,
+    ]) {
+      await expect(appliedHostConfig(front(status), env)).rejects.toThrow(
+        "awaiting firewall acknowledgement",
+      );
+    }
+  });
+
+  test("a failed acknowledgement of the current request reports the reconciler's error", async () => {
+    const root = front(
+      `applied=false\npolicy_hash=HASH\nrequest_id=${id}\nerror=nft: Could not process rule: No such file or directory\n`,
+    );
+    const error = await appliedHostConfig(root, env).catch((failure: Error) => failure.message);
+    expect(error).toContain("database-ingress could not apply the front policy");
+    expect(error).toContain("nft: Could not process rule: No such file or directory");
+    expect(error).not.toContain("awaiting");
   });
 });

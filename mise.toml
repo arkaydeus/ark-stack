@@ -33,7 +33,7 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts scripts/brand-icons.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts scripts/brand-icons.test.ts"
 
 [tasks."brand:icons"]
 description = "Regenerate the committed Ark Stack icons (favicons, app and manifest icons, logos, README icon) from assets/brand/ark-stack-icon.png (dev only)"
