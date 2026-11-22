@@ -174,6 +174,16 @@ describe("secret handling", () => {
 });
 
 describe("maintenance bundles", () => {
+  test.each(["ark-agent", "ark-stack-agent"])("%s requires stateful approval", (repository) => {
+    const images = [`ghcr.io/example/${repository}:release@${DIGEST}`];
+    const bundle = { version: "1", images, digest: bundleDigest(images) };
+
+    expect(() => validateMaintenanceBundle({ ...bundle, allowStateful: false })).toThrow(
+      "Refusing unattended stateful images",
+    );
+    expect(validateMaintenanceBundle({ ...bundle, allowStateful: true }).rollbackSafe).toBe(false);
+  });
+
   test("a stateful image is never reported as rollback safe", () => {
     const images = [`docker.io/library/postgres:16@${DIGEST}`];
     const result = validateMaintenanceBundle({

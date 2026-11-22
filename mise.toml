@@ -235,7 +235,7 @@ raw_args = true
 run = "bun scripts/publish-images.ts"
 
 [tasks."images:pin-edge-caddy"]
-description = "Pin the edge service and the sample release bundle to a published ark-edge-caddy digest (FD-23)"
+description = "Pin the edge service and the sample release bundle to a published ark-stack-edge-caddy digest (FD-23)"
 raw_args = true
 run = "bun scripts/pin-edge-caddy.ts"
 

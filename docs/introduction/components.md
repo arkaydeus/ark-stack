@@ -80,13 +80,13 @@ The control-plane PostgreSQL cluster (database `ark_platform`), holding desired 
 
 A one-shot container that applies the SQL migrations in `server/drizzle` as `ark_migration`.
 
-- **Image.** `ark-stack`. **Network.** `control`. **Secret.** `ARK_CONTROL_DB_PASSWORD` only, in its `DATABASE_URL`. It is the only Ark service that connects as the schema owner.
+- **Image.** `ark-stack-app`. **Network.** `control`. **Secret.** `ARK_CONTROL_DB_PASSWORD` only, in its `DATABASE_URL`. It is the only Ark service that connects as the schema owner.
 
 ### api
 
 The Hono API, Better Auth and the built admin UI, served on port 3000. It owns identity, authorisation, desired state and the operation queue, and serves the internal worker endpoints, the edge lease and the Prometheus metrics.
 
-- **Image.** `ark-stack`. Runs `bun run --cwd server start` with `ARK_EMBEDDED_WORKERS=0`.
+- **Image.** `ark-stack-app`. Runs `bun run --cwd server start` with `ARK_EMBEDDED_WORKERS=0`.
 - **Networks.** `control` (database, workers), `admin` (reached by the edge and the tailnet gateway as `api:3000`), `monitoring` (scraped by Prometheus).
 - **Ports.** `127.0.0.1:3000` on the host, for bootstrap and local recovery only.
 - **May talk to.** `postgres` as `ark_runtime`; `database-worker:3101` (SQL cancellation) and `domain-worker:3102`; the optional off-host heartbeat receiver.
