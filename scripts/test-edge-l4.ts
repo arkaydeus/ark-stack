@@ -1276,13 +1276,14 @@ ${wsHost} {
   );
   // Fresh requests run throughout repeated Caddy reloads: the listener stays open across /load, so
   // HAProxy's fail-fast loopback hop (retries 0) must not turn a reload into failed requests.
+  const since = new Date(Date.now() - 1_000).toISOString();
   const loadTraffic = { done: false, requests: 0, failures: [] as string[] };
   const traffic = (async () => {
     while (!loadTraffic.done) {
       const reply = await secureGet(wsHost).catch((error: Error) => ({ status: 0, body: error.message }));
       loadTraffic.requests++;
       if (reply.status !== 200 || reply.body !== "ok")
-        loadTraffic.failures.push(`${reply.status} ${reply.body.slice(0, 60)}`);
+        loadTraffic.failures.push(`${reply.status} ${reply.body.slice(0, 120)}`);
       await Bun.sleep(50);
     }
   })();
@@ -1309,7 +1310,7 @@ ${wsHost} {
   if (!restored.applied) throw new Error("writeEdge did not re-apply the production configuration");
   if (!loadTraffic.requests || loadTraffic.failures.length)
     throw new HttpContinuityFailure(
-      `requests through 443 during Caddy /load: ${loadTraffic.failures.join(", ") || "no requests"}`,
+      `requests through 443 during Caddy /load: ${loadTraffic.failures.join(", ") || "no requests"}${await continuityEvidence(since, loadTraffic.failures)}`,
     );
   report.lines.push(
     `  ok  requests through 443 during Caddy /load reloads all succeed [${loadTraffic.requests} requests, all 200]`,
