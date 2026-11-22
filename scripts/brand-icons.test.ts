@@ -114,6 +114,8 @@ describe("PNG and ICO codec", () => {
   });
 });
 
+// A full regeneration (eight resamples, palette searches and level-9 deflate of a 1254px master)
+// takes about 5 s on a GitHub runner, so it gets its own budget instead of Bun's 5 s default.
 test("regenerating from a shifted master updates both admin theme files", () => {
   const fixture = mkdtempSync(join(tmpdir(), "ark-brand-"));
   try {
@@ -141,7 +143,7 @@ test("regenerating from a shifted master updates both admin theme files", () => 
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
-});
+}, 60_000);
 
 describe("committed icons", () => {
   test("the master is the supplied 1254px artwork with near-black square corners", () => {
