@@ -284,10 +284,12 @@ describe("pgbouncer-public compose service", () => {
 
   test("CI runs the disposable bootstrap and TLS/SCRAM smoke test", async () => {
     const workflow = Bun.YAML.parse(await Bun.file(join(root, ".github/workflows/ci.yml")).text()) as {
-      jobs: { verify: { steps: Array<{ run?: string }> } };
+      jobs: Record<string, { steps?: Array<{ run?: string }> }>;
     };
-    expect(
-      workflow.jobs.verify.steps.some((step) => step.run === "bun scripts/test-pgbouncer-public.ts"),
-    ).toBe(true);
+    // CI runs its suites in parallel jobs; exactly one of them must run the smoke test.
+    const runs = Object.values(workflow.jobs).filter((job) =>
+      job.steps?.some((step) => step.run === "bun scripts/test-pgbouncer-public.ts"),
+    );
+    expect(runs).toHaveLength(1);
   });
 });
