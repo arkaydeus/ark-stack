@@ -590,6 +590,17 @@ describe("trusted client address and sign-in rate limit", () => {
   afterAll(async () => {
     for (const network of proxyNetworks) await proxyDocker("network", "rm", network);
   });
+  // The public admin proxy is the shipped edge image, built from the Dockerfile's edge-caddy stage
+  // (Caddy plus the rate-limit plugin). A cold build takes about two minutes on a GitHub runner, so
+  // it is fixture setup with its own budget rather than part of each test's timeout.
+  const root = resolvePath(import.meta.dir, "../..");
+  const proxyImages = {} as Record<"public" | "tailnet", { image: string; platformArgs: string[] }>;
+  beforeAll(async () => {
+    const source = await Bun.file(join(root, "infra/platform/docker-compose.yml")).text();
+    const compose = Bun.YAML.parse(source) as { services: { "tailnet-gateway": { image: string } } };
+    proxyImages.public = await prepareEdgeImage(proxyDocker, { root, compose: source });
+    proxyImages.tailnet = { image: compose.services["tailnet-gateway"].image, platformArgs: [] };
+  }, 480_000);
   for (const mode of ["public", "tailnet"] as const) {
     test(`${mode} admin Caddy keeps two clients' sign-in and MFA buckets and session addresses separate`, async () => {
       const directory = await mkdtemp(join(tmpdir(), "ark-admin-proxy-"));
@@ -625,13 +636,7 @@ describe("trusted client address and sign-in rate limit", () => {
           .replaceAll("api:3000", `host.docker.internal:${relay.port}`)
           .concat("\n:8081 {\n  reverse_proxy 127.0.0.1:8080\n}\n");
         await Bun.write(join(directory, "Caddyfile"), mode === "public" ? publicConfig : tailnetConfig);
-        const root = resolvePath(import.meta.dir, "../..");
-        const source = await Bun.file(join(root, "infra/platform/docker-compose.yml")).text();
-        const compose = Bun.YAML.parse(source) as { services: { "tailnet-gateway": { image: string } } };
-        const image =
-          mode === "public"
-            ? await prepareEdgeImage(proxyDocker, { root, compose: source })
-            : { image: compose.services["tailnet-gateway"].image, platformArgs: [] };
+        const image = proxyImages[mode];
         await proxyDocker("network", "create", network);
         proxyNetworks.push(network);
         const proxy = `${network}-caddy`;
