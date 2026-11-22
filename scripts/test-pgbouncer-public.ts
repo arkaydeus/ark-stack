@@ -470,6 +470,19 @@ function expectRejected(result: { status: number; stderr: string }, pattern: Reg
   record(check, `rejected — ${lastLine(result.stderr)}`);
 }
 
+// TEMPORARY CI DIAGNOSTIC: record every container event, to find what removes app-postgres.
+const diagEvents = Bun.spawn(
+  [
+    "docker",
+    "events",
+    "--filter",
+    "type=container",
+    "--format",
+    "{{.TimeNano}} {{.Action}} {{.Actor.Attributes.name}} {{.Actor.ID}} image={{.Actor.Attributes.image}} exit={{.Actor.Attributes.exitCode}}",
+  ],
+  { stdout: "pipe", stderr: "pipe" },
+);
+const diagEventsText = new Response(diagEvents.stdout).text();
 try {
   await mkdir(projectDir, { recursive: true });
   const override = join(work, "smoke-ports.yml");
@@ -565,6 +578,8 @@ try {
   log("Starting app-postgres…");
   await run([...compose, "up", "--detach", "--wait", "--wait-timeout", "120", "app-postgres"]);
   const appContainer = await service("app-postgres");
+  log(`DIAG app-postgres container ${appContainer}`);
+  log(`DIAG compose ${(await run([...compose, "version"])).stdout}`);
   await run([
     "docker",
     "exec",
@@ -2295,6 +2310,32 @@ try {
 } catch (error) {
   const bouncer = await run([...compose, "logs", "--no-color", "pgbouncer-public"], { allowFailure: true });
   console.error(bouncer.stdout || bouncer.stderr);
+  const app = await run([...compose, "logs", "--no-color", "--timestamps", "app-postgres"], {
+    allowFailure: true,
+  });
+  console.error(
+    "DIAG app-postgres logs (tail)\n" + (app.stdout || app.stderr).split("\n").slice(-60).join("\n"),
+  );
+  console.error(
+    "DIAG compose ps -a\n" + (await run([...compose, "ps", "-a"], { allowFailure: true })).stdout,
+  );
+  console.error(
+    "DIAG docker ps -a\n" +
+      (
+        await run(
+          ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}} {{.Names}} {{.Status}} {{.Image}}"],
+          { allowFailure: true },
+        )
+      ).stdout,
+  );
+  diagEvents.kill();
+  console.error(
+    "DIAG docker events\n" +
+      (await diagEventsText)
+        .split("\n")
+        .filter((line) => !/ (exec_create|exec_start|exec_die|attach|resize):? /.test(line))
+        .join("\n"),
+  );
   throw error;
 } finally {
   await run([...compose, "down", "--volumes", "--remove-orphans", "--timeout", "5"], { allowFailure: true });
