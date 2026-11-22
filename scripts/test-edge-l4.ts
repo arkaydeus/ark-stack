@@ -632,10 +632,12 @@ function secureGet(servername: string, hostHeader = servername, path = "/") {
       ALPNProtocols: ["http/1.1"],
     });
     let data = "";
+    let clientPort: number | undefined;
     const timer = setTimeout(() => socket.destroy(new Error("timed out")), 5_000);
-    socket.on("secureConnect", () =>
-      socket.write(`GET ${path} HTTP/1.1\r\nHost: ${hostHeader}\r\nConnection: close\r\n\r\n`),
-    );
+    socket.on("secureConnect", () => {
+      clientPort = socket.localPort;
+      socket.write(`GET ${path} HTTP/1.1\r\nHost: ${hostHeader}\r\nConnection: close\r\n\r\n`);
+    });
     socket.on("data", (chunk) => (data += chunk.toString("utf8")));
     socket.on("error", (error) => {
       clearTimeout(timer);
@@ -653,9 +655,9 @@ function secureGet(servername: string, hostHeader = servername, path = "/") {
       if (!statusLine) {
         reject(
           new Error(
-            socket.authorized || socket.alpnProtocol === "http/1.1"
+            (socket.authorized || socket.alpnProtocol === "http/1.1"
               ? "TLS completed but the peer closed before responding"
-              : "the peer closed before responding",
+              : "the peer closed before responding") + (clientPort ? ` (client port ${clientPort})` : ""),
           ),
         );
         return;
@@ -2421,6 +2423,33 @@ async function legacyHttpWithdrawalTest(report: Report) {
   }
 }
 
+/**
+ * What HAProxy and Caddy recorded since `since`: every 443 tcplog line that did not end normally,
+ * or that names a failed client port (Docker's port publishing may rewrite it), whose termination
+ * state names the side that closed, and Caddy's warnings and errors. An intermittent continuity
+ * failure is then diagnosable from the run that hit it.
+ */
+async function continuityEvidence(since: string, errors: string[]) {
+  const logs = async (container: string) => {
+    const { stdout, stderr } = await runtime
+      .dockerOutput("logs", "--timestamps", "--since", since, container)
+      .catch((error: Error) => ({ stdout: "", stderr: `unavailable: ${error.message}` }));
+    return `${stdout}\n${stderr}`.split("\n");
+  };
+  const clientPorts = errors.flatMap((error) =>
+    [...error.matchAll(/client port (\d+)/g)].map((match) => match[1]!),
+  );
+  const haproxy = (await logs(stack.edgeL4)).filter(
+    (line) =>
+      / fe_tls443 \S+ [-\d]+\/[-\d]+\/\d+ \d+ (?!--)/.test(line) ||
+      clientPorts.some((port) => line.includes(`:${port} [`)),
+  );
+  const caddy = (await logs(stack.edge)).filter(
+    (line) => /"level":"(?:warn|error)"/.test(line) && !line.includes("HTTP/2 skipped"),
+  );
+  return `\n  HAProxy 443 sessions that did not end normally (failed client ports ${clientPorts.join(", ") || "none"}):\n    ${haproxy.join("\n    ") || "no matching line"}\n  Caddy warnings and errors:\n    ${caddy.join("\n    ") || "none"}`;
+}
+
 async function targetedHttpWithdrawalTest(
   report: Report,
   trigger: "identity" | "expiry" | "apply" | "drain",
@@ -2429,6 +2458,7 @@ async function targetedHttpWithdrawalTest(
   await installScopedHttp();
   await edgeApply();
   const fixture = trigger === "drain" ? await coordinatorFixture() : null;
+  const since = new Date(Date.now() - 1_000).toISOString();
   const initialPid = await caddyPid();
   const target = await websocket(wwwHost);
   const sibling = await websocket(tailnetHost);
@@ -2524,7 +2554,7 @@ async function targetedHttpWithdrawalTest(
   );
   if (traffic.requests < 2 || traffic.errors.length)
     throw new HttpContinuityFailure(
-      `unrelated HTTP during withdrawal: ${traffic.requests} requests; ${traffic.errors.join(", ")}`,
+      `unrelated HTTP during withdrawal: ${traffic.requests} requests; ${traffic.errors.join(", ")}${await continuityEvidence(since, traffic.errors)}`,
     );
   report.lines.push(
     `  ok  unrelated HTTP requests succeed throughout [${traffic.requests} requests; zero errors]`,
