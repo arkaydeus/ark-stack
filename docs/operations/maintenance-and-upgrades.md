@@ -96,7 +96,7 @@ A bundle is JSON (`MaintenanceBundle` in `shared/src/maintenance.ts`):
 ```json
 {
   "version": "0.1.0",
-  "images": ["ghcr.io/<namespace>/ark-api@sha256:<64 hex>", "…"],
+  "images": ["ghcr.io/<namespace>/ark-stack-edge-caddy@sha256:<64 hex>", "…"],
   "digest": "sha256:<sha256 of the sorted image list joined by newlines>",
   "composeDigest": "sha256:<sha256 of the exact Compose file>",
   "allowStateful": false,
@@ -108,7 +108,7 @@ A bundle is JSON (`MaintenanceBundle` in `shared/src/maintenance.ts`):
 
 - it has a version and at least one image, and `digest` equals `bundleDigest(images)`;
 - every image is pinned as `…@sha256:<64 hex>`;
-- no image names a stateful component (`postgres`, `stalwart`, `ark-agent`, `ark-api`, `ark-control`) unless `allowStateful` is true;
+- no image names a stateful component (`postgres`, `stalwart`, `ark-stack-agent`, `ark-agent`, `ark-api`, `ark-control`) unless `allowStateful` is true;
 - `composeDigest` equals the SHA-256 of the exact Compose file being applied;
 - `signature` verifies with `ARK_RELEASE_PUBLIC_KEY` over `maintenanceSignaturePayload(bundle)`, the JSON of `version`, the sorted `images`, `digest`, `composeDigest` and `allowStateful`;
 - the set of distinct `image:` values in the Compose file equals the bundle's image list exactly.
@@ -212,6 +212,29 @@ Login and push use a temporary Docker configuration, removed on success or failu
 
 The packages must be public for an unauthenticated host to pull them. GitHub creates a container package as private the first time it is pushed, so check each `ark-*` package's visibility once under the account's **Packages** settings. The installer trusts the registry as much as it trusts the checkout: anyone who can push to the repository's packages can also change its code.
 
+#### Migrating to the renamed images
+
+The first release with the new image names publishes its commit tags and `latest` under the new repositories. The old `latest` tags stop advancing at that release. Update direct image references in Compose overrides, deployment automation, and registry mirrors using this mapping:
+
+| Previous repository     | New repository                |
+| ----------------------- | ----------------------------- |
+| `ark-stack`             | `ark-stack-app`               |
+| `ark-agent`             | `ark-stack-agent`             |
+| `ark-app-postgres`      | `ark-stack-app-postgres`      |
+| `ark-backup-worker`     | `ark-stack-backup-worker`     |
+| `ark-database-ingress`  | `ark-stack-database-ingress`  |
+| `ark-database-worker`   | `ark-stack-database-worker`   |
+| `ark-domain-worker`     | `ark-stack-domain-worker`     |
+| `ark-edge-caddy`        | `ark-stack-edge-caddy`        |
+| `ark-edge-watchdog`     | `ark-stack-edge-watchdog`     |
+| `ark-haproxy-validator` | `ark-stack-haproxy-validator` |
+| `ark-mail-worker`       | `ark-stack-mail-worker`       |
+| `ark-postgres`          | `ark-stack-postgres`          |
+
+When preparing the first renamed release, set the new packages' visibility and verify that the commit tags can be pulled from an unauthenticated host. Upgrades via `mise run host:install` pick up the new repository names from the release checkout. For deployments managed separately, use a commit tag or digest published under each new repository. Keep the saved full pre-rename image references for rollback and backup recovery.
+
+An existing digest-pinned edge manifest can keep its `ark-edge-caddy` reference while the original package is available. To upgrade the pin, use the `ark-stack-edge-caddy` digest printed by the publisher. The pinning command updates the Compose manifest and replaces the previous edge entry in the sample bundle. When rolling out via signed maintenance, update the release bundle to match the Compose manifest and sign it again.
+
 ### Third-party image pins
 
 Caddy, HAProxy, Tailscale, PgBouncer, PostgreSQL, Stalwart and the `oven/bun` base are pinned as `name:version@sha256:<digest>`. Dependabot (`.github/dependabot.yml`) covers only the bun workspace and GitHub Actions, so image bumps are manual:
@@ -223,7 +246,7 @@ Caddy, HAProxy, Tailscale, PgBouncer, PostgreSQL, Stalwart and the `oven/bun` ba
 5. Run `bun scripts/check-image-plan.ts` and `mise run images:publish -- --dry-run`.
 6. Record the digest, how it was verified and the test output in the PR, then roll it out with signed maintenance.
 
-The custom edge Caddy (`edge-caddy`: Caddy with the pinned rate-limit plugin) is built locally until a published digest is pinned. After publishing, `mise run images:pin-edge-caddy -- ghcr.io/<namespace>/ark-edge-caddy@sha256:<digest>` checks the registry image (amd64, the expected Caddy version and the bounded rate-limit handler), replaces the `edge` build in Compose with that reference and adds it to the sample release bundle. The complete procedure is [Third-party image pins](../operating.md#third-party-image-pins).
+The custom edge Caddy (`edge-caddy`: Caddy with the pinned rate-limit plugin) is built locally until a published digest is pinned. After publishing, `mise run images:pin-edge-caddy -- ghcr.io/<namespace>/ark-stack-edge-caddy@sha256:<digest>` checks the registry image (amd64, the expected Caddy version and the bounded rate-limit handler), replaces the `edge` build in Compose with that reference and adds it to the sample release bundle. The complete procedure is [Third-party image pins](../operating.md#third-party-image-pins).
 
 ### Service image updates
 

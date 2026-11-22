@@ -14,7 +14,7 @@ Most recovery paths depend on material that must not live only on the VPS. Store
 | `ARK_PLATFORM_PG_REPO_CIPHER_PASS` and `ARK_APP_PG_REPO_CIPHER_PASS`               | PostgreSQL point-in-time restore                     |
 | Each backup target's restic repository password, and the home rest-server password | Reading the off-VPS repositories                     |
 | A read-only key for the backup bucket                                              | Restoring without the writer credential              |
-| The `ark-postgres` and `ark-app-postgres` image references for the running release | Restoring with matching PostgreSQL binaries          |
+| Full image references for both PostgreSQL clusters in the source release           | Restoring with matching PostgreSQL binaries          |
 
 The installer generates the `.env` values. The backups guide lists the backup material in [Recovery material to keep off-host](../guides/backups.md#recovery-material-to-keep-off-host).
 

@@ -51,25 +51,25 @@ target "_app" {
 target "app" {
   inherits = ["_app"]
   target   = "runtime"
-  tags     = refs("ark-stack")
+  tags     = refs("ark-stack-app")
 }
 
 target "database-worker" {
   inherits = ["_app"]
   target   = "database-worker"
-  tags     = refs("ark-database-worker")
+  tags     = refs("ark-stack-database-worker")
 }
 
 target "database-ingress" {
   inherits = ["_app"]
   target   = "database-ingress"
-  tags     = refs("ark-database-ingress")
+  tags     = refs("ark-stack-database-ingress")
 }
 
 target "domain-worker" {
   inherits = ["_app"]
   target   = "domain-worker"
-  tags     = refs("ark-domain-worker")
+  tags     = refs("ark-stack-domain-worker")
 }
 
 # Caddy 2.11.9 with the pinned caddy-ratelimit plugin, for the `edge` service (docs/design/front-door.md
@@ -77,49 +77,49 @@ target "domain-worker" {
 target "edge-caddy" {
   inherits = ["_app"]
   target   = "edge-caddy"
-  tags     = refs("ark-edge-caddy")
+  tags     = refs("ark-stack-edge-caddy")
 }
 
 target "edge-watchdog" {
   inherits = ["_app"]
   target   = "edge-watchdog"
-  tags     = refs("ark-edge-watchdog")
+  tags     = refs("ark-stack-edge-watchdog")
 }
 
 target "haproxy-validator" {
   inherits = ["_app"]
   target   = "haproxy-validator"
-  tags     = refs("ark-haproxy-validator")
+  tags     = refs("ark-stack-haproxy-validator")
 }
 
 target "mail-worker" {
   inherits = ["_app"]
   target   = "mail-worker"
-  tags     = refs("ark-mail-worker")
+  tags     = refs("ark-stack-mail-worker")
 }
 
 target "backup-worker" {
   inherits = ["_app"]
   target   = "backup-worker"
-  tags     = refs("ark-backup-worker")
+  tags     = refs("ark-stack-backup-worker")
 }
 
 # PostgreSQL clusters with pgBackRest and the backup executor (docs/design/front-door.md §3.18.1, FD-21).
 target "postgres" {
   inherits = ["_app"]
   target   = "postgres-backup"
-  tags     = refs("ark-postgres")
+  tags     = refs("ark-stack-postgres")
 }
 
 target "app-postgres" {
   inherits = ["_app"]
   target   = "app-postgres-backup"
-  tags     = refs("ark-app-postgres")
+  tags     = refs("ark-stack-app-postgres")
 }
 
 target "agent" {
   inherits   = ["_common"]
   context    = "agent"
   dockerfile = "Dockerfile"
-  tags       = refs("ark-agent")
+  tags       = refs("ark-stack-agent")
 }

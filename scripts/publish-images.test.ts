@@ -48,7 +48,7 @@ if (command === "docker" && args[1] === "imagetools" && args[2] === "inspect") {
 }
 if (command === "docker" && args.includes("--push")) {
   writeFileSync(args[args.indexOf("--metadata-file") + 1], env.METADATA ?? JSON.stringify({ app: {
-    "containerimage.digest": "${digest}", "image.name": env.REGISTRY + "/ark-stack:" + env.TAGS.split(",")[0]
+    "containerimage.digest": "${digest}", "image.name": env.REGISTRY + "/ark-stack-app:" + env.TAGS.split(",")[0]
   } }));
 }
 `;
@@ -169,7 +169,7 @@ test("explicit credentials publish without a gh login and use isolated Docker co
   expect(push.builder).toBe(join(result.original, "buildx"));
   expect(push.tags).toBe(revision.slice(0, 12));
   expect(push.platforms).toBe("linux/amd64");
-  expect(result.stdout).toContain(`ghcr.io/arkaydeus/ark-stack@${digest}`);
+  expect(result.stdout).toContain(`ghcr.io/arkaydeus/ark-stack-app@${digest}`);
   expect(result.stdout).not.toContain("explicit-token");
 });
 
@@ -341,8 +341,8 @@ test("empty token and empty tag fail directly", async () => {
 
 const plan = JSON.stringify({
   target: {
-    app: { tags: ["ghcr.io/arkaydeus/ark-stack:TAG"] },
-    "edge-caddy": { tags: ["ghcr.io/arkaydeus/ark-edge-caddy:TAG"] },
+    app: { tags: ["ghcr.io/arkaydeus/ark-stack-app:TAG"] },
+    "edge-caddy": { tags: ["ghcr.io/arkaydeus/ark-stack-edge-caddy:TAG"] },
   },
 });
 
@@ -372,34 +372,34 @@ test("merge verifies every annotated index before promoting latest from its dige
       "--annotation",
       "index:org.opencontainers.image.source=https://github.com/arkaydeus/ark-stack",
       "--tag",
-      `ghcr.io/arkaydeus/ark-stack:${tag}`,
-      `ghcr.io/arkaydeus/ark-stack:${tag}-amd64`,
-      `ghcr.io/arkaydeus/ark-stack:${tag}-arm64`,
+      `ghcr.io/arkaydeus/ark-stack-app:${tag}`,
+      `ghcr.io/arkaydeus/ark-stack-app:${tag}-amd64`,
+      `ghcr.io/arkaydeus/ark-stack-app:${tag}-arm64`,
     ],
     [
       "--annotation",
       "index:org.opencontainers.image.source=https://github.com/arkaydeus/ark-stack",
       "--tag",
-      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}`,
-      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}-amd64`,
-      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}-arm64`,
+      `ghcr.io/arkaydeus/ark-stack-edge-caddy:${tag}`,
+      `ghcr.io/arkaydeus/ark-stack-edge-caddy:${tag}-amd64`,
+      `ghcr.io/arkaydeus/ark-stack-edge-caddy:${tag}-arm64`,
     ],
     [
       "--prefer-index=false",
       "--tag",
-      "ghcr.io/arkaydeus/ark-stack:latest",
-      `ghcr.io/arkaydeus/ark-stack@${digest}`,
+      "ghcr.io/arkaydeus/ark-stack-app:latest",
+      `ghcr.io/arkaydeus/ark-stack-app@${digest}`,
     ],
     [
       "--prefer-index=false",
       "--tag",
-      "ghcr.io/arkaydeus/ark-edge-caddy:latest",
-      `ghcr.io/arkaydeus/ark-edge-caddy@${digest}`,
+      "ghcr.io/arkaydeus/ark-stack-edge-caddy:latest",
+      `ghcr.io/arkaydeus/ark-stack-edge-caddy@${digest}`,
     ],
   ]);
   const login = result.records.find((record) => record.args[0] === "login")!;
   expect(creates.every((record) => record.config === login.config)).toBe(true);
-  expect(result.stdout).toContain(`ghcr.io/arkaydeus/ark-edge-caddy@${digest}`);
+  expect(result.stdout).toContain(`ghcr.io/arkaydeus/ark-stack-edge-caddy@${digest}`);
 
   const noLatest = await publish(["--tag", "v1", "--no-latest", "--merge", "v1-a,v1-b"], {
     GHCR_TOKEN: "token",
@@ -417,7 +417,7 @@ test("a failure creating or inspecting the second immutable target leaves latest
       GHCR_USER: "user",
       PLAN: plan,
       FAIL_IMAGE_OPERATION: operation,
-      FAIL_TARGET: "ghcr.io/arkaydeus/ark-edge-caddy:v1",
+      FAIL_TARGET: "ghcr.io/arkaydeus/ark-stack-edge-caddy:v1",
     });
     expect(result.code).toBe(1);
     expect(result.records.flatMap(({ args }) => args).some((arg) => arg.endsWith(":latest"))).toBe(false);
@@ -430,7 +430,7 @@ test("an interrupted latest promotion can be retried using the published tags al
   const failed = await publish(promotion, {
     ...env,
     FAIL_IMAGE_OPERATION: "create",
-    FAIL_TARGET: "ghcr.io/arkaydeus/ark-edge-caddy:latest",
+    FAIL_TARGET: "ghcr.io/arkaydeus/ark-stack-edge-caddy:latest",
   });
   expect(failed.code).toBe(1);
   expect(failed.stderr).toContain("Retry with --tag v1 --promote-latest");
@@ -444,8 +444,8 @@ test("an interrupted latest promotion can be retried using the published tags al
     ["create", "--tag"],
   ]);
   expect(operations.slice(2).map(({ args }) => args[6])).toEqual([
-    `ghcr.io/arkaydeus/ark-stack@${digest}`,
-    `ghcr.io/arkaydeus/ark-edge-caddy@${digest}`,
+    `ghcr.io/arkaydeus/ark-stack-app@${digest}`,
+    `ghcr.io/arkaydeus/ark-stack-edge-caddy@${digest}`,
   ]);
 });
 

@@ -14,12 +14,12 @@
 // 4. Start PostgreSQL with no network and archiving off; it replays archived WAL to the target and
 //    promotes. Recovery fails loudly if the WAL does not reach the target.
 //
-// CLI (all inputs through the environment, so nothing secret lands in shell history):
+// CLI (set restore_image to the full image reference saved for this cluster and source release):
 //   ARK_RESTORE_ENDPOINT=https://s3.us-east-1.amazonaws.com ARK_RESTORE_REGION=us-east-1 \
 //   ARK_RESTORE_BUCKET=ark-backups ARK_RESTORE_PREFIX=ark ARK_RESTORE_PATH_STYLE=0 \
 //   ARK_RESTORE_ACCESS_KEY_ID=... ARK_RESTORE_SECRET_ACCESS_KEY=... ARK_RESTORE_RESTIC_PASSWORD=... \
 //   ARK_RESTORE_CIPHER_PASS=... ARK_RESTORE_CLUSTER=platform ARK_RESTORE_TARGET_TIME=2026-11-17T10:00:00Z \
-//   ARK_RESTORE_IMAGE=ghcr.io/arkaydeus/ark-postgres:<version> bun scripts/offsite-restore.ts
+//   ARK_RESTORE_IMAGE="$restore_image" bun scripts/offsite-restore.ts
 // The restored server keeps running in container `<name>-pg` with no network; inspect it with
 // `docker exec -it <name>-pg psql -U <superuser>`, then `pg_dump` what you need.
 import { randomBytes } from "node:crypto";
@@ -56,7 +56,7 @@ export type OffsiteRestoreOptions = {
   targetTime?: string;
   /** A specific restic snapshot ID; omitted, the newest snapshot that covers the target time. */
   snapshot?: string;
-  /** The Ark PostgreSQL image for this cluster (ark-postgres or ark-app-postgres). */
+  /** The full Ark PostgreSQL image reference saved for the cluster and source release. */
   image: string;
   /** Docker network for restic (default: bridge). Tests join MinIO's namespace. */
   resticNetwork?: string;

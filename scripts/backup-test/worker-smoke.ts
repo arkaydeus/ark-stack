@@ -283,6 +283,6 @@ export async function workerSmoke(
       )
         await run(["docker", "network", "rm", network], { allowFailure: true });
     }
-    await run(["docker", "image", "rm", `ark-backup-worker:${c.version}`], { allowFailure: true });
+    await run(["docker", "image", "rm", `ark-stack-backup-worker:${c.version}`], { allowFailure: true });
   }
 }

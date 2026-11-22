@@ -1,4 +1,11 @@
-export const statefulComponents = new Set(["postgres", "stalwart", "ark-agent", "ark-api", "ark-control"]);
+export const statefulComponents = new Set([
+  "postgres",
+  "stalwart",
+  "ark-agent",
+  "ark-stack-agent",
+  "ark-api",
+  "ark-control",
+]);
 
 export function parseImageRef(image: string) {
   const [nameDigest, digest] = image.split("@sha256:");
