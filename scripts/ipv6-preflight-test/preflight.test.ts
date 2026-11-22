@@ -187,7 +187,8 @@ test("native IPv6, separate PostgreSQL probes, AAAA withdrawal and Pebble HTTP-0
   const suffix = crypto.randomUUID().slice(0, 8);
   const name = `ark-fd27-${suffix}`;
   const dir = await mkdtemp(join(tmpdir(), name + "-"));
-  const runtime = new EdgeTestRuntime(dir, name + "-v6");
+  // The work directory holds files written by uid 1000 and root containers; cleanup chowns it back.
+  const runtime = new EdgeTestRuntime(dir, name + "-v6", bunImage);
   const stopSignals = runtime.installSignalHandlers();
   const v4Network = name + "-v4";
   const image = name + ":vps";

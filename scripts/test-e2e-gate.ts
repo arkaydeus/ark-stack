@@ -12,7 +12,7 @@
 // deleting them closes their open WebSocket through the revocation journal.
 //
 // Needs Docker, a loopback PostgreSQL in DATABASE_URL (as `mise run test:e2e`) and Playwright's
-// Chromium (`bunx playwright install chromium`).
+// Chromium (`bunx playwright install chromium`). On Linux, run as a non-root user with Docker access.
 import { spawn } from "node:child_process";
 import { createServer, connect, type Socket } from "node:net";
 import { createHmac, randomBytes } from "node:crypto";
@@ -33,6 +33,10 @@ import { bunImage, cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 
 const root = resolve(import.meta.dir, "..");
+const hostUid = process.getuid?.() ?? 1000;
+if (process.platform === "linux" && hostUid === 0) {
+  throw new Error("Run the gate browser harness as a non-root user with Docker access, without sudo.");
+}
 const sourceUrl = process.env.DATABASE_URL;
 if (!sourceUrl) throw new Error("DATABASE_URL is required for the disposable gate browser harness.");
 if (!["127.0.0.1", "localhost", "::1"].includes(new URL(sourceUrl).hostname))
@@ -141,6 +145,19 @@ function connectProxy(httpsPort: number, allowed: Set<string>) {
 
 // ---- Run ---------------------------------------------------------------------------------------------
 
+// The real coordinator runs in this process (claimQueued/runOperation) and rewrites the 0600 edge
+// files that Caddy and the watchdog read; in production all of them run as uid 1000. On a Linux host
+// whose user is not uid 1000 (a GitHub runner is 1001), the test's edge identity is this process's
+// user instead. Docker Desktop translates bind-mount ownership, so elsewhere the shipped identity
+// applies. Test-only: the shipped Compose edge stays 1000:1000.
+const edgeUser =
+  process.platform === "linux" && hostUid !== 1000
+    ? `${hostUid}:${process.getgid?.() ?? hostUid}`
+    : "1000:1000";
+console.log(
+  `Edge identity for this run: ${edgeUser} (host uid ${hostUid}; the shipped edge runs as 1000:1000).`,
+);
+
 const directory = await mkdtemp(join(tmpdir(), `${name}-`));
 const runtime = new EdgeTestRuntime(directory, name, bunImage);
 const removeSignalHandlers = runtime.installSignalHandlers();
@@ -190,7 +207,12 @@ try {
       env: { RELAY_TARGET: `host.docker.internal:${apiPort}` },
       hostGateway: true,
     },
+    edgeUser,
   });
+  for (const container of [edge.stack.edge, `${name}-watchdog`]) {
+    const user = await runtime.docker("inspect", "--format", "{{.Config.User}}", container);
+    if (user !== edgeUser) throw new Error(`${container} runs as ${user}, expected ${edgeUser}`);
+  }
 
   api = spawn("bun", ["server/src/index.ts"], { cwd: root, env: serverEnv, stdio: "inherit" });
   await waitFor(

@@ -13,11 +13,42 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job gets the same disposable platform database and the same placeholder secrets.
+env:
+  DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+  DATABASE_APP_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+  BETTER_AUTH_SECRET: ci-better-auth-secret-0123456789abcdef
+  BETTER_AUTH_URL: http://127.0.0.1:3000
+  BETTER_AUTH_TRUSTED_ORIGINS: http://127.0.0.1:3000
+  ARK_ROOT_KEY: ci-root-key-0123456789abcdef0123456789abcdef
+  ARK_SETUP_TOKEN: ci-setup-token-0123456789
+  ARK_INTERNAL_TOKEN: ci-internal-token-0123456789
+  ARK_DATABASE_WORKER_TOKEN: ci-database-worker-token-0123456789
+  ARK_DOMAIN_WORKER_TOKEN: ci-domain-worker-token-0123456789
+  ARK_MAIL_WORKER_TOKEN: ci-mail-worker-token-0123456789
+  ARK_BACKUP_WORKER_TOKEN: ci-backup-worker-token-0123456789
+  ARK_AGENT_TOKEN: ci-agent-token-0123456789
+  ARK_MAINTENANCE_TOKEN: ci-maintenance-token-0123456789
+  ARK_MFA_RECOVERY_TOKEN: ci-mfa-recovery-token-0123456789
+  ARK_METRICS_TOKEN: ci-metrics-token-0123456789
+  ARK_OFFHOST_HEARTBEAT_TOKEN: ci-offhost-heartbeat-token-0123456789
+  ARK_CONTROL_DB_PASSWORD: ci-control-db-password-0123456789
+  ARK_APP_DB_PASSWORD: ci-app-db-password-0123456789
+  ARK_API_DB_PASSWORD: ci-api-db-password-0123456789
+  ARK_PGBOUNCER_ADMIN_PASSWORD: ci-pgbouncer-admin-password-0123456789
+  STALWART_ADMIN_ADDRESS: admin
+  STALWART_ADMIN_PASSWORD: ci-stalwart-password-0123456789
+
+# The suites run in parallel jobs grouped by area. Each job repeats the shared setup it relies on:
+# the migrated platform database (DATABASE_URL), an empty .env, the host OpenSSL and psql, and
+# the web build where a suite serves or inspects the UI.
 jobs:
-  verify:
+  checks:
+    name: Checks and unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    services:
+    # Measured about 11.5 minutes.
+    timeout-minutes: 20
+    services: &services
       postgres:
         image: postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929
         env:
@@ -29,41 +60,22 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-    env:
-      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
-      DATABASE_APP_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
-      BETTER_AUTH_SECRET: ci-better-auth-secret-0123456789abcdef
-      BETTER_AUTH_URL: http://127.0.0.1:3000
-      BETTER_AUTH_TRUSTED_ORIGINS: http://127.0.0.1:3000
-      ARK_ROOT_KEY: ci-root-key-0123456789abcdef0123456789abcdef
-      ARK_SETUP_TOKEN: ci-setup-token-0123456789
-      ARK_INTERNAL_TOKEN: ci-internal-token-0123456789
-      ARK_DATABASE_WORKER_TOKEN: ci-database-worker-token-0123456789
-      ARK_DOMAIN_WORKER_TOKEN: ci-domain-worker-token-0123456789
-      ARK_MAIL_WORKER_TOKEN: ci-mail-worker-token-0123456789
-      ARK_BACKUP_WORKER_TOKEN: ci-backup-worker-token-0123456789
-      ARK_AGENT_TOKEN: ci-agent-token-0123456789
-      ARK_MAINTENANCE_TOKEN: ci-maintenance-token-0123456789
-      ARK_MFA_RECOVERY_TOKEN: ci-mfa-recovery-token-0123456789
-      ARK_METRICS_TOKEN: ci-metrics-token-0123456789
-      ARK_OFFHOST_HEARTBEAT_TOKEN: ci-offhost-heartbeat-token-0123456789
-      ARK_CONTROL_DB_PASSWORD: ci-control-db-password-0123456789
-      ARK_APP_DB_PASSWORD: ci-app-db-password-0123456789
-      ARK_API_DB_PASSWORD: ci-api-db-password-0123456789
-      ARK_PGBOUNCER_ADMIN_PASSWORD: ci-pgbouncer-admin-password-0123456789
-      STALWART_ADMIN_ADDRESS: admin
-      STALWART_ADMIN_PASSWORD: ci-stalwart-password-0123456789
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
+      - &checkout
+        uses: actions/checkout@v7
+      - &setup-bun
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
       - uses: actions/setup-go@v6
         with:
           go-version: 1.25.1
-      - run: bun install --frozen-lockfile
-      - run: touch .env
-      - run: bun run --cwd server db:migrate
+      - &install
+        run: bun install --frozen-lockfile
+      - &dotenv
+        run: touch .env
+      - &migrate
+        run: bun run --cwd server db:migrate
       - run: bunx oxfmt --check .
       - run: bunx oxlint . --deny-warnings
       - run: bunx tsc --noEmit -p shared/tsconfig.json
@@ -75,10 +87,12 @@ jobs:
       - run: bunx tsc --noEmit -p scripts/tsconfig.test-db.json
       - run: bunx tsc --noEmit -p scripts/tsconfig.docs.json
       - run: ARK_TEST_DB_DOCKER=1 bun --no-env-file test scripts/test-db.test.ts
-      - name: Install OpenSSL for PKI tests and the PostgreSQL client for the loopback smoke test
+      - &host-tools
+        name: Install OpenSSL for PKI tests and the PostgreSQL client for the loopback smoke test
         run: sudo apt-get update && sudo apt-get install -y postgresql-client openssl
       # tests/browser/flows.test.ts checks the built UI, so build it before the unit tests.
-      - run: bun run --cwd web build
+      - &web-build
+        run: bun run --cwd web build
       # The server suite includes the bounded DER fuzz and OpenSSL CSR differential tests.
       - run: bun test shared server workers tests scripts/publish-images.test.ts scripts/install-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts scripts/brand-icons.test.ts
         env:
@@ -87,16 +101,47 @@ jobs:
       - run: bun --no-env-file scripts/test-install-bootstrap.ts
       - run: ARK_DOCKER_INTEGRATION=1 go test ./...
         working-directory: agent
-      - run: bunx playwright install --with-deps chromium
+
+  integration:
+    name: Docker and browser integration
+    runs-on: ubuntu-24.04
+    # Measured about 6 minutes.
+    timeout-minutes: 15
+    services: *services
+    steps:
+      - *checkout
+      - *setup-bun
+      - *install
+      - *dotenv
+      - *migrate
+      - *host-tools
+      - *web-build
+      - &playwright
+        run: bunx playwright install --with-deps chromium
       - run: bunx playwright test e2e/vercel-rollover.spec.ts e2e/docs-site.spec.ts
       - run: bun scripts/test-e2e.ts
       - run: bun scripts/test-upgrade-migrations.ts
       - run: env -u STALWART_URL -u STALWART_ADMIN_ADDRESS -u STALWART_ADMIN_PASSWORD bun scripts/test-stalwart-integration.ts
       - run: bun scripts/test-pgbouncer-public.ts
+
+  edge-l4:
+    name: Edge router and L4 suites
+    runs-on: ubuntu-24.04
+    # Measured about 21.5 minutes; test-edge-l4.ts idles a WebSocket for 10 of them.
+    timeout-minutes: 35
+    services: *services
+    steps:
+      - *checkout
+      - *setup-bun
+      - *install
+      - *dotenv
+      - *migrate
+      - *host-tools
       # edge-ts's tailscaled uses the image's legacy ip6tables. A container cannot load kernel
       # modules, and the runner has not loaded the legacy IPv6 tables, so tailscaled would log
       # "can't initialize ip6tables table `filter': Table does not exist" and fail the edge-ts check.
-      - name: Load the legacy IPv6 netfilter tables that tailscaled in edge-ts uses
+      - &ip6tables
+        name: Load the legacy IPv6 netfilter tables that tailscaled in edge-ts uses
         run: sudo modprobe -a ip6_tables ip6table_filter ip6table_nat ip6table_mangle
       - run: |
           bun test scripts/edge-test scripts/edge-l4-guard.test.ts scripts/maintain.test.ts
@@ -104,6 +149,22 @@ jobs:
       - run: bun scripts/test-db-ingress.ts
       - run: bun scripts/test-edge-observer.ts
       - run: bun scripts/test-edge-l4.ts
+
+  edge:
+    name: Edge database, IPv6 and gate suites
+    runs-on: ubuntu-24.04
+    # Measured about 11.5 minutes before test-e2e-gate.ts.
+    timeout-minutes: 25
+    services: *services
+    steps:
+      - *checkout
+      - *setup-bun
+      - *install
+      - *dotenv
+      - *migrate
+      - *host-tools
+      - *web-build
+      - *ip6tables
       # FD-26: the PostgreSQL router on 5432 (V-13 matrix, pooler policy, compat port, isolation).
       - run: bun scripts/test-edge-pg5432.ts
       - run: bun scripts/test-edge-reload-race.ts
@@ -113,8 +174,24 @@ jobs:
           bun --no-env-file scripts/test-db.ts scripts/ipv6-preflight-test/preflight.test.ts
       - run: bun scripts/test-edge-gate.ts
       - run: bun scripts/test-edge-http-controls.ts
-      # FD-11: Chromium through the containerised edge to the real API (Playwright installed above).
+      # FD-11: Chromium through the containerised edge to the real API.
+      - *playwright
       - run: bun scripts/test-e2e-gate.ts
+
+  backups-images:
+    name: Backups, images and Compose
+    runs-on: ubuntu-24.04
+    # Measured about 9 minutes, including the cold build of every image.
+    timeout-minutes: 20
+    services: *services
+    steps:
+      - *checkout
+      - *setup-bun
+      - *install
+      - *dotenv
+      - *migrate
+      - *host-tools
+      - *ip6tables
       - name: Off-VPS backups against MinIO (FD-21)
         run: |
           bunx tsc --noEmit -p scripts/tsconfig.backups.json
@@ -137,3 +214,18 @@ jobs:
         if: always()
       - run: docker compose -f infra/mail/docker-compose.yml config --quiet
       - run: docker compose -f infra/monitoring/docker-compose.yml config --quiet
+
+  # One check to require: it fails unless every job above succeeded.
+  ci:
+    name: CI
+    if: always()
+    needs: [checks, integration, edge-l4, edge, backups-images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every CI job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success")' > /dev/null

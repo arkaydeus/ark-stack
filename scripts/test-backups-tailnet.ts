@@ -176,6 +176,8 @@ async function restLog(name = homeServer) {
 }
 
 async function startBackupTs() {
+  const composeVersion = await docker("compose", "version", "--short");
+  const supportsGatewayPriority = Bun.semver.satisfies(composeVersion.split("-")[0]!, ">=2.33.1");
   const compose = await Bun.file(composePath).text();
   const required = [...new Set([...compose.matchAll(/\$\{([A-Z0-9_]+):\?/g)].map((match) => match[1]))];
   const envFile = join(work, `${project}.env`);
@@ -206,6 +208,11 @@ async function startBackupTs() {
     `    entrypoint: ${JSON.stringify(command.slice(0, 1))}`,
     `    command: ${JSON.stringify(command.slice(1))}`,
     `    ports: ["127.0.0.1::1055"]`,
+    // Compose 2.33.1+ can keep backup-ts-egress as the gateway when the fake tailnet attaches.
+    // If the gateway moves, Docker 28 can re-publish :1055, so read the final port below either way.
+    ...(supportsGatewayPriority
+      ? ["    networks:", "      backup-ts-egress:", "        gw_priority: 1"]
+      : []),
     "networks:",
     "  backup-tailnet:",
     `    ipam: { config: [{ subnet: "${base}.0/26" }] }`,
@@ -237,12 +244,13 @@ async function startBackupTs() {
     "backup-ts's LocalAPI socket",
     async () => (await docker("exec", backupTs, "test", "-S", env.TS_SOCKET!).then(() => true)) || undefined,
   );
+  await docker("network", "connect", tailnetNetwork, backupTs);
+  // Read the publish after the last network change, so the port matches the final topology.
   const mapped = await waitFor("backup-ts's SOCKS5 publish", async () => {
     const value = await docker("port", backupTs, "1055/tcp");
     return value.match(/:(\d+)\s*$/m)?.[1];
   });
   socksPort = Number(mapped);
-  await docker("network", "connect", tailnetNetwork, backupTs);
   backupTsTailnetIp = await docker(
     "inspect",
     "-f",

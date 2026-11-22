@@ -50,7 +50,6 @@ import {
   locationPolicy,
   planEdge,
   routeIdentityKey,
-  sha256Hex,
   servedHttpHostnames,
   servedHttpRoutes,
   type EdgeHttpRoute,
@@ -531,6 +530,25 @@ async function edgeApply(plan = fixturePlan()) {
   );
 }
 
+/** Acknowledges each new front-ingress request whose hash matches the published rules. */
+const INGRESS_ACKNOWLEDGER = `
+  const { createHash } = await import("node:crypto");
+  const dir = "/edge/fixture-ingress";
+  let acknowledged = "";
+  setInterval(async () => {
+    try {
+      const { id, hash } = await Bun.file(dir + "/policy.request").json();
+      const rules = await Bun.file(dir + "/policy.nft").text();
+      if (id !== acknowledged && hash === createHash("sha256").update(rules).digest("hex")) {
+        await Bun.write(dir + "/policy.status", "request_id=" + id + "\\npolicy_hash=" + hash + "\\napplied=true\\n");
+        acknowledged = id;
+      }
+    } catch {
+      // The request may not have been published yet.
+    }
+  }, 75);
+`;
+
 async function edgeWorker<T>(args: string[], settings: string[]) {
   const output = await docker(
     "run",
@@ -614,10 +632,12 @@ function secureGet(servername: string, hostHeader = servername, path = "/") {
       ALPNProtocols: ["http/1.1"],
     });
     let data = "";
+    let clientPort: number | undefined;
     const timer = setTimeout(() => socket.destroy(new Error("timed out")), 5_000);
-    socket.on("secureConnect", () =>
-      socket.write(`GET ${path} HTTP/1.1\r\nHost: ${hostHeader}\r\nConnection: close\r\n\r\n`),
-    );
+    socket.on("secureConnect", () => {
+      clientPort = socket.localPort;
+      socket.write(`GET ${path} HTTP/1.1\r\nHost: ${hostHeader}\r\nConnection: close\r\n\r\n`);
+    });
     socket.on("data", (chunk) => (data += chunk.toString("utf8")));
     socket.on("error", (error) => {
       clearTimeout(timer);
@@ -635,9 +655,9 @@ function secureGet(servername: string, hostHeader = servername, path = "/") {
       if (!statusLine) {
         reject(
           new Error(
-            socket.authorized || socket.alpnProtocol === "http/1.1"
+            (socket.authorized || socket.alpnProtocol === "http/1.1"
               ? "TLS completed but the peer closed before responding"
-              : "the peer closed before responding",
+              : "the peer closed before responding") + (clientPort ? ` (client port ${clientPort})` : ""),
           ),
         );
         return;
@@ -1256,13 +1276,14 @@ ${wsHost} {
   );
   // Fresh requests run throughout repeated Caddy reloads: the listener stays open across /load, so
   // HAProxy's fail-fast loopback hop (retries 0) must not turn a reload into failed requests.
+  const since = new Date(Date.now() - 1_000).toISOString();
   const loadTraffic = { done: false, requests: 0, failures: [] as string[] };
   const traffic = (async () => {
     while (!loadTraffic.done) {
       const reply = await secureGet(wsHost).catch((error: Error) => ({ status: 0, body: error.message }));
       loadTraffic.requests++;
       if (reply.status !== 200 || reply.body !== "ok")
-        loadTraffic.failures.push(`${reply.status} ${reply.body.slice(0, 60)}`);
+        loadTraffic.failures.push(`${reply.status} ${reply.body.slice(0, 120)}`);
       await Bun.sleep(50);
     }
   })();
@@ -1289,7 +1310,7 @@ ${wsHost} {
   if (!restored.applied) throw new Error("writeEdge did not re-apply the production configuration");
   if (!loadTraffic.requests || loadTraffic.failures.length)
     throw new HttpContinuityFailure(
-      `requests through 443 during Caddy /load: ${loadTraffic.failures.join(", ") || "no requests"}`,
+      `requests through 443 during Caddy /load: ${loadTraffic.failures.join(", ") || "no requests"}${await continuityEvidence(since, loadTraffic.failures)}`,
     );
   report.lines.push(
     `  ok  requests through 443 during Caddy /load reloads all succeed [${loadTraffic.requests} requests, all 200]`,
@@ -2134,7 +2155,6 @@ async function coordinatorFixture() {
   env.DATABASE_URL = workerUrl.toString();
   delete env.DATABASE_APP_URL;
   const sql = postgres(url, { max: 1 });
-  const ingress = join(edgeDir, "fixture-ingress");
   try {
     await sql`INSERT INTO platform_settings (id, admin_mode, admin_hostname, gate_login_mode, gate_login_hostname)
       VALUES ('default', 'public', ${adminHost}, 'public', ${loginHost}) ON CONFLICT (id) DO UPDATE SET
@@ -2166,28 +2186,31 @@ async function coordinatorFixture() {
           ${route.ip}, ${route.port}, 'public', ${JSON.stringify({ redirectTo: route.redirectTo })}::jsonb, 'ready', true)`;
     }
     // The real coordinator publishes firewall rules. Acknowledge the exact request in this
-    // isolated fixture, which publishes only HTTP and has no host firewall reconciler.
+    // isolated fixture, which publishes only HTTP and has no host firewall reconciler. The worker
+    // writes the request and rules as uid 1000 with mode 0600, so acknowledge as that uid in the
+    // same mount: the host user (uid 1001 on GitHub runners) cannot read them.
     return {
       sql,
       async run(kind: "edge.drain" | "edge.l4_apply", { enqueue = true, failCensus = false } = {}) {
-        let acknowledged = "";
-        const timer = setInterval(async () => {
-          try {
-            const { id, hash } = await Bun.file(join(ingress, "policy.request")).json();
-            if (
-              id !== acknowledged &&
-              hash === sha256Hex(await Bun.file(join(ingress, "policy.nft")).text())
-            ) {
-              await Bun.write(
-                join(ingress, "policy.status"),
-                `request_id=${id}\npolicy_hash=${hash}\napplied=true\n`,
-              );
-              acknowledged = id;
-            }
-          } catch {
-            // The request may not have been published yet.
-          }
-        }, 75);
+        const acknowledger = `${network}-ingress-ack-${randomBytes(4).toString("hex")}`;
+        runtime.containers.push(acknowledger);
+        await docker(
+          "run",
+          "--detach",
+          "--rm",
+          "--name",
+          acknowledger,
+          "--network",
+          "none",
+          "--user",
+          "1000:1000",
+          "--volume",
+          `${edgeDir}:/edge`,
+          bunImage,
+          "bun",
+          "-e",
+          INGRESS_ACKNOWLEDGER,
+        );
         try {
           return await edgeWorker<{ id: string; status: string; error: string | null; evidence: unknown }>(
             ["coordinator", JSON.stringify({ kind, enqueue, failCensus })],
@@ -2199,7 +2222,7 @@ async function coordinatorFixture() {
             ],
           );
         } finally {
-          clearInterval(timer);
+          await docker("rm", "--force", acknowledger).catch(() => undefined);
         }
       },
     };
@@ -2401,6 +2424,33 @@ async function legacyHttpWithdrawalTest(report: Report) {
   }
 }
 
+/**
+ * What HAProxy and Caddy recorded since `since`: every 443 tcplog line that did not end normally,
+ * or that names a failed client port (Docker's port publishing may rewrite it), whose termination
+ * state names the side that closed, and Caddy's warnings and errors. An intermittent continuity
+ * failure is then diagnosable from the run that hit it.
+ */
+async function continuityEvidence(since: string, errors: string[]) {
+  const logs = async (container: string) => {
+    const { stdout, stderr } = await runtime
+      .dockerOutput("logs", "--timestamps", "--since", since, container)
+      .catch((error: Error) => ({ stdout: "", stderr: `unavailable: ${error.message}` }));
+    return `${stdout}\n${stderr}`.split("\n");
+  };
+  const clientPorts = errors.flatMap((error) =>
+    [...error.matchAll(/client port (\d+)/g)].map((match) => match[1]!),
+  );
+  const haproxy = (await logs(stack.edgeL4)).filter(
+    (line) =>
+      / fe_tls443 \S+ [-\d]+\/[-\d]+\/\d+ \d+ (?!--)/.test(line) ||
+      clientPorts.some((port) => line.includes(`:${port} [`)),
+  );
+  const caddy = (await logs(stack.edge)).filter(
+    (line) => /"level":"(?:warn|error)"/.test(line) && !line.includes("HTTP/2 skipped"),
+  );
+  return `\n  HAProxy 443 sessions that did not end normally (failed client ports ${clientPorts.join(", ") || "none"}):\n    ${haproxy.join("\n    ") || "no matching line"}\n  Caddy warnings and errors:\n    ${caddy.join("\n    ") || "none"}`;
+}
+
 async function targetedHttpWithdrawalTest(
   report: Report,
   trigger: "identity" | "expiry" | "apply" | "drain",
@@ -2409,6 +2459,7 @@ async function targetedHttpWithdrawalTest(
   await installScopedHttp();
   await edgeApply();
   const fixture = trigger === "drain" ? await coordinatorFixture() : null;
+  const since = new Date(Date.now() - 1_000).toISOString();
   const initialPid = await caddyPid();
   const target = await websocket(wwwHost);
   const sibling = await websocket(tailnetHost);
@@ -2504,7 +2555,7 @@ async function targetedHttpWithdrawalTest(
   );
   if (traffic.requests < 2 || traffic.errors.length)
     throw new HttpContinuityFailure(
-      `unrelated HTTP during withdrawal: ${traffic.requests} requests; ${traffic.errors.join(", ")}`,
+      `unrelated HTTP during withdrawal: ${traffic.requests} requests; ${traffic.errors.join(", ")}${await continuityEvidence(since, traffic.errors)}`,
     );
   report.lines.push(
     `  ok  unrelated HTTP requests succeed throughout [${traffic.requests} requests; zero errors]`,

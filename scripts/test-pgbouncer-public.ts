@@ -607,7 +607,23 @@ try {
   log(`app-postgres (${clientImage}) ready; ${appRole} stores a SCRAM-SHA-256 verifier.`);
 
   log("Starting pgbouncer-public…");
-  await run([...compose, "up", "--detach", "--wait", "--wait-timeout", "120", "pgbouncer-public"]);
+  // app-postgres is already running, healthy and provisioned above. Without --no-deps, Compose
+  // 2.38 on Docker 28 (the GitHub runner) can recreate the locally built app-postgres while
+  // starting its dependent, killing PostgreSQL and invalidating every container ID taken above.
+  await run([
+    ...compose,
+    "up",
+    "--detach",
+    "--no-deps",
+    "--wait",
+    "--wait-timeout",
+    "120",
+    "pgbouncer-public",
+  ]);
+  if ((await service("app-postgres")) !== appContainer)
+    throw new Error(
+      "Starting pgbouncer-public recreated app-postgres; the checks below need the same cluster.",
+    );
   const bouncer = await service("pgbouncer-public");
   log(
     `pgbouncer-public: ${await inspect(bouncer, "status={{.State.Status}} health={{.State.Health.Status}} user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}} capdrop={{json .HostConfig.CapDrop}} secopt={{json .HostConfig.SecurityOpt}}")}`,

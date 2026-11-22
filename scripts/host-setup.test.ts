@@ -170,6 +170,10 @@ class FakeHost {
   passwdLookupError?: RunResult;
   opensshConfig = ok("passwordauthentication no\nkbdinteractiveauthentication no\n");
   sshdConfigDir = "";
+  /** The fixture's UFW rules directory, standing in for /etc/ufw. */
+  ufwDirectory = "";
+  /** UFW rules files the SSH cutover backed up, as [source, destination]. */
+  ufwBackups: [string, string][] = [];
   /** Whether the effective policy honours setup's per-user drop-in (false: something else wins). */
   sshdHonoursDropIn = true;
   sshdSyntax = ok();
@@ -570,6 +574,13 @@ class FakeHost {
     if (line === "systemctl is-enabled ark-host-firewall.service") return ok("enabled\n");
     if (line.includes("systemctl is-active ark-ssh-rollback.timer")) return fail();
     if (line.startsWith("systemd-run ")) return ok();
+    if (argv[0] === "cp" && argv[1] === "-p" && argv[2] === "--" && argv.length === 5) {
+      const [source, destination] = [argv[3]!, argv[4]!];
+      expect(source.startsWith(this.ufwDirectory + "/")).toBe(true);
+      copyFileSync(source, destination);
+      this.ufwBackups.push([source, destination]);
+      return ok();
+    }
     if (argv[0] === "flock") {
       if (argv.includes("force")) {
         if (this.failRollback) return fail("OpenSSH refused to start");
@@ -730,8 +741,13 @@ function fixture() {
   const sshdConfigDir = join(hostDir, "sshd_config.d");
   mkdirSync(sshdConfigDir);
   host.sshdConfigDir = sshdConfigDir;
+  // Never let the cutover read the real /etc/ufw: Ubuntu CI runners ship UFW rules files.
+  const ufwDirectory = join(hostDir, "ufw");
+  mkdirSync(ufwDirectory);
+  for (const file of ["user.rules", "user6.rules"]) writeFileSync(join(ufwDirectory, file), `# ${file}\n`);
+  host.ufwDirectory = ufwDirectory;
   const stateDir = join(root, "tmp", "host-setup");
-  return { root, host, stateDir, osRelease, homeBase, sshdConfigDir };
+  return { root, host, stateDir, osRelease, homeBase, sshdConfigDir, ufwDirectory };
 }
 
 type Fixture = ReturnType<typeof fixture>;
@@ -755,6 +771,7 @@ async function setup(
       hostFirewall: f.host.firewallPath,
       sshHomeBase: f.homeBase,
       sshdConfigDir: f.sshdConfigDir,
+      ufwDirectory: f.ufwDirectory,
     },
     isRoot: true,
     platform: "linux",
@@ -1403,6 +1420,13 @@ describe("host:setup full run", () => {
       "ufw --force delete 3",
       "ufw --force delete 1",
     ]);
+    // Both UFW rules files are backed up for rollback before any rule is removed.
+    expect(f.host.ufwBackups.map(([source]) => source)).toEqual(
+      ["user.rules", "user6.rules"].map((file) => join(f.ufwDirectory, file)),
+    );
+    expect(f.host.calls.findLastIndex((call) => call.startsWith("cp -p -- "))).toBeLessThan(
+      f.host.calls.findIndex((call) => call.startsWith("ufw --force delete")),
+    );
 
     const env = parseEnvFile(readFileSync(f.host.envPath, "utf8"));
     expect(statSync(f.host.envPath).mode & 0o777).toBe(0o600);

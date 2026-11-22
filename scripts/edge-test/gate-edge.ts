@@ -64,6 +64,14 @@ export type GateEdgeOptions = {
   /** The `api:3000` container: bundled entry point and its environment. */
   lease?: () => Promise<EdgeLeaseDocument | undefined>;
   api: { entry: string; env: Record<string, string>; hostGateway?: boolean };
+  /**
+   * Test-only "uid:gid" for the edge identity: the edge and certificate files, Caddy, the
+   * watchdog and the write-edge worker. Defaults to the shipped 1000:1000. A suite that runs the
+   * real coordinator in its own process (scripts/test-e2e-gate.ts) shares the edge files with them,
+   * as the uid 1000 domain worker does in production, so on a Linux host whose user is not uid
+   * 1000 it passes the host user here.
+   */
+  edgeUser?: string;
 };
 
 export type GateEdge = {
@@ -113,6 +121,8 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
   const peerName = `${name}-upstream`;
   const watchdogName = `${name}-watchdog`;
   const policy = options.policy(peerIp);
+  const edgeUser = options.edgeUser ?? "1000:1000";
+  if (!/^\d+:\d+$/.test(edgeUser)) throw new Error(`edgeUser must be "uid:gid", got ${edgeUser}`);
 
   // Lease API: the API's read-only lease endpoint, served by this process.
   const watchdogToken = randomBytes(24).toString("base64url");
@@ -177,7 +187,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     [
       "set -e",
       ...options.hostnames.map((host) => certificate(`/out/certs/${host}`, host)),
-      "chown -R 1000:1000 /out/certs /out/edge",
+      `chown -R ${edgeUser} /out/certs /out/edge`,
     ].join("\n"),
   );
 
@@ -212,6 +222,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     acmeDir,
     certDir,
     edgeDir,
+    ...(edgeUser === "1000:1000" ? {} : { edgeUser }),
     validator: options.targetedHttp,
     ports: ["127.0.0.1::80", "127.0.0.1::443"],
     edgeEnvironment: { ARK_EDGE_GATE_TOKEN: options.gateToken },
@@ -242,7 +253,8 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     "/fixture/app.ts",
   );
 
-  // The edge watchdog as shipped (uid 1000, read-only root, no capabilities).
+  // The edge watchdog as shipped (uid 1000 unless edgeUser says otherwise, read-only root, no
+  // capabilities).
   runtime.containers.push(watchdogName);
   await docker(
     "run",
@@ -250,7 +262,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
     "--name",
     watchdogName,
     "--user",
-    "1000:1000",
+    edgeUser,
     "--group-add",
     "4400",
     "--read-only",
@@ -307,7 +319,7 @@ export async function startGateEdge(options: GateEdgeOptions): Promise<GateEdge>
       "--network",
       stack.networks.edgeControl,
       "--user",
-      "1000:1000",
+      edgeUser,
       "--group-add",
       "4400",
       "--env",

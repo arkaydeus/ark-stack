@@ -93,7 +93,7 @@ Each test task is described in depth, with its prerequisites, in [Testing](../de
 
 ### Docker harnesses
 
-These need Docker and no external credentials.
+These need Docker and no external credentials. On Linux, run `test:e2e-gate` as a non-root user with Docker access.
 
 | Task                     | Covers                                                                                                          | Also needs                                                                 |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |

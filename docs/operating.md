@@ -507,7 +507,7 @@ mise run test:e2e-gate # or another task listed above
 mise run test:db:down <container>
 ```
 
-For `test:e2e` and `test:e2e-gate`, install Chromium with `bunx playwright install chromium`. In a fresh checkout these tasks and `test:upgrade` expect a root `.env` file. `touch .env` creates an empty one so the task uses the disposable shell exports. Start a fresh disposable database for each isolated acceptance run if you need a clean baseline.
+For `test:e2e` and `test:e2e-gate`, install Chromium with `bunx playwright install chromium`. On Linux, run `test:e2e-gate` as a non-root user with Docker access. In a fresh checkout these tasks and `test:upgrade` expect a root `.env` file. `touch .env` creates an empty one so the task uses the disposable shell exports. Start a fresh disposable database for each isolated acceptance run if you need a clean baseline.
 
 The local Docker harnesses need no external credentials:
 

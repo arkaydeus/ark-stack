@@ -114,4 +114,5 @@ test("gate login origin and session separation (FD-10), in an isolated database 
     await admin.end();
     await rm(directory, { recursive: true, force: true });
   }
-}, 180_000);
+  // The public proxy case builds the edge-caddy image in setup (up to 480 s cold).
+}, 600_000);

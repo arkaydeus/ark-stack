@@ -590,8 +590,12 @@ describe("trusted client address and sign-in rate limit", () => {
   afterAll(async () => {
     for (const network of proxyNetworks) await proxyDocker("network", "rm", network);
   });
-  for (const mode of ["public", "tailnet"] as const) {
+  const root = resolvePath(import.meta.dir, "../..");
+  const composeFile = Bun.file(join(root, "infra/platform/docker-compose.yml"));
+  type ProxyImage = Pick<Awaited<ReturnType<typeof prepareEdgeImage>>, "image" | "platformArgs">;
+  function testAdminProxy(mode: "public" | "tailnet", loadImage: () => ProxyImage | Promise<ProxyImage>) {
     test(`${mode} admin Caddy keeps two clients' sign-in and MFA buckets and session addresses separate`, async () => {
+      const image = await loadImage();
       const directory = await mkdtemp(join(tmpdir(), "ark-admin-proxy-"));
       const network = `ark-admin-proxy-${crypto.randomUUID()}`;
       const containers: string[] = [];
@@ -625,13 +629,6 @@ describe("trusted client address and sign-in rate limit", () => {
           .replaceAll("api:3000", `host.docker.internal:${relay.port}`)
           .concat("\n:8081 {\n  reverse_proxy 127.0.0.1:8080\n}\n");
         await Bun.write(join(directory, "Caddyfile"), mode === "public" ? publicConfig : tailnetConfig);
-        const root = resolvePath(import.meta.dir, "../..");
-        const source = await Bun.file(join(root, "infra/platform/docker-compose.yml")).text();
-        const compose = Bun.YAML.parse(source) as { services: { "tailnet-gateway": { image: string } } };
-        const image =
-          mode === "public"
-            ? await prepareEdgeImage(proxyDocker, { root, compose: source })
-            : { image: compose.services["tailnet-gateway"].image, platformArgs: [] };
         await proxyDocker("network", "create", network);
         proxyNetworks.push(network);
         const proxy = `${network}-caddy`;
@@ -723,6 +720,22 @@ describe("trusted client address and sign-in rate limit", () => {
       }
     }, 120_000);
   }
+
+  describe("public admin proxy", () => {
+    // A cold build of the shipped edge-caddy stage takes about two minutes on a GitHub runner.
+    let image: ProxyImage;
+    beforeAll(async () => {
+      image = await prepareEdgeImage(proxyDocker, { root, compose: await composeFile.text() });
+    }, 480_000);
+    testAdminProxy("public", () => image);
+  });
+
+  testAdminProxy("tailnet", async () => {
+    const compose = Bun.YAML.parse(await composeFile.text()) as {
+      services: { "tailnet-gateway": { image: string } };
+    };
+    return { image: compose.services["tailnet-gateway"].image, platformArgs: [] };
+  });
 
   const failedSignIn = (input: Partial<Call>) =>
     call({
