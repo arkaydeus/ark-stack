@@ -4,17 +4,17 @@
 // the same image: they build the stage, or pull the pinned digest, and check what it reports.
 
 /** The local tag Compose gives the built image when ARK_VERSION is unset. */
-export const LOCAL_EDGE_CADDY_IMAGE = "ark-edge-caddy:local";
+export const LOCAL_EDGE_CADDY_IMAGE = "ark-stack-edge-caddy:local";
 export const PINNED_EDGE_PLATFORM = "linux/amd64";
 export const EDGE_CADDY_TARGET = "edge-caddy";
 export const PINNED_EDGE_CADDY =
-  /^ghcr\.io\/[a-z0-9][a-z0-9-]*\/ark-edge-caddy(?::[A-Za-z0-9._-]{1,128})?@sha256:[a-f0-9]{64}$/;
+  /^ghcr\.io\/[a-z0-9][a-z0-9-]*\/ark-stack-edge-caddy(?::[A-Za-z0-9._-]{1,128})?@sha256:[a-f0-9]{64}$/;
 
 type ComposeService = { image?: unknown; build?: { target?: unknown; dockerfile?: unknown } | unknown };
 
 /**
  * What Compose runs as `edge`, refused unless it is exactly the local `edge-caddy` build or a
- * digest-pinned GHCR `ark-edge-caddy` reference without a build section.
+ * digest-pinned GHCR `ark-stack-edge-caddy` reference without a build section.
  */
 export function composeEdgeImage(compose: string) {
   const services = (Bun.YAML.parse(compose) as { services?: Record<string, ComposeService> }).services;
@@ -23,12 +23,12 @@ export function composeEdgeImage(compose: string) {
   if (edge.build !== undefined) {
     const build = edge.build as { target?: unknown; dockerfile?: unknown };
     if (
-      edge.image !== "ark-edge-caddy:${ARK_VERSION:-local}" ||
+      edge.image !== "ark-stack-edge-caddy:${ARK_VERSION:-local}" ||
       build.target !== EDGE_CADDY_TARGET ||
       build.dockerfile !== "Dockerfile"
     ) {
       throw new Error(
-        `Compose edge must build the ${EDGE_CADDY_TARGET} Dockerfile stage as ark-edge-caddy:\${ARK_VERSION:-local}.`,
+        `Compose edge must build the ${EDGE_CADDY_TARGET} Dockerfile stage as ark-stack-edge-caddy:\${ARK_VERSION:-local}.`,
       );
     }
     return { kind: "build" as const, image: LOCAL_EDGE_CADDY_IMAGE };
@@ -98,12 +98,12 @@ const COMPOSE_EDGE_HEAD =
   /^ {2}edge:\n(?: {4}#.*\n)* {4}image: .*\n(?: {4}platform: .*\n)?(?: {4}build:\n(?: {6}.*\n)+)?/m;
 
 /**
- * Pins Compose's `edge` service to a published `ark-edge-caddy` digest (`mise run images:pin-edge-caddy`):
+ * Pins Compose's `edge` service to a published `ark-stack-edge-caddy` digest (`mise run images:pin-edge-caddy`):
  * the image line is replaced and the build section removed, so Compose pulls exactly that digest.
  */
 export function pinComposeEdge(compose: string, reference: string) {
   if (!PINNED_EDGE_CADDY.test(reference))
-    throw new Error(`${reference} is not ghcr.io/<namespace>/ark-edge-caddy[:<tag>]@sha256:<digest>.`);
+    throw new Error(`${reference} is not ghcr.io/<namespace>/ark-stack-edge-caddy[:<tag>]@sha256:<digest>.`);
   if (!COMPOSE_EDGE_HEAD.test(compose)) throw new Error("Could not find the edge service image in Compose.");
   const pinned = compose.replace(
     COMPOSE_EDGE_HEAD,
@@ -122,6 +122,6 @@ export function pinComposeEdge(compose: string, reference: string) {
 /** Replaces any earlier ark-edge-caddy entry of a release bundle's image list with `reference`. */
 export function pinReleaseEdge(images: string[], reference: string) {
   if (!PINNED_EDGE_CADDY.test(reference))
-    throw new Error(`${reference} is not ghcr.io/<namespace>/ark-edge-caddy[:<tag>]@sha256:<digest>.`);
-  return [...images.filter((image) => !/\/ark-edge-caddy[:@]/.test(image)), reference];
+    throw new Error(`${reference} is not ghcr.io/<namespace>/ark-stack-edge-caddy[:<tag>]@sha256:<digest>.`);
+  return [...images.filter((image) => !/\/ark-stack-edge-caddy[:@]/.test(image)), reference];
 }

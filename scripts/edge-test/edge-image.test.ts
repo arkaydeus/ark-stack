@@ -15,11 +15,11 @@ const dockerfile = await Bun.file(new URL("../../Dockerfile", import.meta.url)).
 const release = await Bun.file(new URL("../../infra/platform/release.json", import.meta.url)).json();
 const officialCaddy = [...compose.matchAll(/^\s*image:\s*(caddy:\S+)\s*$/gm)].map((match) => match[1]);
 const digest = `sha256:${"a".repeat(64)}`;
-const reference = `ghcr.io/arkaydeus/ark-edge-caddy:0123456789ab@${digest}`;
+const reference = `ghcr.io/arkaydeus/ark-stack-edge-caddy:0123456789ab@${digest}`;
 
 const buildFixture = `services:
   edge:
-    image: ark-edge-caddy:\${ARK_VERSION:-local}
+    image: ark-stack-edge-caddy:\${ARK_VERSION:-local}
     build:
       context: ../..
       dockerfile: Dockerfile
@@ -32,7 +32,7 @@ const otherImages = ["registry.example/base@sha256:" + "e".repeat(64)];
 
 test("the shipped edge build or pin agrees with the release bundle", () => {
   const shipped = composeEdgeImage(compose);
-  const releaseEdge = release.images.filter((image: string) => /\/ark-edge-caddy[:@]/.test(image));
+  const releaseEdge = release.images.filter((image: string) => /\/ark-stack-edge-caddy[:@]/.test(image));
   expect(releaseEdge).toEqual(shipped.kind === "build" ? [] : [shipped.image]);
   if (shipped.kind === "pinned") {
     const document = Bun.YAML.parse(compose) as { services: { edge: { platform?: string } } };
@@ -62,18 +62,18 @@ test("pinning replaces the build with the published digest, and re-pinning repla
   expect(pinned.replace(/^ {2}edge:\n(?: {4}#.*\n)* {4}image: .*\n {4}platform: .*\n/m, "")).toBe(
     buildFixture.replace(/^ {2}edge:\n(?: {4}#.*\n)* {4}image: .*\n {4}build:\n(?: {6}.*\n)+/m, ""),
   );
-  const next = `ghcr.io/arkaydeus/ark-edge-caddy:v0.2.0@sha256:${"b".repeat(64)}`;
+  const next = `ghcr.io/arkaydeus/ark-stack-edge-caddy:v0.2.0@sha256:${"b".repeat(64)}`;
   expect(composeEdgeImage(pinComposeEdge(pinned, next)).image).toBe(next);
   // Exactly the line `mise run images:publish` prints, without a tag, is accepted too.
-  const printed = `ghcr.io/arkaydeus/ark-edge-caddy@sha256:${"d".repeat(64)}`;
+  const printed = `ghcr.io/arkaydeus/ark-stack-edge-caddy@sha256:${"d".repeat(64)}`;
   expect(composeEdgeImage(pinComposeEdge(buildFixture, printed)).image).toBe(printed);
 });
 
 test("refuses tags without a digest, other registries and other images", () => {
   for (const bad of [
-    "ghcr.io/arkaydeus/ark-edge-caddy:latest",
-    `docker.io/arkaydeus/ark-edge-caddy:1@${digest}`,
-    `ghcr.io/arkaydeus/ark-stack:1@${digest}`,
+    "ghcr.io/arkaydeus/ark-stack-edge-caddy:latest",
+    `docker.io/arkaydeus/ark-stack-edge-caddy:1@${digest}`,
+    `ghcr.io/arkaydeus/ark-stack-app:1@${digest}`,
     `caddy:2.11.9@${digest}`,
   ]) {
     expect(() => pinComposeEdge(buildFixture, bad)).toThrow();
@@ -81,7 +81,7 @@ test("refuses tags without a digest, other registries and other images", () => {
   }
   expect(() =>
     composeEdgeImage(
-      buildFixture.replace("image: ark-edge-caddy:${ARK_VERSION:-local}", "image: caddy:latest"),
+      buildFixture.replace("image: ark-stack-edge-caddy:${ARK_VERSION:-local}", "image: caddy:latest"),
     ),
   ).toThrow("must build");
   expect(() => composeEdgeImage(buildFixture.replace("target: edge-caddy", "target: runtime"))).toThrow(
@@ -92,7 +92,7 @@ test("refuses tags without a digest, other registries and other images", () => {
 test("the release bundle keeps the official pin and holds one edge-caddy digest", () => {
   const once = pinReleaseEdge(otherImages, reference);
   expect(once).toEqual([...otherImages, reference]);
-  const next = `ghcr.io/arkaydeus/ark-edge-caddy:v2@sha256:${"c".repeat(64)}`;
+  const next = `ghcr.io/arkaydeus/ark-stack-edge-caddy:v2@sha256:${"c".repeat(64)}`;
   expect(pinReleaseEdge(once, next)).toEqual([...otherImages, next]);
 });
 

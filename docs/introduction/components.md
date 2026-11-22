@@ -70,7 +70,7 @@ The Ark images are built from the repository `Dockerfile` (one stage per service
 
 The control-plane PostgreSQL cluster (database `ark_platform`), holding desired state, the operation queue, audit events, sessions and sealed secrets.
 
-- **Image.** `ark-postgres`, built from the `postgres-backup` stage: the pinned `postgres:17.6` digest plus pgBackRest, the backup executor and WAL archiving into an encrypted local repository (repo2).
+- **Image.** `ark-stack-postgres`, built from the `postgres-backup` stage: the pinned `postgres:17.6` digest plus pgBackRest, the backup executor and WAL archiving into an encrypted local repository (repo2).
 - **Networks.** `control`; `backup-management` with the alias `ark-platform-backup`, where the executor listens on port 8432 for the backup worker only.
 - **Volumes.** `ark_platform_pg` (data), `ark_platform_pgbackrest` (repo2, never expired on the VPS), `ark_platform_pg_stages` (staged read-only copies for export). `init-control-db.sh` creates or updates the `ark_runtime` login.
 - **Secrets.** `ARK_CONTROL_DB_PASSWORD` (the owner role `ark_migration`), `ARK_API_DB_PASSWORD` (to set the `ark_runtime` password), `ARK_PLATFORM_PG_EXECUTOR_TOKEN`, `ARK_PLATFORM_PG_REPO_CIPHER_PASS`. Without a cipher pass WAL archiving stays off and backup health reports it.
@@ -97,7 +97,7 @@ The Hono API, Better Auth and the built admin UI, served on port 3000. It owns i
 
 Runs `database.*` and `pgbouncer.*` operations: provisioning and rotating application databases and roles, SQL queries and schema inspection, client certificates and rollover, and rendering and reloading PgBouncer.
 
-- **Image.** `ark-database-worker` (`database-worker` stage). **Networks.** `control`, `database-management`.
+- **Image.** `ark-stack-database-worker` (`database-worker` stage). **Networks.** `control`, `database-management`.
 - **Port.** 3101 inside the network, a private listener for SQL cancellation authenticated by the database worker token.
 - **May talk to.** `app-postgres` as `ark_cluster_admin`; PgBouncer's admin console over the `ark_pgbouncer_socket` unix socket, with `RELOAD` and `KILL_CLIENT`. It has no Docker CLI, no Docker socket and no internet egress.
 - **Secrets.** `ARK_DATABASE_WORKER_TOKEN`, `ARK_ROOT_KEY`, `ARK_API_DB_PASSWORD`, `ARK_APP_DB_PASSWORD`, `ARK_PGBOUNCER_ADMIN_PASSWORD`.
@@ -107,7 +107,7 @@ Runs `database.*` and `pgbouncer.*` operations: provisioning and rotating applic
 
 Runs `domain.*`, `dns.*`, `certificate.*`, `edge.*`, `admin.*` and `integration.*` operations: DNS verification and Cloudflare publishing, ACME issuance with lego, the IPv6 preflight, rendering the Caddy and HAProxy configurations, tailnet observation, admin mode changes and the optional Vercel integration. It is the only worker with external egress for providers.
 
-- **Image.** `ark-domain-worker` (runtime plus `lego` v4.26.0 and OpenSSL). **Networks.** `control`, `admin`, `edge-control`. **Port.** 3102 inside the network.
+- **Image.** `ark-stack-domain-worker` (runtime plus `lego` v4.26.0 and OpenSSL). **Networks.** `control`, `admin`, `edge-control`. **Port.** 3102 inside the network.
 - **May talk to.** Caddy's admin API at `edge-admin:2019`; HAProxy's master and admin sockets and the validator socket, through the shared group 4400; the edge node's tailscaled LocalAPI through a read-only socket mount, where tailscaled allows only reads; DNS, Let's Encrypt and Cloudflare on the internet. No Docker access.
 - **Secrets.** `ARK_DOMAIN_WORKER_TOKEN`, `ARK_ROOT_KEY`, `ARK_API_DB_PASSWORD`, `DNS_API_TOKEN` or `CLOUDFLARE_API_TOKEN`, `ARK_ACME_EMAIL`, `ARK_OFFHOST_HEARTBEAT_TOKEN` (for the managed IPv6 preflight runner).
 - **Writes.** `tmp/certs`, `tmp/edge` (Caddyfile and its closed variant), `tmp/acme` (HTTP-01 webroot) and immutable HAProxy generations in `tmp/edge-l4`.
@@ -116,7 +116,7 @@ Runs `domain.*`, `dns.*`, `certificate.*`, `edge.*`, `admin.*` and `integration.
 
 Runs `mail.*`, `mailbox.*` and `ses.*` operations: reconciling Stalwart domains, mailboxes, aliases and device credentials through JMAP, the mail queue, and the SES relay. Not built or started when mail is disabled.
 
-- **Image.** `ark-mail-worker`. **Networks.** `control`, `mail-management` (the external `ark_mail_management`).
+- **Image.** `ark-stack-mail-worker`. **Networks.** `control`, `mail-management` (the external `ark_mail_management`).
 - **May talk to.** `stalwart:8080` (Stalwart's management API, never exposed publicly); Amazon SES.
 - **Secrets.** `ARK_MAIL_WORKER_TOKEN`, `ARK_ROOT_KEY`, `ARK_API_DB_PASSWORD`, `STALWART_ADMIN_PASSWORD`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `SES_SMTP_USERNAME`.
 
@@ -124,7 +124,7 @@ Runs `mail.*`, `mailbox.*` and `ses.*` operations: reconciling Stalwart domains,
 
 Runs `backup.*`, `update.detect` and `import.*` operations: scheduling and observing pgBackRest backups, exporting restic snapshots off the VPS, verifying targets and canaries, restore tests, update detection and import scans.
 
-- **Image.** `ark-backup-worker` (runtime plus pgBackRest and the pinned restic 0.19.1). **Networks.** `control`, `backup-management` (executors only), `backup-egress` (S3-compatible targets on the internet), `backup-tailnet` (only `backup-ts`).
+- **Image.** `ark-stack-backup-worker` (runtime plus pgBackRest and the pinned restic 0.19.1). **Networks.** `control`, `backup-management` (executors only), `backup-egress` (S3-compatible targets on the internet), `backup-tailnet` (only `backup-ts`).
 - **May talk to.** The executors at `ark-platform-backup:8432` and `ark-app-backup:8432`; S3-compatible targets; the home `rest-server` only through `backup-ts`'s SOCKS5 proxy, which is given to the home target's restic subprocess alone; `backup-ts`'s LocalAPI through a read-only socket.
 - **Secrets.** `ARK_BACKUP_WORKER_TOKEN`, `ARK_ROOT_KEY`, `ARK_API_DB_PASSWORD`, `ARK_PLATFORM_PG_EXECUTOR_TOKEN`, `ARK_APP_PG_EXECUTOR_TOKEN`. Target credentials and restic passwords are sealed in the database and passed only to restic's own process environment.
 - **Mounts.** Staged pgBackRest copies of both clusters, read-only through group 999. It never mounts the live repository or PGDATA.
@@ -133,7 +133,7 @@ Runs `backup.*`, `update.detect` and `import.*` operations: scheduling and obser
 
 The Go Docker agent: deploys, starts, stops, restarts, inspects, discovers and adopts service containers, and applies service updates.
 
-- **Image.** `ark-agent`, a static Go binary on the pinned `docker:28.4.0-cli` image with the Compose plugin. **Network.** `control`.
+- **Image.** `ark-stack-agent`, a static Go binary on the pinned `docker:28.4.0-cli` image with the Compose plugin. **Network.** `control`.
 - **May talk to.** The API, and the Docker Engine through `/var/run/docker.sock`. It is the only container that mounts the socket.
 - **Secrets.** `ARK_AGENT_TOKEN`. Its state volume `ark_agent_state` holds the resource ledger.
 - **Controls.** `no-new-privileges`, 128 processes. It does not drop capabilities, because it drives Docker.
@@ -144,7 +144,7 @@ The Go Docker agent: deploys, starts, stops, restarts, inspects, discovers and a
 
 The application PostgreSQL cluster that holds your databases.
 
-- **Image.** `ark-app-postgres`, built from the `app-postgres-backup` stage: the pinned `pgvector/pgvector:pg17` image plus the same pgBackRest layer.
+- **Image.** `ark-stack-app-postgres`, built from the `app-postgres-backup` stage: the pinned `pgvector/pgvector:pg17` image plus the same pgBackRest layer.
 - **Networks.** `database-management`; `backup-management` with the alias `ark-app-backup`.
 - **Volumes.** `ark_app_pg`, `ark_app_pgbackrest`, `ark_app_pg_stages`.
 - **Secrets.** `ARK_APP_DB_PASSWORD` (the cluster administrator `ark_cluster_admin`), `ARK_APP_PG_EXECUTOR_TOKEN`, `ARK_APP_PG_REPO_CIPHER_PASS`.
@@ -165,7 +165,7 @@ See [infra/database/README.md](../../infra/database/README.md) for the generated
 
 A host-namespace reconciler for nftables: the `ark_front` policy for front-door ports and the per-source limits on TCP 5432 (`ark_db_ingress`). It exports drop counters every 15 seconds for the API.
 
-- **Image.** `ark-database-ingress`. **Network.** `network_mode: host`.
+- **Image.** `ark-stack-database-ingress`. **Network.** `network_mode: host`.
 - **Controls.** Runs as root with only `NET_ADMIN` and `DAC_OVERRIDE`, to run `nft` and read the installer-owned policy files. 64 processes.
 - **Secrets.** None. It reads the policy written by the database and domain workers and writes counters to `tmp/db-ingress`.
 
@@ -195,7 +195,7 @@ HAProxy 3.2, the SNI and port router. It owns 443, 5432, 20000–20049 and the e
 
 Caddy 2.11.9 with the pinned `caddy-ratelimit` plugin. It serves `:80` (ACME challenges, HTTPS redirects, `404` for unknown hosts) and the HTTPS sites behind HAProxy: the public admin hostname, the login origin and front-door HTTP routes, including the login gate's `forward_auth` to the API.
 
-- **Image.** `ark-edge-caddy`, built from the `edge-caddy` stage on the official Caddy digest until a published digest is pinned. **Network.** `service:edge-ts`.
+- **Image.** `ark-stack-edge-caddy`, built from the `edge-caddy` stage on the official Caddy digest until a published digest is pinned. **Network.** `service:edge-ts`.
 - **Secrets.** `ARK_EDGE_GATE_TOKEN`, sent to the API only on the allowlisted auth and gate paths and resolved at request time, never written into the Caddyfile. It reads Ark-issued certificates and keys read-only.
 - **Controls.** uid 1000, all capabilities dropped. Its admin API listens only on the internal `edge-control` network. A launch guard starts `Caddyfile.closed` unless the watchdog confirms the lease.
 
@@ -203,14 +203,14 @@ Caddy 2.11.9 with the pinned `caddy-ratelimit` plugin. It serves `:80` (ACME cha
 
 The lease watchdog. Every second it reads the read-only lease from the API and withdraws tailnet backends the lease no longer allows from the running Caddy and HAProxy, closing only the affected sessions. It keeps working while the operation workers are stopped.
 
-- **Image.** `ark-edge-watchdog` (the runtime image with nothing added). **Networks.** `control`, `edge-control`. **Port.** 2021 inside the network, for the launch guards.
+- **Image.** `ark-stack-edge-watchdog` (the runtime image with nothing added). **Networks.** `control`, `edge-control`. **Port.** 2021 inside the network, for the launch guards.
 - **Secrets.** `ARK_EDGE_WATCHDOG_TOKEN`, which can only read `/api/internal/edge/` endpoints. No database credential, root key, Docker or Tailscale socket.
 
 ### haproxy-validator
 
 Checks HAProxy configuration generations before they are activated, by running only `haproxy -c` on a generation named by its hash.
 
-- **Image.** `ark-haproxy-validator`: the exact `edge-l4` image plus Bun. **Network.** `network_mode: none`.
+- **Image.** `ark-stack-haproxy-validator`: the exact `edge-l4` image plus Bun. **Network.** `network_mode: none`.
 - **Secrets.** None. Read-only configuration, all capabilities dropped, socket shared only with the domain worker.
 
 ## Tailscale nodes

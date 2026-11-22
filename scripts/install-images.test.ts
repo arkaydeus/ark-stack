@@ -7,10 +7,10 @@ const root = join(import.meta.dir, "..");
 const revision = "0123456789ab".padEnd(40, "c");
 const compose = `
 x-app: &app
-  image: ark-stack:\${ARK_VERSION:-local}
+  image: ark-stack-app:\${ARK_VERSION:-local}
 services:
   edge:
-    image: ark-edge-caddy:\${ARK_VERSION:-local}
+    image: ark-stack-edge-caddy:\${ARK_VERSION:-local}
   edge-l4:
     image: haproxy:3.2.26-alpine@sha256:${"1".repeat(64)}
 `;
@@ -54,12 +54,12 @@ test("pulls, verifies and retags every first-party image for the checkout's comm
     "HEAD",
   ]);
   expect(calls.filter((argv) => argv[1] === "pull").map((argv) => argv.at(-1))).toEqual([
-    "ghcr.io/arkaydeus/ark-edge-caddy:0123456789ab",
-    "ghcr.io/arkaydeus/ark-stack:0123456789ab",
+    "ghcr.io/arkaydeus/ark-stack-app:0123456789ab",
+    "ghcr.io/arkaydeus/ark-stack-edge-caddy:0123456789ab",
   ]);
   expect(calls.filter((argv) => argv[1] === "tag")).toEqual([
-    ["docker", "tag", "ghcr.io/arkaydeus/ark-edge-caddy:0123456789ab", "ark-edge-caddy:local"],
-    ["docker", "tag", "ghcr.io/arkaydeus/ark-stack:0123456789ab", "ark-stack:local"],
+    ["docker", "tag", "ghcr.io/arkaydeus/ark-stack-app:0123456789ab", "ark-stack-app:local"],
+    ["docker", "tag", "ghcr.io/arkaydeus/ark-stack-edge-caddy:0123456789ab", "ark-stack-edge-caddy:local"],
   ]);
 });
 
@@ -74,8 +74,8 @@ test("a registry override and ARK_VERSION select the pulled and local names", as
   });
   expect(result.pulled).toBe(true);
   expect(calls.filter((argv) => argv[1] === "tag").map((argv) => argv.slice(2))).toContainEqual([
-    "ghcr.io/fork/ark-stack:0123456789ab",
-    "ark-stack:v2",
+    "ghcr.io/fork/ark-stack-app:0123456789ab",
+    "ark-stack-app:v2",
   ]);
 });
 
@@ -85,7 +85,7 @@ test("falls back to a local build without tagging anything", async () => {
     [{}, { ARK_IMAGE_REGISTRY: "docker.io/someone" }, /ARK_IMAGE_REGISTRY/],
     [{ headStatus: 128 }, {}, /commit could not be read/],
     [{ dirty: true }, {}, /local changes/],
-    [{ missing: "ark-stack" }, {}, /ark-stack:0123456789ab is not available/],
+    [{ missing: "ark-stack-app" }, {}, /ark-stack-app:0123456789ab is not available/],
     [{ label: "f".repeat(40) }, {}, /built from f{40}/],
     [{ label: "" }, {}, /unknown revision/],
   ];

@@ -19,7 +19,7 @@
 //   ARK_RESTORE_BUCKET=ark-backups ARK_RESTORE_PREFIX=ark ARK_RESTORE_PATH_STYLE=0 \
 //   ARK_RESTORE_ACCESS_KEY_ID=... ARK_RESTORE_SECRET_ACCESS_KEY=... ARK_RESTORE_RESTIC_PASSWORD=... \
 //   ARK_RESTORE_CIPHER_PASS=... ARK_RESTORE_CLUSTER=platform ARK_RESTORE_TARGET_TIME=2026-11-17T10:00:00Z \
-//   ARK_RESTORE_IMAGE=ghcr.io/arkaydeus/ark-postgres:<version> bun scripts/offsite-restore.ts
+//   ARK_RESTORE_IMAGE=ghcr.io/arkaydeus/ark-stack-postgres:<version> bun scripts/offsite-restore.ts
 // The restored server keeps running in container `<name>-pg` with no network; inspect it with
 // `docker exec -it <name>-pg psql -U <superuser>`, then `pg_dump` what you need.
 import { randomBytes } from "node:crypto";

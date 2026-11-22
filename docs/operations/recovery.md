@@ -6,15 +6,15 @@ This page covers getting back control when something has gone wrong: local locko
 
 Most recovery paths depend on material that must not live only on the VPS. Store these somewhere independent of it:
 
-| Material                                                                           | Needed for                                           |
-| ---------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| `ARK_ROOT_KEY` and `ARK_ROOT_KEY_ID` from `.env`                                   | Reading any sealed secret after a database restore   |
-| `ARK_MFA_RECOVERY_TOKEN` from `.env`                                               | [Resetting an owner's MFA](#resetting-an-owners-mfa) |
-| Each owner's MFA recovery codes (shown once at enrolment)                          | Signing in without the authenticator                 |
-| `ARK_PLATFORM_PG_REPO_CIPHER_PASS` and `ARK_APP_PG_REPO_CIPHER_PASS`               | PostgreSQL point-in-time restore                     |
-| Each backup target's restic repository password, and the home rest-server password | Reading the off-VPS repositories                     |
-| A read-only key for the backup bucket                                              | Restoring without the writer credential              |
-| The `ark-postgres` and `ark-app-postgres` image references for the running release | Restoring with matching PostgreSQL binaries          |
+| Material                                                                                       | Needed for                                           |
+| ---------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `ARK_ROOT_KEY` and `ARK_ROOT_KEY_ID` from `.env`                                               | Reading any sealed secret after a database restore   |
+| `ARK_MFA_RECOVERY_TOKEN` from `.env`                                                           | [Resetting an owner's MFA](#resetting-an-owners-mfa) |
+| Each owner's MFA recovery codes (shown once at enrolment)                                      | Signing in without the authenticator                 |
+| `ARK_PLATFORM_PG_REPO_CIPHER_PASS` and `ARK_APP_PG_REPO_CIPHER_PASS`                           | PostgreSQL point-in-time restore                     |
+| Each backup target's restic repository password, and the home rest-server password             | Reading the off-VPS repositories                     |
+| A read-only key for the backup bucket                                                          | Restoring without the writer credential              |
+| The `ark-stack-postgres` and `ark-stack-app-postgres` image references for the running release | Restoring with matching PostgreSQL binaries          |
 
 The installer generates the `.env` values. The backups guide lists the backup material in [Recovery material to keep off-host](../guides/backups.md#recovery-material-to-keep-off-host).
 

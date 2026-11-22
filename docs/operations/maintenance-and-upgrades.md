@@ -223,7 +223,7 @@ Caddy, HAProxy, Tailscale, PgBouncer, PostgreSQL, Stalwart and the `oven/bun` ba
 5. Run `bun scripts/check-image-plan.ts` and `mise run images:publish -- --dry-run`.
 6. Record the digest, how it was verified and the test output in the PR, then roll it out with signed maintenance.
 
-The custom edge Caddy (`edge-caddy`: Caddy with the pinned rate-limit plugin) is built locally until a published digest is pinned. After publishing, `mise run images:pin-edge-caddy -- ghcr.io/<namespace>/ark-edge-caddy@sha256:<digest>` checks the registry image (amd64, the expected Caddy version and the bounded rate-limit handler), replaces the `edge` build in Compose with that reference and adds it to the sample release bundle. The complete procedure is [Third-party image pins](../operating.md#third-party-image-pins).
+The custom edge Caddy (`edge-caddy`: Caddy with the pinned rate-limit plugin) is built locally until a published digest is pinned. After publishing, `mise run images:pin-edge-caddy -- ghcr.io/<namespace>/ark-stack-edge-caddy@sha256:<digest>` checks the registry image (amd64, the expected Caddy version and the bounded rate-limit handler), replaces the `edge` build in Compose with that reference and adds it to the sample release bundle. The complete procedure is [Third-party image pins](../operating.md#third-party-image-pins).
 
 ### Service image updates
 

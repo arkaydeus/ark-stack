@@ -225,7 +225,7 @@ ${testNetworks}
   delete env.COMPOSE_FILE;
   delete env.COMPOSE_PROJECT_NAME;
   const compose = ["docker", "compose", "-f", composeFile, "-f", override, "-p", project];
-  const images = { platform: `ark-postgres:${version}`, app: `ark-app-postgres:${version}` };
+  const images = { platform: `ark-stack-postgres:${version}`, app: `ark-stack-app-postgres:${version}` };
 
   const proxies: Array<ReturnType<typeof Bun.serve>> = [];
   const teardown = async () => {

@@ -1,4 +1,4 @@
-// `mise run images:pin-edge-caddy -- ghcr.io/<namespace>/ark-edge-caddy[:<tag>]@sha256:<digest>`
+// `mise run images:pin-edge-caddy -- ghcr.io/<namespace>/ark-stack-edge-caddy[:<tag>]@sha256:<digest>`
 // (docs/design/front-door.md FD-23, docs/operating.md "Third-party image pins").
 //
 // The custom edge Caddy (Caddy 2.11.9 plus the pinned caddy-ratelimit plugin) only has a registry digest
@@ -25,7 +25,7 @@ const verify = !args.includes("--no-verify");
 const reference = args.find((arg) => !arg.startsWith("--"));
 if (!reference || !PINNED_EDGE_CADDY.test(reference)) {
   console.error(
-    "Usage: mise run images:pin-edge-caddy -- ghcr.io/<namespace>/ark-edge-caddy[:<tag>]@sha256:<digest> [--no-verify]\n" +
+    "Usage: mise run images:pin-edge-caddy -- ghcr.io/<namespace>/ark-stack-edge-caddy[:<tag>]@sha256:<digest> [--no-verify]\n" +
       "Take the edge-caddy line that `mise run images:publish` prints.",
   );
   process.exit(2);
