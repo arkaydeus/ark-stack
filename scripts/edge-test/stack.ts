@@ -39,6 +39,11 @@ export type EdgeStackOptions = {
    * the node cannot log in, and the restart strands `edge`; long offline runs start tailscaled itself.
    */
   edgeTsCommand?: string[];
+  /**
+   * Test-only "uid:gid" for the `edge` (Caddy) service and the files the seed step owns. Unset, the
+   * shipped 1000:1000 applies. See GateEdgeOptions.edgeUser.
+   */
+  edgeUser?: string;
   /** Also build and start the restricted `haproxy-validator` service from the Dockerfile target. */
   validator?: boolean;
   /** Run the shipped host reconciler in an isolated DNAT gateway for firewall tests. */
@@ -128,6 +133,7 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
         ]
       : []),
     "  edge:",
+    ...(options.edgeUser ? [`    user: ${yamlString(options.edgeUser)}`] : []),
     ...(edgeEnvironment.length
       ? ["    environment:", ...edgeEnvironment.map(([key, value]) => `      ${key}: ${yamlString(value)}`)]
       : []),
@@ -206,7 +212,7 @@ export async function startEdgeStack(options: EdgeStackOptions): Promise<EdgeSta
     "bun",
     "/seed/seed-edge-l4.js",
     "/usr/local/etc/haproxy",
-    "1000",
+    (options.edgeUser ?? "1000:1000").split(":")[0]!,
   );
 
   const composeArgs = ["-p", project, "--env-file", envFile, "-f", composeFile, "-f", overrideFile];
