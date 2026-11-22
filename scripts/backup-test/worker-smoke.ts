@@ -96,6 +96,8 @@ export async function workerSmoke(
   let workerId = "";
   const sourceVolume = `${c.project}_worker-files`;
   let sourceCreated = false;
+  const controlNetwork = `${c.project}_control`;
+  let controlConnected = false;
   const finished = async (id: string) => {
     const [row] = await sql`SELECT status, error FROM operations WHERE id=${id}`;
     if (row?.status === "failed") throw new Error(`Worker job failed: ${row.error}`);
@@ -131,8 +133,14 @@ export async function workerSmoke(
       "-c",
       'printf "off-VPS file recovery sentinel\\n" > /data/sentinel; chmod 0644 /data/sentinel',
     ]);
+    // The worker reaches the control database as in production, over the project's control
+    // network: the port the harness publishes on the host loopback is unreachable from a Linux
+    // container (Docker Desktop's host.docker.internal hides this).
+    await run(["docker", "network", "connect", controlNetwork, control.container]);
+    controlConnected = true;
     const databaseUrl = new URL(control.url);
-    databaseUrl.hostname = "host.docker.internal";
+    databaseUrl.hostname = control.container;
+    databaseUrl.port = "5432";
     const diagnosticRunner = join(c.work, "restic-smoke.sh");
     await writeFile(
       diagnosticRunner,
@@ -146,6 +154,9 @@ export async function workerSmoke(
         volumes: { [sourceVolume]: { external: true, name: sourceVolume } },
         services: {
           "backup-worker": {
+            // The API, storage and executor stand-ins listen on the host. Linux Docker defines
+            // host.docker.internal only when it is mapped to the host gateway.
+            extra_hosts: ["host.docker.internal:host-gateway"],
             environment: {
               ARK_API_URL: `http://host.docker.internal:${api.port}`,
               ARK_WORKER_TOKEN: process.env.ARK_BACKUP_WORKER_TOKEN,
@@ -264,6 +275,10 @@ export async function workerSmoke(
     releaseBackup();
     releaseUpload();
     if (workerId) await run(["docker", "rm", "--force", workerId], { allowFailure: true });
+    if (controlConnected)
+      await run(["docker", "network", "disconnect", "--force", controlNetwork, control.container], {
+        allowFailure: true,
+      });
     if (sourceCreated) {
       const volume = await run(["docker", "volume", "inspect", sourceVolume], { allowFailure: true });
       if (volume.status === 0 && JSON.parse(volume.stdout)[0].Labels?.["ark.worker-smoke"] === c.project)
