@@ -50,7 +50,6 @@ import {
   locationPolicy,
   planEdge,
   routeIdentityKey,
-  sha256Hex,
   servedHttpHostnames,
   servedHttpRoutes,
   type EdgeHttpRoute,
@@ -530,6 +529,25 @@ async function edgeApply(plan = fixturePlan()) {
     ],
   );
 }
+
+/** Acknowledges each new front-ingress request whose hash matches the published rules. */
+const INGRESS_ACKNOWLEDGER = `
+  const { createHash } = await import("node:crypto");
+  const dir = "/edge/fixture-ingress";
+  let acknowledged = "";
+  setInterval(async () => {
+    try {
+      const { id, hash } = await Bun.file(dir + "/policy.request").json();
+      const rules = await Bun.file(dir + "/policy.nft").text();
+      if (id !== acknowledged && hash === createHash("sha256").update(rules).digest("hex")) {
+        await Bun.write(dir + "/policy.status", "request_id=" + id + "\\npolicy_hash=" + hash + "\\napplied=true\\n");
+        acknowledged = id;
+      }
+    } catch {
+      // The request may not have been published yet.
+    }
+  }, 75);
+`;
 
 async function edgeWorker<T>(args: string[], settings: string[]) {
   const output = await docker(
@@ -2134,7 +2152,6 @@ async function coordinatorFixture() {
   env.DATABASE_URL = workerUrl.toString();
   delete env.DATABASE_APP_URL;
   const sql = postgres(url, { max: 1 });
-  const ingress = join(edgeDir, "fixture-ingress");
   try {
     await sql`INSERT INTO platform_settings (id, admin_mode, admin_hostname, gate_login_mode, gate_login_hostname)
       VALUES ('default', 'public', ${adminHost}, 'public', ${loginHost}) ON CONFLICT (id) DO UPDATE SET
@@ -2166,28 +2183,31 @@ async function coordinatorFixture() {
           ${route.ip}, ${route.port}, 'public', ${JSON.stringify({ redirectTo: route.redirectTo })}::jsonb, 'ready', true)`;
     }
     // The real coordinator publishes firewall rules. Acknowledge the exact request in this
-    // isolated fixture, which publishes only HTTP and has no host firewall reconciler.
+    // isolated fixture, which publishes only HTTP and has no host firewall reconciler. The worker
+    // writes the request and rules as uid 1000 with mode 0600, so acknowledge as that uid in the
+    // same mount: the host user (uid 1001 on GitHub runners) cannot read them.
     return {
       sql,
       async run(kind: "edge.drain" | "edge.l4_apply", { enqueue = true, failCensus = false } = {}) {
-        let acknowledged = "";
-        const timer = setInterval(async () => {
-          try {
-            const { id, hash } = await Bun.file(join(ingress, "policy.request")).json();
-            if (
-              id !== acknowledged &&
-              hash === sha256Hex(await Bun.file(join(ingress, "policy.nft")).text())
-            ) {
-              await Bun.write(
-                join(ingress, "policy.status"),
-                `request_id=${id}\npolicy_hash=${hash}\napplied=true\n`,
-              );
-              acknowledged = id;
-            }
-          } catch {
-            // The request may not have been published yet.
-          }
-        }, 75);
+        const acknowledger = `${network}-ingress-ack-${randomBytes(4).toString("hex")}`;
+        runtime.containers.push(acknowledger);
+        await docker(
+          "run",
+          "--detach",
+          "--rm",
+          "--name",
+          acknowledger,
+          "--network",
+          "none",
+          "--user",
+          "1000:1000",
+          "--volume",
+          `${edgeDir}:/edge`,
+          bunImage,
+          "bun",
+          "-e",
+          INGRESS_ACKNOWLEDGER,
+        );
         try {
           return await edgeWorker<{ id: string; status: string; error: string | null; evidence: unknown }>(
             ["coordinator", JSON.stringify({ kind, enqueue, failCensus })],
@@ -2199,7 +2219,7 @@ async function coordinatorFixture() {
             ],
           );
         } finally {
-          clearInterval(timer);
+          await docker("rm", "--force", acknowledger).catch(() => undefined);
         }
       },
     };
