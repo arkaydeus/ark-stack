@@ -32,12 +32,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
+import { bunImage } from "./test-images.ts";
 
 const root = resolve(import.meta.dir, "..");
 const haproxyImage =
   "haproxy:3.2.26-alpine@sha256:1c3568e520453cc8ba98c39501febcf450429c80e6cc27ecad779961d76e597c";
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const rounds = Number(process.env.ARK_EDGE_RELOAD_ROUNDS ?? 50);
 if (!Number.isInteger(rounds) || rounds < 1)
   throw new Error("ARK_EDGE_RELOAD_ROUNDS must be a positive integer");

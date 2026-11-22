@@ -29,7 +29,8 @@ import {
 } from "@ark-stack/shared";
 import postgres from "postgres";
 
-import { bunImage, cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from "./edge-test/gate-edge.ts";
+import { cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from "./edge-test/gate-edge.ts";
+import { bunImage } from "./test-images.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 
 const root = resolve(import.meta.dir, "..");

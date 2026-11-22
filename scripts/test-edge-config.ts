@@ -32,6 +32,7 @@ import { checkEdgeCaddyBase, composeEdgeImage, prepareEdgeImage } from "./edge-t
 import { checkReleasePins } from "./edge-test/pins.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
+import { bunImage } from "./test-images.ts";
 
 const caddyImage = "caddy:2.11.9@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c";
 /** The shipped edge image (FD-23), set by `checkPins`: built from the edge-caddy stage or pinned. */
@@ -43,9 +44,6 @@ const tailscaleImage =
 // edge-ts never reaches Tailscale's control plane in this run: login fails fast and tailscaled keeps
 // running, which is what a node without TS_EDGE_AUTHKEY does.
 const offlineLoginServer = "--login-server=http://127.0.0.1:9";
-// Same pin as the Dockerfile runtime stage; hosts the fixture upstream and generates fixture certificates.
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
 const idleSeconds = 80;

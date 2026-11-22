@@ -16,6 +16,8 @@
     "host-setup.test.ts",
     "install-sh.test.ts",
     "test-install-bootstrap.ts",
-    "test-install-live.ts"
+    "test-install-live.ts",
+    "test-images.ts",
+    "test-images.test.ts"
   ]
 }

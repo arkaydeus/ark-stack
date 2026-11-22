@@ -62,13 +62,12 @@ import postgres from "postgres";
 import { composeImages, verifyImageIds } from "./install-edge-l4.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { type EdgeStack, httpRouterArgs, startEdgeStack } from "./edge-test/stack.ts";
+import { bunImage } from "./test-images.ts";
 
 const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
 const haproxyImage =
   "haproxy:3.2.26-alpine@sha256:1c3568e520453cc8ba98c39501febcf450429c80e6cc27ecad779961d76e597c";
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-l4-${suffix}-`));
 const network = `ark-edge-l4-${suffix}`;

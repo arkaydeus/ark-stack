@@ -53,6 +53,7 @@ import {
 
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { type EdgeStack, startEdgeStack } from "./edge-test/stack.ts";
+import { bunImage } from "./test-images.ts";
 
 // The PKI module is pure apart from persistence; it only needs a (never used) database URL to load.
 process.env.DATABASE_URL ??= "postgres://unused@127.0.0.1:1/unused";
@@ -61,8 +62,6 @@ const x509 = await import("../server/src/modules/x509.ts");
 
 const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const nftImage = `ark-db-ingress-test:${suffix}`;
 let nftImageBuilt = false;

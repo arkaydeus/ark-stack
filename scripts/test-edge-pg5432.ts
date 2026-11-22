@@ -59,6 +59,7 @@ import {
 
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { type EdgeStack, composeFile, startEdgeStack } from "./edge-test/stack.ts";
+import { bunImage } from "./test-images.ts";
 
 // The PKI and PgBouncer modules are pure apart from persistence; give them a (never used) database URL.
 process.env.DATABASE_URL ??= "postgres://unused@127.0.0.1:1/unused";
@@ -67,8 +68,6 @@ const { planPgbouncer, renderPgbouncerFiles } = await import("../server/src/modu
 
 const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 // Same pin as scripts/test-db.ts and the Dockerfile's postgres stage: psql 17 and the PG 17 target.
 const pg17Image = "postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929";
 const pg16Image = process.env.ARK_TEST_PG16_IMAGE ?? "postgres:16.10";

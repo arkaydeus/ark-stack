@@ -28,6 +28,7 @@ import { join, resolve } from "node:path";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { startEdgeStack } from "./edge-test/stack.ts";
 import { verifyShieldsUp } from "./edge-test/shields-up.ts";
+import { bunImage } from "./test-images.ts";
 
 const edgeKey = process.env.ARK_TEST_TS_EDGE_AUTHKEY?.trim() ?? "";
 if (!edgeKey) {
@@ -44,8 +45,6 @@ const udpPort = Number(process.env.ARK_TEST_TS_UDP_PORT ?? "41642");
 const requireDirect = process.env.ARK_TEST_TS_REQUIRE_DIRECT === "1";
 
 const root = resolve(import.meta.dir, "..");
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const tailscaleImage =
   "tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2";
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
