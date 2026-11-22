@@ -2429,7 +2429,6 @@ async function targetedHttpWithdrawalTest(
   await installScopedHttp();
   await edgeApply();
   const fixture = trigger === "drain" ? await coordinatorFixture() : null;
-  const diagSince = new Date(Date.now() - 1_000).toISOString(); // TEMPORARY DIAGNOSTIC
   const initialPid = await caddyPid();
   const target = await websocket(wwwHost);
   const sibling = await websocket(tailnetHost);
@@ -2453,8 +2452,7 @@ async function targetedHttpWithdrawalTest(
         body: error.message,
       }));
       traffic.requests++;
-      if (reply.status !== 200)
-        traffic.errors.push(`${new Date().toISOString()} ${reply.status} ${reply.body.slice(0, 80)}`); // TEMPORARY DIAGNOSTIC
+      if (reply.status !== 200) traffic.errors.push(`${reply.status} ${reply.body.slice(0, 80)}`);
       await Bun.sleep(50);
     }
   })();
@@ -2515,20 +2513,6 @@ async function targetedHttpWithdrawalTest(
     current.end();
     sibling.end();
     await fixture?.sql.end();
-  }
-  if (trigger === "expiry") {
-    // TEMPORARY DIAGNOSTIC: timestamps and proxy logs for the expiry window.
-    console.log(`DIAG expiry window since ${diagSince}; errors: ${JSON.stringify(traffic.errors)}`);
-    for (const [label, name] of [
-      ["edge-l4", stack.edgeL4],
-      ["edge", stack.edge],
-      ["watchdog", watchdogName],
-    ] as const) {
-      const logs = await runtime
-        .dockerOutput("logs", "--timestamps", "--since", diagSince, name)
-        .catch((error: Error) => ({ stdout: "", stderr: error.message }));
-      console.log(`DIAG ---- ${label} (${name}) ----\n${logs.stdout}\n${logs.stderr}`);
-    }
   }
   await allowAllTailnetRoutes();
   await installScopedHttp();
@@ -2734,12 +2718,6 @@ try {
   await run("FD-09: static 502 through 443", fd09ErrorTest);
   await run("FD-09: apex redirect and the :80 list", fd09RedirectTest);
   await run("HTTP coordinator census and publication", coordinatorHttpPublicationTest);
-  // TEMPORARY DIAGNOSTIC: repeat expiry to catch the intermittent continuity failure, then stop.
-  for (const trigger of ["expiry", "expiry", "expiry", "expiry", "expiry", "expiry"] as const)
-    await run(`HTTP targeted withdrawal: ${trigger}`, (report) =>
-      targetedHttpWithdrawalTest(report, trigger),
-    );
-  if (process.env.CI) throw new Error("TEMPORARY DIAGNOSTIC: stopping after the expiry repeats");
   for (const trigger of ["identity", "expiry", "apply", "drain"] as const)
     await run(`HTTP targeted withdrawal: ${trigger}`, (report) =>
       targetedHttpWithdrawalTest(report, trigger),
