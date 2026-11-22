@@ -176,6 +176,8 @@ async function restLog(name = homeServer) {
 }
 
 async function startBackupTs() {
+  const composeVersion = await docker("compose", "version", "--short");
+  const supportsGatewayPriority = Bun.semver.satisfies(composeVersion.split("-")[0]!, ">=2.33.1");
   const compose = await Bun.file(composePath).text();
   const required = [...new Set([...compose.matchAll(/\$\{([A-Z0-9_]+):\?/g)].map((match) => match[1]))];
   const envFile = join(work, `${project}.env`);
@@ -206,12 +208,11 @@ async function startBackupTs() {
     `    entrypoint: ${JSON.stringify(command.slice(0, 1))}`,
     `    command: ${JSON.stringify(command.slice(1))}`,
     `    ports: ["127.0.0.1::1055"]`,
-    // Keep the shipped default gateway (backup-ts-egress) when the fake tailnet network is attached
-    // below. Docker 28 sets published ports up on the gateway endpoint, so a gateway that moved to
-    // the fake tailnet would re-publish :1055 on another host port.
-    "    networks:",
-    "      backup-ts-egress:",
-    "        gw_priority: 1",
+    // Compose 2.33.1+ can keep backup-ts-egress as the gateway when the fake tailnet attaches.
+    // If the gateway moves, Docker 28 can re-publish :1055, so read the final port below either way.
+    ...(supportsGatewayPriority
+      ? ["    networks:", "      backup-ts-egress:", "        gw_priority: 1"]
+      : []),
     "networks:",
     "  backup-tailnet:",
     `    ipam: { config: [{ subnet: "${base}.0/26" }] }`,

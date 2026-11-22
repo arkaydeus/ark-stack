@@ -286,10 +286,13 @@ describe("pgbouncer-public compose service", () => {
     const workflow = Bun.YAML.parse(await Bun.file(join(root, ".github/workflows/ci.yml")).text()) as {
       jobs: Record<string, { steps?: Array<{ run?: string }> }>;
     };
-    // CI runs its suites in parallel jobs; exactly one of them must run the smoke test.
-    const runs = Object.values(workflow.jobs).filter((job) =>
-      job.steps?.some((step) => step.run === "bun scripts/test-pgbouncer-public.ts"),
-    );
+    const runs = Object.values(workflow.jobs)
+      .flatMap((job) => job.steps ?? [])
+      .flatMap(({ run }) => [
+        ...(run ?? "").matchAll(
+          /(?:^|[;&|])[ \t]*bun[ \t]+scripts\/test-pgbouncer-public\.ts(?=$|[ \t;&|])/gm,
+        ),
+      ]);
     expect(runs).toHaveLength(1);
   });
 });

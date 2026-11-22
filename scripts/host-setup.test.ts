@@ -1424,7 +1424,7 @@ describe("host:setup full run", () => {
     expect(f.host.ufwBackups.map(([source]) => source)).toEqual(
       ["user.rules", "user6.rules"].map((file) => join(f.ufwDirectory, file)),
     );
-    expect(f.host.calls.findIndex((call) => call.startsWith("cp -p -- "))).toBeLessThan(
+    expect(f.host.calls.findLastIndex((call) => call.startsWith("cp -p -- "))).toBeLessThan(
       f.host.calls.findIndex((call) => call.startsWith("ufw --force delete")),
     );
 

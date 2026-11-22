@@ -125,7 +125,7 @@ There are four kinds of spec:
 
 ### `test:e2e-gate`
 
-`mise run test:e2e-gate` (`scripts/test-e2e-gate.ts`, FD-11) runs the real API on the host against a disposable database, and the shipped edge (`edge-ts`, Caddy behind its launch guard, HAProxy) in a disposable Compose project, with the edge watchdog and a fake tailnet upstream. Chromium reaches the edge through a local CONNECT proxy, so hostnames, SNI and `__Host-` cookies are what a browser sees in production. `e2e/gate.spec.ts` checks the login-origin redirect, password and TOTP, the host-only route cookie, the identity header the upstream receives, that a gate user created in Ark must enrol TOTP before the route opens, sign-out from the rendered pages, and that revocation closes an authenticated WebSocket. It needs Docker, a loopback `DATABASE_URL` and Chromium.
+`mise run test:e2e-gate` (`scripts/test-e2e-gate.ts`, FD-11) runs the real API on the host against a disposable database, and the shipped edge (`edge-ts`, Caddy behind its launch guard, HAProxy) in a disposable Compose project, with the edge watchdog and a fake tailnet upstream. Chromium reaches the edge through a local CONNECT proxy, so hostnames, SNI and `__Host-` cookies are what a browser sees in production. `e2e/gate.spec.ts` checks the login-origin redirect, password and TOTP, the host-only route cookie, the identity header the upstream receives, that a gate user created in Ark must enrol TOTP before the route opens, sign-out from the rendered pages, and that revocation closes an authenticated WebSocket. It needs Docker, a loopback `DATABASE_URL` and Chromium. On Linux, run it as a non-root user with Docker access.
 
 ## Docker harnesses
 
