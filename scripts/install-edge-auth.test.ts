@@ -6,9 +6,11 @@ import { join, resolve } from "node:path";
 import { EventEmitter } from "node:events";
 
 import { configureEdgeAuthKey, promptHidden, readHidden } from "./install-edge-auth.ts";
+import { composeBuiltImages } from "./install-images.ts";
 
 const root = resolve(import.meta.dir, "..");
 const installedKey = "tskey-auth-installed-secret";
+const revision = "a".repeat(40);
 
 test("preserved key configuration leaves the env file byte-for-byte unchanged and does not prompt", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ark-auth-preserved-"));
@@ -36,7 +38,7 @@ test("preserved key configuration leaves the env file byte-for-byte unchanged an
 
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), "ark-install-auth-"));
-  for (const path of ["scripts", "bin", "infra/platform", "tmp/certs/database"]) {
+  for (const path of ["scripts", "bin", "infra/platform", "infra/mail", "tmp/certs/database"]) {
     await mkdir(join(directory, path), { recursive: true });
   }
   for (const name of [
@@ -44,6 +46,7 @@ async function fixture() {
     "install-edge-auth.ts",
     "install-docker-ipv6.ts",
     "install-edge-l4.ts",
+    "install-images.ts",
     "install-host-hardening.ts",
     "install-mail-submission.ts",
     "host-inventory.ts",
@@ -64,6 +67,10 @@ async function fixture() {
     join(root, "infra/platform/docker-compose.yml"),
     join(directory, "infra/platform/docker-compose.yml"),
   );
+  await copyFile(
+    join(root, "infra/mail/docker-compose.yml"),
+    join(directory, "infra/mail/docker-compose.yml"),
+  );
   // Existing certs avoid invoking openssl; Docker is replaced only inside this disposable install.
   for (const name of ["fullchain.pem", "privkey.pem"]) {
     await Bun.write(join(directory, "tmp/certs/database", name), "fixture");
@@ -82,6 +89,7 @@ if (process.argv.includes("--config")) console.log(JSON.stringify({
   }, "op"]],
 }));
 if (process.argv.some((arg) => arg.includes("id -u"))) console.log(process.argv.some((arg) => arg.startsWith("haproxy:")) ? "99\\n---" : "1000\\n---");
+if (process.argv.some((arg) => arg.includes("org.opencontainers.image.revision"))) console.log("${revision}");
 appendFileSync(process.env.INSTALL_CALLS, JSON.stringify({args:process.argv.slice(2), key:process.env.TS_EDGE_AUTHKEY}) + "\\n");
 if (process.env.INSTALL_FAIL_BUILD === "1" && process.argv.includes("build")) process.exit(42);
 `,
@@ -89,6 +97,114 @@ if (process.env.INSTALL_FAIL_BUILD === "1" && process.argv.includes("build")) pr
   await chmod(join(directory, "bin/docker"), 0o700);
   return directory;
 }
+
+async function runInstaller(directory: string, args: string[], env: Record<string, string>) {
+  const child = Bun.spawn([process.execPath, "scripts/install.ts", ...args], {
+    cwd: directory,
+    env: {
+      ...process.env,
+      PATH: `${directory}/bin:${process.env.PATH}`,
+      ARK_INSTALL_NONINTERACTIVE: "1",
+      ARK_INSTALL_SKIP_DOCKER: "0",
+      INSTALL_CALLS: join(directory, "calls"),
+      ...env,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  expect(code, stderr).toBe(0);
+  return stdout;
+}
+
+test.each(["0", "1"])(
+  "hardening-only keeps the running API and reconciler in place (mail=%s)",
+  async (mail) => {
+    const directory = await fixture();
+    try {
+      await Bun.write(join(directory, ".env"), `TS_EDGE_AUTHKEY=${installedKey}\nARK_MAIL_ENABLED=${mail}\n`);
+      await Bun.write(
+        join(directory, "scripts/install-host-hardening.ts"),
+        `
+export const hostFirewallPath = "/fixture/ark-host.nft";
+export const hostMetricsPath = "/fixture/host-metrics";
+export const enrollVps = () => { throw new Error("unexpected enrolment"); };
+export const hostCommand = () => { throw new Error("unexpected host command"); };
+export async function installHostHardening(configure) {
+  const config = await configure({ ports: [22] });
+  console.log("Fixture hardening applied", config.mailEnabled);
+}
+`,
+      );
+      const stdout = await runInstaller(directory, ["--harden-vps"], {
+        ARK_INSTALL_HARDEN_ONLY: "1",
+        ARK_SETUP_DEFER_EDGE_ENROLMENT: "1",
+      });
+      expect(stdout).toContain(`Fixture hardening applied ${mail === "1"}`);
+      expect(await Bun.file(join(directory, "calls")).exists()).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([false, true])(
+  "installer resolves Compose image tags and rejects tracked changes (dirty=%s)",
+  async (dirty) => {
+    const directory = await fixture();
+    try {
+      const envPath = join(directory, ".env");
+      const composePath = join(directory, "infra/platform/docker-compose.yml");
+      const gitPath = join(directory, "bin/git");
+      await Bun.write(envPath, `TS_EDGE_AUTHKEY=${installedKey}\nARK_VERSION=v2\nARK_MAIL_ENABLED=0\n`);
+      await Bun.write(
+        gitPath,
+        `#!/bin/sh
+case "$*" in
+  *rev-parse*) printf '%s\\n' '${revision}' ;;
+  *status*) ${dirty ? "{ sleep 0.05; printf ' M Dockerfile\\n'; } &" : ":"} ;;
+esac
+`,
+      );
+      await chmod(gitPath, 0o700);
+      const stdout = await runInstaller(directory, [], { ARK_VERSION: "", ARK_INSTALL_BUILD_IMAGES: "0" });
+      const calls = (await Bun.file(join(directory, "calls")).text())
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line).args as string[]);
+      const tags = calls.filter(([command]) => command === "tag").map((args) => args[2]!);
+      if (dirty) {
+        expect(stdout).toContain("the checkout has local changes");
+        expect(tags).toEqual([]);
+        expect(calls.some((args) => args.includes("build"))).toBe(true);
+      } else {
+        const local = composeBuiltImages(await Bun.file(composePath).text()).map((name) => `${name}:local`);
+        expect(stdout).toContain("skipping the local build");
+        expect(tags).toEqual(local);
+        expect(calls.some((args) => args.includes("build"))).toBe(false);
+        expect(calls.some((args) => args.includes("--wait") && args.includes("api"))).toBe(true);
+        const docker = Bun.which("docker");
+        if (docker && Bun.spawnSync([docker, "compose", "version"]).exitCode === 0) {
+          const config = Bun.spawnSync(
+            [docker, "compose", "--env-file", envPath, "-f", composePath, "config", "--images"],
+            {
+              cwd: directory,
+              env: { ...process.env, ARK_VERSION: "" },
+            },
+          );
+          expect(config.exitCode, config.stderr.toString()).toBe(0);
+          expect(config.stdout.toString().trim().split("\n")).toEqual(expect.arrayContaining(tags));
+        }
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 for (const inherited of ["tskey-auth-inherited-other", ""]) {
   test(`installer Docker children receive the installed key over ${inherited ? "another key" : "an empty export"}`, async () => {

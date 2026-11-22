@@ -176,15 +176,25 @@ async function main(args: string[]) {
     await Promise.all(args.slice(2).map((address) => auditExternal(config, address)));
     return;
   }
-  if (args.length > 1 || (args.length === 1 && !["--inventory", "--retain-ssh"].includes(args[0]!))) {
-    throw new Error("Usage: host:audit [--inventory | --retain-ssh | --external INVENTORY.json IP [IP...]]");
+  const inventory = args.includes("--inventory");
+  const audit = !inventory || args.includes("--audit");
+  const retainSsh = args.includes("--retain-ssh");
+  if (
+    new Set(args).size !== args.length ||
+    args.some((arg) => !["--inventory", "--audit", "--retain-ssh"].includes(arg)) ||
+    (args.includes("--audit") && !inventory) ||
+    (retainSsh && !audit)
+  ) {
+    throw new Error(
+      "Usage: host:audit [--retain-ssh | --inventory [--audit [--retain-ssh]] | --external INVENTORY.json IP [IP...]]",
+    );
   }
   const config = await appliedHostConfig(join(import.meta.dir, ".."));
-  if (args[0] === "--inventory") {
+  if (audit) await auditLocal(config, retainSsh);
+  if (inventory) {
     console.log(JSON.stringify({ config, providerRules: providerFirewallRules(config) }, null, 2));
     return;
   }
-  await auditLocal(config, args[0] === "--retain-ssh");
   console.log("Host listeners, Docker publications and ark_host match the public inventory.");
 }
 

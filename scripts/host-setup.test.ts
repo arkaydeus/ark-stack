@@ -24,12 +24,17 @@ import {
   parseEnvFile,
   parseHujson,
   parseSniPorts,
+  providerFirewallRules,
+  renderFrontIngress,
+  type HostPortConfig,
   readHostSshAccess,
+  sha256Hex,
   renderHostFirewall,
   replaceHostSshAccess,
   type HostSshAccess,
 } from "@ark-stack/shared";
 
+import { appliedHostConfig, frontPolicyPending } from "./host-inventory.ts";
 import { runSetup, type SetupDependencies } from "./host-setup.ts";
 import {
   USAGE,
@@ -86,6 +91,8 @@ import {
 
 const repoRoot = join(import.meta.dir, "..");
 const BUN = "/test/bun";
+const INVENTORY = `${BUN} scripts/host-audit.ts --inventory`;
+const AUDIT = `${INVENTORY} --audit`;
 const VPS_KEY = "tskey-auth-kVPS1234CNTRL-vpsSecretValue0123456789";
 const EDGE_KEY = "tskey-auth-kEDGE5678CNTRL-edgeSecretValue0123456789";
 const RECOVERY_IP = "198.51.100.23";
@@ -107,6 +114,10 @@ class FakeHost {
   vpsTags?: string[];
   runSsh = false;
   healthy = false;
+  reconcilerRunning = false;
+  platformServices: string[] = [];
+  onPlatformRestart?: () => void;
+  routes: HostPortConfig["routes"];
   ssh = { service: { enabled: true, active: true }, socket: { enabled: false, active: false } };
   edge = { running: false, tags: [] as string[], hostName: "" };
   edgeJoinTags = ["tag:ark-edge"];
@@ -133,6 +144,10 @@ class FakeHost {
   configuredKeys = new Map<string, string>();
   ufw: string | undefined;
   failInstall = 0;
+  /** Fails only the full platform install, after hardening and the SSH cutover succeeded. */
+  failPlatformInstall = 0;
+  /** "harden" or "platform" for each scripts/install.ts --harden-vps run, in order. */
+  installModes: string[] = [];
   failAudit = 0;
   breakTailscaleOnSshStop = false;
   privateSsh = false;
@@ -426,8 +441,14 @@ class FakeHost {
     if (line === `${BUN} scripts/install.ts --harden-vps`) {
       expect(options.env?.ARK_INSTALL_NONINTERACTIVE).toBe("1");
       expect(options.env?.TS_EDGE_AUTHKEY).toBeUndefined();
+      const mode = options.env?.ARK_INSTALL_HARDEN_ONLY === "1" ? "harden" : "platform";
+      this.installModes.push(mode);
       if (this.failInstall > 0) {
         this.failInstall--;
+        return fail("docker build failed\n");
+      }
+      if (mode === "platform" && this.failPlatformInstall > 0) {
+        this.failPlatformInstall--;
         return fail("docker build failed\n");
       }
       const existing = existsSync(this.envPath) ? readFileSync(this.envPath, "utf8") : "";
@@ -454,12 +475,30 @@ class FakeHost {
         JSON.parse(options.env!.ARK_SETUP_HOST_SSH_ACCESS!),
       );
       writeFileSync(this.firewallPath, firewall);
-      this.liveFirewall = firewall.split("\n").slice(2).join("\n");
+      const active = renderHostFirewall(
+        {
+          mailEnabled: values.ARK_MAIL_ENABLED === "1",
+          sniPorts: parseSniPorts(values.ARK_EDGE_SNI_PORTS),
+          routes: this.routes,
+        },
+        JSON.parse(options.env!.ARK_SETUP_HOST_SSH_ACCESS!),
+      );
+      this.liveFirewall = active.split("\n").slice(2).join("\n");
+      if (mode === "harden") return ok("Ark Stack host hardened.\n");
+      if (values.ARK_MAIL_ENABLED === "0") {
+        this.platformServices.push("stop database-ingress", "stop api");
+        this.reconcilerRunning = false;
+        this.healthy = false;
+      }
+      this.reconcilerRunning = true;
+      this.platformServices.push("up database-ingress");
+      this.onPlatformRestart?.();
       this.composeUp(
         "edge-ts",
         options.env?.ARK_SETUP_DEFER_EDGE_ENROLMENT === "1" ? { TS_EDGE_AUTHKEY: "" } : undefined,
       );
       this.healthy = true;
+      this.platformServices.push("up api");
       return ok(`Ark Stack host install ready.\nSetup token: ${values.ARK_SETUP_TOKEN}\n`);
     }
     if (line.startsWith("curl -fsS")) return this.healthy ? ok("{}") : fail("", 7);
@@ -598,31 +637,27 @@ class FakeHost {
     if (line === "ufw status numbered")
       return this.ufw === undefined ? fail("ufw: not found", 127) : ok(this.ufw);
     if (argv[0] === "ufw") return this.failUfwDelete ? fail("ufw delete failed") : ok();
-    if (line === `${BUN} scripts/host-audit.ts --inventory`) {
-      return ok(
-        JSON.stringify({
-          config: {
-            mailEnabled: parseEnvFile(readFileSync(this.envPath, "utf8")).ARK_MAIL_ENABLED !== "0",
-            sniPorts: parseSniPorts(parseEnvFile(readFileSync(this.envPath, "utf8")).ARK_EDGE_SNI_PORTS),
-          },
-          providerRules: PROVIDER_RULES,
-        }),
-      );
-    }
-    if (line.startsWith(`${BUN} scripts/host-audit.ts`)) {
-      if (this.failAudit > 0) {
-        this.failAudit--;
-        return fail("Unexpected TCP 0.0.0.0:22 listening on the host.");
+    if (line === INVENTORY || line.startsWith(AUDIT)) {
+      try {
+        const values = parseEnvFile(readFileSync(this.envPath, "utf8"));
+        const config = await appliedHostConfig(this.root, values);
+        if (argv.includes("--audit")) {
+          if (this.failAudit > 0) {
+            this.failAudit--;
+            return fail("Unexpected TCP 0.0.0.0:22 listening on the host.");
+          }
+          if (
+            this.ssh.service.active &&
+            !this.privateSsh &&
+            (!argv.includes("--retain-ssh") || !readHostSshAccess(this.liveFirewall).ports.includes(22))
+          ) {
+            return fail("Unexpected TCP 0.0.0.0:22 listening on the host.");
+          }
+        }
+        return ok(JSON.stringify({ config, providerRules: providerFirewallRules(config) }));
+      } catch (error) {
+        return fail(String(error));
       }
-      const retained = argv.includes("--retain-ssh");
-      if (
-        this.ssh.service.active &&
-        !this.privateSsh &&
-        (!retained || !readHostSshAccess(this.liveFirewall).ports.includes(22))
-      ) {
-        return fail("Unexpected TCP 0.0.0.0:22 listening on the host.");
-      }
-      return ok("Host listeners, Docker publications and ark_host match the public inventory.\n");
     }
     if (line.startsWith("ip -j address show")) {
       return ok(
@@ -651,6 +686,8 @@ class FakeHost {
 /** A UI that answers prompts from a script (question substring -> answer) and records the output. */
 class ScriptedUi implements Ui {
   output: string[] = [];
+  prompts: string[] = [];
+  onPrompt?: (question: string) => void;
   constructor(
     readonly interactive: boolean,
     private answers: [string, string][] = [],
@@ -660,6 +697,8 @@ class ScriptedUi implements Ui {
     this.output.push(line);
   }
   private take(list: [string, string][], question: string) {
+    this.prompts.push(question);
+    this.onPrompt?.(question);
     const index = list.findIndex(([match]) => question.includes(match));
     if (index < 0) throw new Error(`Unscripted prompt: ${question}`);
     const [, answer] = list.splice(index, 1)[0]!;
@@ -1278,21 +1317,85 @@ describe("host:setup missing SSH user", () => {
 });
 
 describe("host:setup full run", () => {
+  test.each([false, true])(
+    "the default source collects remaining manual answers before install (skip=%s)",
+    async (skip) => {
+      const f = fixture();
+      const backupKey = "tskey-auth-manual-backup";
+      const ui = new ScriptedUi(
+        true,
+        [
+          ["Your domain", "example.com"],
+          ["Admin hostname", "<default>"],
+          ["Let's Encrypt", "ops@example.com"],
+          ["trusted Let's Encrypt", "<default>"],
+          ["incoming mail", "<default>"],
+          ["Shared SNI", "<default>"],
+          ["reboot time", "<default>"],
+          ["local (non-root) user", "alice"],
+          ["Tailscale machine name", "<default>"],
+          ["Continue", "<default>"],
+          ["policy is saved", ""],
+          ["session works", "yes"],
+          ["Type yes once they are applied", "yes"],
+        ],
+        [
+          ["Cloudflare", ""],
+          ["Tailscale API access token", ""],
+          ["tag:ark-edge key", skip ? "" : EDGE_KEY],
+          ["tag:ark-backup key", skip ? "" : backupKey],
+        ],
+      );
+      ui.onPrompt = () => expect(f.host.installModes).not.toContain("platform");
+      const result = await setup(
+        f,
+        ["--backup-node", "--keep-public-ssh"],
+        { TS_VPS_AUTHKEY: VPS_KEY },
+        { scripted: ui },
+      );
+      expect(result.code, result.text).toBe(0);
+      expect(
+        ui.prompts.filter((question) => /Paste the tag:ark-(edge|backup) key/.test(question)),
+      ).toHaveLength(2);
+      expect(f.host.installModes).toEqual(["harden", "platform"]);
+      expect(result.state.steps.edge.status).toBe(skip ? "skipped" : "done");
+      expect(result.state.steps["backup-node"].status).toBe(skip ? "skipped" : "done");
+      expect(f.host.containerKeys).toEqual(
+        skip
+          ? []
+          : [
+              { service: "edge-ts", key: EDGE_KEY, from: ".env" },
+              { service: "backup-ts", key: backupKey, from: "env" },
+            ],
+      );
+      for (const secret of [EDGE_KEY, backupKey]) {
+        expect(result.log + JSON.stringify(result.state)).not.toContain(secret);
+      }
+    },
+  );
+
   test("installs end to end without editing files; summary has the token, the log does not", async () => {
     const f = fixture();
     f.host.ufw = `Status: active\n\n     To                         Action      From\n     --                         ------      ----\n[ 1] 22/tcp                     ALLOW IN    Anywhere\n[ 2] 80/tcp                     ALLOW IN    Anywhere\n[ 3] 22/tcp (v6)                ALLOW IN    Anywhere (v6)\n`;
     const result = await setup(f, [...FULL, "--ssh-user", "alice"], { ...KEYS, DNS_API_TOKEN: DNS_TOKEN });
     expect(result.code).toBe(0);
+    // Hardening, then the public SSH cutover while the operator is present, then the unattended install.
+    const installs = f.host.calls.flatMap((call, index) =>
+      call === `${BUN} scripts/install.ts --harden-vps` ? [index] : [],
+    );
+    expect(f.host.installModes).toEqual(["harden", "platform"]);
     const order = [
-      `${BUN} scripts/install.ts --enroll-vps --key-stdin`,
-      `${BUN} scripts/install.ts --harden-vps`,
-      "up -d edge-ts edge edge-l4",
-      "scripts/edge-namespace.ts",
-      "up --wait --wait-timeout 120 api domain-worker",
-      "systemctl stop ssh.service",
-      `${BUN} scripts/host-audit.ts --inventory`,
-      `${BUN} scripts/host-audit.ts`,
-    ].map((needle) => f.host.calls.findIndex((call) => call === needle || call.endsWith(needle)));
+      f.host.calls.indexOf(`${BUN} scripts/install.ts --enroll-vps --key-stdin`),
+      installs[0]!,
+      f.host.calls.indexOf("systemctl stop ssh.service"),
+      installs[1]!,
+      ...[
+        "up -d edge-ts edge edge-l4",
+        "scripts/edge-namespace.ts",
+        "up --wait --wait-timeout 120 api domain-worker",
+      ].map((needle) => f.host.calls.findIndex((call) => call === needle || call.endsWith(needle))),
+      f.host.calls.lastIndexOf(AUDIT),
+    ];
     expect(order.every((index) => index >= 0)).toBe(true);
     expect(order).toEqual(order.toSorted((a, b) => a - b));
     // UFW: only the SSH rules are removed, highest number first.
@@ -1369,7 +1472,9 @@ describe("host:setup full run", () => {
     f.host.failAudit = 1;
     const first = await setup(f, FULL, KEYS);
     expect(first.code).toBe(1);
-    expect(first.state.steps["provider-firewall"].status).toBe("failed");
+    // The provider confirmation came before the install; only the final local audit failed.
+    expect(first.state.steps["provider-firewall"].status).toBe("done");
+    expect(first.state.steps.audit.status).toBe("failed");
     expect(first.text).toContain(`cd ${f.root} && sudo mise run host:setup`);
     const secrets = parseEnvFile(readFileSync(f.host.envPath, "utf8"));
     f.host.calls = [];
@@ -1377,7 +1482,7 @@ describe("host:setup full run", () => {
     expect(second.code).toBe(0);
     expect(f.host.calls).not.toContain(`${BUN} scripts/install.ts --enroll-vps --key-stdin`);
     expect(f.host.calls).not.toContain(`${BUN} scripts/install.ts --harden-vps`);
-    expect(f.host.calls).toContain(`${BUN} scripts/host-audit.ts`);
+    expect(f.host.calls).toContain(AUDIT);
     const after = parseEnvFile(readFileSync(f.host.envPath, "utf8"));
     for (const key of ["ARK_ROOT_KEY", "BETTER_AUTH_SECRET", "ARK_SETUP_TOKEN", "ARK_CONTROL_DB_PASSWORD"]) {
       expect(after[key]).toBe(secrets[key]!);
@@ -1386,15 +1491,67 @@ describe("host:setup full run", () => {
 
   test("a failed install resumes at the install step without enrolling again", async () => {
     const f = fixture();
-    f.host.failInstall = 1;
+    f.host.failPlatformInstall = 1;
     const first = await setup(f, FULL, KEYS);
     expect(first.code).toBe(1);
     expect(first.state.steps.install.status).toBe("failed");
+    expect(first.state.steps.harden.status).toBe("done");
+    expect(first.state.steps["public-ssh"].status).toBe("done");
     expect(first.state.steps.tailscale.status).toBe("done");
     f.host.calls = [];
+    f.host.installModes = [];
     expect((await setup(f, FULL, { TS_EDGE_AUTHKEY: EDGE_KEY })).code).toBe(0);
     expect(f.host.calls).not.toContain(`${BUN} scripts/install.ts --enroll-vps --key-stdin`);
-    expect(f.host.calls).toContain(`${BUN} scripts/install.ts --harden-vps`);
+    // Hardening and the cutover are verified and skipped; only the platform install runs again.
+    expect(f.host.installModes).toEqual(["platform"]);
+    expect(f.host.calls).not.toContain("systemctl stop ssh.service");
+  });
+
+  test("a failed hardening stops before the public SSH cutover and the platform install", async () => {
+    const f = fixture();
+    f.host.failInstall = 1;
+    const first = await setup(f, FULL, KEYS);
+    expect(first.code).toBe(1);
+    expect(first.state.steps.harden.status).toBe("failed");
+    expect(first.state.steps["public-ssh"]).toBeUndefined();
+    expect(f.host.installModes).toEqual(["harden"]);
+    expect(f.host.calls).not.toContain("systemctl stop ssh.service");
+  });
+
+  test("declining the SSH cutover on an installed host leaves the platform running", async () => {
+    const f = fixture();
+    expect((await setup(f, [...FULL, "--no-mail", "--keep-public-ssh"], KEYS)).code).toBe(0);
+    const store = new StateStore(f.stateDir);
+    const legacyState = store.load();
+    delete legacyState.steps.harden;
+    store.save(legacyState);
+    f.host.installModes = [];
+    f.host.platformServices = [];
+    const ui = new ScriptedUi(
+      true,
+      [
+        ["Your domain", "<default>"],
+        ["Admin hostname", "<default>"],
+        ["Let's Encrypt", "<default>"],
+        ["trusted Let's Encrypt", "<default>"],
+        ["Shared SNI", "<default>"],
+        ["reboot time", "<default>"],
+        ["local (non-root) user", "<default>"],
+        ["Tailscale machine name", "<default>"],
+        ["Continue", "<default>"],
+        ["new session works", "no"],
+      ],
+      [["Cloudflare", ""]],
+    );
+
+    const result = await setup(f, ["--no-mail"], {}, { scripted: ui });
+    expect(result.code, result.text).toBe(1);
+    expect(result.state.steps["public-ssh"].error).toContain("restored");
+    expect(f.host.ssh.service.active).toBe(true);
+    expect(f.host.installModes).toEqual(["harden"]);
+    expect(f.host.platformServices).toEqual([]);
+    expect(f.host.healthy).toBe(true);
+    expect(f.host.reconcilerRunning).toBe(true);
   });
 
   test("changed answers re-run the install with the new settings", async () => {
@@ -1479,7 +1636,7 @@ describe("host:setup public SSH", () => {
     expect(result.text).toContain("Public OpenSSH was left running (--keep-public-ssh).");
     expect(result.text).toContain("Re-run host:setup without --keep-public-ssh to close it.");
     expect(result.text).toContain("keep the listed OpenSSH allowance");
-    expect(f.host.calls).toContain(`${BUN} scripts/host-audit.ts --retain-ssh`);
+    expect(f.host.calls).toContain(`${AUDIT} --retain-ssh`);
   });
 
   test("scripted setup without off-host verification leaves cutover pending", async () => {
@@ -1592,6 +1749,31 @@ describe("host:setup edge node", () => {
 });
 
 describe("host:setup provider firewall", () => {
+  test("an existing mail-disabled platform stays up if early provider verification fails", async () => {
+    const f = fixture();
+    const args = [...FULL, "--no-mail"];
+    expect((await setup(f, args, KEYS)).code).toBe(0);
+    const store = new StateStore(f.stateDir);
+    const legacyState = store.load();
+    delete legacyState.steps.harden;
+    store.save(legacyState);
+    f.host.installModes = [];
+    f.host.platformServices = [];
+    const adapter = {
+      ...manualProviderFirewall,
+      async plan() {
+        throw new Error("provider is temporarily unavailable");
+      },
+    };
+    const result = await setup(f, args, {}, { firewalls: [adapter] });
+    expect(result.code).toBe(1);
+    expect(result.state.steps["provider-firewall"].error).toContain("provider is temporarily unavailable");
+    expect(f.host.installModes).toEqual(["harden"]);
+    expect(f.host.platformServices).toEqual([]);
+    expect(f.host.healthy).toBe(true);
+    expect(f.host.reconcilerRunning).toBe(true);
+  });
+
   test("without confirmation (non-interactive) the rules are printed and the audit waits", async () => {
     const f = fixture();
     const result = await setup(f, [...BASE, "--tailscale-ssh-confirmed"], KEYS);
@@ -1599,7 +1781,7 @@ describe("host:setup provider firewall", () => {
     expect(result.state.steps["provider-firewall"].status).toBe("pending");
     expect(result.text).toContain("allow UDP 41641, 41642 from 0.0.0.0/0 and ::/0");
     expect(result.text).toContain("--provider-firewall-applied");
-    expect(f.host.calls).not.toContain(`${BUN} scripts/host-audit.ts --retain-ssh`);
+    expect(f.host.calls).not.toContain(`${AUDIT} --retain-ssh`);
   });
 
   test("an inspectable adapter overrides an earlier manual confirmation and repairs later drift", async () => {
@@ -3343,7 +3525,7 @@ describe("Hetzner Cloud provider firewall", () => {
     expect(hetzner.writes().some((request) => request.path.startsWith("/v1/firewalls/7"))).toBe(false);
     // The local audit runs after the provider change, not before it.
     const createdAt = f.host.calls.indexOf("hetzner POST /v1/firewalls");
-    const auditAt = f.host.calls.lastIndexOf(`${BUN} scripts/host-audit.ts`);
+    const auditAt = f.host.calls.lastIndexOf(AUDIT);
     expect(createdAt).toBeGreaterThan(-1);
     expect(auditAt).toBeGreaterThan(createdAt);
     for (const output of [result.text, result.log]) expect(output).not.toContain(HCLOUD_TOKEN);
@@ -3414,11 +3596,11 @@ describe("Hetzner Cloud provider firewall", () => {
       expect(result.state.steps["provider-firewall"].status).toBe("pending");
       expect(result.text).toContain("has yet to report firewall");
     }
-    expect(f.host.calls).not.toContain(BUN + " scripts/host-audit.ts");
+    expect(f.host.calls).not.toContain(AUDIT);
     hetzner.associationStatus = "applied";
     const verified = await setup(f, firewallArgs, env, deps);
     expect(verified.state.steps["provider-firewall"].status).toBe("done");
-    expect(f.host.calls).toContain(BUN + " scripts/host-audit.ts");
+    expect(f.host.calls).toContain(AUDIT);
     expect(hetzner.writes()).toHaveLength(1);
   });
 
@@ -3440,7 +3622,7 @@ describe("Hetzner Cloud provider firewall", () => {
     expect(result.code).toBe(1);
     expect(result.text).toContain(message);
     expect(result.state.steps["provider-firewall"].status).toBe("failed");
-    expect(f.host.calls).not.toContain(BUN + " scripts/host-audit.ts");
+    expect(f.host.calls).not.toContain(AUDIT);
     expect(hetzner.requests.filter(({ path }) => path === "/v1/actions/1")).toHaveLength(polls);
   });
 
@@ -3484,7 +3666,7 @@ describe("Hetzner Cloud provider firewall", () => {
     expect(result.text).toContain("+ inbound TCP 443 from 0.0.0.0/0, ::/0");
     expect(result.text).toContain("--approve-provider-firewall");
     expect(hetzner.writes()).toEqual([]);
-    expect(f.host.calls).not.toContain(BUN + " scripts/host-audit.ts");
+    expect(f.host.calls).not.toContain(AUDIT);
   });
 
   test("without a token, or off Hetzner, the print-the-rules adapter is used", async () => {
@@ -3557,5 +3739,159 @@ describe("Hetzner Cloud provider firewall", () => {
         description: "Ark Stack ICMP and ICMPv6",
       },
     ]);
+  });
+});
+
+describe("front policy acknowledgement in the host inventory", () => {
+  const id = "0f4c2c1e-7d0b-4f4e-9a55-2d1c1c7b9e01";
+  function front(status?: string) {
+    const root = mkdtempSync(join(tmpdir(), "ark-inventory-"));
+    const dir = join(root, "tmp", "edge-l4", "front-ingress");
+    mkdirSync(dir, { recursive: true });
+    const rules = "table inet ark_front {}\n";
+    writeFileSync(join(dir, "policy.nft"), rules);
+    writeFileSync(join(dir, "policy.request"), JSON.stringify({ id, hash: sha256Hex(rules) }));
+    if (status !== undefined)
+      writeFileSync(join(dir, "policy.status"), status.replaceAll("HASH", sha256Hex(rules)));
+    return root;
+  }
+  const env = { ARK_MAIL_ENABLED: "0", ARK_EDGE_SNI_PORTS: "" };
+
+  function writeFront(root: string, ports: number[] = []) {
+    const dir = join(root, "tmp", "edge-l4", "front-ingress");
+    mkdirSync(dir, { recursive: true });
+    const rules = renderFrontIngress(
+      ports.map((port) => ({ id: `rt_${port}`, listenPort: port, sourceCidrs: [], allowInternet: true })),
+    );
+    writeFileSync(join(dir, "policy.nft"), rules);
+    const hash = sha256Hex(rules);
+    return {
+      request: () => writeFileSync(join(dir, "policy.request"), JSON.stringify({ id, hash })),
+      acknowledge: (error = "") =>
+        writeFileSync(
+          join(dir, "policy.status"),
+          `applied=${!error}\npolicy_hash=${hash}\nrequest_id=${id}\nerror=${error}\n`,
+        ),
+    };
+  }
+
+  test("a resumed setup restarts a stopped reconciler before waiting for its pending policy", async () => {
+    const f = fixture();
+    const args = [...FULL, "--no-mail", "--keep-public-ssh"];
+    const policy = writeFront(f.root, [20001]);
+    policy.request();
+    policy.acknowledge();
+    f.host.routes = [{ port: 20001, policy: "internet" }];
+    expect((await setup(f, args, KEYS)).code).toBe(0);
+    const store = new StateStore(f.stateDir);
+    const legacyState = store.load();
+    delete legacyState.steps.harden;
+    store.save(legacyState);
+    f.host.reconcilerRunning = false;
+    f.host.installModes = [];
+    f.host.sleeps = [];
+    const pending = writeFront(f.root, [20001]);
+    pending.request();
+    pending.acknowledge("the reconciler stopped before applying the policy");
+    f.host.onPlatformRestart = () => pending.acknowledge();
+
+    const result = await setup(f, args);
+    expect(result.code, result.text).toBe(0);
+    expect(f.host.installModes).toEqual(["harden", "platform"]);
+    expect(f.host.reconcilerRunning).toBe(true);
+    expect(f.host.sleeps).not.toContain(2000);
+    expect(result.state.steps.audit.status).toBe("done");
+  });
+
+  test("the final audit waits for the first request and retries a failed acknowledgement", async () => {
+    const f = fixture();
+    let advance = () => {};
+    const delays: number[] = [];
+    f.host.onPlatformRestart = () => {
+      const policy = writeFront(f.root);
+      advance = () => {
+        if (delays.length === 1) {
+          policy.request();
+          policy.acknowledge("temporary nftables failure");
+        } else policy.acknowledge();
+      };
+    };
+    const result = await setup(f, [...FULL, "--keep-public-ssh"], KEYS, {
+      sleep: async (ms) => {
+        if (ms !== 2000) return;
+        delays.push(ms);
+        advance();
+      },
+    });
+    expect(result.code, result.text).toBe(0);
+    expect(delays).toEqual([2000, 2000]);
+    expect(result.log).toContain("request not yet published");
+    expect(result.log).toContain("temporary nftables failure");
+    expect(result.state.steps.audit.status).toBe("done");
+  });
+
+  test("the acknowledgement wait is bounded and retains the last reconciler error", async () => {
+    const f = fixture();
+    f.host.onPlatformRestart = () => {
+      const policy = writeFront(f.root);
+      policy.request();
+      policy.acknowledge("nftables rejected the policy");
+    };
+    const result = await setup(f, [...FULL, "--keep-public-ssh"], KEYS);
+    expect(result.code).toBe(1);
+    expect(f.host.sleeps.filter((ms) => ms === 2000)).toHaveLength(30);
+    expect(f.host.calls.filter((call) => call === `${AUDIT} --retain-ssh`)).toHaveLength(31);
+    expect(result.state.steps.audit.error).toContain("Timed out");
+    expect(result.state.steps.audit.error).toContain("nftables rejected the policy");
+  });
+
+  test("a changed dedicated port set reopens provider verification and lists the exact rule delta", async () => {
+    const f = fixture();
+    const earlier = writeFront(f.root, [20001]);
+    earlier.request();
+    earlier.acknowledge();
+    f.host.onPlatformRestart = () => {
+      const later = writeFront(f.root, [20002]);
+      later.request();
+      later.acknowledge();
+    };
+    const result = await setup(f, FULL, KEYS);
+    expect(result.code, result.text).toBe(0);
+    expect(result.state.steps["provider-firewall"].status).toBe("pending");
+    expect(result.state.steps.audit.status).toBe("pending");
+    expect(result.text).toContain("allow TCP 20002 from 0.0.0.0/0 and ::/0");
+    expect(result.text).toContain("remove TCP 20001 from 0.0.0.0/0 and ::/0");
+    expect(result.text).not.toContain("Local audit passed");
+    expect(readFileSync(join(f.root, "tmp", "ark-host-inventory.json"), "utf8")).toContain("20002");
+    const resumed = await setup(f, FULL, KEYS);
+    expect(resumed.code, resumed.text).toBe(0);
+    expect(resumed.state.steps["provider-firewall"].status).toBe("done");
+    expect(resumed.state.steps.audit.status).toBe("done");
+  });
+
+  test("without a front policy it returns the configured ports", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ark-inventory-"));
+    expect(await appliedHostConfig(root, env)).toEqual({ mailEnabled: false, sniPorts: [] });
+  });
+
+  test("a request without its acknowledgement yet is reported as awaiting", async () => {
+    for (const status of [
+      undefined,
+      `applied=true\npolicy_hash=HASH\nrequest_id=${"1".repeat(36)}\nerror=\n`,
+    ]) {
+      await expect(appliedHostConfig(front(status), env)).rejects.toThrow(
+        "awaiting firewall acknowledgement",
+      );
+    }
+  });
+
+  test("a failed acknowledgement of the current request reports the reconciler's error", async () => {
+    const root = front(
+      `applied=false\npolicy_hash=HASH\nrequest_id=${id}\nerror=nft: Could not process rule: No such file or directory\n`,
+    );
+    const error = await appliedHostConfig(root, env).catch((failure: Error) => failure.message);
+    expect(error).toContain("database-ingress could not apply the front policy");
+    expect(error).toContain("nft: Could not process rule: No such file or directory");
+    expect(error).toContain(frontPolicyPending);
   });
 });

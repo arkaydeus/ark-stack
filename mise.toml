@@ -33,7 +33,7 @@ run = ["mise run typecheck", "bun run --cwd web build"]
 
 [tasks.test]
 description = "Run unit tests"
-run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts scripts/brand-icons.test.ts"
+run = "bun --env-file=.env test shared server workers tests scripts/publish-images.test.ts scripts/install-images.test.ts scripts/install-edge-auth.test.ts scripts/install-edge-l4.test.ts scripts/edge-namespace.test.ts scripts/check-docs.test.ts scripts/docs-site/build.test.ts scripts/host-setup.test.ts scripts/install-sh.test.ts scripts/brand-icons.test.ts"
 
 [tasks."brand:icons"]
 description = "Regenerate the committed Ark Stack icons (favicons, app and manifest icons, logos, README icon) from assets/brand/ark-stack-icon.png (dev only)"
@@ -255,7 +255,7 @@ env = { _.file = ".env" }
 raw_args = true
 
 [tasks."host:setup"]
-description = "Guided production install on an Ubuntu VPS (run as root; started by install.sh): questions, Tailscale enrolment (manual keys or Tailscale API), SSH safety check, hardening and install, edge and optional backup node, admin origin and ACME, closing public SSH, provider firewall (manual or Hetzner Cloud API) and audit, summary"
+description = "Guided production install on an Ubuntu VPS. Started by install.sh as root. Covers questions, Tailscale enrolment (manual keys or Tailscale API), SSH safety check, hardening, public SSH cutover, provider firewall review (manual or Hetzner Cloud API), remaining keys, platform install, edge and optional backup enrolment, admin origin and ACME, local audit, summary"
 run = "bun --no-env-file scripts/host-setup.ts"
 raw_args = true
 

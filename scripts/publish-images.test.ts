@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { digestReferences } from "./publish-images";
+import { digestReferences, imageNames, mergePlatforms, promoteLatest } from "./publish-images";
 
 const fixtures: string[] = [];
 afterEach(async () => {
@@ -29,6 +29,9 @@ appendFileSync(env.STUB_LOG, JSON.stringify(record) + "\\n");
 if (env.FAIL_COMMAND && (command + " " + args.slice(0, 2).join(" ")).startsWith(env.FAIL_COMMAND)) {
   console.error("controlled command failure"); process.exit(9);
 }
+if (env.FAIL_TARGET && args[2] === env.FAIL_IMAGE_OPERATION && args.includes(env.FAIL_TARGET)) {
+  console.error("controlled target failure"); process.exit(9);
+}
 if (command === "git") console.log(args[0] === "status" ? (env.DIRTY ? " M file" : "") : "${revision}");
 if (command === "gh") {
   if (args[0] === "auth") console.log(env.EMPTY_TOKEN ? "" : "cli-token");
@@ -36,6 +39,12 @@ if (command === "gh") {
     if (env.GH_TOKEN !== "cli-token" || env.GITHUB_TOKEN) throw new Error("wrong API credentials");
     console.log(args.includes("--include") ? "HTTP/2 200\\r\\nX-OAuth-Scopes: " + (env.SCOPES ?? "repo, write:packages") + "\\r\\n\\r\\n{}" : "cli-user");
   }
+}
+if (command === "docker" && args[1] === "bake" && args.includes("--print") && env.PLAN) {
+  console.log(env.PLAN.replaceAll("TAG", env.TAGS));
+}
+if (command === "docker" && args[1] === "imagetools" && args[2] === "inspect") {
+  console.log(JSON.stringify({ mediaType: "application/vnd.oci.image.index.v1+json", digest: "${digest}" }));
 }
 if (command === "docker" && args.includes("--push")) {
   writeFileSync(args[args.indexOf("--metadata-file") + 1], env.METADATA ?? JSON.stringify({ app: {
@@ -104,6 +113,7 @@ async function publish(args: string[] = [], overrides: Record<string, string | u
       SCOPES: undefined,
       FAIL_COMMAND: undefined,
       METADATA: undefined,
+      PLAN: undefined,
       STUB_LOG: log,
       ...overrides,
     },
@@ -157,7 +167,7 @@ test("explicit credentials publish without a gh login and use isolated Docker co
   const push = result.records.find((record) => record.args.includes("--push"))!;
   expect(push.config).toBe(login.config);
   expect(push.builder).toBe(join(result.original, "buildx"));
-  expect(push.tags).toBe(`${revision.slice(0, 12)},latest`);
+  expect(push.tags).toBe(revision.slice(0, 12));
   expect(push.platforms).toBe("linux/amd64");
   expect(result.stdout).toContain(`ghcr.io/arkaydeus/ark-stack@${digest}`);
   expect(result.stdout).not.toContain("explicit-token");
@@ -203,7 +213,9 @@ test("dry run selects tags, platforms and registry without accessing credentials
   expect(
     (await publish(["--dry-run"], { ARK_IMAGE_PLATFORMS: "linux/arm64" })).records.at(-1)?.platforms,
   ).toBe("linux/arm64");
-  expect((await publish(["--dry-run", "--tag", "latest"])).records.at(-1)?.tags).toBe("latest");
+  expect((await publish(["--dry-run", "--tag", "latest"])).records.at(-1)?.tags).toBe(
+    `${revision.slice(0, 12)},latest`,
+  );
 });
 
 test("dirty trees require opt-in, suffix explicit tags and revision, and omit latest", async () => {
@@ -253,7 +265,8 @@ test("command failures propagate and cleanup runs for login, push, and metadata 
     expect(result.code).toBe(1);
     expect(result.stdout).not.toContain("Pushed");
   }
-});
+  // Eight publisher processes, each with stubbed git, gh and docker: more than the 5 s default.
+}, 20_000);
 
 test("metadata produces immutable references for every target and rejects invalid shapes", () => {
   expect(
@@ -325,3 +338,328 @@ test("empty token and empty tag fail directly", async () => {
   expect(result.records.some((record) => record.args[0] === "api")).toBe(false);
   expect((await publish(["--tag", ""])).stderr).toContain("Invalid Docker tag");
 });
+
+const plan = JSON.stringify({
+  target: {
+    app: { tags: ["ghcr.io/arkaydeus/ark-stack:TAG"] },
+    "edge-caddy": { tags: ["ghcr.io/arkaydeus/ark-edge-caddy:TAG"] },
+  },
+});
+
+test("merge verifies every annotated index before promoting latest from its digest", async () => {
+  const tag = revision.slice(0, 12);
+  const result = await publish(["--tag", tag, "--merge", `${tag}-amd64,${tag}-arm64`], {
+    GHCR_TOKEN: "token",
+    GHCR_USER: "user",
+    PLAN: plan,
+  });
+  expect(result.code).toBe(0);
+  expect(result.records.some((record) => record.args.includes("--push"))).toBe(false);
+  const print = result.records.find((record) => record.args.includes("--print"))!;
+  expect(print.tags).toBe(`${tag}-amd64`);
+  const operations = result.records.filter((record) => record.args[1] === "imagetools");
+  expect(operations.map(({ args }) => args[2])).toEqual([
+    "create",
+    "create",
+    "inspect",
+    "inspect",
+    "create",
+    "create",
+  ]);
+  const creates = operations.filter((record) => record.args[2] === "create");
+  expect(creates.map((record) => record.args.slice(3))).toEqual([
+    [
+      "--annotation",
+      "index:org.opencontainers.image.source=https://github.com/arkaydeus/ark-stack",
+      "--tag",
+      `ghcr.io/arkaydeus/ark-stack:${tag}`,
+      `ghcr.io/arkaydeus/ark-stack:${tag}-amd64`,
+      `ghcr.io/arkaydeus/ark-stack:${tag}-arm64`,
+    ],
+    [
+      "--annotation",
+      "index:org.opencontainers.image.source=https://github.com/arkaydeus/ark-stack",
+      "--tag",
+      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}`,
+      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}-amd64`,
+      `ghcr.io/arkaydeus/ark-edge-caddy:${tag}-arm64`,
+    ],
+    [
+      "--prefer-index=false",
+      "--tag",
+      "ghcr.io/arkaydeus/ark-stack:latest",
+      `ghcr.io/arkaydeus/ark-stack@${digest}`,
+    ],
+    [
+      "--prefer-index=false",
+      "--tag",
+      "ghcr.io/arkaydeus/ark-edge-caddy:latest",
+      `ghcr.io/arkaydeus/ark-edge-caddy@${digest}`,
+    ],
+  ]);
+  const login = result.records.find((record) => record.args[0] === "login")!;
+  expect(creates.every((record) => record.config === login.config)).toBe(true);
+  expect(result.stdout).toContain(`ghcr.io/arkaydeus/ark-edge-caddy@${digest}`);
+
+  const noLatest = await publish(["--tag", "v1", "--no-latest", "--merge", "v1-a,v1-b"], {
+    GHCR_TOKEN: "token",
+    GHCR_USER: "user",
+    PLAN: plan,
+  });
+  expect(noLatest.code).toBe(0);
+  expect(noLatest.records.flatMap(({ args }) => args).some((arg) => arg.endsWith(":latest"))).toBe(false);
+});
+
+test("a failure creating or inspecting the second immutable target leaves latest untouched", async () => {
+  for (const operation of ["create", "inspect"]) {
+    const result = await publish(["--tag", "v1", "--merge", "v1-amd64,v1-arm64"], {
+      GHCR_TOKEN: "token",
+      GHCR_USER: "user",
+      PLAN: plan,
+      FAIL_IMAGE_OPERATION: operation,
+      FAIL_TARGET: "ghcr.io/arkaydeus/ark-edge-caddy:v1",
+    });
+    expect(result.code).toBe(1);
+    expect(result.records.flatMap(({ args }) => args).some((arg) => arg.endsWith(":latest"))).toBe(false);
+  }
+});
+
+test("an interrupted latest promotion can be retried using the published tags alone", async () => {
+  const env = { GHCR_TOKEN: "token", GHCR_USER: "user", PLAN: plan };
+  const promotion = ["--tag", "v1", "--promote-latest"];
+  const failed = await publish(promotion, {
+    ...env,
+    FAIL_IMAGE_OPERATION: "create",
+    FAIL_TARGET: "ghcr.io/arkaydeus/ark-edge-caddy:latest",
+  });
+  expect(failed.code).toBe(1);
+  expect(failed.stderr).toContain("Retry with --tag v1 --promote-latest");
+  const retried = await publish(promotion, env);
+  expect(retried.code).toBe(0);
+  const operations = retried.records.filter(({ args }) => args[1] === "imagetools");
+  expect(operations.map(({ args }) => [args[2], args[4]])).toEqual([
+    ["inspect", "--format"],
+    ["inspect", "--format"],
+    ["create", "--tag"],
+    ["create", "--tag"],
+  ]);
+  expect(operations.slice(2).map(({ args }) => args[6])).toEqual([
+    `ghcr.io/arkaydeus/ark-stack@${digest}`,
+    `ghcr.io/arkaydeus/ark-edge-caddy@${digest}`,
+  ]);
+});
+
+test("queued workflow candidates all publish commit tags and only the current main tip promotes", async () => {
+  const workflow = Bun.YAML.parse(
+    await Bun.file(join(import.meta.dir, "../.github/workflows/publish-images.yml")).text(),
+  ) as {
+    concurrency: { group: string; queue: string };
+    jobs: { merge: { steps: { name?: string; if?: string; run?: string }[] } };
+  };
+  expect(workflow.concurrency).toEqual({ group: "publish-images", queue: "max" });
+  const steps = workflow.jobs.merge.steps;
+  const merge = steps.find(({ name }) => name?.startsWith("Merge the platform images"));
+  const promote = steps.find(({ name }) => name?.startsWith("Promote the current main tip"));
+  expect(merge?.run).toBeDefined();
+  expect(promote?.run).toBeDefined();
+  expect(promote?.if).toBe("github.ref == 'refs/heads/main'");
+  const commits = ["a", "b", "c"].map((char) => char.repeat(40));
+  const [first, second, tip] = commits;
+  for (const sha of [first, second, tip, first]) {
+    const child = Bun.spawnSync(
+      [
+        "bash",
+        "-e",
+        "-c",
+        `
+git() { printf '%s\\trefs/heads/main\\n' "$MAIN_TIP"; }
+bun() { printf '%s\\n' "$*"; }
+${merge!.run}
+${promote!.run}
+`,
+      ],
+      { env: { ...process.env, MAIN_TIP: tip, GITHUB_SHA: sha, GITHUB_REPOSITORY_OWNER: "arkaydeus" } },
+    );
+    expect(child.exitCode, child.stderr.toString()).toBe(0);
+    const tag = sha!.slice(0, 12);
+    expect(child.stdout.toString()).toContain(`--tag ${tag} --no-latest --merge ${tag}-amd64,${tag}-arm64`);
+    expect(child.stdout.toString().includes("--promote-latest")).toBe(sha === tip);
+  }
+});
+
+test("merge refuses bad source lists before credentials", async () => {
+  for (const args of [
+    ["--merge", "only-one"],
+    ["--merge", "a,a"],
+    ["--merge", "a,bad/tag"],
+    ["--merge", "a,b", "--dry-run"],
+    ["--tag", "v1", "--merge", "v1,v1-arm64"],
+    ["--tag", "v1", "--merge", "latest,v1-arm64"],
+  ]) {
+    const result = await publish(args, { PLAN: plan });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--merge");
+    expect(result.records.some((record) => record.command === "gh" || record.args[0] === "login")).toBe(
+      false,
+    );
+  }
+});
+
+test("image names come from each target's first tag and reject plans without that tag", () => {
+  expect(
+    imageNames(
+      { target: { b: { tags: ["ghcr.io/x/b:t", "ghcr.io/x/b:latest"] }, a: { tags: ["ghcr.io/x/a:t"] } } },
+      "t",
+    ),
+  ).toEqual([
+    ["a", "ghcr.io/x/a"],
+    ["b", "ghcr.io/x/b"],
+  ]);
+  for (const bad of [
+    null,
+    {},
+    { target: {} },
+    { target: { a: { tags: ["ghcr.io/x/a:other"] } } },
+    { target: { a: {} } },
+  ]) {
+    expect(() => imageNames(bad, "t")).toThrow();
+  }
+});
+
+test.skipIf(process.env.ARK_TEST_IMAGE_REGISTRY !== "1")(
+  "real registry publishes a pullable amd64/arm64 index and preserves provenance during promotion",
+  async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "ark-registry-test-"));
+    fixtures.push(fixture);
+    const docker = async (...args: string[]) => {
+      const child = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+      const [code, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect(code, `docker ${args.join(" ")}\n${stdout}\n${stderr}`).toBe(0);
+      return stdout.trim();
+    };
+    const registry = await docker(
+      "run",
+      "--detach",
+      "--rm",
+      "-p",
+      "127.0.0.1::5000",
+      "registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c",
+    );
+    const builder = `ark-registry-${registry.slice(0, 12)}`;
+    let builderCreated = false;
+    try {
+      const address = await docker("port", registry, "5000/tcp");
+      const endpoint = `http://${address}/v2/`;
+      let ready = false;
+      for (let attempt = 0; attempt < 50 && !ready; attempt++) {
+        ready = await fetch(endpoint).then(
+          (response) => response.ok,
+          () => false,
+        );
+        if (!ready) await Bun.sleep(100);
+      }
+      expect(ready, "disposable registry is reachable").toBe(true);
+      const repository = "ark-publish-test";
+      const name = `${address}/${repository}`;
+      // BuildKit runs beside the daemon, which is inside a VM on Docker Desktop.
+      const ip = await docker(
+        "inspect",
+        "--format",
+        "{{.NetworkSettings.Networks.bridge.IPAddress}}",
+        registry,
+      );
+      await docker(
+        "buildx",
+        "create",
+        "--name",
+        builder,
+        "--driver",
+        "docker-container",
+        "--driver-opt",
+        "network=bridge",
+        "--driver-opt",
+        `env.NO_PROXY=${ip}`,
+      );
+      builderCreated = true;
+      async function getBlob(blobDigest: string) {
+        const response = await fetch(`${endpoint}${repository}/blobs/${blobDigest}`);
+        expect(response.ok, blobDigest).toBe(true);
+        const bytes = await response.arrayBuffer();
+        expect(`sha256:${new Bun.CryptoHasher("sha256").update(bytes).digest("hex")}`).toBe(blobDigest);
+        return bytes;
+      }
+      const tag = revision.slice(0, 12);
+      const architectures = ["amd64", "arm64"];
+      await writeFile(join(fixture, "payload"), "Small image contents\n");
+      await writeFile(join(fixture, "Dockerfile"), "FROM scratch\nCOPY payload /payload\n");
+      for (const arch of architectures) {
+        await docker(
+          "buildx",
+          "build",
+          "--builder",
+          builder,
+          "--platform",
+          `linux/${arch}`,
+          "--provenance=mode=min",
+          "--label",
+          `org.opencontainers.image.revision=${revision}`,
+          "--output",
+          `type=image,name=${ip}:5000/${repository}:${tag}-${arch},push=true,registry.insecure=true`,
+          fixture,
+        );
+      }
+
+      const images = await mergePlatforms(
+        [["test", name]],
+        architectures.map((arch) => `${tag}-${arch}`),
+        tag,
+      );
+      const raw = await docker("buildx", "imagetools", "inspect", "--raw", `${name}:${tag}`);
+      const manifests = JSON.parse(raw).manifests as {
+        digest: string;
+        platform: { architecture: string; os: string };
+        annotations?: Record<string, string>;
+      }[];
+      const platforms = manifests.filter(({ platform }) => platform.os === "linux");
+      expect(platforms.map(({ platform }) => platform.architecture).toSorted()).toEqual(architectures);
+      for (const manifest of platforms) {
+        const arch = manifest.platform.architecture;
+        const ref = `${name}@${manifest.digest}`;
+        const { config, layers } = JSON.parse(await docker("buildx", "imagetools", "inspect", "--raw", ref));
+        const image = JSON.parse(new TextDecoder().decode(await getBlob(config.digest)));
+        expect(image.architecture).toBe(arch);
+        expect(image.config.Labels["org.opencontainers.image.revision"]).toBe(revision);
+        expect(layers).toHaveLength(1);
+        await getBlob(layers[0].digest);
+        const attestation = manifests.find(
+          ({ annotations }) =>
+            annotations?.["vnd.docker.reference.type"] === "attestation-manifest" &&
+            annotations?.["vnd.docker.reference.digest"] === manifest.digest,
+        );
+        expect(attestation).toBeDefined();
+        const provenance = JSON.parse(
+          await docker("buildx", "imagetools", "inspect", "--raw", `${name}@${attestation!.digest}`),
+        );
+        const statement = provenance.layers.find((layer: { annotations?: Record<string, string> }) =>
+          layer.annotations?.["in-toto.io/predicate-type"]?.startsWith("https://slsa.dev/provenance/"),
+        );
+        expect(statement?.mediaType).toBe("application/vnd.in-toto+json");
+        const payload = JSON.parse(new TextDecoder().decode(await getBlob(statement.digest)));
+        expect(payload.predicateType).toBe(statement.annotations["in-toto.io/predicate-type"]);
+      }
+      await promoteLatest(images, tag);
+      expect(await docker("buildx", "imagetools", "inspect", "--raw", `${name}:latest`)).toBe(raw);
+    } finally {
+      try {
+        if (builderCreated) await docker("buildx", "rm", builder);
+      } finally {
+        await docker("stop", registry);
+      }
+    }
+  },
+  120_000,
+);

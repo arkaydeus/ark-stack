@@ -42,8 +42,10 @@ export interface TailscaleKeySource {
    * asks and applies it). Without it, setup prints `policyInstructions` and waits for the owner.
    */
   preparePolicy?(options?: { enrolled?: boolean; offerCredential?: boolean }): Promise<void>;
+  /** Collect a manual answer before installation, or defer acquisition to enrolment. */
+  collect?(request: KeyRequest): Promise<{ acquired: AcquiredKey | undefined } | undefined>;
   /** Returns a key, or `undefined` when an optional key was declined. */
-  acquire(request: KeyRequest): Promise<AcquiredKey | undefined>;
+  acquire(request: KeyRequest, options?: { allowPrompt?: boolean }): Promise<AcquiredKey | undefined>;
 }
 
 export function tailnetPolicyInstructions({ backup = false }: { backup?: boolean } = {}) {
@@ -84,10 +86,14 @@ export function manualKeySource({
   interactive: boolean;
   backup?: boolean;
 }): TailscaleKeySource {
-  return {
+  const source: TailscaleKeySource = {
     id: "manual",
     policyInstructions: () => tailnetPolicyInstructions({ backup }),
-    async acquire(request) {
+    async collect(request) {
+      ui.print(`      Asking for the ${request.tag} key now, so the rest of setup can run unattended.`);
+      return { acquired: await source.acquire(request) };
+    },
+    async acquire(request, { allowPrompt = true } = {}) {
       if (request.tag === ARK_VPS_TAG && env.TS_VPS_AUTHKEY_FILE?.trim()) {
         return { file: env.TS_VPS_AUTHKEY_FILE.trim() };
       }
@@ -97,7 +103,7 @@ export function manualKeySource({
           throw new Error(`${request.variable} must be a Tailscale auth key (tskey-…).`);
         return { key: supplied };
       }
-      if (!interactive) {
+      if (!interactive || !allowPrompt) {
         if (request.optional) return undefined;
         const alternatives =
           request.tag === ARK_VPS_TAG ? `${request.variable} or TS_VPS_AUTHKEY_FILE` : request.variable;
@@ -115,4 +121,5 @@ export function manualKeySource({
       }
     },
   };
+  return source;
 }
