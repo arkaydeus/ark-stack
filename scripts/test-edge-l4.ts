@@ -2516,9 +2516,18 @@ async function targetedHttpWithdrawalTest(
     sibling.end();
     await fixture?.sql.end();
   }
-  if (trigger === "expiry") {
-    // TEMPORARY DIAGNOSTIC: timestamps and proxy logs for the expiry window.
-    console.log(`DIAG expiry window since ${diagSince}; errors: ${JSON.stringify(traffic.errors)}`);
+  {
+    // TEMPORARY DIAGNOSTIC: timestamps and abnormal HAProxy terminations for each window.
+    console.log(`DIAG ${trigger} window since ${diagSince}; errors: ${JSON.stringify(traffic.errors)}`);
+    const l4 = await runtime
+      .dockerOutput("logs", "--timestamps", "--since", diagSince, stack.edgeL4)
+      .catch(() => ({ stdout: "", stderr: "" }));
+    const abnormal = `${l4.stdout}\n${l4.stderr}`
+      .split("\n")
+      .filter((line) => / fe_tls443 /.test(line) && !/ -- \d/.test(line));
+    console.log(`DIAG ${trigger} abnormal fe_tls443 lines:\n${abnormal.join("\n")}`);
+  }
+  if (traffic.errors.length) {
     for (const [label, name] of [
       ["edge-l4", stack.edgeL4],
       ["edge", stack.edge],
@@ -2735,7 +2744,18 @@ try {
   await run("FD-09: apex redirect and the :80 list", fd09RedirectTest);
   await run("HTTP coordinator census and publication", coordinatorHttpPublicationTest);
   // TEMPORARY DIAGNOSTIC: repeat expiry to catch the intermittent continuity failure, then stop.
-  for (const trigger of ["expiry", "expiry", "expiry", "expiry", "expiry", "expiry"] as const)
+  for (const trigger of [
+    "identity",
+    "expiry",
+    "identity",
+    "expiry",
+    "identity",
+    "expiry",
+    "identity",
+    "expiry",
+    "identity",
+    "expiry",
+  ] as const)
     await run(`HTTP targeted withdrawal: ${trigger}`, (report) =>
       targetedHttpWithdrawalTest(report, trigger),
     );
