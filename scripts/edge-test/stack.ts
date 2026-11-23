@@ -10,10 +10,9 @@ import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
 import type { EdgeTestRuntime } from "./runtime.ts";
+import { bunImage } from "../test-images.ts";
 
 export const composeFile = join(import.meta.dir, "..", "..", "infra", "platform", "docker-compose.yml");
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 
 export type EdgeStackOptions = {
   runtime: EdgeTestRuntime;

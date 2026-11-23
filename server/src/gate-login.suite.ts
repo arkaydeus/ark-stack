@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 
 import { prepareEdgeImage } from "../../scripts/edge-test/edge-image.ts";
+import { bunImage } from "../../scripts/test-images.ts";
 
 import { GATE_EDGE_API_PATHS, createId, privilegedRequestHash, renderCaddyfile } from "@ark-stack/shared";
 import { createAuthEndpoint } from "better-auth/api";
@@ -661,7 +662,7 @@ describe("trusted client address and sign-in rate limit", () => {
             name,
             "--network",
             network,
-            "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61",
+            bunImage,
             "bun",
             "-e",
             "setInterval(() => {}, 1000)",

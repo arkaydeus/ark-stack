@@ -40,6 +40,7 @@ import postgres from "postgres";
 import { watchListener } from "./edge-test/listener.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 import { type EdgeStack, httpRouterArgs, startEdgeStack } from "./edge-test/stack.ts";
+import { bunImage } from "./test-images.ts";
 
 const root = resolve(import.meta.dir, "..");
 if (!process.env.DATABASE_URL && existsSync(join(root, ".env"))) {
@@ -51,8 +52,6 @@ if (!sourceUrl || !["localhost", "127.0.0.1", "::1"].includes(new URL(sourceUrl)
   process.exit(1);
 }
 
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const fixtures = join(import.meta.dir, "edge-test");
 const suffix = `${process.pid}-${randomBytes(4).toString("hex")}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-edge-observer-${suffix}-`));

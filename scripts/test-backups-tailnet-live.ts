@@ -31,6 +31,7 @@ import { REST_SERVER_IMAGE } from "./backup-test/minio.ts";
 import { composePath } from "./backup-test/tailnet-compose.ts";
 import { createWorkVolume } from "./backup-test/work-volume.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
+import { bunImage } from "./test-images.ts";
 
 const backupKey = process.env.ARK_TEST_TS_BACKUP_AUTHKEY?.trim() ?? "";
 const homeKey = process.env.ARK_TEST_TS_HOME_AUTHKEY?.trim() ?? "";
@@ -49,8 +50,6 @@ const tailnetName = process.env.ARK_TEST_TS_TAILNET?.trim() || "-";
 
 const tailscaleImage =
   "tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2";
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const suffix = randomBytes(4).toString("hex");
 const project = `ark-fd30-live-${suffix}`;
 const work = await mkdtemp(join(tmpdir(), `${project}-`));

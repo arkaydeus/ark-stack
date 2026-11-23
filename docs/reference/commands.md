@@ -4,7 +4,7 @@ This page lists every mise task in `mise.toml`, grouped by purpose, with what ea
 
 ## How tasks run
 
-All project commands are mise tasks. `mise.toml` pins the toolchain (`bun` 1.4.2 and `go` 1.25.1), so `mise install` (or `mise run setup`) gives every machine the same versions. Run `mise trust` once in a fresh checkout so mise will read the file.
+All project commands are mise tasks. `mise.toml` pins the toolchain (`bun` 1.4.4 and `go` 1.25.1), so `mise install` (or `mise run setup`) gives every machine the same versions. Run `mise trust` once in a fresh checkout so mise will read the file.
 
 ```sh
 mise tasks              # list every task with its description

@@ -56,10 +56,9 @@ import { prepareEdgeImage } from "../edge-test/edge-image.ts";
 import { EdgeTestRuntime } from "../edge-test/runtime.ts";
 import type { Subprocess } from "bun";
 import type { ProbeCredential } from "../ipv6-preflight-probe.ts";
+import { bunImage } from "../test-images.ts";
 
 const root = resolve(import.meta.dir, "../..");
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const pgImage = "postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929";
 const pebbleImage =
   "ghcr.io/letsencrypt/pebble:2.10.3@sha256:0c81f05db371f436c97fb894bd6d2ab8fc9c8e2ce40f8bef8a8e15941bcd75ef";

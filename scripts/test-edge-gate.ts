@@ -32,7 +32,8 @@ import { connect as tlsConnect } from "node:tls";
 
 import { planEdge, type EdgeHttpRoute } from "@ark-stack/shared";
 
-import { bunImage, cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from "./edge-test/gate-edge.ts";
+import { cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from "./edge-test/gate-edge.ts";
+import { bunImage } from "./test-images.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 
 const fixtures = join(import.meta.dir, "edge-test");

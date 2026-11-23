@@ -7,6 +7,8 @@ import { spawn } from "node:child_process";
 import { generateInstallSecrets } from "@ark-stack/shared";
 import postgres from "postgres";
 
+import { bunImage } from "./test-images.ts";
+
 const sourceUrl = process.env.DATABASE_URL;
 if (!sourceUrl) throw new Error("DATABASE_URL is required for the upgrade migration test.");
 const parsed = new URL(sourceUrl);
@@ -60,7 +62,7 @@ async function startIngress() {
   // build cache. A separate netns keeps this upgrade from touching the host firewall.
   await docker(
     ["build", "--quiet", "-t", ingressImage, "-"],
-    `FROM oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61
+    `FROM ${bunImage}
 RUN apt-get update \
   && apt-get install -y --no-install-recommends nftables iproute2 \
   && rm -rf /var/lib/apt/lists/*

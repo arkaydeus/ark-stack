@@ -140,7 +140,7 @@ In development Vite proxies `/api` to `127.0.0.1:3000`. In production the API se
 
 | Area                        | Choice                                                                  | Version (pinned)                      |
 | --------------------------- | ----------------------------------------------------------------------- | ------------------------------------- |
-| Runtime and package manager | Bun                                                                     | 1.4.2 (`mise.toml`, `packageManager`) |
+| Runtime and package manager | Bun                                                                     | 1.4.4 (`mise.toml`, `packageManager`) |
 | Language                    | TypeScript, strict                                                      | 5.9.3                                 |
 | HTTP framework              | Hono                                                                    | 4.13.18                               |
 | Authentication              | Better Auth with the two-factor plugin                                  | 1.7.25                                |

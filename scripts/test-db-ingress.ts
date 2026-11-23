@@ -17,10 +17,9 @@ import {
   renderFrontIngress,
   type IngressCounterSnapshot,
 } from "@ark-stack/shared";
+// The Dockerfile runtime stage pin, which the database-ingress image builds on.
+import { bunImage } from "./test-images.ts";
 
-// Same pin as the Dockerfile runtime stage, which the database-ingress image builds on.
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 // Same pin as infra/monitoring/docker-compose.yml.
 const prometheusImage =
   "prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996";

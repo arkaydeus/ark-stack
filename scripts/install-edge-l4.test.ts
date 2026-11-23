@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { hashGenerationDir } from "@ark-stack/shared";
 
 import { checkImageIds, composeImages, seedEdgeL4 } from "./install-edge-l4.ts";
+import { bunImage } from "./test-images.ts";
 
 const root = join(import.meta.dir, "..");
 
@@ -42,7 +43,7 @@ test("reads the pinned HAProxy and Bun images from the shipped files", async () 
   expect(images.haproxy).toBe(
     "haproxy:3.2.26-alpine@sha256:1c3568e520453cc8ba98c39501febcf450429c80e6cc27ecad779961d76e597c",
   );
-  expect(images.bun).toMatch(/^oven\/bun:1\.4\.2-slim@sha256:[a-f0-9]{64}$/);
+  expect(images.bun).toBe(bunImage);
 });
 
 test("maintenance initializes a pre-FD-25 tree and converts both persisted Caddy variants idempotently", async () => {

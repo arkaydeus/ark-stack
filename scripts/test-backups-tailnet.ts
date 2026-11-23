@@ -52,10 +52,9 @@ import { startControlDb, testNetworkBase, type ControlDb } from "./backup-test/h
 import { REST_SERVER_IMAGE, startMinio, type MinioFixture } from "./backup-test/minio.ts";
 import { loadCompose, tailnetComposeClaims, composePath } from "./backup-test/tailnet-compose.ts";
 import { createWorkVolume } from "./backup-test/work-volume.ts";
+import { bunImage } from "./test-images.ts";
 
 const root = resolve(import.meta.dir, "..");
-const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 
 const suffix = randomBytes(4).toString("hex");
 const project = `ark-fd30-${suffix}`;

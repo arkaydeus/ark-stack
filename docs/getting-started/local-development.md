@@ -19,7 +19,7 @@ Embedded workers run the same job handlers as the worker containers, inside the 
 
 ## Prerequisites
 
-- [mise](https://mise.jdx.dev), which installs the pinned toolchain from `mise.toml`: Bun 1.4.2 and Go 1.25.1.
+- [mise](https://mise.jdx.dev), which installs the pinned toolchain from `mise.toml`: Bun 1.4.4 and Go 1.25.1.
 - Docker with Compose v2, for the PostgreSQL containers and for most integration tests.
 - OpenSSL on the `PATH`. The installer and the development certificate fallback call it.
 - `nc` (netcat) on the `PATH` to check the published database ports.

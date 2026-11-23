@@ -14,9 +14,8 @@ import type { EdgeLeaseDocument, EdgePolicyRoute, WatchdogEvent } from "@ark-sta
 
 import type { EdgeTestRuntime } from "./runtime.ts";
 import { type EdgeStack, httpRouterArgs, startEdgeStack } from "./stack.ts";
+import { bunImage } from "../test-images.ts";
 
-export const bunImage =
-  "oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61";
 const fixtures = import.meta.dir;
 const root = resolve(import.meta.dir, "..", "..");
 
