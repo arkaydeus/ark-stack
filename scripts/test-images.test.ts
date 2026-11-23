@@ -144,7 +144,7 @@ describe("Bun pins", () => {
   });
 
   test("the docs name the pinned Bun version", () => {
-    // "Bun 1.4.4", "`bun` 1.4.4" and the "| Bun | 1.4.4" toolchain table row.
+    // "Bun 1.4.5", "`bun` 1.4.5" and the "| Bun | 1.4.5" toolchain table row.
     const mentions = find(/\bbun`?[\s|]*(\d+\.\d+\.\d+)\b/i, (file) => file.endsWith(".md"));
     expect(mentions.length).toBeGreaterThan(0);
     expect(mentions.filter((match) => match.groups[0] !== bunVersion).map(where)).toEqual([]);

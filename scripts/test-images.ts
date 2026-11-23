@@ -4,4 +4,4 @@
 // it, or if any other Bun pin in the repository (mise, packageManager, CI, the Dockerfile's default
 // and Alpine stages) names a different Bun version.
 export const bunImage =
-  "oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4";
+  "oven/bun:1.4.5-slim@sha256:b780593f3e10918cbdaec3d5a08d52224b9198069a65eb47812085c2ec007643";
