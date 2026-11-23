@@ -39,9 +39,9 @@ for (const file of trackedFiles) {
 
 type Match = { file: string; line: number; value: string; groups: string[] };
 
-function find(pattern: RegExp, only?: (file: string) => boolean): Match[] {
+function find(pattern: RegExp, only?: (file: string) => boolean, sources = files): Match[] {
   const matches: Match[] = [];
-  for (const [file, text] of files) {
+  for (const [file, text] of sources) {
     if (only && !only(file)) continue;
     for (const match of text.matchAll(new RegExp(pattern.source, `${pattern.flags.replace("g", "")}g`))) {
       matches.push({
@@ -57,8 +57,18 @@ function find(pattern: RegExp, only?: (file: string) => boolean): Match[] {
 
 const where = (match: Match) => `${match.file}:${match.line} ${match.value}`;
 
-// oven/bun:<tag> optionally followed by @sha256:<digest>.
-const imageReferences = find(/oven\/bun:([0-9A-Za-z._-]+)(?:@sha256:([0-9a-f]{64}))?/);
+// Match tagged image literals, including slash and dot escapes in regular expression source.
+const taggedBunImage = /oven\\?\/bun:((?:[0-9A-Za-z._-]|\\\.)+)(?:@sha256:([0-9a-f]{64}))?/;
+const imageReferences = find(taggedBunImage);
+const isDockerfile = (file: string) => /(^|\/)Dockerfile[^/]*$/.test(file);
+
+function untaggedDockerImages(sources = files): Match[] {
+  return find(
+    /^[\t ]*(?:FROM[\t ]+(?:--platform=\S+[\t ]+)?|COPY[\t ]+(?:--\S+[\t ]+)*?--from=)(oven\/bun(?:@\S+)?)(?=\s|$)/im,
+    isDockerfile,
+    sources,
+  );
+}
 
 describe("Bun pins", () => {
   test("finds the pins it checks", () => {
@@ -73,6 +83,14 @@ describe("Bun pins", () => {
     expect(literals.map(where)).toEqual([]);
   });
 
+  test("finds a Bun image in escaped regex source", () => {
+    const tag = bunImage.split("@")[0]!.replaceAll("/", "\\/").replaceAll(".", "\\.");
+    const source = `expect(image).toMatch(/^${tag}@sha256:[a-f0-9]{64}$/);`;
+    expect(find(taggedBunImage, undefined, new Map([["fixture.ts", source]])).map(where)).toEqual([
+      `fixture.ts:1 ${tag}`,
+    ]);
+  });
+
   test("every literal slim pin matches the shared Bun image", () => {
     const slim = imageReferences.filter((match) => match.groups[0]!.endsWith("-slim"));
     expect(slim.length).toBeGreaterThan(0);
@@ -85,7 +103,8 @@ describe("Bun pins", () => {
   });
 
   test("Dockerfiles pin every oven/bun image by digest, one digest per tag", () => {
-    const dockerfileReferences = imageReferences.filter((match) => /(^|\/)Dockerfile[^/]*$/.test(match.file));
+    expect(untaggedDockerImages().map(where)).toEqual([]);
+    const dockerfileReferences = imageReferences.filter((match) => isDockerfile(match.file));
     expect(dockerfileReferences.filter((match) => match.groups[1] === "").map(where)).toEqual([]);
     const digests = new Map<string, Set<string>>();
     for (const reference of imageReferences.filter((match) => match.groups[1] !== "")) {
@@ -96,6 +115,18 @@ describe("Bun pins", () => {
       .filter(([, set]) => set.size > 1)
       .map(([tag, set]) => `${tag}: ${[...set].join(", ")}`);
     expect(mixed).toEqual([]);
+  });
+
+  test("finds untagged Dockerfile sources alongside a pinned stage", () => {
+    const source = [
+      `FROM ${bunImage} AS pinned`,
+      "FROM oven/bun AS unpinned",
+      "COPY --chown=1000 --from=oven/bun /usr/local/bin/bun /bin/bun",
+    ].join("\n");
+    expect(untaggedDockerImages(new Map([["Dockerfile", source]])).map(where)).toEqual([
+      "Dockerfile:2 FROM oven/bun",
+      "Dockerfile:3 COPY --chown=1000 --from=oven/bun",
+    ]);
   });
 
   test("the toolchain, package manager and CI use the same Bun version", () => {
