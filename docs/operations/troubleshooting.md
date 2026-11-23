@@ -114,7 +114,7 @@ Details are in [Login gate for SSO routes](../operating.md#login-gate-for-sso-ro
 ### "Gate revocation not applied within 5 s; the edge withdrew route(s) …"
 
 - **Cause:** a revocation (a user removed from a route, a gate user deleted, an HTTP mTLS certificate revoked) queued an `edge.drain` that did not finish in time, so the watchdog withdrew the route. The alert key is `gate-revocation-overdue`.
-- **Fix:** check the `edge.drain` operations with `reason: gate_revocation` and the domain worker. Drains retry with backoff from 10 seconds to 5 minutes; the route returns after a successful drain and reload.
+- **Fix:** check the `edge.drain` operations with `reason: gate_revocation` and the domain worker. Drains retry with backoff from 10 seconds to 5 minutes. After the drain completes, the queued apply restores the route once the watchdog verifies the applied journal on both proxies.
 
 ## Domains, DNS and certificates
 

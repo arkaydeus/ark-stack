@@ -11,22 +11,80 @@
 //   bun write-edge.js load-without-revalidate   (control: /adapt + /load without Cache-Control)
 import { join } from "node:path";
 
-import { servedHttpHostnames, servedHttpRoutes, sha256Hex } from "@ark-stack/shared";
+import {
+  caddyTailnetRouteKeys,
+  servedHttpHostnames,
+  servedHttpRoutes,
+  sha256Hex,
+  type EdgeWatchdogHealth,
+} from "@ark-stack/shared";
 import { writeEdgeL4 } from "../../server/src/modules/edge-l4.ts";
 import { writeEdge } from "../../server/src/modules/providers.ts";
 
 const [mode, input] = process.argv.slice(2);
 
 if (mode === "coordinator") {
-  const { kind, enqueue: create, failCensus, acknowledgeIngress } = JSON.parse(input ?? "{}");
+  const {
+    kind,
+    enqueue: create,
+    failCensus,
+    acknowledgeIngress,
+    holdLoadFor,
+  } = JSON.parse(input ?? "{}") as {
+    kind?: string;
+    enqueue?: boolean;
+    failCensus?: boolean;
+    acknowledgeIngress?: boolean;
+    holdLoadFor?: { identity: string; allowed: number };
+  };
   if (kind !== "edge.drain" && kind !== "edge.l4_apply" && kind !== "edge.apply")
     throw new Error("Unexpected edge operation");
   const { enqueue, processQueued } = await import("../../server/src/coordinator.ts");
   const { sql } = await import("../../server/src/db.ts");
-  const fault = failCensus
-    ? Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null, { status: 503 }) })
-    : null;
-  if (fault) process.env.ARK_EDGE_RELOAD_URL = fault.url.origin;
+  const caddy = process.env.ARK_EDGE_RELOAD_URL!;
+  const admin =
+    failCensus || holdLoadFor
+      ? Bun.serve({
+          hostname: "127.0.0.1",
+          port: 0,
+          async fetch(request) {
+            if (failCensus) return new Response(null, { status: 503 });
+            const path = new URL(request.url).pathname;
+            const body = request.method === "GET" ? undefined : await request.text();
+            const headers = new Headers(request.headers);
+            headers.delete("host");
+            const response = await fetch(new URL(path, caddy), { method: request.method, headers, body });
+            if (holdLoadFor && path === "/load" && body && response.ok) {
+              // Caddy has committed the forced load, but the domain worker is still awaiting its
+              // response and cannot mark the revocation applied. Run a watchdog pass in that window.
+              const loadedAt = Date.now();
+              const deadline = performance.now() + 8_000;
+              let denied = false;
+              while (!denied && performance.now() < deadline) {
+                const watchdog = await fetch(new URL("/v1/health", process.env.ARK_EDGE_WATCHDOG_URL!), {
+                  signal: AbortSignal.timeout(1_000),
+                });
+                const health = (await watchdog.json()) as EdgeWatchdogHealth;
+                const tick = health.proxies.caddy?.lastTick;
+                denied = Boolean(
+                  tick?.verified &&
+                  tick.policy.leaseValid &&
+                  Date.parse(tick.policy.observedAt ?? "") > loadedAt &&
+                  tick.policy.allowed === holdLoadFor.allowed,
+                );
+                if (!denied) await Bun.sleep(100);
+              }
+              if (!denied)
+                throw new Error("The watchdog did not enforce the overdue lease during the forced load.");
+              if (caddyTailnetRouteKeys(JSON.parse(body)).includes(holdLoadFor.identity)) {
+                throw new Error("The forced load exposed a handler while its gate revocation was overdue.");
+              }
+            }
+            return response;
+          },
+        })
+      : null;
+  if (admin) process.env.ARK_EDGE_RELOAD_URL = admin.url.origin;
   // This fixture has no host firewall reconciler. Acknowledge only the exact rendered request.
   const ingress = process.env.ARK_FRONT_INGRESS_DIR;
   let acknowledged = "";
@@ -62,7 +120,7 @@ if (mode === "coordinator") {
     console.log(JSON.stringify({ ...finished, evidence: steps[0]?.evidence ?? null }));
   } finally {
     clearInterval(timer);
-    await fault?.stop(true);
+    await admin?.stop(true);
     await sql.end();
   }
 } else if (mode === "write" || mode === "write-routed") {

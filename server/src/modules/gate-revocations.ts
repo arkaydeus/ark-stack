@@ -9,8 +9,8 @@
 // fields on `user`, so a revocation made by Better Auth, a cascade or a script is journalled exactly like one made here.
 //
 // - The drain snapshots pending rows, fences and drains the affected HAProxy backends before
-//   and after a forced Caddy load, then marks those rows applied. The next HAProxy generation
-//   re-admits routes whose revocations have been applied.
+//   and after a forced Caddy load, then marks those rows applied. A queued apply restores Caddy
+//   handlers and HAProxy admission after the watchdog has enforced the applied journal revision.
 // - Claims retry pending work with exponential backoff from 10 s to 5 min.
 // - A row pending longer than 5 s takes its route out of the watchdog lease. The watchdog
 //   fences the backend and closes its existing sessions, and the API raises a critical alert.
@@ -18,7 +18,9 @@
 import {
   GATE_REVOCATION_DEADLINE_MS,
   routesAfterRevocations,
+  sha256Hex,
   type EdgeLeaseDocument,
+  type EdgeWatchdogHealth,
   type PendingGateRevocation,
 } from "@ark-stack/shared";
 
@@ -28,18 +30,56 @@ import { edgePolicy } from "./edge-observe.ts";
 
 export const GATE_REVOCATION_ALERT = "gate-revocation-overdue";
 
-/** Revocations whose route drain is still pending, oldest first. */
-export async function pendingGateRevocations(): Promise<PendingGateRevocation[]> {
+/** Read the pending revocations and the latest applied revision from a single database snapshot. */
+export async function gateRevocationState() {
   const rows = await sql`
-    SELECT id, route_id, created_at FROM gate_revocations
+    SELECT id, route_id, created_at, false AS applied FROM gate_revocations
     WHERE applied_at IS NULL
+    UNION ALL (
+      SELECT id, route_id, created_at, true AS applied FROM gate_revocations
+      WHERE applied_at IS NOT NULL ORDER BY applied_at DESC, id DESC LIMIT 1
+    )
     ORDER BY created_at
   `;
-  return rows.map((row) => ({
-    id: String(row.id),
-    routeId: String(row.route_id),
-    createdAt: new Date(row.created_at as string).toISOString(),
-  }));
+  const latest = rows.find((row) => row.applied);
+  return {
+    revision: latest ? sha256Hex(String(latest.id)) : null,
+    pending: rows
+      .filter((row) => !row.applied)
+      .map((row): PendingGateRevocation => ({
+        id: String(row.id),
+        routeId: String(row.route_id),
+        createdAt: new Date(row.created_at as string).toISOString(),
+      })),
+  };
+}
+
+/** Wait until neither proxy can be working on an allowlist that predates this drain. */
+export async function waitForGateRecovery(revision: string, watchdogUrl: string, scoped: boolean) {
+  const url = new URL("/v1/health", watchdogUrl);
+  const deadline = performance.now() + 10_000;
+  const proxies = scoped ? ["caddy", "haproxy"] : ["caddy"];
+  for (let remaining = 10_000; remaining > 0; remaining = Math.floor(deadline - performance.now())) {
+    try {
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(Math.min(1_000, remaining)),
+      });
+      if (response.ok) {
+        const health = (await response.json()) as EdgeWatchdogHealth;
+        if (
+          proxies.every((name) => {
+            const pass = health.proxies?.[name]?.lastTick;
+            return pass?.verified && pass.policy?.leaseValid && pass.policy.gateRecovery === revision;
+          })
+        )
+          return;
+      }
+    } catch {
+      // A restarted or temporarily unavailable watchdog must acknowledge the revision before admission.
+    }
+    await Bun.sleep(Math.max(0, Math.min(100, deadline - performance.now())));
+  }
+  throw new Error("The edge watchdog did not verify the applied gate revocation policy.");
 }
 
 /** Marks revocations applied after the affected sessions have closed and Caddy has loaded. */
@@ -69,7 +109,7 @@ export async function ensureGateRevocationDrain() {
  */
 export async function edgeLeaseDocument(now = new Date()): Promise<EdgeLeaseDocument> {
   const policy = await edgePolicy(now);
-  const pending = await pendingGateRevocations();
+  const { pending, revision } = await gateRevocationState();
   const { routes, overdue } = routesAfterRevocations(policy.routes, pending, now);
   if (overdue.length) {
     const late = await sql`
@@ -89,6 +129,7 @@ export async function edgeLeaseDocument(now = new Date()): Promise<EdgeLeaseDocu
   return {
     ...policy,
     routes,
+    gateRecovery: revision,
     revocations: pending.map((item) => ({
       ...item,
       overdue: overdue.includes(item.routeId),

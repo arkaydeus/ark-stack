@@ -22,7 +22,8 @@ export class EdgeTestRuntime {
     readonly ownershipImage?: string,
   ) {}
 
-  private async execute(args: string[]) {
+  private async execute(args: string[], signal?: AbortSignal) {
+    signal?.throwIfAborted();
     // The live-tailnet runner sets TS_EDGE_AUTHKEY after startup. Pass the current environment,
     // rather than Bun.spawn's launch-time default, so Compose receives the accepted key.
     const child = Bun.spawn(["docker", ...args], {
@@ -30,18 +31,40 @@ export class EdgeTestRuntime {
       stdout: "pipe",
       stderr: "pipe",
     });
-    const [status, stdout, stderr] = await Promise.all([
+    const output = Promise.all([
       child.exited,
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
     ]);
-    if (status !== 0) throw new Error(`docker ${args[0]} failed: ${stderr.trim().slice(0, 2000)}`);
-    return { stdout, stderr };
+    let cancel: (() => void) | undefined;
+    try {
+      const [status, stdout, stderr] = signal
+        ? await Promise.race([
+            output,
+            new Promise<never>((_, reject) => {
+              cancel = () => {
+                child.kill("SIGKILL");
+                reject(signal.reason);
+              };
+              signal.addEventListener("abort", cancel, { once: true });
+            }),
+          ])
+        : await output;
+      if (status !== 0) throw new Error(`docker ${args[0]} failed: ${stderr.trim().slice(0, 2000)}`);
+      return { stdout, stderr };
+    } finally {
+      if (cancel) signal?.removeEventListener("abort", cancel);
+      if (signal?.aborted) await child.exited;
+    }
   }
 
   async dockerOutput(...args: string[]) {
+    return this.runDocker(args);
+  }
+
+  private async runDocker(args: string[], signal?: AbortSignal) {
     if (this.stopping) throw new Error("Edge test is shutting down.");
-    const command = this.execute(args);
+    const command = this.execute(args, signal);
     this.pending.add(command);
     try {
       return await command;
@@ -52,6 +75,10 @@ export class EdgeTestRuntime {
 
   async docker(...args: string[]) {
     return (await this.dockerOutput(...args)).stdout.trim();
+  }
+
+  async dockerWithSignal(signal: AbortSignal, ...args: string[]) {
+    return (await this.runDocker(args, signal)).stdout.trim();
   }
 
   async dumpLogs() {

@@ -10,7 +10,13 @@ import { randomBytes } from "node:crypto";
 import { chmod, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
-import type { EdgeLeaseDocument, EdgePolicyRoute, WatchdogEvent } from "@ark-stack/shared";
+import type {
+  CompletedEdgePass,
+  EdgeLeaseDocument,
+  EdgePolicyRoute,
+  EdgeWatchdogHealth,
+  WatchdogEvent,
+} from "@ark-stack/shared";
 
 import type { EdgeTestRuntime } from "./runtime.ts";
 import { type EdgeStack, httpRouterArgs, startEdgeStack } from "./stack.ts";
@@ -21,17 +27,45 @@ const root = resolve(import.meta.dir, "..", "..");
 
 export async function waitFor<T>(
   what: string,
-  attempt: () => Promise<T | undefined>,
+  attempt: (remainingMs: number) => Promise<T | undefined>,
   timeoutMs = 30_000,
   stepMs = 200,
 ) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = await attempt().catch(() => undefined);
-    if (value !== undefined) return value;
-    await Bun.sleep(stepMs);
+  const deadline = performance.now() + timeoutMs;
+  for (let remaining = timeoutMs; remaining > 0; remaining = Math.floor(deadline - performance.now())) {
+    const value = await attempt(remaining).catch(() => undefined);
+    if (value !== undefined && performance.now() <= deadline) return value;
+    await Bun.sleep(Math.max(0, Math.min(stepMs, deadline - performance.now())));
   }
   throw new Error(`Timed out after ${timeoutMs} ms waiting for ${what}.`);
+}
+
+/** Every seeded route has one identity. A count of all routes proves the fixture route was allowed. */
+export function settledGatePass(
+  tick: CompletedEdgePass | null | undefined,
+  since: number,
+  routeCount: number,
+) {
+  return !!(
+    tick?.verified &&
+    tick.withdrawn === 0 &&
+    tick.policy.leaseValid &&
+    tick.policy.allowed === routeCount &&
+    tick.policy.observedAt &&
+    Date.parse(tick.policy.observedAt) > since
+  );
+}
+
+export async function gateWatchdogHealth(runtime: EdgeTestRuntime, container: string, remainingMs: number) {
+  const output = await runtime.dockerWithSignal(
+    AbortSignal.timeout(Math.min(3_000, remainingMs)),
+    "exec",
+    container,
+    "bun",
+    "--eval",
+    'console.log(JSON.stringify(await (await fetch("http://127.0.0.1:2021/v1/health", {signal: AbortSignal.timeout(2000)})).json()))',
+  );
+  return JSON.parse(output) as EdgeWatchdogHealth;
 }
 
 /** The simulated tailnet network of a run: not one of the runtime's own resources. */

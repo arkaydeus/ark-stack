@@ -236,6 +236,8 @@ services:
       ARK_IPV6_DOCKER_SNAPSHOT: /var/lib/ark/ipv6/snapshot.json
       ARK_IPV6_HOST_SNAPSHOT: /var/lib/ark/db-ingress/ipv6-host.json
       ARK_DOMAIN_WORKER_PORT: "3102"
+      # Gate recovery waits for both proxies to enforce the applied revocation journal.
+      ARK_EDGE_WATCHDOG_URL: http://edge-watchdog:2021
       # edge.observe reads the edge node's LocalAPI status through this socket (front door §3.6).
       ARK_EDGE_TS_SOCKET: /var/run/tailscale/tailscaled.sock
       # edge.l4_apply (front door §3.8.6, FD-25): writes immutable generations, has the restricted

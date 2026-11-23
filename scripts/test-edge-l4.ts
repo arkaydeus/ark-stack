@@ -50,8 +50,10 @@ import {
   locationPolicy,
   planEdge,
   routeIdentityKey,
+  routesAfterRevocations,
   servedHttpHostnames,
   servedHttpRoutes,
+  sha256Hex,
   type EdgeHttpRoute,
   type EdgeLeaseDocument,
   type EdgePolicyRoute,
@@ -220,6 +222,7 @@ const lease = {
   routes: [webRoute, mqttRoute, ...fd09Policy] as EdgePolicyRoute[],
 };
 const events: WatchdogEvent[] = [];
+let journalPolicy: ((document: EdgeLeaseDocument) => Promise<EdgeLeaseDocument>) | undefined;
 const api = Bun.serve({
   hostname: "0.0.0.0",
   port: 0,
@@ -242,7 +245,7 @@ const api = Bun.serve({
         },
         routes: valid ? lease.routes : [],
       };
-      return Response.json(document);
+      return Response.json(journalPolicy ? await journalPolicy(document) : document);
     }
     if (pathname === "/api/internal/edge/watchdog-event") {
       events.push((await request.json()) as WatchdogEvent);
@@ -2190,7 +2193,20 @@ async function coordinatorFixture() {
     // same mount: the host user (uid 1001 on GitHub runners) cannot read them.
     return {
       sql,
-      async run(kind: "edge.drain" | "edge.l4_apply", { enqueue = true, failCensus = false } = {}) {
+      async run(
+        kind: "edge.drain" | "edge.apply" | "edge.l4_apply",
+        {
+          enqueue = true,
+          failCensus = false,
+          supervised = false,
+          holdLoadFor,
+        }: {
+          enqueue?: boolean;
+          failCensus?: boolean;
+          supervised?: boolean;
+          holdLoadFor?: { identity: string; allowed: number };
+        } = {},
+      ) {
         const acknowledger = `${network}-ingress-ack-${randomBytes(4).toString("hex")}`;
         runtime.containers.push(acknowledger);
         await docker(
@@ -2212,11 +2228,12 @@ async function coordinatorFixture() {
         );
         try {
           return await edgeWorker<{ id: string; status: string; error: string | null; evidence: unknown }>(
-            ["coordinator", JSON.stringify({ kind, enqueue, failCensus })],
+            ["coordinator", JSON.stringify({ kind, enqueue, failCensus, holdLoadFor })],
             [
               ...Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
               "--env",
               "ARK_FRONT_INGRESS_DIR=/edge/fixture-ingress",
+              ...(supervised ? ["--env", "ARK_EDGE_WATCHDOG_URL=http://edge-watchdog:2021"] : []),
               ...httpRouterArgs(stack, true),
             ],
           );
@@ -2353,6 +2370,77 @@ async function journaledHttpWithdrawalTest(report: Report) {
   } finally {
     leaving.end();
     current.end();
+    sibling.end();
+    await fixture.sql.end();
+    await installScopedHttp();
+    await edgeApply();
+  }
+}
+
+async function overdueGateRecoveryTest(report: Report) {
+  await allowAllTailnetRoutes();
+  await installScopedHttp();
+  const fixture = await coordinatorFixture();
+  const initial = await fixture.run("edge.apply", { supervised: true });
+  if (initial.status !== "succeeded") throw new Error(initial.error ?? "Initial edge apply failed.");
+  const sni = await fixture.run("edge.l4_apply", { enqueue: false, supervised: true });
+  if (sni.status !== "succeeded") throw new Error(sni.error ?? "Initial SNI apply failed.");
+  const pid = await caddyPid();
+  const sibling = await websocket(tailnetHost);
+  const revoked = await websocket(wwwHost);
+  const count = new Set(lease.routes.map(routeIdentityKey)).size;
+  try {
+    await fixture.sql`SELECT ark_gate_revoke(${wwwRoute.id}, 'overdue recovery fixture')`;
+    await fixture.sql`UPDATE gate_revocations SET created_at = now() - interval '6 seconds'`;
+    journalPolicy = async (document) => {
+      const [row] = await fixture.sql`SELECT id, created_at, applied_at FROM gate_revocations`;
+      if (row?.applied_at) return { ...document, gateRecovery: sha256Hex(String(row.id)) };
+      if (!row) return document;
+      const { routes } = routesAfterRevocations(
+        document.routes,
+        [
+          {
+            id: String(row.id),
+            routeId: wwwRoute.id,
+            createdAt: new Date(row.created_at as string).toISOString(),
+          },
+        ],
+        new Date(document.now),
+      );
+      return { ...document, routes };
+    };
+    const drain = await fixture.run("edge.drain", {
+      enqueue: false,
+      supervised: true,
+      holdLoadFor: { identity: routeIdentityKey(wwwRoute), allowed: count - 1 },
+    });
+    expect(
+      report,
+      drain.status === "succeeded" &&
+        revoked.closedAt() !== null &&
+        (await sibling.echo("during drain")) === "during drain" &&
+        (await secureGet(tailnetHost)).status === 200 &&
+        (await failedHandshake(wwwHost)).outcome !== "handshake completed",
+      "the forced load overlaps a verified overdue lease with only the drained route fenced",
+      drain.error ?? drain.status,
+    );
+
+    const apply = await fixture.run("edge.apply", { enqueue: false, supervised: true });
+    const publish = await fixture.run("edge.l4_apply", { enqueue: false, supervised: true });
+    expect(
+      report,
+      apply.status === "succeeded" &&
+        publish.status === "succeeded" &&
+        (await secureGet(wwwHost)).status === 200 &&
+        (await secureGet(tailnetHost)).status === 200 &&
+        (await sibling.echo("after recovery")) === "after recovery" &&
+        (await caddyPid()) === pid,
+      "the queued production operations restore the drained route and preserve its sibling",
+      apply.error ?? publish.error ?? publish.status,
+    );
+  } finally {
+    journalPolicy = undefined;
+    revoked.end();
     sibling.end();
     await fixture.sql.end();
     await installScopedHttp();
@@ -2753,6 +2841,7 @@ try {
       targetedHttpWithdrawalTest(report, trigger),
     );
   await run("HTTP coordinator journaled gate withdrawal", journaledHttpWithdrawalTest);
+  await run("HTTP coordinator overdue gate recovery", overdueGateRecoveryTest);
   await run(
     "FD-10: login-origin path allowlist, edge token and client address through 443",
     fd10AllowlistTest,
