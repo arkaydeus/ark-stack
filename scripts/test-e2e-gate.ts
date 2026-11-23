@@ -29,6 +29,7 @@ import {
 } from "@ark-stack/shared";
 import postgres from "postgres";
 
+import { PASS_BUDGET_MS } from "../workers/src/proxy-watchdog.ts";
 import { cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from "./edge-test/gate-edge.ts";
 import { bunImage } from "./test-images.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
@@ -358,6 +359,47 @@ try {
     }
     return claimed.rows.length;
   };
+  // Settled: the watchdog's policy was read after `since`, Caddy has a recently verified pass, and
+  // a pass that ended a full pass budget after `since` withdrew nothing.
+  const watchdogSettled = (since: number) =>
+    waitFor(
+      "a clean watchdog pass on a lease read after the drain",
+      async () => {
+        const asked = Date.now();
+        const output = await runtime.docker(
+          "exec",
+          `${name}-watchdog`,
+          "bun",
+          "--eval",
+          'const [s, h] = await Promise.all(["/v1/supervise?proxy=caddy", "/v1/health"].map((path) => fetch(`http://127.0.0.1:2021${path}`))); console.log(JSON.stringify({ verified: s.ok, health: await h.json() }))',
+        );
+        const { verified, health } = JSON.parse(output) as {
+          verified: boolean;
+          health: {
+            proxies: Record<
+              string,
+              {
+                policyAgeMs: number | null;
+                lastTick: { at: string; withdrawn: number; errors: string[] } | null;
+              }
+            >;
+          };
+        };
+        const caddy = health.proxies.caddy;
+        const tick = caddy?.lastTick;
+        return verified &&
+          caddy?.policyAgeMs != null &&
+          asked - caddy.policyAgeMs > since &&
+          tick &&
+          Date.parse(tick.at) >= since + PASS_BUDGET_MS &&
+          tick.withdrawn === 0 &&
+          tick.errors.length === 0
+          ? true
+          : undefined;
+      },
+      30_000,
+      250,
+    );
   // FD-12: an owner with assured MFA calls the real admin API (`/api/step-up`, `/api/gate/users`,
   // `PUT /api/front/routes/:id/access`) exactly as the admin SPA does.
   const ownerEmail = `owner-${suffix}@example.test`;
@@ -447,7 +489,11 @@ try {
               (await fetch(`http://127.0.0.1:${adminBridge!.port}/config/`)).ok ? true : undefined,
             30_000,
           );
-          await worker();
+          // After a failure case the drain applies an overdue revocation: it loads the route into
+          // Caddy and only then marks the revocation applied. A watchdog pass that read the lease
+          // before that mark still withdraws the route and stops Caddy (the launch guard restarts
+          // it). Apply this case's edge only once the watchdog enforces a lease read after the drain.
+          if ((await worker()) > 0) await watchdogSettled(Date.now());
           await edge!.edgeApply(
             planEdge({
               adminMode: "tailnet",
