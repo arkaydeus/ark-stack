@@ -784,6 +784,9 @@ export const gateRevocations = pgTable(
     index("gate_revocations_pending_idx")
       .on(table.createdAt)
       .where(sql`applied_at IS NULL`),
+    index("gate_revocations_applied_idx")
+      .on(table.appliedAt.desc(), table.id.desc())
+      .where(sql`applied_at IS NOT NULL`),
   ],
 );
 

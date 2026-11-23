@@ -1,7 +1,7 @@
 // Docker-backed regression tests for the harness itself, separate from the 80-second behaviour run.
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -101,3 +101,49 @@ test(
   () => exercise("startup-interrupt"),
   30_000,
 );
+
+test("a stalled Docker health command is killed within the settle budget and cleanup completes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ark-edge-runtime-"));
+  const fixture = join(directory, "fixture");
+  const pidFile = join(directory, "pid");
+  try {
+    await mkdir(fixture);
+    const dockerStub = join(directory, "docker");
+    await Bun.write(
+      dockerStub,
+      `#!${process.execPath}\nawait Bun.write(process.env.ARK_GATE_TEST_PID, String(process.pid));\nawait Bun.sleep(60_000);\n`,
+    );
+    await chmod(dockerStub, 0o700);
+    const gateEdgePath = new URL("./gate-edge.ts", import.meta.url).pathname;
+    const source = `
+      import { gateWatchdogHealth, waitFor } from ${JSON.stringify(gateEdgePath)};
+      import { EdgeTestRuntime } from ${JSON.stringify(runtimePath)};
+      const runtime = new EdgeTestRuntime(${JSON.stringify(fixture)}, "unused");
+      try {
+        await waitFor("stalled Docker health", async (remaining) => {
+          await gateWatchdogHealth(runtime, "watchdog", remaining);
+          return true;
+        }, 1_000);
+        throw new Error("The stalled probe succeeded.");
+      } catch (error) {
+        if (error.message !== "Timed out after 1000 ms waiting for stalled Docker health.") throw error;
+      } finally {
+        await runtime.cleanup();
+      }
+    `;
+    const started = performance.now();
+    const child = Bun.spawn([process.execPath, "--eval", source], {
+      env: { ...process.env, PATH: `${directory}:${process.env.PATH}`, ARK_GATE_TEST_PID: pidFile },
+      stderr: "pipe",
+      timeout: 4_000,
+    });
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    expect(code, stderr).toBe(0);
+    expect(performance.now() - started).toBeLessThan(3_000);
+    const pid = Number(await readFile(pidFile, "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow();
+    await expect(access(fixture)).rejects.toThrow();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

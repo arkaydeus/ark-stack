@@ -36,6 +36,8 @@ export type EdgeLeaseDocument = {
   lease: { generation: string; completedAt: string; validUntil: string; valid: boolean } | null;
   /** Allowed routes; always empty when the lease is missing or expired. */
   routes: EdgePolicyRoute[];
+  /** Opaque revision of the applied gate revocation journal, from the same read as `revocations`. */
+  gateRecovery?: string | null;
   /**
    * Gate revocations (FD-11, §3.9.3) still waiting for their forced reload. A route whose
    * revocation is older than 5 s is already left out of `routes` (fail closed); this list is
@@ -55,6 +57,8 @@ export type WithdrawalResult = {
   error?: string;
   /** The proxy could not be inspected at all (it may be stopped or restarting). */
   unreachable?: boolean;
+  /** A concurrent apply replaced the inspected configuration before verification. */
+  superseded?: boolean;
   /**
    * Withdrawn backends that may hold upgraded streams a reload cannot promptly close (Caddy keeps
    * them for the old handler's `stream_close_delay`, FD-09). The adapter stopped the proxy; its
@@ -465,7 +469,8 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
         body: JSON.stringify(next),
       });
       // A concurrent apply won. Re-inspect the new config on the next watchdog pass.
-      if (etag && loaded.status === 412) return { proxy: this.proxy, active, withdrawn: [] };
+      if (etag && loaded.status === 412)
+        return { proxy: this.proxy, active, withdrawn: [], superseded: true };
       if (!loaded.ok)
         throw new Error(
           `${method} ${path} returned ${loaded.status}: ${(await loaded.text()).slice(0, 200)}`,
@@ -474,7 +479,7 @@ export class CaddyWithdrawalAdapter implements EdgeWithdrawalAdapter {
       const remaining = withdrawCaddyBackends(verified, allowed).withdrawn;
       if (remaining.length) {
         if (caddyGeneration(verified) !== caddyGeneration(config))
-          return { proxy: this.proxy, active, withdrawn: [] };
+          return { proxy: this.proxy, active, withdrawn: [], superseded: true };
         throw new Error(`still dialing ${remaining.join(", ")} after reload`);
       }
     } catch (error) {
@@ -567,6 +572,23 @@ export type WatchdogOptions = {
   startupGraceMs?: number;
 };
 
+export type EnforcedEdgePolicy = {
+  observedAt: string | null;
+  gateRecovery: string | null;
+  leaseValid: boolean;
+  allowed: number;
+};
+
+export type CompletedEdgePass = {
+  verified: boolean;
+  withdrawn: number;
+  policy: EnforcedEdgePolicy;
+};
+
+export type EdgeWatchdogHealth = {
+  proxies: Record<string, { lastTick: CompletedEdgePass | null }>;
+};
+
 /**
  * The edge-local lease watchdog (§3.2). `tick` runs at least every second, independently of the
  * operation workers: it refreshes the policy from the API, and when the lease has expired or the
@@ -578,6 +600,8 @@ export class EdgeWatchdog {
   private deadline = Number.NEGATIVE_INFINITY;
   /** When the last policy was read (local clock), or null before the first successful read. */
   private fetchedAt: number | null = null;
+  private observedAt: string | null = null;
+  private gateRecovery: string | null = null;
   private lastPolicyError = "";
   /** Last unreachable message per proxy, so the log records changes rather than every second. */
   private readonly unreachable = new Map<string, string>();
@@ -616,10 +640,15 @@ export class EdgeWatchdog {
 
   async refresh() {
     const started = this.now();
+    const recoveryAtStart = this.gateRecovery;
     try {
       const document = await this.options.fetchLease();
       // A slow answer must not replace a newer one that arrived first.
       if (this.fetchedAt !== null && started < this.fetchedAt) return;
+      const recovery = document.gateRecovery ?? null;
+      // Requests on either side of a journal commit can reach the database out of order. Once a
+      // refresh advances the journal, overlapping reads must agree with it or retry on the next pass.
+      if (this.gateRecovery !== recoveryAtStart && recovery !== this.gateRecovery) return;
       const apiNow = Date.parse(document.now);
       const validUntil = document.lease ? Date.parse(document.lease.validUntil) : Number.NaN;
       this.allowed = allowedBackends(document);
@@ -629,6 +658,8 @@ export class EdgeWatchdog {
           ? started + Math.max(0, validUntil - apiNow)
           : Number.NEGATIVE_INFINITY;
       this.fetchedAt = started;
+      this.observedAt = document.now;
+      this.gateRecovery = recovery;
       if (this.lastPolicyError) this.options.log?.("edge policy available again");
       this.lastPolicyError = "";
     } catch (error) {
@@ -644,18 +675,21 @@ export class EdgeWatchdog {
   }
 
   /**
-   * One pass: refresh the policy, waiting at most `refreshWaitMs`, then enforce. Reading the policy
-   * after the config it is compared with means a route that edge.apply has just made live is not
-   * withdrawn on a policy that predates it; bounding the wait means a slow API never delays expiry.
+   * One pass: refresh the policy, waiting at most `refreshWaitMs`, then enforce. The refresh can
+   * finish during enforcement, so report the policy captured with the exact allowlist used.
    */
   async tick(refreshWaitMs = Number.POSITIVE_INFINITY) {
+    return (await this.tickWithPolicy(refreshWaitMs)).results;
+  }
+
+  async tickWithPolicy(refreshWaitMs: number) {
     const refreshed = this.refresh();
     if (Number.isFinite(refreshWaitMs)) {
       await Promise.race([refreshed, new Promise((resolve) => setTimeout(resolve, refreshWaitMs))]);
     } else {
       await refreshed;
     }
-    return this.enforce();
+    return this.enforceWithPolicy();
   }
 
   /**
@@ -663,8 +697,19 @@ export class EdgeWatchdog {
    * own cadence and at the lease deadline, so a slow or hanging lease read cannot delay expiry.
    */
   async enforce() {
+    return (await this.enforceWithPolicy()).results;
+  }
+
+  private async enforceWithPolicy() {
     await this.flushEvents();
-    const allowed = this.effectiveAllowed();
+    const at = this.now();
+    const allowed = this.effectiveAllowed(at);
+    const policy: EnforcedEdgePolicy = {
+      observedAt: this.observedAt,
+      gateRecovery: this.gateRecovery,
+      leaseValid: this.leaseValid(at),
+      allowed: allowed.size,
+    };
     const results: WithdrawalResult[] = [];
     for (const adapter of this.options.adapters) {
       const started = this.now();
@@ -719,7 +764,7 @@ export class EdgeWatchdog {
         this.stopOutcomes.delete(adapter.proxy);
       }
     }
-    return results;
+    return { results, policy };
   }
 
   private async emit(event: WatchdogEvent) {

@@ -1,4 +1,4 @@
-import { EdgeWatchdog, type WatchdogOptions } from "@ark-stack/shared";
+import { EdgeWatchdog, type CompletedEdgePass, type WatchdogOptions } from "@ark-stack/shared";
 
 /** A verified pass is fresh for this long; the launch guard stops the proxy after two misses. */
 export const VERIFIED_FRESH_MS = 2_000;
@@ -14,7 +14,7 @@ export class ProxyWatchdog {
   lastVerifiedAt = Number.NEGATIVE_INFINITY;
   /** Start of the pass in progress, or null between passes. */
   passStartedAt: number | null = null;
-  lastTick: { at: string; withdrawn: string[]; errors: string[] } | null = null;
+  private lastTick: (CompletedEdgePass & { at: string; errors: string[] }) | null = null;
 
   private readonly extendPass: boolean;
 
@@ -35,18 +35,29 @@ export class ProxyWatchdog {
     );
   }
 
+  completedPass(now = performance.now()) {
+    return (
+      this.lastTick && {
+        ...this.lastTick,
+        verified: this.lastTick.verified && now - this.lastVerifiedAt <= VERIFIED_FRESH_MS,
+      }
+    );
+  }
+
   async tick() {
     this.passStartedAt = performance.now();
     try {
-      const results = await this.watchdog.tick(300);
+      const { results, policy } = await this.watchdog.tickWithPolicy(300);
       // An unreachable proxy is never verified, not even while it restarts after a deliberate stop.
       this.lastVerifiedAt = results.some((result) => result.error || result.unreachable)
         ? Number.NEGATIVE_INFINITY
         : this.passStartedAt;
       this.lastTick = {
         at: new Date().toISOString(),
-        withdrawn: results.flatMap((result) => result.withdrawn),
+        withdrawn: results.reduce((count, result) => count + result.withdrawn.length, 0),
         errors: results.flatMap((result) => (result.error ? [`${result.proxy}: ${result.error}`] : [])),
+        policy,
+        verified: results.every((result) => !result.error && !result.unreachable && !result.superseded),
       };
     } catch (error) {
       this.lastVerifiedAt = Number.NEGATIVE_INFINITY;

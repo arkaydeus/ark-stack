@@ -642,6 +642,25 @@ describe("EdgeWatchdog", () => {
     expect(watchdog.effectiveAllowed().size).toBe(0);
   });
 
+  test("an overlapping lease read cannot roll back an observed gate recovery", async () => {
+    let clock = 0;
+    const base = Date.parse("2026-11-16T12:00:00Z");
+    const first = Promise.withResolvers<EdgeLeaseDocument>();
+    const second = Promise.withResolvers<EdgeLeaseDocument>();
+    const answers = [first.promise, second.promise];
+    const watchdog = new EdgeWatchdog({ fetchLease: () => answers.shift()!, adapters: [], now: () => clock });
+    const recovered = watchdog.refresh();
+    clock += 10;
+    const stale = watchdog.refresh();
+    // The second request reached the API before the journal commit, but its reply arrives last.
+    first.resolve({ ...lease(base, 60_000), gateRecovery: "applied" });
+    await recovered;
+    second.resolve(lease(base, 0));
+    await stale;
+    expect(watchdog.state().leaseValid).toBe(true);
+    expect(watchdog.state().allowed).toBeGreaterThan(0);
+  });
+
   test("a failed withdrawal stops the proxy and raises events", async () => {
     const h = harness({ failLoad: true });
     await h.watchdog.tick();

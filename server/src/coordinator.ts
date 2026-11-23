@@ -83,8 +83,9 @@ import { refreshHttpRouteCrls, refreshRouteCrls, routeCrlsDue } from "./modules/
 import {
   edgeLeaseDocument,
   ensureGateRevocationDrain,
+  gateRevocationState,
   markGateRevocationsApplied,
-  pendingGateRevocations,
+  waitForGateRecovery,
 } from "./modules/gate-revocations.ts";
 import {
   EDGE_OBSERVE_TARGET,
@@ -1846,7 +1847,8 @@ async function changeModeLocked(operation: OperationRow) {
         : null
       : (process.env.ARK_TAILNET_AUTH_ORIGIN ?? null);
   if (!destinationOrigin) throw new Error("The destination administration origin is not configured.");
-  const plan = await edgePlan(adminMode, settings?.adminHostname);
+  const lease = await edgeLeaseDocument();
+  const plan = await edgePlan(adminMode, settings?.adminHostname, lease.routes);
   if (adminMode === "public" && plan.adminHostname && plan.awaitingCertificate.includes(plan.adminHostname)) {
     throw new Error(`The admin certificate for ${plan.adminHostname} is not issued yet.`);
   }
@@ -1865,6 +1867,7 @@ async function changeModeLocked(operation: OperationRow) {
       `Better Auth's admin hosts do not include ${destination.origin}; restart with BETTER_AUTH_URL=${destinationOrigin} before switching ingress.`,
     );
   }
+  await verifyGateRecovery(lease.gateRecovery, plan.httpRoutes.length);
   const edge = await writeEdge(plan);
   await db
     .update(platformSettings)
@@ -2858,22 +2861,33 @@ async function applyEdge(operation: OperationRow) {
   return withEdgeLock(() => applyEdgeLocked(operation));
 }
 
+async function verifyGateRecovery(revision: string | null | undefined, httpRoutes: number) {
+  const watchdog = process.env.ARK_EDGE_WATCHDOG_URL;
+  if (revision && watchdog && httpRoutes) await waitForGateRecovery(revision, watchdog, edgeL4Configured());
+}
+
 async function applyEdgeLocked(operation: OperationRow) {
   // The forced Caddy load and HAProxy drain apply the revocations in this snapshot. A
   // revocation that commits during this apply waits for the next drain.
-  const revocations = await pendingGateRevocations();
+  const { pending: revocations, revision } = await gateRevocationState();
+  const revokedRouteIds = new Set(revocations.map((item) => item.routeId));
   const [settings] = await db.select().from(platformSettings).where(eq(platformSettings.id, "default"));
+  // The forced load leaves draining routes out until the watchdog has enforced the journal that
+  // marks them applied. Keep this two-phase path on supervised edges, where old passes can race it.
+  const recovering = revokedRouteIds.size > 0 && Boolean(process.env.ARK_EDGE_WATCHDOG_URL);
+  const routes = (await edgePolicy()).routes;
   const plan = await edgePlan(
     settings?.adminMode === "tailnet" ? "tailnet" : "public",
     settings?.adminHostname,
+    recovering ? routes.filter((route) => !revokedRouteIds.has(route.id)) : routes,
   );
-  // Queue the SNI generation before marking revocations applied. It takes this same lock before
-  // reading policy, so the reload can re-admit a drained route once its new handler is active.
-  if (edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
-  const written = await writeEdge({
-    ...plan,
-    revokedRouteIds: [...new Set(revocations.map((item) => item.routeId))],
-  });
+  await verifyGateRecovery(revision, plan.httpRoutes.length);
+  if (!recovering && edgeL4Configured()) await enqueue({ kind: "edge.l4_apply", targetIds: ["platform"] });
+  const written = await writeEdge({ ...plan, revokedRouteIds: [...revokedRouteIds] });
+  // The successor takes the edge lock and waits for verification of the committed journal before
+  // loading recovered Caddy handlers and queueing their SNI generation. Queue before marking so a
+  // worker exiting immediately after the mark still leaves durable recovery work.
+  if (recovering) await enqueue({ kind: "edge.apply", targetIds: ["platform"] });
   // Without an edge to reload (development, tests) there is no socket to close either.
   const applied =
     written.applied || (!process.env.ARK_EDGE_RELOAD_URL && process.env.NODE_ENV !== "production")
@@ -2969,6 +2983,7 @@ async function applyEdgeL4Locked(operation: OperationRow) {
   }
   if (edgeL4Configured() && !edgeL4Settings().validatorSocket)
     throw new Error("ARK_HAPROXY_VALIDATOR_SOCKET is required to apply edge-l4.");
+  await verifyGateRecovery(policy.gateRecovery, input.httpRoutes?.length ?? 0);
   const firewall = edgeL4Configured()
     ? await applyFrontIngress(input, platformDbIngressLimits(settings))
     : null;

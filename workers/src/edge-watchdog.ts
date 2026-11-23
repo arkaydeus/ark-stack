@@ -145,20 +145,17 @@ const server = Bun.serve({
       });
     }
     if (pathname === "/v1/health") {
-      // Counts and timings only: no route, address or token.
+      // Counts, timings and an opaque journal revision. Route identities and addresses stay private.
       return Response.json({
         ...watchdog.state(),
         // Preserve the original Caddy health summary for existing monitoring clients.
-        lastTick: proxies.get("caddy")!.lastTick && {
-          ...proxies.get("caddy")!.lastTick,
-          withdrawn: proxies.get("caddy")!.lastTick!.withdrawn.length,
-        },
+        lastTick: proxies.get("caddy")!.completedPass(),
         proxies: Object.fromEntries(
           [...proxies].map(([name, state]) => [
             name,
             {
               ...state.watchdog.state(),
-              lastTick: state.lastTick && { ...state.lastTick, withdrawn: state.lastTick.withdrawn.length },
+              lastTick: state.completedPass(),
             },
           ]),
         ),

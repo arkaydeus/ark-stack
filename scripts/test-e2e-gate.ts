@@ -29,8 +29,14 @@ import {
 } from "@ark-stack/shared";
 import postgres from "postgres";
 
-import { PASS_BUDGET_MS } from "../workers/src/proxy-watchdog.ts";
-import { cleanupGateEdge, startGateEdge, waitFor, type GateEdge } from "./edge-test/gate-edge.ts";
+import {
+  cleanupGateEdge,
+  gateWatchdogHealth,
+  settledGatePass,
+  startGateEdge,
+  waitFor,
+  type GateEdge,
+} from "./edge-test/gate-edge.ts";
 import { bunImage } from "./test-images.ts";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
 
@@ -335,22 +341,33 @@ try {
     port: 0,
     async fetch(request) {
       const path = new URL(request.url).pathname;
+      if (path === "/v1/health") {
+        return Response.json(await gateWatchdogHealth(runtime, `${name}-watchdog`, 900));
+      }
       if (rejectLoad && path === "/load") return new Response("fixture rejected load", { status: 500 });
       const body = Buffer.from(await request.arrayBuffer()).toString("base64");
       const script = `const r=await fetch(${JSON.stringify(`http://edge-admin:2019${path}`)}, {method:${JSON.stringify(request.method)},headers:${JSON.stringify(Object.fromEntries([...request.headers].filter(([key]) => !["host", "content-length"].includes(key))))},${["GET", "HEAD"].includes(request.method) ? "" : `body:Buffer.from(${JSON.stringify(body)},"base64"),`}}); console.log(JSON.stringify({status:r.status,headers:Object.fromEntries(r.headers),body:await r.text()}))`;
-      const output = await runtime.docker("exec", `${name}-watchdog`, "bun", "--eval", script);
+      const output = await runtime.dockerWithSignal(
+        AbortSignal.timeout(4_000),
+        "exec",
+        `${name}-watchdog`,
+        "bun",
+        "--eval",
+        script,
+      );
       const result = JSON.parse(output) as { status: number; headers: Record<string, string>; body: string };
       return new Response(result.body || null, { status: result.status, headers: result.headers });
     },
   });
   process.env.ARK_EDGE_RELOAD_URL = `http://127.0.0.1:${adminBridge.port}`;
+  process.env.ARK_EDGE_WATCHDOG_URL = process.env.ARK_EDGE_RELOAD_URL;
   process.env.ARK_EDGE_DIR = join(directory, "edge");
   const { claimQueued, runOperation, enqueue } = await import("../server/src/coordinator.ts");
-  const worker = async () => {
-    const claimed = await claimQueued({ kindPrefix: "edge.drain", limit: 1 });
+  const runNext = async (kind: "edge.drain" | "edge.apply") => {
+    const claimed = await claimQueued({ exactKinds: [kind], limit: 1 });
     for (const op of claimed.rows) {
       try {
-        await runOperation("edge.drain", op);
+        await runOperation(kind, op);
         await sql`UPDATE operations SET status = 'succeeded', updated_at = now() WHERE id = ${op.id}`;
       } catch (error) {
         await sql`UPDATE operations SET status = 'failed', updated_at = now(), error = ${String(error)} WHERE id = ${op.id}`;
@@ -359,43 +376,18 @@ try {
     }
     return claimed.rows.length;
   };
-  // Settled: the watchdog's policy was read after `since`, Caddy has a recently verified pass, and
-  // a pass that ended a full pass budget after `since` withdrew nothing.
+  const worker = async () => {
+    const drained = await runNext("edge.drain");
+    if (drained) await runNext("edge.apply");
+    return drained;
+  };
   const watchdogSettled = (since: number) =>
     waitFor(
       "a clean watchdog pass on a lease read after the drain",
-      async () => {
-        const asked = Date.now();
-        const output = await runtime.docker(
-          "exec",
-          `${name}-watchdog`,
-          "bun",
-          "--eval",
-          'const [s, h] = await Promise.all(["/v1/supervise?proxy=caddy", "/v1/health"].map((path) => fetch(`http://127.0.0.1:2021${path}`))); console.log(JSON.stringify({ verified: s.ok, health: await h.json() }))',
-        );
-        const { verified, health } = JSON.parse(output) as {
-          verified: boolean;
-          health: {
-            proxies: Record<
-              string,
-              {
-                policyAgeMs: number | null;
-                lastTick: { at: string; withdrawn: number; errors: string[] } | null;
-              }
-            >;
-          };
-        };
-        const caddy = health.proxies.caddy;
-        const tick = caddy?.lastTick;
-        return verified &&
-          caddy?.policyAgeMs != null &&
-          asked - caddy.policyAgeMs > since &&
-          tick &&
-          Date.parse(tick.at) >= since + PASS_BUDGET_MS &&
-          tick.withdrawn === 0 &&
-          tick.errors.length === 0
-          ? true
-          : undefined;
+      async (remaining) => {
+        const health = await gateWatchdogHealth(runtime, `${name}-watchdog`, remaining);
+        // This database seeds exactly one tailnet route, so a count of one identifies it.
+        return settledGatePass(health.proxies.caddy?.lastTick, since, 1) ? true : undefined;
       },
       30_000,
       250,
@@ -442,6 +434,7 @@ try {
   control = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
+    idleTimeout: 65,
     async fetch(request) {
       try {
         const action = new URL(request.url).pathname.slice(1);
@@ -489,24 +482,8 @@ try {
               (await fetch(`http://127.0.0.1:${adminBridge!.port}/config/`)).ok ? true : undefined,
             30_000,
           );
-          // After a failure case the drain applies an overdue revocation: it loads the route into
-          // Caddy and only then marks the revocation applied. A watchdog pass that read the lease
-          // before that mark still withdraws the route and stops Caddy (the launch guard restarts
-          // it). Apply this case's edge only once the watchdog enforces a lease read after the drain.
+          // Before the next case, wait for a clean pass under a lease read after recovery.
           if ((await worker()) > 0) await watchdogSettled(Date.now());
-          await edge!.edgeApply(
-            planEdge({
-              adminMode: "tailnet",
-              gateHostname: loginHost,
-              endpoints: hosts.map((host) => ({ id: `end_${host.hostname}`, exposure: "public", ...host })),
-              certificates: hosts.map((host) => ({
-                endpointId: `end_${host.hostname}`,
-                status: "issued",
-                lastDeployedAt: new Date(),
-              })),
-              httpRoutes: [route],
-            }),
-          );
         } else if (action === "browser-session") {
           const session = await ctx.internalAdapter.createSession(user.id, false, { origin: "gate" });
           const { authCookieName } = await import("../server/src/auth.ts");
