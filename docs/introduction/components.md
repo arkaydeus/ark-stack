@@ -62,7 +62,7 @@ Every worker and the agent talk to the API over HTTP on the internal `control` n
 
 The Ark-built application images (`api`, `migrate`, the four workers, `database-ingress` and `edge-watchdog`) share one Compose anchor: `restart: unless-stopped`, `no-new-privileges`, every capability dropped, a read-only root filesystem, a 64 MB `noexec` tmpfs on `/tmp` and a limit of 256 processes. They run as the image's non-root `bun` user unless stated below. Every third-party image is pinned by version and OCI digest. Other services list their own controls below.
 
-The Ark images are built from the repository `Dockerfile` (one stage per service; `api` and `migrate` use the last stage) on the pinned `oven/bun:1.4.4` image, which sets `NODE_ENV=production`. Images are tagged `${ARK_VERSION:-local}`.
+The Ark images are built from the repository `Dockerfile` (one stage per service; `api` and `migrate` use the last stage) on the pinned `oven/bun:1.4.5` image, which sets `NODE_ENV=production`. Images are tagged `${ARK_VERSION:-local}`.
 
 ## Control plane
 

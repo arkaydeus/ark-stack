@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.4
+          bun-version: 1.4.5
       - uses: docker/setup-buildx-action@v4
       - run: bun scripts/check-image-plan.ts
       - name: Build and push linux/${{ matrix.arch }}
@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.4
+          bun-version: 1.4.5
       - uses: docker/setup-buildx-action@v4
       - name: Merge the platform images into multi-platform tags
         run: |

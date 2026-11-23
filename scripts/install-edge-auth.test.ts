@@ -11,6 +11,10 @@ import { composeBuiltImages } from "./install-images.ts";
 const root = resolve(import.meta.dir, "..");
 const installedKey = "tskey-auth-installed-secret";
 const revision = "a".repeat(40);
+// A full installer run spawns dozens of fake `docker` processes (each a Bun startup); the
+// published-image path alone pulls, inspects and tags twelve images. That takes 1-3 s on a quiet
+// runner, so Bun's 5 s default leaves no headroom on a loaded one.
+const installerTimeout = 30_000;
 
 test("preserved key configuration leaves the env file byte-for-byte unchanged and does not prompt", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ark-auth-preserved-"));
@@ -204,20 +208,78 @@ esac
       await rm(directory, { recursive: true, force: true });
     }
   },
+  installerTimeout,
 );
 
 for (const inherited of ["tskey-auth-inherited-other", ""]) {
-  test(`installer Docker children receive the installed key over ${inherited ? "another key" : "an empty export"}`, async () => {
+  test(
+    `installer Docker children receive the installed key over ${inherited ? "another key" : "an empty export"}`,
+    async () => {
+      const directory = await fixture();
+      try {
+        const envPath = join(directory, ".env");
+        await Bun.write(envPath, `TS_EDGE_AUTHKEY=${installedKey}\n`);
+        const child = Bun.spawn([process.execPath, "scripts/install.ts"], {
+          cwd: directory,
+          env: {
+            ...process.env,
+            PATH: `${directory}/bin:${process.env.PATH}`,
+            TS_EDGE_AUTHKEY: inherited,
+            ARK_INSTALL_NONINTERACTIVE: "1",
+            ARK_INSTALL_SKIP_DOCKER: "0",
+            INSTALL_CALLS: join(directory, "calls"),
+          },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [code, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ]);
+        expect(code, stderr).toBe(0);
+        const calls = (await Bun.file(join(directory, "calls")).text())
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const composeCalls = calls.filter((call) => call.args[0] === "compose");
+        expect(composeCalls.length).toBeGreaterThan(0);
+        const generatedEnv = await realpath(envPath);
+        for (const { args } of composeCalls) {
+          const envFlag = args.indexOf("--env-file");
+          expect(envFlag).toBeGreaterThan(0);
+          expect(args[envFlag + 1]).toBe(generatedEnv);
+        }
+        expect(stdout).toContain("Setup URL: http://localhost:3000");
+        expect(calls.map((call) => ({ args: call.args, key: call.key }))).toEqual(
+          calls.map((call) => ({ args: call.args, key: installedKey })),
+        );
+        expect(
+          (await Bun.file(envPath).text()).split("\n").filter((line) => line.startsWith("TS_EDGE_AUTHKEY=")),
+        ).toEqual([`TS_EDGE_AUTHKEY=${installedKey}`]);
+        expect(stdout + stderr).not.toContain(installedKey);
+        expect((await stat(envPath)).mode & 0o777).toBe(0o600);
+        expect((await stat(join(directory, "tmp/db-ingress"))).isDirectory()).toBe(true);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+    installerTimeout,
+  );
+}
+
+test(
+  "the first install passes its generated environment to Compose",
+  async () => {
     const directory = await fixture();
     try {
-      const envPath = join(directory, ".env");
-      await Bun.write(envPath, `TS_EDGE_AUTHKEY=${installedKey}\n`);
+      await copyFile(join(root, ".env.example"), join(directory, ".env.example"));
       const child = Bun.spawn([process.execPath, "scripts/install.ts"], {
         cwd: directory,
         env: {
           ...process.env,
           PATH: `${directory}/bin:${process.env.PATH}`,
-          TS_EDGE_AUTHKEY: inherited,
+          TS_EDGE_AUTHKEY: "",
           ARK_INSTALL_NONINTERACTIVE: "1",
           ARK_INSTALL_SKIP_DOCKER: "0",
           INSTALL_CALLS: join(directory, "calls"),
@@ -231,69 +293,20 @@ for (const inherited of ["tskey-auth-inherited-other", ""]) {
         new Response(child.stderr).text(),
       ]);
       expect(code, stderr).toBe(0);
-      const calls = (await Bun.file(join(directory, "calls")).text())
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
-      const composeCalls = calls.filter((call) => call.args[0] === "compose");
-      expect(composeCalls.length).toBeGreaterThan(0);
-      const generatedEnv = await realpath(envPath);
-      for (const { args } of composeCalls) {
-        const envFlag = args.indexOf("--env-file");
-        expect(envFlag).toBeGreaterThan(0);
-        expect(args[envFlag + 1]).toBe(generatedEnv);
-      }
+      const envPath = await realpath(join(directory, ".env"));
+      const calls = (await Bun.file(join(directory, "calls")).text()).trim().split("\n");
+      const build = calls
+        .map((line) => JSON.parse(line).args as string[])
+        .find((args) => args.includes("build"));
+      expect(build?.slice(0, 3)).toEqual(["compose", "--env-file", envPath]);
+      expect(await Bun.file(envPath).text()).toContain("BETTER_AUTH_URL=http://localhost:3000");
       expect(stdout).toContain("Setup URL: http://localhost:3000");
-      expect(calls.map((call) => ({ args: call.args, key: call.key }))).toEqual(
-        calls.map((call) => ({ args: call.args, key: installedKey })),
-      );
-      expect(
-        (await Bun.file(envPath).text()).split("\n").filter((line) => line.startsWith("TS_EDGE_AUTHKEY=")),
-      ).toEqual([`TS_EDGE_AUTHKEY=${installedKey}`]);
-      expect(stdout + stderr).not.toContain(installedKey);
-      expect((await stat(envPath)).mode & 0o777).toBe(0o600);
-      expect((await stat(join(directory, "tmp/db-ingress"))).isDirectory()).toBe(true);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
-  });
-}
-
-test("the first install passes its generated environment to Compose", async () => {
-  const directory = await fixture();
-  try {
-    await copyFile(join(root, ".env.example"), join(directory, ".env.example"));
-    const child = Bun.spawn([process.execPath, "scripts/install.ts"], {
-      cwd: directory,
-      env: {
-        ...process.env,
-        PATH: `${directory}/bin:${process.env.PATH}`,
-        TS_EDGE_AUTHKEY: "",
-        ARK_INSTALL_NONINTERACTIVE: "1",
-        ARK_INSTALL_SKIP_DOCKER: "0",
-        INSTALL_CALLS: join(directory, "calls"),
-      },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [code, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ]);
-    expect(code, stderr).toBe(0);
-    const envPath = await realpath(join(directory, ".env"));
-    const calls = (await Bun.file(join(directory, "calls")).text()).trim().split("\n");
-    const build = calls
-      .map((line) => JSON.parse(line).args as string[])
-      .find((args) => args.includes("build"));
-    expect(build?.slice(0, 3)).toEqual(["compose", "--env-file", envPath]);
-    expect(await Bun.file(envPath).text()).toContain("BETTER_AUTH_URL=http://localhost:3000");
-    expect(stdout).toContain("Setup URL: http://localhost:3000");
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
+  },
+  installerTimeout,
+);
 
 test("prompt selection writes a normalized key without echoing it", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ark-auth-prompt-"));
@@ -364,6 +377,7 @@ test.each([false, true])(
       await rm(directory, { recursive: true, force: true });
     }
   },
+  installerTimeout,
 );
 
 test("invalid inherited key aborts the installer after secret merge and before any Docker command", async () => {

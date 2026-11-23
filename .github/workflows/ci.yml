@@ -66,7 +66,7 @@ jobs:
       - &setup-bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.4
+          bun-version: 1.4.5
       - uses: actions/setup-go@v6
         with:
           go-version: 1.25.1
