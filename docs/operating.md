@@ -107,7 +107,7 @@ The public edge has its own Tailscale node, `edge-ts` (`tag:ark-edge`, hostname 
 
 The existing admin node, `tailscale` with `tailnet-gateway` (profile `tailnet`, userspace, no capabilities), is unchanged and still serves the admin UI over the tailnet. The two nodes have separate state, keys and tags.
 
-**Enrolling the edge node.** The edge serves public traffic without a key. Until it joins, it just waits for login.
+**Enrolling the edge node.** The edge serves public traffic without a key. Until it joins, it just waits for login. Compose runs `tailscaled` alone until then, because the image's `containerboot` exits after 60 seconds without a login. Once the node has a key or an identity, `containerboot` reapplies the flags in Compose on every start with `--reset`, so a setting changed by hand with `tailscale set` lasts only until the next restart.
 
 1. In the Tailscale admin console, add the tag to the tailnet policy file, owned by the admins who enrol hosts:
 

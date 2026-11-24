@@ -12,6 +12,22 @@ x-app: &app
   tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
   pids_limit: 256
 
+# The pinned image's containerboot gives up after 60 s without a login and exits, so a node that has
+# neither a key nor a stored identity would restart every minute (and strand edge-ts's dependents in
+# its old namespace). Such a node runs tailscaled alone and really waits for login; its preferences are
+# set first, so it never joins without them. With a key or an identity, containerboot runs as usual.
+x-tailscale-entrypoint: &tailscale-entrypoint
+  - /bin/sh
+  - -c
+  - |
+    if [ -z "$$TS_AUTHKEY" ] && ! grep -q '"_current-profile"' "$$TS_STATE_DIR/tailscaled.state" 2>/dev/null; then
+      (until tailscale --socket="$$TS_SOCKET" set --shields-up --accept-dns=false --hostname="$$TS_HOSTNAME"; do sleep 1; done) &
+      [ "$$TS_USERSPACE" = false ] || set -- --tun=userspace-networking
+      [ -z "$$TS_SOCKS5_SERVER" ] || set -- "$$@" "--socks5-server=$$TS_SOCKS5_SERVER"
+      exec tailscaled --socket="$$TS_SOCKET" --statedir="$$TS_STATE_DIR" "$$@" $$TS_TAILSCALED_EXTRA_ARGS
+    fi
+    exec /usr/local/bin/containerboot
+
 services:
   # Platform cluster. The image is the pinned postgres:17.6 digest plus pgBackRest, the backup executor
   # and WAL archiving into the encrypted local repo2 (Dockerfile `postgres-backup`, front door §3.18.1,
@@ -443,10 +459,11 @@ services:
   edge-ts:
     image: tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2
     hostname: ark-edge
+    entrypoint: *tailscale-entrypoint
     environment:
       TS_USERSPACE: "false"
       # A one-off, pre-approved key for tag:ark-edge (docs/operating.md, "Edge Tailscale node").
-      # Without it the node waits for login and the edge still serves.
+      # Without it the node waits for login (the entrypoint above) and the edge still serves.
       TS_AUTHKEY: ${TS_EDGE_AUTHKEY:-}
       # The Tailscale machine name, passed on every start so a restart never renames the node.
       # host:setup writes it (<name>-edge by default); empty keeps the original ark-edge.
@@ -455,8 +472,11 @@ services:
       TS_SOCKET: /var/run/tailscale/tailscaled.sock
       # Keep Docker's resolver so `api` and `edge-admin` resolve; MagicDNS is never needed here.
       TS_ACCEPT_DNS: "false"
-      # No inbound tailnet connections to the edge node, whatever the tailnet policy allows.
-      TS_EXTRA_ARGS: "--shields-up"
+      # No inbound tailnet connections to the edge node, whatever the tailnet policy allows. --reset
+      # makes these flags the node's whole configuration: without it `tailscale up` refuses to start
+      # (and the container restarts forever) if the stored preferences hold any flag not passed here.
+      # It never logs the node out.
+      TS_EXTRA_ARGS: "--reset --shields-up"
       # The host tailscaled keeps the default 41641.
       TS_TAILSCALED_EXTRA_ARGS: "--port=41642"
     devices: ["/dev/net/tun:/dev/net/tun"]
@@ -510,6 +530,7 @@ services:
   backup-ts:
     image: tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2
     hostname: ark-backup
+    entrypoint: *tailscale-entrypoint
     environment:
       TS_USERSPACE: "true"
       # A one-off, pre-approved key for tag:ark-backup (docs/guides/backups.md, "Home machine").
@@ -520,8 +541,9 @@ services:
       TS_STATE_DIR: /var/lib/tailscale
       TS_SOCKET: /var/run/tailscale/tailscaled.sock
       TS_ACCEPT_DNS: "false"
-      # No inbound tailnet connections to the backup node, whatever the tailnet policy allows.
-      TS_EXTRA_ARGS: "--shields-up"
+      # No inbound tailnet connections to the backup node, whatever the tailnet policy allows. --reset as
+      # on edge-ts: a stored preference that is not passed here must not stop the node from starting.
+      TS_EXTRA_ARGS: "--reset --shields-up"
       TS_SOCKS5_SERVER: ":1055"
       # The host tailscaled keeps 41641 and edge-ts 41642.
       TS_TAILSCALED_EXTRA_ARGS: "--port=41643"

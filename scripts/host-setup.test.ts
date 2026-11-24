@@ -60,6 +60,8 @@ import {
   type HetznerRule,
 } from "./host-setup/provider-firewalls/hetzner.ts";
 import {
+  ENROL_CONTAINER,
+  READ_IDENTITY,
   detectSessionOrigin,
   publicSshListeners,
   publicUfwSshRules,
@@ -105,6 +107,22 @@ const PROVIDER_RULES = [
 const ok = (stdout = ""): RunResult => ({ status: 0, stdout, stderr: "" });
 const fail = (stderr = "", status = 1): RunResult => ({ status, stdout: "", stderr });
 
+type RestartLoop = {
+  logs: string;
+  /** The hostname preference in the state volume; undefined without an identity, null if unreadable. */
+  storedName?: string | null;
+  fixedBy: (created: { name: string; key: string }) => boolean;
+};
+
+const flagsLog = (name: string) => `boot: 2026/11/24 Running 'tailscale up'
+Error: changing settings via 'tailscale up' requires mentioning all
+non-default flags. To proceed, either re-run your command with --reset or
+
+\ttailscale up --accept-dns=false --shields-up --hostname=${name}
+
+boot: 2026/11/24 failed to auth tailscale: tailscale up failed: exit status 1
+`;
+
 /** A simulated Ubuntu VPS. Each stub mutates this state the way the real command would. */
 class FakeHost {
   calls: string[] = [];
@@ -123,6 +141,10 @@ class FakeHost {
   edgeJoinTags = ["tag:ark-edge"];
   backup = { running: false, tags: [] as string[], hostName: "" };
   stoppedContainers = new Set<string>();
+  /** Containers Docker keeps restarting, until one is recreated and `fixedBy` holds for it. */
+  restartLoops = new Map<string, RestartLoop>();
+  /** containerboot exits when Tailscale refuses the key, instead of staying up to report it. */
+  crashOnRejectedKey = false;
   startupNames = new Map<string, string>();
   containerCreations: [string, string][] = [];
   firstContainerJoins: [string, string][] = [];
@@ -243,6 +265,15 @@ class FakeHost {
     } else this.configuredKeys.delete(service);
     const node = this.container(service);
     this.restartContainer(service);
+    const loop = this.restartLoops.get(service);
+    if (loop && !loop.fixedBy({ name: startupName, key })) return;
+    this.restartLoops.delete(service);
+    if (!node.running && key && key === this.rejectEdgeKey && this.crashOnRejectedKey) {
+      this.restartLoops.set(service, {
+        logs: `backend error: invalid key: API key does not exist (${key})\nboot: failed to auth tailscale\n`,
+        fixedBy: (created) => created.key !== key,
+      });
+    }
     if (!node.running && key && key !== this.rejectEdgeKey) {
       this.joinContainer(service, startupName);
     }
@@ -526,6 +557,8 @@ class FakeHost {
     if (serviceExec) {
       const service = serviceExec[1]!;
       const command = serviceExec[2];
+      if (this.restartLoops.has(service))
+        return fail(`Error response from daemon: Container ${service} is restarting, wait until`);
       if (this.stoppedContainers.has(service)) return fail(`service ${service} is not running`);
       if (command === "printenv") {
         const name = this.startupNames.get(service);
@@ -550,6 +583,29 @@ class FakeHost {
         .at(-1)!;
       return ok(this.startupNames.has(service) || this.container(service).running ? service + "\n" : "");
     }
+    if (line.startsWith("docker inspect --format {{.State.Status}} {{.State.ExitCode}}")) {
+      const service = argv.at(-1)!;
+      const image = `sha256:image ark-${service.replace("-ts", "")}`;
+      if (this.restartLoops.has(service)) return ok(`restarting 1 4143 ${image}\n`);
+      return ok(`${this.stoppedContainers.has(service) ? "exited" : "running"} 0 0 ${image}\n`);
+    }
+    if (line.startsWith("docker inspect --format {{range .Config.Env}}")) {
+      return ok(`TS_USERSPACE=false\nTS_AUTHKEY=${this.configuredKeys.get(argv.at(-1)!) ?? ""}\n`);
+    }
+    if (line.startsWith("docker logs --tail ")) {
+      return { status: 0, stdout: "", stderr: this.restartLoops.get(argv.at(-1)!)?.logs ?? "" };
+    }
+    if (line.startsWith("docker run --rm ")) {
+      expect(argv).toContain("--network=none");
+      expect(argv).toContain("--cap-drop=ALL");
+      const from = argv.find((arg) => arg.startsWith("--volumes-from="))!;
+      expect(from).toEndWith(":ro");
+      const service = from.slice("--volumes-from=".length, -":ro".length);
+      const stored = this.restartLoops.get(service)?.storedName;
+      if (stored === null) return fail("sed: permission denied");
+      return ok(stored === undefined ? "none\n" : `enrolled ${stored}\n`);
+    }
+    if (line.startsWith("docker start ") && this.restartLoops.has(argv.at(-1)!)) return ok();
     if (line.startsWith("docker start ")) {
       this.restartContainer(argv.at(-1)!);
       return ok();
@@ -1751,6 +1807,182 @@ describe("host:setup edge node", () => {
     expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_AUTHKEY).toBe("");
     expect((await setup(f, FULL, { TS_EDGE_AUTHKEY: EDGE_KEY + "-replacement" })).code).toBe(0);
   });
+
+  /** An edge node that joined before Compose passed TS_HOSTNAME: containerboot now exits on every start. */
+  function loopingEdge(f: Fixture, storedName: string, fixed = true) {
+    writeFileSync(f.host.envPath, "", { mode: 0o600 });
+    f.host.edge = { running: true, tags: ["tag:ark-edge"], hostName: storedName };
+    f.host.restartLoops.set("edge-ts", {
+      logs: flagsLog(storedName),
+      storedName,
+      fixedBy: ({ name }) => fixed && name === storedName,
+    });
+  }
+
+  test.each(["ark-edge", "custom-edge"])(
+    "a re-run recovers an enrolled edge-ts stuck in a restart loop and keeps its name %s",
+    async (name) => {
+      const f = fixture();
+      loopingEdge(f, name);
+      const identity = f.host.containerSelf("edge-ts").ID;
+      // Where the failure left setup: the host node is enrolled, nothing is hardened.
+      f.host.enrolled = true;
+      f.host.runSsh = true;
+      const result = await setup(f, [...FULL, "--tailscale-hostname", "prod"], KEYS);
+      expect(result.code).toBe(0);
+      expect(f.host.installModes).toEqual(["harden", "platform"]);
+      expect(result.text).toContain(
+        "edge-ts cannot stay up (restarting, exit code 1, restarted 4143 times); the install recreates it",
+      );
+      expect(f.host.containerSelf("edge-ts")).toMatchObject({ ID: identity, HostName: name });
+      expect(f.host.containerCreations).toEqual([["edge-ts", name]]);
+      expect(f.host.firstContainerJoins).toEqual([]);
+      expect(f.host.containerKeys).toEqual([]);
+      // Docker ignores a start while it restarts the container itself.
+      expect(f.host.calls).not.toContain("docker start edge-ts");
+      expect(
+        f.host.calls.some(
+          (call) => /volume|prune|compose .* down/.test(call) && !call.includes("--volumes-from"),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  test("repairs edge-ts in the edge step when the install has nothing to do", async () => {
+    const f = fixture();
+    expect((await setup(f, [...FULL, "--tailscale-hostname", "prod"], KEYS)).code).toBe(0);
+    writeFileSync(
+      f.host.envPath,
+      setEnvValues(readFileSync(f.host.envPath, "utf8"), { TS_EDGE_HOSTNAME: "" }),
+    );
+    const store = new StateStore(f.stateDir);
+    const saved = store.load();
+    delete saved.answers.tailscaleEdgeHostname;
+    store.save(saved);
+    const identity = f.host.containerSelf("edge-ts").ID;
+    let recreated = 0;
+    f.host.restartLoops.set("edge-ts", {
+      logs: flagsLog("prod-edge"),
+      storedName: "prod-edge",
+      fixedBy: ({ name, key }) => {
+        recreated++;
+        return name === "prod-edge" && key === "";
+      },
+    });
+    f.host.containerCreations.length = 0;
+    f.host.calls = [];
+    const result = await setup(f, FULL, {});
+    expect(result.code).toBe(0);
+    expect(recreated).toBe(1);
+    expect(result.text).toContain("recreating it and keeping its state volume");
+    expect(f.host.containerSelf("edge-ts")).toMatchObject({ ID: identity, HostName: "prod-edge" });
+    expect(f.host.calls.some((call) => call.endsWith("scripts/edge-namespace.ts"))).toBe(true);
+  });
+
+  test("gives up with the container's state and redacted log when recreating it does not help", async () => {
+    const f = fixture();
+    loopingEdge(f, "ark-edge", false);
+    const key = "tskey-auth-kOLD00000CNTRL-oldSecretValue0123456789";
+    f.host.restartLoops.get("edge-ts")!.logs =
+      `boot: up --authkey=${key} at https://login.tailscale.com/a/abc123def\nboot: failed to create TUN\n`;
+    const result = await setup(f, FULL, KEYS);
+    expect(result.code).toBe(1);
+    expect(f.host.installModes).toEqual(["harden", "platform"]);
+    expect(result.state.steps.edge.status).toBe("failed");
+    expect(result.text).toContain("edge-ts container: restarting, exit code 1, restarted 4143 times.");
+    expect(result.text).toContain("boot: failed to create TUN");
+    expect(result.text).toContain("docs/operations/troubleshooting.md#");
+    for (const text of [result.text, result.log]) {
+      expect(text).not.toContain(key);
+      expect(text).not.toContain("abc123def");
+    }
+  });
+
+  test("does not recreate a looping edge-ts whose identity cannot be read, but still hardens", async () => {
+    const f = fixture();
+    loopingEdge(f, "ark-edge");
+    f.host.restartLoops.get("edge-ts")!.storedName = null;
+    const result = await setup(f, FULL, KEYS);
+    expect(result.code).toBe(1);
+    expect(f.host.installModes).toEqual(["harden"]);
+    expect(f.host.containerCreations).toEqual([]);
+    expect(result.text).toContain("stored identity could not be read");
+    expect(result.text).toContain("exit code 1, restarted 4143 times");
+  });
+
+  test("a rejected key that crashes the container is replaced on the next run", async () => {
+    const f = fixture();
+    f.host.rejectEdgeKey = EDGE_KEY;
+    f.host.crashOnRejectedKey = true;
+    const failed = await setup(f, FULL, KEYS);
+    expect(failed.code).toBe(1);
+    expect(failed.text).toContain("Tailscale rejected the edge auth key");
+    expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_AUTHKEY).toBe("");
+    const replacement = `${EDGE_KEY}-replacement`;
+    const result = await setup(f, FULL, { TS_EDGE_AUTHKEY: replacement });
+    expect(result.code).toBe(0);
+    expect(f.host.edge.running).toBe(true);
+    for (const text of [failed.text, failed.log, result.text, result.log])
+      expect(text).not.toContain(EDGE_KEY);
+  });
+
+  test.each([
+    { name: "drops the rejected key from .env", inEnv: EDGE_KEY, kept: "" },
+    { name: "keeps a fresh key placed in .env since", inEnv: `${EDGE_KEY}-fresh`, kept: `${EDGE_KEY}-fresh` },
+  ])("a crash on a rejected key $name", async ({ inEnv, kept }) => {
+    const f = fixture();
+    writeFileSync(f.host.envPath, `TS_EDGE_AUTHKEY=${EDGE_KEY}\n`, { mode: 0o600 });
+    f.host.rejectEdgeKey = EDGE_KEY;
+    f.host.crashOnRejectedKey = true;
+    f.host.composeUp("edge-ts", {});
+    expect(f.host.restartLoops.has("edge-ts")).toBe(true);
+    writeFileSync(f.host.envPath, `TS_EDGE_AUTHKEY=${inEnv}\n`, { mode: 0o600 });
+    const ui = new ScriptedUi(true, [], []);
+    const asked: string[] = [];
+    const source = manualKeySource({ env: {}, ui, interactive: false });
+    await setup(
+      f,
+      FULL,
+      { TS_VPS_AUTHKEY: VPS_KEY },
+      {
+        keys: () => ({
+          ...source,
+          acquire: async (request, options) => {
+            asked.push(request.tag);
+            return request.tag === "tag:ark-vps" ? { key: VPS_KEY } : source.acquire(request, options);
+          },
+        }),
+      },
+    );
+    // Nothing joined with the rejected key; a fresh one in .env is used without asking.
+    expect(f.host.edge.running).toBe(Boolean(kept));
+    expect(asked.includes("tag:ark-edge")).toBe(!kept);
+    expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_AUTHKEY).toBe("");
+  });
+
+  test("a looping backup-ts is recreated with its stored name and identity, without a key", async () => {
+    const f = fixture();
+    const args = [...FULL, "--backup-node"];
+    expect((await setup(f, args, { ...KEYS, TS_BACKUP_AUTHKEY: BACKUP_KEY })).code).toBe(0);
+    const identity = f.host.containerSelf("backup-ts").ID;
+    const name = f.host.backup.hostName;
+    writeFileSync(
+      f.host.envPath,
+      setEnvValues(readFileSync(f.host.envPath, "utf8"), { TS_BACKUP_HOSTNAME: "" }),
+    );
+    f.host.restartLoops.set("backup-ts", {
+      logs: flagsLog(name),
+      storedName: name,
+      fixedBy: (created) => created.name === name && created.key === "",
+    });
+    f.host.containerKeys.length = 0;
+    const result = await setup(f, args, {});
+    expect(result.code).toBe(0);
+    expect(result.text).toContain("backup-ts cannot stay up");
+    expect(f.host.containerSelf("backup-ts")).toMatchObject({ ID: identity, HostName: name });
+    expect(f.host.containerKeys).toEqual([]);
+  });
+
   test("refuses an edge node that joined with the wrong tags", async () => {
     const f = fixture();
     f.host.edgeJoinTags = ["tag:ark-edge", "tag:server"];
@@ -3147,9 +3379,12 @@ for (const service of ["edge-ts", "backup-ts"]) {
       const platform = Bun.YAML.parse(
         readFileSync(join(repoRoot, "infra/platform/docker-compose.yml"), "utf8"),
       ) as {
-        services: Record<string, { image: string; hostname: string; environment: Record<string, string> }>;
+        services: Record<
+          string,
+          { image: string; hostname: string; entrypoint: string[]; environment: Record<string, string> }
+        >;
       };
-      const { image, hostname, environment } = platform.services[service]!;
+      const { image, hostname, entrypoint, environment } = platform.services[service]!;
       const file = join(f.root, "offline-compose.json");
       writeFileSync(
         file,
@@ -3158,6 +3393,7 @@ for (const service of ["edge-ts", "backup-ts"]) {
             [service]: {
               image,
               hostname,
+              entrypoint,
               environment: { ...environment, TS_USERSPACE: "true" },
               network_mode: "none",
             },
@@ -3182,6 +3418,8 @@ for (const service of ["edge-ts", "backup-ts"]) {
         });
       let inspected = false;
       const run: SetupDependencies["run"] = async (argv, options) => {
+        // Nothing created the real container yet, whatever the simulated install did.
+        if (argv[1] === "ps" && argv.some((arg) => arg.endsWith(`.service=${service}`))) return ok();
         if (argv[0] !== "docker" || !argv.includes(service)) return f.host.run(argv, options);
         const args = argv.slice(argv.indexOf("infra/platform/docker-compose.yml") + 1);
         if (args[0] === "up") return runDocker([...prefix, "up", "-d", service], options);
@@ -3253,6 +3491,256 @@ for (const service of ["edge-ts", "backup-ts"]) {
       }
     },
     30_000,
+  );
+}
+
+// Enrols, restarts and recreates the shipped services against a local coordination server on an
+// internal network (no internet, so no real tailnet), with every container and volume removed after.
+const HEADSCALE =
+  "headscale/headscale:0.26.1@sha256:ea9b5ee06274d757a4d52103de56cd11a9c393acb19d9a35f4b9fe52ada410de";
+for (const service of ["edge-ts", "backup-ts"]) {
+  test.skipIf(process.env.ARK_TEST_SETUP_DOCKER !== "1")(
+    `${service} waits for login, then keeps its identity and name through restarts and recreations`,
+    async () => {
+      const directory = mkdtempSync(join(tmpdir(), "ark-setup-ts-"));
+      const tag = service === "edge-ts" ? "tag:ark-edge" : "tag:ark-backup";
+      const variable = service === "edge-ts" ? "TS_EDGE" : "TS_BACKUP";
+      const platform = Bun.YAML.parse(
+        readFileSync(join(repoRoot, "infra/platform/docker-compose.yml"), "utf8"),
+      ) as {
+        services: Record<string, { volumes: string[]; environment: Record<string, string> } & object>;
+      };
+      const shipped = platform.services[service]!;
+      const login = "--login-server=http://hs:8080";
+      const definition = {
+        ...shipped,
+        ports: [],
+        networks: ["test"],
+        environment: {
+          ...shipped.environment,
+          TS_EXTRA_ARGS: `${shipped.environment.TS_EXTRA_ARGS} ${login}`,
+        },
+      };
+      // What Compose created before #72: no TS_HOSTNAME, no --reset and the image's own entrypoint.
+      const { TS_HOSTNAME: _name, ...earlier } = shipped.environment;
+      const before72 = {
+        ...definition,
+        entrypoint: ["/usr/local/bin/containerboot"],
+        environment: { ...earlier, TS_EXTRA_ARGS: `--shields-up ${login}` },
+      };
+      mkdirSync(join(directory, "hs"));
+      writeFileSync(
+        join(directory, "hs", "config.yaml"),
+        JSON.stringify({
+          server_url: "http://hs:8080",
+          listen_addr: "0.0.0.0:8080",
+          metrics_listen_addr: "127.0.0.1:9090",
+          grpc_listen_addr: "127.0.0.1:50443",
+          noise: { private_key_path: "/var/lib/headscale/noise.key" },
+          prefixes: { v4: "100.64.0.0/10", v6: "fd7a:115c:a1e0::/48", allocation: "sequential" },
+          derp: {
+            server: {
+              enabled: true,
+              region_id: 999,
+              region_code: "test",
+              region_name: "test",
+              stun_listen_addr: "0.0.0.0:3478",
+              private_key_path: "/var/lib/headscale/derp.key",
+              automatically_add_embedded_derp_region: true,
+            },
+            urls: [],
+            paths: [],
+            auto_update_enabled: false,
+          },
+          disable_check_updates: true,
+          database: { type: "sqlite", sqlite: { path: "/var/lib/headscale/db.sqlite" } },
+          dns: { magic_dns: false, base_domain: "example.test", override_local_dns: false },
+          unix_socket: "/var/run/headscale/headscale.sock",
+        }),
+      );
+      const write = (name: string, node: object) => {
+        const path = join(directory, name);
+        writeFileSync(
+          path,
+          JSON.stringify({
+            services: {
+              [service]: node,
+              hs: {
+                image: HEADSCALE,
+                command: "serve",
+                networks: ["test"],
+                volumes: [`${join(directory, "hs")}:/etc/headscale:ro`, "hs:/var/lib/headscale"],
+              },
+            },
+            networks: { test: { internal: true, ipam: { config: [{ subnet: "10.231.78.0/24" }] } } },
+            volumes: Object.fromEntries(
+              ["hs", ...shipped.volumes.map((volume) => volume.split(":")[0]!)].map((volume) => [volume, {}]),
+            ),
+          }),
+        );
+        return path;
+      };
+      const files = { shipped: write("shipped.json", definition), old: write("old.json", before72) };
+      const project = `ark-setup-${crypto.randomUUID()}`;
+      const compose = (file: string, args: string[], options: RunOptions = {}) =>
+        runCommand(["docker", "compose", "-p", project, "-f", file, ...args], {
+          env: {
+            ...withoutSetupSecrets(process.env),
+            [`${variable}_AUTHKEY`]: "",
+            [`${variable}_HOSTNAME`]: "kept-name",
+            PATH: process.env.PATH,
+            ...options.env,
+          },
+          stdin: options.stdin,
+          timeoutMs: 100_000,
+        });
+      const must = async (file: string, args: string[], options?: RunOptions) => {
+        const result = await compose(file, args, options);
+        assert.equal(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
+        return result.stdout;
+      };
+      const docker = async (...args: string[]) => {
+        const result = await runCommand(["docker", ...args], { env: process.env, timeoutMs: 60_000 });
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout.trim();
+      };
+      const container = async () => (await must(files.shipped, ["ps", "-aq", service])).trim();
+      const until = async <T>(read: () => Promise<T | undefined>) => {
+        for (let attempt = 0; attempt < 60; attempt++) {
+          const value = await read();
+          if (value !== undefined) return value;
+          await Bun.sleep(500);
+        }
+        throw new Error("timed out");
+      };
+      const self = () =>
+        until(async () => {
+          const result = await compose(files.shipped, [
+            "exec",
+            "-T",
+            service,
+            "tailscale",
+            "status",
+            "--json",
+          ]);
+          try {
+            const status = JSON.parse(result.stdout);
+            return status.BackendState === "Running"
+              ? {
+                  id: status.Self.ID,
+                  key: status.Self.PublicKey,
+                  name: status.Self.HostName,
+                  tags: status.Self.Tags,
+                }
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        });
+      const prefs = async () =>
+        JSON.parse(await must(files.shipped, ["exec", "-T", service, "tailscale", "debug", "prefs"]));
+      const identity = async () => {
+        const id = await container();
+        const image = await docker("inspect", "--format", "{{.Image}}", id);
+        return docker(
+          "run",
+          "--rm",
+          "--network=none",
+          "--read-only",
+          "--cap-drop=ALL",
+          `--volumes-from=${id}:ro`,
+          "--entrypoint=/bin/sh",
+          image,
+          "-c",
+          READ_IDENTITY,
+        );
+      };
+      try {
+        await must(files.shipped, ["up", "-d", "hs", service]);
+        // Without a key or an identity tailscaled runs alone, so containerboot's 60 s deadline is not armed.
+        expect(
+          await until(async () => {
+            const value = await prefs().catch(() => undefined);
+            return value?.ShieldsUp ? value : undefined;
+          }),
+        ).toMatchObject({ ShieldsUp: true, CorpDNS: false, WantRunning: false });
+        expect(await must(files.shipped, ["exec", "-T", service, "cat", "/proc/1/comm"])).toBe(
+          "tailscaled\n",
+        );
+        expect(await identity()).toBe("none");
+
+        await until(async () =>
+          (await compose(files.shipped, ["exec", "-T", "hs", "headscale", "users", "create", "owner"]))
+            .status === 0
+            ? true
+            : undefined,
+        );
+        const key = JSON.parse(
+          await must(files.shipped, [
+            "exec",
+            "-T",
+            "hs",
+            "headscale",
+            "preauthkeys",
+            "create",
+            "-u",
+            "1",
+            "--tags",
+            tag,
+            "-o",
+            "json",
+          ]),
+        ).key as string;
+        await must(
+          files.shipped,
+          [
+            "exec",
+            "-T",
+            service,
+            "sh",
+            "-c",
+            ENROL_CONTAINER.replace("--shields-up", `--shields-up ${login}`),
+            "sh",
+            "/var/run/tailscale/tailscaled.sock",
+            "kept-name",
+          ],
+          { stdin: key },
+        );
+        const enrolled = await self();
+        expect(enrolled).toMatchObject({ name: "kept-name", tags: [tag] });
+        expect(await identity()).toBe("enrolled kept-name");
+
+        await must(files.shipped, ["restart", service]);
+        expect(await self()).toEqual(enrolled);
+        await must(files.shipped, ["up", "-d", "--force-recreate", service]);
+        expect(await self()).toEqual(enrolled);
+        // A preference nobody passes as a flag must not stop the next start.
+        await must(files.shipped, ["exec", "-T", service, "tailscale", "set", "--accept-routes"]);
+        await must(files.shipped, ["restart", service]);
+        expect(await self()).toEqual(enrolled);
+        expect(await prefs()).toMatchObject({ RouteAll: false, ShieldsUp: true, Hostname: "kept-name" });
+
+        // The reported failure: a container that does not pass the stored hostname exits on every start.
+        await must(files.old, ["up", "-d", service]);
+        const looping = await container();
+        await until(async () =>
+          (await docker("inspect", "--format", "{{.State.Status}}", looping)) === "restarting"
+            ? true
+            : undefined,
+        );
+        const logs = await runCommand(["docker", "logs", looping], { env: process.env });
+        expect(logs.stdout + logs.stderr).toContain("requires mentioning all");
+        expect(await identity()).toBe("enrolled kept-name");
+        // The recovery: recreate it from the shipped definition with the stored name and no key.
+        await must(files.shipped, ["up", "-d", "--force-recreate", "--no-deps", service]);
+        expect(await self()).toEqual(enrolled);
+      } finally {
+        const removed = await compose(files.shipped, ["down", "--volumes", "--remove-orphans"]);
+        expect(removed.status).toBe(0);
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+    240_000,
   );
 }
 

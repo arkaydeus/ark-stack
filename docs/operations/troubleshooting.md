@@ -190,6 +190,23 @@ For manual providers, automatic checks run every two minutes for 30 minutes afte
 - **Cause:** `edge` and `edge-l4` join one specific `edge-ts` container's namespace. If `edge-ts` is restarted in place or recreated on its own, they keep running in the old, empty namespace.
 - **Fix:** run `mise run edge:rejoin`. If `edge-ts` is stopped, it fails with a start-the-owner-first error; start `edge-ts` first. Signed maintenance and the installer run this step themselves.
 
+### Host setup reports that `edge-ts` or `backup-ts` cannot stay up
+
+- **Symptom:** `docker ps -a` shows `edge-ts` (or `backup-ts`) as `Restarting`, with a high restart count. Setup prints `edge-ts cannot stay up (restarting, exit code 1, restarted … times)`. Older versions of setup stopped at "Harden the host" with `Could not determine whether edge-ts is enrolled`, on every run, and the log repeats `Container … is restarting, wait until the container is running`. `docker start` reports success but does nothing, because Docker is already restarting the container.
+- **Causes:** the end of the container's log says which one applies. Setup prints the last lines itself when it gives up, without any auth key.
+  - `Error: changing settings via 'tailscale up' requires mentioning all non-default flags`: the node is enrolled, but its stored preferences hold a setting that the container does not pass. Containers created before Compose passed `TS_HOSTNAME` do this at every start once the node was enrolled with a name.
+  - `backend error: invalid key`: Tailscale refused the auth key in the container's configuration because it was used, expired or revoked.
+  - Anything else, such as a missing `/dev/net/tun`: setup shows the lines and stops at the edge or backup step.
+- **Fix:** run host setup again. It reads the node's name from the state volume and recreates the container with that name and without a key, so an enrolled node keeps its identity, tag and name. If a key was refused, setup removes that key from `.env` and the edge step asks for a new one (or takes `TS_EDGE_AUTHKEY`). Setup never removes the state volume. If it cannot read the identity in that volume, it stops before the install and does not recreate the container.
+- **By hand:** the last line of the `requires mentioning` message ends with the name the node has, `--hostname=<name>`. Use that name here, so the node is not renamed. Run from the installation directory:
+
+  ```sh
+  sudo env TS_EDGE_AUTHKEY= TS_EDGE_HOSTNAME=<name> docker compose --env-file .env -f infra/platform/docker-compose.yml up -d --no-deps edge-ts
+  sudo mise run edge:rejoin
+  ```
+
+  The first command recreates only the `edge-ts` container and reattaches its state volume (`ark_edge_ts_state`). The second recreates `edge` and `edge-l4`, which were left in the old container's namespace. If `<name>` is not `ark-edge`, also set `TS_EDGE_HOSTNAME=<name>` in `.env`. For `backup-ts`, use `TS_BACKUP_AUTHKEY`, `TS_BACKUP_HOSTNAME` and `backup-ts`; it needs no rejoin.
+
 ### "Edge route withdrawal failed; …" or an `Edge watchdog: …` alert
 
 - **Cause:** the alert key `edge-withdrawal` is raised when the watchdog reports `withdrawal_failed`, `proxy_stopped`, `stop_failed` or `policy_unavailable`, or when `edge.drain` cannot update Caddy and stops it. A stopped Caddy restarts through its launch guard, which uses the closed configuration (ACME, redirects and the admin site keep working; tailnet routes stay withdrawn) unless the watchdog authorises the full one.

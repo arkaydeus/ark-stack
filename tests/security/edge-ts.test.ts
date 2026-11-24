@@ -9,6 +9,7 @@ const root = join(import.meta.dir, "..", "..");
 type Service = {
   image?: string;
   hostname?: string;
+  entrypoint?: string[];
   profiles?: string[];
   environment?: Record<string, string>;
   devices?: string[];
@@ -55,11 +56,24 @@ describe("edge-ts", () => {
       TS_STATE_DIR: "/var/lib/tailscale",
       TS_SOCKET: "/var/run/tailscale/tailscaled.sock",
       TS_ACCEPT_DNS: "false",
-      TS_EXTRA_ARGS: "--shields-up",
+      // --reset: a stored preference that is not passed here must not stop the node from starting.
+      TS_EXTRA_ARGS: "--reset --shields-up",
       TS_TAILSCALED_EXTRA_ARGS: "--port=41642",
     });
     expect(edgeTs.hostname).toBe("ark-edge");
     expect(edgeTs.profiles).toBeUndefined();
+  });
+
+  test("waits for login with its preferences set when it has neither a key nor an identity", () => {
+    const [shell, flag, script = ""] = edgeTs.entrypoint ?? [];
+    expect([shell, flag]).toEqual(["/bin/sh", "-c"]);
+    expect(script).toContain('set --shields-up --accept-dns=false --hostname="$$TS_HOSTNAME"');
+    expect(script).toContain("exec tailscaled ");
+    expect(script.trimEnd()).toEndWith("exec /usr/local/bin/containerboot");
+    expect(compose.services["backup-ts"]!.entrypoint).toEqual(edgeTs.entrypoint!);
+    expect(compose.services["backup-ts"]!.environment!.TS_EXTRA_ARGS).toBe(
+      edgeTs.environment!.TS_EXTRA_ARGS!,
+    );
   });
 
   test("has only the kernel-mode capabilities and the TUN device", () => {
