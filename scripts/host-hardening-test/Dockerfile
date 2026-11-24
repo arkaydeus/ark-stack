@@ -4,6 +4,11 @@ FROM tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb417424
 FROM ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 AS ubuntu
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 
+# The VPS's nft without the rest of the VPS, for readback.ts. The installer adds netbase.
+FROM ubuntu AS nft
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nftables netbase
+
 FROM ubuntu AS ssh
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

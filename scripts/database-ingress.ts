@@ -195,7 +195,8 @@ async function applyPolicies(policies: [string, string][], guards: Guard[], host
   await nft(["-f", "-"], transaction.join("\n"));
   for (const [table, rules] of policies) await verifyPolicyTable(table, rules, -1);
   if (host) {
-    const rules = await nft(["-s", "-y", "list", "table", "inet", HOST_FIREWALL_TABLE]);
+    // This image has no /etc/protocols, so list protocols as numbers whatever it contains.
+    const rules = await nft(["-s", "-y", "-p", "list", "table", "inet", HOST_FIREWALL_TABLE]);
     const ssh = /\bchain ssh_access \{/.test(rules) ? readHostSshAccess(rules) : undefined;
     assertHostFirewall(rules, host, ssh);
   }
