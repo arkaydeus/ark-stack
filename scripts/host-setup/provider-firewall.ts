@@ -73,6 +73,20 @@ export function describeProviderRules(rules: ProviderRule[], retainSsh = false) 
   return lines;
 }
 
+/**
+ * What the manual step is about, printed before its rules. Hosts and plans differ, so the wording
+ * stays hedged. The same explanation is in docs/getting-started/production-install.md#provider-firewall.
+ */
+const providerFirewallExplanation = [
+  "Your host may run a separate firewall outside this VPS. Setup has configured the firewall on the",
+  "VPS itself, but it cannot see or change the host's one: you set that in the host's control panel.",
+  "  Normally on: AWS (security groups), Google Cloud (VPC firewall rules), Azure (network security",
+  "    groups) and Oracle Cloud (security lists or network security groups).",
+  "  Not normally on, unless you added one: Hetzner, DigitalOcean, HOSTKEY, Vultr and Linode.",
+  "  Not sure? Look for Firewall, Security group or Network ACL in the control panel.",
+  "  If the VPS is behind a router, set up any port forwards needed to reach it.",
+];
+
 export const manualProviderFirewall: ProviderFirewall = {
   id: "manual",
   label: "any provider (manual)",
@@ -80,7 +94,11 @@ export const manualProviderFirewall: ProviderFirewall = {
     return true;
   },
   async plan(rules, context) {
-    return { adapter: "manual", inSync: false, changes: describeProviderRules(rules, context.retainSsh) };
+    return {
+      adapter: "manual",
+      inSync: false,
+      changes: [...providerFirewallExplanation, ...describeProviderRules(rules, context.retainSsh)],
+    };
   },
   async apply(_plan, context) {
     if (context.confirmed) return { status: "applied" };
@@ -93,8 +111,13 @@ export const manualProviderFirewall: ProviderFirewall = {
         finish,
       };
     }
-    context.ui.print("Apply these rules in your provider's firewall (console or infrastructure code) now.");
-    const answer = await context.ui.ask("Type yes once they are applied, or skip to finish this later", "");
+    context.ui.print(
+      "If your host has a separate firewall, apply these rules to it now (control panel or infrastructure code).",
+    );
+    const answer = await context.ui.ask(
+      "Type yes once they are applied (if you have a provider firewall) and any required router port forwards are in place. If neither is required, type yes. If any required rules or forwards are still pending, type skip. The install carries on, but this step and the final local audit stay unfinished",
+      "",
+    );
     if (/^y(?:es)?$/i.test(answer.trim())) return { status: "applied" };
     return { status: "pending", note: "The provider firewall rules were not confirmed.", finish };
   },

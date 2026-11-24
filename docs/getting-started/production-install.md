@@ -6,15 +6,15 @@ This page takes you from a fresh Ubuntu VPS to a hardened, running Ark Stack. On
 
 You need:
 
-| Item             | Requirement                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| VPS              | An Ubuntu VPS with a public IPv4 address (a global IPv6 address is optional) and a provider firewall you control. Keep the provider's console or rescue access working throughout. On Hetzner Cloud, an API token lets setup apply the firewall itself ([Provider firewall adapters](#provider-firewall-adapters)).                                                                                              |
-| Operating system | Ubuntu 22.04, 24.04 or 26.04 LTS on x86_64 or aarch64, with `apt` and systemd. Anything else is refused before any change.                                                                                                                                                                                                                                                                                       |
-| Access           | Root, or a user with `sudo`. The installer installs Docker Engine with Compose v2, `git`, `curl`, `jq`, OpenSSL, mise and the Tailscale package itself, from their signed apt repositories, if they are missing.                                                                                                                                                                                                 |
-| Tailscale        | A tailnet where you can edit the policy file and create auth keys, and an untagged owner device with Tailscale for SSH. A local non-root user with `sudo` on the VPS to log in as over Tailscale SSH (if it does not exist yet, an interactive setup offers to create it). Optionally one API credential, so setup does the policy and the keys for you ([Tailscale API automation](#tailscale-api-automation)). |
-| Domain           | A domain whose DNS you control, at Cloudflare (for reviewed automatic publishing) or any other provider (manual records).                                                                                                                                                                                                                                                                                        |
-| Let's Encrypt    | An email address for the ACME account.                                                                                                                                                                                                                                                                                                                                                                           |
-| Optional         | An Amazon SES account for outbound mail, an S3-compatible bucket and a home machine for off-VPS backups, and an independent HTTPS host for the off-host heartbeat.                                                                                                                                                                                                                                               |
+| Item             | Requirement                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| VPS              | An Ubuntu VPS with a public IPv4 address (a global IPv6 address is optional). If your host runs a separate firewall outside the VPS, you need to be able to change its rules; not every host does ([Provider firewall](#provider-firewall)). Keep the provider's console or rescue access working throughout. On Hetzner Cloud, an API token lets setup apply the firewall itself ([Provider firewall adapters](#provider-firewall-adapters)). |
+| Operating system | Ubuntu 22.04, 24.04 or 26.04 LTS on x86_64 or aarch64, with `apt` and systemd. Anything else is refused before any change.                                                                                                                                                                                                                                                                                                                     |
+| Access           | Root, or a user with `sudo`. The installer installs Docker Engine with Compose v2, `git`, `curl`, `jq`, OpenSSL, mise and the Tailscale package itself, from their signed apt repositories, if they are missing.                                                                                                                                                                                                                               |
+| Tailscale        | A tailnet where you can edit the policy file and create auth keys, and an untagged owner device with Tailscale for SSH. A local non-root user with `sudo` on the VPS to log in as over Tailscale SSH (if it does not exist yet, an interactive setup offers to create it). Optionally one API credential, so setup does the policy and the keys for you ([Tailscale API automation](#tailscale-api-automation)).                               |
+| Domain           | A domain whose DNS you control, at Cloudflare (for reviewed automatic publishing) or any other provider (manual records).                                                                                                                                                                                                                                                                                                                      |
+| Let's Encrypt    | An email address for the ACME account.                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Optional         | An Amazon SES account for outbound mail, an S3-compatible bucket and a home machine for off-VPS backups, and an independent HTTPS host for the off-host heartbeat.                                                                                                                                                                                                                                                                             |
 
 ## Install with one command
 
@@ -59,7 +59,7 @@ Every question comes before the long platform install. Once setup prints "Nothin
 1. **Tailnet policy and the host key.** It first asks for an optional Tailscale API credential. With one, it shows the exact policy change (the `tag:ark-vps` and `tag:ark-edge` tag owners and the owner-only Tailscale SSH rule in `check` mode), applies it after your `yes` and mints every auth key itself ([Tailscale API automation](#tailscale-api-automation)). Without one (press Enter), it prints the policy you need (see [Plan the Tailscale identities](#plan-the-tailscale-identities)) and asks you to paste a one-off `tag:ark-vps` auth key. Either way the key is passed to enrolment through stdin.
 2. **The Tailscale SSH check.** After enrolment, interactive setup offers to create the selected local user if it is missing. It requires an unused `/home/<user>` and, where OpenSSH is installed, a policy that denies that user or disables both `PasswordAuthentication` and `KbdInteractiveAuthentication` for them. If OpenSSH would still accept a password for that user (the stock Ubuntu cloud image sets `PasswordAuthentication yes`), setup writes `/etc/ssh/sshd_config.d/10-ark-ssh-user-<user>.conf` with a `Match User <user>` block that turns both off for that account only. It validates a new drop-in with `sshd -t`, checks the effective policy for the selected user, and waits for the active Ubuntu SSH service to reload before creating the account. When the standard SSH socket is idle, the service loads the verified policy on activation. Setup preserves files that were already at the drop-in path and removes only a file it added during a failed validation or reload. If setup cannot verify the listeners, their startup configuration, or the effective policy (including group or connection-specific `Match` rules), create a protected local account manually and select it with `--ssh-user`. Setup prompts for the new user's sudo password without echo. Next it prints `tailscale ssh <user>@<vps-magicdns-name>`, using the MagicDNS name Tailscale assigned to the node. Open that from your own device, keep it open, and type `yes` once it works. A newly created account always needs a fresh login check. Setup pauses before firewall hardening and the public SSH cutover until you confirm, and prints the resume command. Any per-user drop-in added by setup stays in effect during the pause.
 3. **Hardening and closing public SSH.** Setup installs the firewall baseline and automatic updates, which takes a minute or two. Hardening preserves OpenSSH access from your current OpenSSH client's IP. From a console or Tailscale session, give that client's IP with `--ssh-recovery-source IP` if public OpenSSH is active. Straight after hardening, setup arms a five-minute systemd rollback timer, stops the units serving public listeners, and asks you to open a fresh Tailscale SSH login from your device within four minutes and then type `yes` in the setup terminal. After confirmation, it disables those units and removes the recovery rule and unambiguously public UFW SSH allowances. If verification fails, times out or the session drops before confirmation, rollback restores the OpenSSH units and preserves the scoped firewall path. With `--keep-public-ssh`, setup retains OpenSSH and its audit and provider allowances.
-4. **The provider firewall.** Setup prints the inbound rules for your provider and asks you to confirm them, or, on Hetzner Cloud with an API token, shows the planned changes to an Ark firewall and applies them after your `yes`. Keep the listed OpenSSH allowance while cutover is pending.
+4. **The provider firewall.** Setup explains what a [provider firewall](#provider-firewall) is, prints the inbound rules and asks you to confirm them (answer `yes` if your host has no separate firewall), or, on Hetzner Cloud with an API token, shows the planned changes to an Ark firewall and applies them after your `yes`. Keep the listed OpenSSH allowance while cutover is pending.
 5. **The edge key.** Without a Tailscale API credential, setup asks you now for a one-off `tag:ark-edge` key (Enter skips edge enrolment, and the summary says how to finish it), and for a `tag:ark-backup` key with `--backup-node`. It keeps them in memory until it uses them later in the run. With an API credential nothing is asked: setup mints each key when it needs it and revokes it once the node has joined.
 
 From here setup runs unattended. It installs the platform (images, containers, migrations). It then brings up `edge-ts` (named `<name>-edge`), `edge` and `edge-l4`, rejoins the namespace, checks the edge node is tagged exactly `["tag:ark-edge"]` and empties `TS_EDGE_AUTHKEY` in `.env` (a minted key never reaches `.env`). It enrols the backup node (`backup-ts`, `tag:ark-backup`) the same way with `--backup-node`, applies the admin origin and ACME settings, and finally runs the local audit of the firewall, listeners and Docker publications. If `database-ingress` has not yet acknowledged a front policy the domain worker just submitted, setup waits up to a minute for it. After cutover, setup prints the external scan command to run from another machine.
@@ -119,6 +119,34 @@ What setup does with the credential:
 
 `--backup-node` (`ARK_SETUP_BACKUP_NODE=1`) also enrols `backup-ts` as `tag:ark-backup` for a home backup target, with a minted key or one given in `TS_BACKUP_AUTHKEY`. Its grant to the home machine still comes from the generated snippet ([backups guide](../guides/backups.md#setting-up-the-home-machine)).
 
+### Provider firewall
+
+Your host may run a separate firewall outside the VPS. Setup configures the firewall on the VPS itself, but, apart from the Hetzner Cloud adapter [below](#provider-firewall-adapters), it cannot see or change the host's one: you set that in the host's control panel. Hosts and plans differ, so treat this as a guide:
+
+- **Normally on:** AWS (security groups), Google Cloud (VPC firewall rules), Azure (network security groups) and Oracle Cloud (security lists or network security groups).
+- **Not normally on, unless you added one:** Hetzner, DigitalOcean, HOSTKEY, Vultr and Linode.
+- **Not sure?** Look for **Firewall**, **Security group** or **Network ACL** in the control panel.
+- **If the VPS is behind a router**, set up any port forwards needed to reach it.
+
+When setup asks:
+
+- Answer `yes` once any applicable provider firewall rules and required router port forwards are in place. If neither is required, answer `yes`.
+- If any required rules or forwards are still pending, answer `skip`. The install carries on, but this step and the final local audit stay unfinished until you rerun setup and confirm.
+
+To check from outside, capture on the VPS on a port Ark does not use. Install `tcpdump` with `apt` if it is missing. Replace `198.51.100.23` with the external test machine's public source IP for this connection.
+
+```sh
+sudo tcpdump -ni any 'src host 198.51.100.23 and tcp dst port 22222'
+```
+
+While the capture runs, connect from the test machine on a different network. Replace `203.0.113.10` with the VPS's public IP, using the same address family as the source IP in the capture filter.
+
+```sh
+nc -vz -w 5 203.0.113.10 22222
+```
+
+`nc` is expected to fail because Ark opens nothing on that port. Look for a SYN (`Flags [S]`) from the test machine as `nc` runs. That SYN shows the probe reached the VPS. If no matching SYN appears, check the addresses, upstream firewall rules and any router forwarding for the test port. Stop `tcpdump` with Ctrl+C.
+
 ### Provider firewall adapters
 
 The firewall step passes the inventory's `providerRules` and any retained OpenSSH allowance to the first `ProviderFirewall` adapter in `scripts/host-setup/provider-firewall.ts` whose `detect` succeeds, or to the one named by `--provider-firewall` (`hetzner` or `manual`). It never runs before the Tailscale SSH check has passed, and TCP 22 stays in the rules while public OpenSSH is retained. The local `host:audit` runs after the rules are applied or confirmed.
@@ -131,7 +159,7 @@ The firewall step passes the inventory's `providerRules` and any retained OpenSS
 - never modifies, detaches or deletes any other firewall. It refuses a firewall with the Ark name but without the label, or one also applied to other resources. It lists other firewalls applied to the server, because Hetzner allows whatever any of them allows;
 - makes no API change on a rerun with the same rules, and still shows notices about other attached firewalls. A rerun without a token reuses the recorded apply for the same host and rules and reports that it needs the token to verify at Hetzner. After public SSH is closed, the next approved run with a token removes the TCP 22 rule.
 
-**Any other provider (`manual`).** Prints the rules and waits for `yes` (scripted: `--provider-firewall-applied`). It is the fallback on Hetzner without a token or an applicable recorded result. It reuses an earlier confirmation for the same VPS and rules.
+**Any other provider (`manual`).** Prints the [explanation above](#provider-firewall) and the rules. Confirm with `yes` (scripted: `--provider-firewall-applied`) once all applicable provider firewall rules and required router port forwards are in place. It is the fallback on Hetzner without a token or an applicable recorded result. It reuses an earlier confirmation for the same VPS and rules.
 
 **Adding a provider.** Add one module to `scripts/host-setup/provider-firewalls/` that returns a `ProviderFirewall`, as `hetzner.ts` does:
 
@@ -267,14 +295,14 @@ curl -fsS http://127.0.0.1:3000/api/health
 
 After confirming a new Tailscale SSH session works with the baseline active:
 
-- remove public TCP 22 at the provider firewall;
+- remove public TCP 22 at the provider firewall, if your host has one;
 - stop Ubuntu's public OpenSSH listener, or bind it to a private address (Tailscale SSH is served by `tailscaled`, not OpenSSH);
 - remove UFW rules that conflict with nftables;
 - keep the provider's required ICMP and ICMPv6 allowances.
 
 ### Provider firewall and audit
 
-Generate the inbound rules from the VPS after the front policy has reconciled, apply the generated `providerRules` in your provider's firewall, then audit:
+Generate the inbound rules from the VPS after the front policy has reconciled, apply the generated `providerRules` in your provider's firewall if your host has one ([Provider firewall](#provider-firewall) explains how to tell), then audit:
 
 ```sh
 sudo mise run host:audit --inventory > ark-host-inventory.json
@@ -289,7 +317,7 @@ Then scan from outside, from a machine with Nmap and raw-socket permission, givi
 sudo mise run host:audit --external ark-host-inventory.json <public-ipv4> <public-ipv6>
 ```
 
-Keep the provider firewall in step whenever mail, the shared SNI ports or raw routes change. [Provider firewall and audit](../operating.md#provider-firewall-and-audit) explains the results.
+Keep any provider firewall in step whenever mail, the shared SNI ports or raw routes change. [Provider firewall and audit](../operating.md#provider-firewall-and-audit) explains the results.
 
 ### Enrol the edge node
 
