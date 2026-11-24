@@ -652,7 +652,12 @@ class FakeHost {
     }
     if (line.startsWith("docker start ") && this.restartLoops.has(argv.at(-1)!)) return ok();
     if (line.startsWith("docker start ")) {
-      this.restartContainer(argv.at(-1)!);
+      const service = argv.at(-1)!;
+      this.restartContainer(service);
+      const key = this.configuredKeys.get(service);
+      const node = this.container(service);
+      if (!node.running && !node.hostName && key && key !== this.rejectEdgeKey)
+        this.joinContainer(service, this.startupNames.get(service)!);
       return ok();
     }
     if (line.endsWith("scripts/edge-namespace.ts"))
@@ -2587,10 +2592,15 @@ describe("host:setup Tailscale machine names", () => {
       f.host.containerKeys.length = 0;
       expect((await setup(f, args, {})).code).toBe(0);
       expect(f.host.containerSelf(service)).toMatchObject({ ID: identity, HostName: "custom" });
-      expect(f.host.calls).toContain(`docker start ${service}`);
+      if (service === "edge-ts") {
+        // The existing identity is recovered without the old configured auth key.
+        expect(f.host.calls).not.toContain("docker start edge-ts");
+        expect(f.host.configuredKeys.has(service)).toBe(false);
+      }
 
       f.host.stoppedContainers.add(service);
       expect((await setup(f, [...args, flag, "renamed"], {})).code).toBe(0);
+      expect(f.host.calls).toContain(`docker start ${service}`);
       expect(f.host.containerSelf(service)).toMatchObject({ ID: identity, HostName: "renamed" });
       expect(f.host.containerKeys).toEqual([]);
     },
@@ -3006,11 +3016,14 @@ afterEach(() => {
 
 /** A mock of the Tailscale API v2 endpoints the setup uses. */
 class MockTailscale {
+  tailnets = ["-"];
   policy = NARROWED_POLICY;
   etag = '"etag-1"';
   requests: { method: string; path: string; auth: string; body: string; ifMatch?: string }[] = [];
   keys = new Map<string, { key: string; body: Record<string, any>; revoked: boolean }>();
   validateProblem?: string;
+  validateData?: unknown;
+  policyError?: { method: "GET" | "POST"; message: string };
   revokeStatuses = new Map<string, number[]>();
   oauthScopes = ["policy_file", "auth_keys", "devices:posture_attributes", "devices:core:read"];
   oauthTag = "tag:ark-setup";
@@ -3056,7 +3069,10 @@ class MockTailscale {
     }
     if (auth !== `Bearer ${API_TOKEN}` && auth !== `Bearer ${OAUTH_ACCESS}`)
       return Response.json({ message: "unauthorized" }, { status: 401 });
-    const base = "/api/v2/tailnet/-";
+    const base = this.tailnets
+      .map((tailnet) => `/api/v2/tailnet/${tailnet}`)
+      .find((path) => url.pathname.startsWith(`${path}/`));
+    if (!base) return Response.json({ message: "unknown tailnet" }, { status: 404 });
     if (
       auth === `Bearer ${OAUTH_ACCESS}` &&
       url.pathname.startsWith(`${base}/acl`) &&
@@ -3065,6 +3081,8 @@ class MockTailscale {
       )
     )
       return Response.json({ message: "insufficient scope" }, { status: 403 });
+    if (url.pathname === `${base}/acl` && request.method === this.policyError?.method)
+      return Response.json({ message: this.policyError.message }, { status: 400 });
     if (request.method === "GET" && url.pathname === `${base}/acl`) {
       const response = new Response(this.policy, {
         headers: { "content-type": "application/hujson", etag: this.etag },
@@ -3077,7 +3095,9 @@ class MockTailscale {
     }
     if (request.method === "POST" && url.pathname === `${base}/acl/validate`) {
       parseHujson(body);
-      return this.validateProblem ? Response.json({ message: this.validateProblem }) : new Response("");
+      return this.validateProblem || this.validateData
+        ? Response.json({ message: this.validateProblem, data: this.validateData })
+        : new Response("");
     }
     if (request.method === "POST" && url.pathname === `${base}/acl`) {
       if (request.headers.get("if-match") !== this.etag)
@@ -4153,6 +4173,7 @@ describe("Tailscale API key source", () => {
       options: { nonInteractive: !interactive, acceptBroadTailnetPolicy, tailnetPolicyReviewed: false },
       state: { version: 1, answers: {}, steps: {} },
       save: () => {},
+      redact: (text) => text,
       resumeCommand: "host:setup",
     });
   const api = (mock: MockTailscale, credential = credentialFromEnv({ TS_API_KEY: API_TOKEN })!) => {
@@ -4529,6 +4550,8 @@ describe("catch-all tailnet policy detection", () => {
       grants: [{ src: ["*"], dst: ["*"], ip: ["*"], app: { "example.com/cap": [{ token: "private" }] } }],
     });
     expect(rule!.text).toBe('{"src": ["*"], "dst": ["*"], "ip": ["*"]}');
+    expect(rule!.replacement).toBeUndefined();
+    expect(rule!.sourceEdit).toBe('{"src": ["autogroup:member"]}');
   });
 
   test("the digest ignores rule and key order and notices every change", () => {
@@ -4549,6 +4572,8 @@ describe("host:setup with a catch-all tailnet policy", () => {
   const SCRIPTED = FULL.filter((flag) => flag !== "--tailnet-policy-reviewed");
   const APPROVED = [...SCRIPTED, "--approve-tailnet-policy"];
   const API = { TS_API_KEY: API_TOKEN };
+  const TAILNET_ID = "T123456CNTRL";
+  const NAMED_API = { ...API, TS_TAILNET: TAILNET_ID };
   /** Owner content that must never leave the policy: rules, comments, hosts and groups. */
   const PRIVATE = ["private-host", "100.64.9.9", "group:private", "private comment", "autogroup:self"];
   const PRIVATE_POLICY = DEFAULT_POLICY.replace(
@@ -4561,6 +4586,7 @@ describe("host:setup with a catch-all tailnet policy", () => {
 
   function broad(policy = PRIVATE_POLICY) {
     const mock = new MockTailscale();
+    mock.tailnets.push(TAILNET_ID);
     mock.policy = policy;
     return mock;
   }
@@ -4643,7 +4669,7 @@ describe("host:setup with a catch-all tailnet policy", () => {
     const f = fixture();
     const mock = broad();
     const ui = interactive([["Type accept to continue", "accept"], ["Apply this change", "yes"], ...FINISH]);
-    const result = await setup(f, INTERACTIVE, API, { ...tsApi(mock), scripted: ui });
+    const result = await setup(f, INTERACTIVE, NAMED_API, { ...tsApi(mock), scripted: ui });
     expect(result.code, result.text).toBe(0);
     expect(ui.prompts.filter((prompt) => prompt.includes("Type accept"))).toHaveLength(1);
     expect(summaryOf(result)).toContain("you accepted a catch-all rule");
@@ -4654,7 +4680,7 @@ describe("host:setup with a catch-all tailnet policy", () => {
     // The same rules, with unrelated edits around them.
     mock.policy = `// edited elsewhere\n${mock.policy}`;
     const same = interactive([]);
-    const second = await setup(f, FINISHED, API, { ...tsApi(mock), scripted: same });
+    const second = await setup(f, FINISHED, NAMED_API, { ...tsApi(mock), scripted: same });
     expect(second.code, second.text).toBe(0);
     expect(same.prompts.some((prompt) => prompt.includes("Type accept"))).toBe(false);
     expect(summaryOf(second)).toContain("you accepted a catch-all rule");
@@ -4662,7 +4688,7 @@ describe("host:setup with a catch-all tailnet policy", () => {
     // Enrolled nodes: a changed rule asks again, and a refusal does not block.
     mock.policy = mock.policy.replace('"dst": ["*"], "ip": ["*"]}', '"dst": ["*"], "ip": ["tcp:22"]}');
     const changed = interactive([["Type accept to continue", "no"]]);
-    const third = await setup(f, FINISHED, API, { ...tsApi(mock), scripted: changed });
+    const third = await setup(f, FINISHED, NAMED_API, { ...tsApi(mock), scripted: changed });
     expect(third.code, third.text).toBe(0);
     expect(summaryOf(third)).toContain("Still to do:");
     expect(summaryOf(third)).toContain('grant {"src": ["*"], "dst": ["*"], "ip": ["tcp:22"]}');
@@ -4702,13 +4728,15 @@ describe("host:setup with a catch-all tailnet policy", () => {
     async (flags, env) => {
       const f = fixture();
       const mock = broad();
-      const result = await setup(f, [...APPROVED, ...flags], { ...API, ...env }, tsApi(mock));
+      const result = await setup(f, [...APPROVED, ...flags], { ...NAMED_API, ...env }, tsApi(mock));
       expect(result.code, result.text).toBe(0);
       expect(summaryOf(result)).toContain("you accepted a catch-all rule");
       expect(summaryOf(result)).toContain(`grant ${RULE}`);
       expectPrivate(f, result);
       // Remembered: the flag is not needed again.
-      expect((await setup(f, APPROVED, API, tsApi(mock))).code).toBe(0);
+      const rerun = await setup(f, APPROVED, NAMED_API, tsApi(mock));
+      expect(rerun.code).toBe(0);
+      expect(rerun.text).toContain("you accepted a catch-all rule");
     },
   );
 
@@ -4728,14 +4756,98 @@ describe("host:setup with a catch-all tailnet policy", () => {
     const f = fixture();
     enrolled(f);
     const mock = broad();
-    const result = await setup(f, APPROVED, API, tsApi(mock));
+    const result = await setup(f, SCRIPTED, API, tsApi(mock));
     expect(result.code, result.text).toBe(0);
     expect(summaryOf(result)).toContain("Still to do:");
     expect(summaryOf(result)).toContain(`grant ${RULE}`);
     expect(summaryOf(result)).toContain(ACCEPT);
+    expect(summaryOf(result)).toContain("Ark policy additions are awaiting approval");
+    expect(mock.writes()).toEqual([]);
     expect(mock.keys.size).toBe(0);
     expectPrivate(f, result);
   });
+
+  test("API, interactive, everything enrolled: declining policy additions leaves them pending", async () => {
+    const f = fixture();
+    enrolled(f);
+    const mock = broad();
+    const ui = interactive([
+      ["Type accept to continue", ""],
+      ["Apply this change", "no"],
+    ]);
+    const result = await setup(f, FINISHED, API, { ...tsApi(mock), scripted: ui });
+    expect(result.code, result.text).toBe(0);
+    expect(summaryOf(result)).toContain("Ark policy additions are awaiting approval");
+    expect(summaryOf(result)).toContain(`grant ${RULE}`);
+    expect(mock.writes()).toEqual([]);
+    expect(mock.requests.every((request) => request.method === "GET")).toBe(true);
+  });
+
+  test.each([{ skip: true }, { skip: false }])(
+    "a stopped keyed edge is gated before docker start (skip edge: $skip)",
+    async ({ skip }) => {
+      const f = fixture();
+      f.host.enrolled = f.host.runSsh = true;
+      const mock = broad();
+      f.host.startupNames.set("edge-ts", "ark-edge");
+      f.host.stoppedContainers.add("edge-ts");
+      f.host.configuredKeys.set("edge-ts", EDGE_KEY);
+      const args = skip ? [...APPROVED, "--skip-edge"] : APPROVED;
+      const result = await setup(f, args, API, tsApi(mock));
+      expect(result.code, result.text).toBe(skip ? 0 : 2);
+      expect(result.text).toContain(skip ? "was not accepted" : "Stopped before enrolling tag:ark-edge");
+      expect(f.host.calls).not.toContain("docker start edge-ts");
+      expect(f.host.firstContainerJoins).toEqual([]);
+      if (!skip) {
+        const resumed = await setup(f, [...args, ACCEPT], API, tsApi(mock));
+        expect(resumed.code, resumed.text).toBe(0);
+        expect(f.host.calls).toContain("docker start edge-ts");
+        expect(f.host.firstContainerJoins).toEqual([["edge-ts", "ark-edge"]]);
+      }
+    },
+  );
+
+  test.each(["minted", "supplied"])("a mid-install policy edit holds back a %s edge key", async (kind) => {
+    const f = fixture();
+    const mock = new MockTailscale();
+    const run = f.host.run;
+    f.host.run = async (argv, options) => {
+      const result = await run(argv, options);
+      if (argv.includes("--harden-vps") && f.host.installModes.at(-1) === "platform") {
+        mock.policy = mock.policy.replace('"src": ["autogroup:member"]', '"src": ["*"]');
+        mock.etag = '"edited-mid-install"';
+      }
+      return result;
+    };
+    const env = kind === "supplied" ? { ...API, TS_EDGE_AUTHKEY: EDGE_KEY } : API;
+    const result = await setup(f, [...APPROVED, "--tailnet-policy-reviewed"], env, tsApi(mock));
+    expect(result.code, result.text).toBe(2);
+    expect(result.text).toContain("Stopped before enrolling tag:ark-edge");
+    expect(f.host.enrolled).toBe(true);
+    expect(f.host.firstContainerJoins).toEqual([]);
+    expect(mock.keys.size).toBe(1);
+    expect(readFileSync(f.host.envPath, "utf8")).not.toContain(EDGE_KEY);
+  });
+
+  test.each(["different ID", "unverified default"])(
+    "API acceptance cannot authorise an enrolment with a %s",
+    async (target) => {
+      const f = fixture();
+      const mock = broad();
+      const firstApi = target === "different ID" ? NAMED_API : API;
+      const first = await setup(f, [...APPROVED, ACCEPT, "--skip-edge"], firstApi, tsApi(mock));
+      expect(first.code, first.text).toBe(0);
+      const otherId = "T654321CNTRL";
+      mock.tailnets.push(otherId);
+      // Both tailnets return identical rules and ETags.
+      const nextApi = target === "different ID" ? { ...API, TS_TAILNET: otherId } : API;
+      const next = await setup(f, APPROVED, nextApi, tsApi(mock));
+      expect(next.code, next.text).toBe(2);
+      expect(next.state.tailnetPolicy.digest).toBe(first.state.tailnetPolicy.digest);
+      expect(f.host.firstContainerJoins).toEqual([]);
+      expect(mock.keys.size).toBe(1);
+    },
+  );
 
   test("API: an edge that has not joined yet is gated before the policy changes", async () => {
     const f = fixture();
@@ -4775,7 +4887,7 @@ describe("host:setup with a catch-all tailnet policy", () => {
   test.each([
     ["yes", "clear"],
     ["accept", "accepted"],
-  ])("pasted keys, interactive: %s continues and is remembered", async (answer, status) => {
+  ])("pasted keys, interactive: %s continues and is remembered for the summary", async (answer, status) => {
     const f = fixture();
     const ui = interactive(
       [["policy is saved and contains no such rule", answer], ...FINISH],
@@ -4865,14 +4977,112 @@ describe("host:setup with a catch-all tailnet policy", () => {
   test("pasted keys never use what the API read earlier to enrol a new node", async () => {
     const f = fixture();
     const mock = broad();
-    expect((await setup(f, [...APPROVED, ACCEPT, "--skip-edge"], API, tsApi(mock))).code).toBe(0);
+    expect((await setup(f, [...APPROVED, ACCEPT, "--skip-edge"], NAMED_API, tsApi(mock))).code).toBe(0);
     const result = await setup(f, SCRIPTED, { TS_EDGE_AUTHKEY: EDGE_KEY });
     expect(result.code).toBe(2);
     expect(f.host.edge.running).toBe(false);
     // The acceptance of the rules setup read still stands.
     expect(result.state.tailnetPolicy).toMatchObject({ status: "accepted", read: true });
-    expect((await setup(f, APPROVED, API, tsApi(mock))).code).toBe(0);
+    expect((await setup(f, APPROVED, NAMED_API, tsApi(mock))).code).toBe(0);
   });
+
+  test.each(["edge", "backup", "vps"])(
+    "a prior manual answer cannot authorise a new %s join",
+    async (node) => {
+      const f = fixture();
+      const args = [...SCRIPTED, "--skip-edge"];
+      const first = await setup(f, [...args, node === "vps" ? ACCEPT : "--tailnet-policy-reviewed"], {
+        TS_VPS_AUTHKEY: VPS_KEY,
+      });
+      expect(first.code, first.text).toBe(0);
+      if (node === "vps") f.host.enrolled = f.host.runSsh = false;
+      const options = node === "edge" ? SCRIPTED : node === "backup" ? [...args, "--backup-node"] : args;
+      const result = await setup(f, options, { ...KEYS, TS_BACKUP_AUTHKEY: BACKUP_KEY });
+      expect(result.code, result.text).toBe(2);
+      expect(result.text).toContain(`Stopped before enrolling tag:ark-${node}`);
+      expect(f.host.firstContainerJoins).toEqual([]);
+      expect(f.host.enrolled).toBe(node !== "vps");
+    },
+  );
+
+  test.each(["environment", "key file", ".env"])(
+    "a clean API tailnet cannot authorise an independently supplied key from %s",
+    async (where) => {
+      const f = fixture();
+      const mock = new MockTailscale();
+      const env: Record<string, string> = { ...API };
+      if (where === "environment") env.TS_VPS_AUTHKEY = VPS_KEY;
+      if (where === "key file") {
+        env.TS_VPS_AUTHKEY_FILE = join(f.root, "vps-key");
+        writeFileSync(env.TS_VPS_AUTHKEY_FILE, VPS_KEY, { mode: 0o600 });
+      }
+      if (where === ".env") {
+        f.host.enrolled = f.host.runSsh = true;
+        writeFileSync(f.host.envPath, `TS_EDGE_AUTHKEY=${EDGE_KEY}\n`, { mode: 0o600 });
+      }
+      const result = await setup(f, APPROVED, env, tsApi(mock));
+      expect(result.code, result.text).toBe(2);
+      expect(result.text).toContain("cannot verify which tailnet each supplied key will join");
+      expect(enrolments(f)).toEqual([]);
+      expect(mock.writes()).toEqual([]);
+    },
+  );
+
+  test("matching selectors and mixed-grant guidance redact credentials on pause and rerun", async () => {
+    const f = fixture();
+    const selectorSecret = "tskey-api-synthetic-selector";
+    const appSecret = "private-app-parameter";
+    const mock = broad(
+      JSON.stringify({
+        grants: [
+          {
+            src: ["*", `tag:${selectorSecret}`, "group:retained"],
+            dst: ["*"],
+            ip: ["*"],
+            app: { "example.com/cap": [{ token: appSecret }] },
+          },
+        ],
+      }),
+    );
+    const paused = await setup(f, APPROVED, NAMED_API, tsApi(mock));
+    const resumed = await setup(f, [...APPROVED, ACCEPT], NAMED_API, tsApi(mock));
+    expect(paused.code).toBe(2);
+    expect(resumed.code, resumed.text).toBe(0);
+    expect(paused.text).toContain("change only the source field in the existing grant");
+    expect(paused.text).toContain('"src": ["autogroup:member", "tag:<redacted>", "group:retained"]');
+    expect(paused.text).not.toContain("Suggested replacement:");
+    expect(resumed.state.tailnetPolicy.digest).toBe(paused.state.tailnetPolicy.digest);
+    for (const result of [paused, resumed]) {
+      expect(result.text).not.toContain(selectorSecret);
+      expect(result.text).not.toContain(appSecret);
+      expect(result.log).not.toContain(selectorSecret);
+      expect(result.log).not.toContain(appSecret);
+      expect(JSON.stringify(result.state)).not.toContain(selectorSecret);
+      expect(JSON.stringify(result.state)).not.toContain(appSecret);
+    }
+  });
+
+  test.each(["read", "validate", "write"])(
+    "policy %s errors omit private API diagnostics",
+    async (operation) => {
+      const f = fixture();
+      const mock = new MockTailscale();
+      if (operation === "validate") {
+        mock.validateProblem = "policy test for private-host failed";
+        mock.validateData = { failed: ["group:private"] };
+      } else {
+        mock.policyError = { method: operation === "read" ? "GET" : "POST", message: "private-host" };
+      }
+      const result = await setup(f, APPROVED, API, tsApi(mock));
+      expect(result.code).toBe(1);
+      expect(result.text).toContain(
+        operation === "validate" ? "Tailscale rejected the merged policy" : "HTTP 400",
+      );
+      expect(f.host.enrolled).toBe(false);
+      expect(mock.keys.size).toBe(0);
+      expectPrivate(f, result);
+    },
+  );
 
   test("a supplied key is checked again before it enrols a node that lost its identity during install", async () => {
     const f = fixture();

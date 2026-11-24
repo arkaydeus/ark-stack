@@ -5,7 +5,7 @@
 // (tailscale-api.ts), or without any when the policy cannot be read (pasted keys). It asks, or takes
 // a scripted run's flags, and either returns or pauses setup. It only pauses while a node the policy
 // concerns is still to be enrolled: enrolled nodes never hold up a re-run. The outcome is kept in
-// the state file with the matching rules only, so an acceptance lasts until those rules change.
+// the state file with the matching rules only. A reusable acceptance also identifies the tailnet.
 import { ARK_BACKUP_TAG, ARK_EDGE_TAG, ARK_VPS_TAG } from "@ark-stack/shared";
 
 import type { Options } from "./answers.ts";
@@ -27,11 +27,10 @@ const ACCESS_CONTROLS = "Access controls (https://login.tailscale.com/admin/acls
 
 export interface PolicyGate {
   /** The rules found in the policy just read, and the Ark tags this run still has to enrol. */
-  found(rules: CatchAllRule[], pending: EnrolledTag[]): Promise<void>;
-  /** The policy cannot be read (no API credential). */
-  unread(pending: EnrolledTag[]): Promise<void>;
-  /** Whether a node with one of these tags must not be enrolled before another review. */
-  unresolved(pending: EnrolledTag[]): boolean;
+  found(rules: CatchAllRule[], pending: EnrolledTag[], scope: string | symbol): Promise<void>;
+  /** The policy for these keys cannot be verified through the API. */
+  unread(pending: EnrolledTag[], withApi?: boolean): Promise<void>;
+  policyWriteDeferred(deferred: boolean): void;
 }
 
 export type PolicyGateOptions = {
@@ -40,6 +39,7 @@ export type PolicyGateOptions = {
   options: Pick<Options, "nonInteractive" | "acceptBroadTailnetPolicy" | "tailnetPolicyReviewed">;
   state: SetupState;
   save: () => void;
+  redact: (text: string) => string;
   resumeCommand: string;
 };
 
@@ -69,7 +69,13 @@ const DEFAULT_RULE = catchAllRules({ grants: [{ src: ["*"], dst: ["*"], ip: ["*"
 function suggestion(rules: CatchAllRule[]) {
   const lines: string[] = [];
   for (const rule of rules) {
-    if (rule.replacement) lines.push("Suggested replacement:", `  ${rule.replacement}`);
+    if (rule.sourceEdit) {
+      lines.push(
+        "Suggested source edit: change only the source field in the existing grant to keep its app capabilities:",
+        `  ${rule.sourceEdit}`,
+        "  If no sources remain, review who needs its application capabilities before removing the grant.",
+      );
+    } else if (rule.replacement) lines.push("Suggested replacement:", `  ${rule.replacement}`);
     else {
       lines.push(
         "Suggested replacement: remove the rule, or name the tags and devices that need it",
@@ -77,11 +83,11 @@ function suggestion(rules: CatchAllRule[]) {
       );
     }
   }
-  if (rules.some((rule) => rule.coversOtherTags && rule.replacement))
+  if (rules.some((rule) => rule.coversOtherTags && (rule.replacement || rule.sourceEdit)))
     lines.push(
       "Other tagged machines lose the access this rule gives them, unless you name their tags in it.",
     );
-  if (rules.some((rule) => rule.replacement))
+  if (rules.some((rule) => rule.replacement || rule.sourceEdit))
     lines.push(
       "If you use exit nodes, Tailscale requires a rule for them whose destination is autogroup:internet:",
       '  {"src": ["autogroup:member"], "dst": ["autogroup:internet"], "ip": ["*"]}',
@@ -97,13 +103,13 @@ function suggestion(rules: CatchAllRule[]) {
 const ruleLine = (rule: Pick<CatchAllRule, "kind" | "text">) => `${rule.kind} ${rule.text}`;
 
 export function policyGate(input: PolicyGateOptions): PolicyGate {
-  const { ui, interactive, options, state, save } = input;
+  const { ui, interactive, options, state, save, redact } = input;
   const scripted = !interactive && options.nonInteractive;
-  /** Tags this run may not enrol yet. */
-  let open: readonly EnrolledTag[] = ENROLLED_TAGS;
+  let manualConfirmed = false;
+  let lastApiReview: { scope: string | symbol; digest: string; accepted: boolean } | undefined;
 
   const say = (lines: string[]) => {
-    for (const line of lines) ui.print(line ? `      ${line}` : "");
+    for (const line of lines) ui.print(line ? `      ${redact(line)}` : "");
   };
   const record = (review: Omit<NonNullable<SetupState["tailnetPolicy"]>, "at">) => {
     state.tailnetPolicy = { ...review, at: new Date().toISOString() };
@@ -134,32 +140,46 @@ export function policyGate(input: PolicyGateOptions): PolicyGate {
   }
 
   return {
-    unresolved: (pending) => pending.some((tag) => open.includes(tag)),
+    policyWriteDeferred(deferred) {
+      const value = deferred || undefined;
+      if (state.tailnetPolicyWriteDeferred === value) return;
+      state.tailnetPolicyWriteDeferred = value;
+      save();
+    },
 
-    async found(rules, pending) {
+    async found(rules, pending, scope) {
       if (!rules.length) {
-        open = [];
-        record({ status: "clear", read: true });
+        lastApiReview = undefined;
+        if (!state.tailnetPolicy?.read || state.tailnetPolicy.status !== "clear")
+          record({ status: "clear", read: true });
         return;
       }
       const digest = rulesDigest(rules);
-      const shown = rules.map(ruleLine);
+      const storedScope = typeof scope === "string" ? scope : undefined;
+      const shown = rules.map((rule) => redact(ruleLine(rule)));
       const previous = state.tailnetPolicy;
+      const tags = ENROLLED_TAGS.filter((tag) => rules.some((rule) => rule.tags.includes(tag)));
+      // A fresh host is always gated; later only for the nodes the rules concern.
+      const blocking = pending.some((tag) => tag === ARK_VPS_TAG || tags.includes(tag));
+      if (lastApiReview?.scope === scope && lastApiReview.digest === digest) {
+        if (lastApiReview.accepted || !blocking) return;
+      }
       ui.print("");
       say([
         `Warning: your tailnet policy has ${rules.length === 1 ? "a catch-all rule" : "catch-all rules"}:`,
         ...shown.map((line) => `  ${line}`),
       ]);
-      if (previous?.status === "accepted" && previous.digest === digest) {
+      if (
+        storedScope &&
+        previous?.status === "accepted" &&
+        previous.scope === storedScope &&
+        previous.digest === digest
+      ) {
         say([`You accepted ${rules.length === 1 ? "it" : "them"} on ${previous.at}; continuing.`]);
-        open = [];
+        lastApiReview = { scope, digest, accepted: true };
         return;
       }
-      const tags = ENROLLED_TAGS.filter((tag) => rules.some((rule) => rule.tags.includes(tag)));
       say(["", ...meaning(tags), "", ...suggestion(rules), ""]);
-      // A fresh host is always gated; later only for the nodes the rules concern.
-      const concerned = (tag: EnrolledTag) => tag === ARK_VPS_TAG || tags.includes(tag);
-      const blocking = pending.some(concerned);
       let accepted = scripted && options.acceptBroadTailnetPolicy;
       if (interactive) {
         accepted =
@@ -167,8 +187,14 @@ export function policyGate(input: PolicyGateOptions): PolicyGate {
             `Type ${ACCEPT_WORD} to continue with ${rules.length === 1 ? "this rule" : "these rules"} in place (anything else ${blocking ? "stops here" : "continues and lists it as unfinished"})`,
           )) === ACCEPT_WORD;
       } else if (accepted) say([`Accepted with ${ACCEPT_FLAG}.`]);
-      open = accepted ? [] : ENROLLED_TAGS.filter(concerned);
-      record({ status: accepted ? "accepted" : "unconfirmed", read: true, rules: shown, digest });
+      lastApiReview = { scope, digest, accepted };
+      record({
+        status: accepted ? "accepted" : "unconfirmed",
+        read: true,
+        rules: shown,
+        digest,
+        scope: storedScope,
+      });
       if (!accepted && blocking) {
         pause(
           "the tailnet policy lets Ark nodes open connections to every device, and that was not accepted.",
@@ -183,33 +209,23 @@ export function policyGate(input: PolicyGateOptions): PolicyGate {
         ]);
     },
 
-    async unread(pending) {
+    async unread(pending, withApi = false) {
+      if (manualConfirmed) return;
       const previous = state.tailnetPolicy;
-      const fresh = pending.includes(ARK_VPS_TAG);
       const accept = scripted && options.acceptBroadTailnetPolicy;
       const reviewed = scripted && options.tailnetPolicyReviewed;
-      if (!accept && !reviewed && previous && previous.status !== "unconfirmed") {
-        // The operator's own answer about a policy setup cannot read; a fresh host confirms it again.
-        if (!previous.read && (previous.status === "accepted" || !fresh)) {
-          say([
-            previous.status === "accepted"
-              ? `You accepted continuing with a catch-all tailnet policy rule on ${previous.at}.`
-              : `You confirmed on ${previous.at} that the tailnet policy has no catch-all rule.`,
-          ]);
-          open = [];
-          return;
-        }
-        // Nothing to enrol: keep what setup read earlier. A later enrolment asks again.
-        if (!pending.length) return;
-      }
+      // With nothing to enrol, keep the earlier review for the summary.
+      if (!pending.length && !accept && !reviewed && previous && previous.status !== "unconfirmed") return;
       ui.print("");
       say([
-        "Setup cannot read your tailnet policy without a Tailscale API credential, so check it yourself.",
+        withApi
+          ? "Setup cannot verify which tailnet each supplied key will join. Check the policy of every tailnet these keys will join."
+          : "Setup cannot read your tailnet policy without a Tailscale API credential. Check the policy of every tailnet your keys will join.",
         `In ${ACCESS_CONTROLS}, look for a catch-all rule: one whose source`,
         `covers the Ark tags ("*", "autogroup:tagged", an Ark tag, or a range such as 100.64.0.0/10) and whose`,
         `destination covers every device ("*" or such a range). Tailscale's default rule is one:`,
         `  ${DEFAULT_RULE.text}`,
-        ...(previous?.status !== "clear" && previous?.rules
+        ...(!withApi && previous?.status !== "clear" && previous?.rules
           ? ["When setup last read the policy, it had:", ...previous.rules.map((rule) => `  ${rule}`)]
           : []),
         "",
@@ -231,10 +247,14 @@ export function policyGate(input: PolicyGateOptions): PolicyGate {
             ? `Continuing with any catch-all rule accepted (${ACCEPT_FLAG}).`
             : `You reviewed the policy (${REVIEWED_FLAG}).`,
         ]);
-      open = outcome ? [] : ENROLLED_TAGS;
-      // What setup read earlier says more than another acceptance, or no answer at all.
-      const keep = outcome === "accepted" ? previous?.status === "accepted" : !outcome && previous?.rules;
-      if (!keep) record({ status: outcome ?? "unconfirmed", read: false });
+      manualConfirmed = Boolean(outcome);
+      if (withApi || (!outcome && previous?.read)) {
+        state.suppliedKeyPolicy = { status: outcome ?? "unconfirmed", at: new Date().toISOString() };
+        save();
+      } else {
+        delete state.suppliedKeyPolicy;
+        record({ status: outcome ?? "unconfirmed", read: false });
+      }
       if (!outcome && blocking) {
         pause(
           "you have not confirmed that the tailnet policy has no catch-all rule.",
@@ -254,7 +274,22 @@ export function policyGate(input: PolicyGateOptions): PolicyGate {
 
 /** The summary's lines about a catch-all: one accepted, and one still to resolve. */
 export function policySummary(state: SetupState): { accepted: string[]; unfinished: string[] } {
-  const review = state.tailnetPolicy;
+  const summary = reviewSummary(state.tailnetPolicy);
+  const supplied = state.suppliedKeyPolicy;
+  if (supplied?.status === "accepted")
+    summary.accepted.push(`Supplied keys: you accepted a catch-all rule on ${supplied.at}.`);
+  if (supplied?.status === "unconfirmed")
+    summary.unfinished.push(
+      "  - Supplied keys: confirm the policy of the tailnet they will join before using them.",
+    );
+  if (state.tailnetPolicyWriteDeferred)
+    summary.unfinished.push(
+      "  - Tailnet policy: Ark policy additions are awaiting approval. Re-run interactively, or with --non-interactive --approve-tailnet-policy.",
+    );
+  return summary;
+}
+
+function reviewSummary(review: SetupState["tailnetPolicy"]): { accepted: string[]; unfinished: string[] } {
   if (!review || review.status === "clear") return { accepted: [], unfinished: [] };
   const rules = (review.rules ?? []).map((rule) => `      ${rule}`);
   const recheck = `re-run host:setup with a Tailscale API credential (or with --non-interactive ${REVIEWED_FLAG}) to clear this`;

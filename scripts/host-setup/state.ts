@@ -74,7 +74,12 @@ export type SetupState = {
     rules?: string[];
     /** Identifies exactly those rules: an acceptance no longer holds once they change. */
     digest?: string;
+    /** Identifies the API and verified tailnet ID for a reusable acceptance. */
+    scope?: string;
   };
+  /** The operator's attestation for supplied keys when the API policy was also reviewed. */
+  suppliedKeyPolicy?: { status: "clear" | "accepted" | "unconfirmed"; at: string };
+  tailnetPolicyWriteDeferred?: boolean;
   /** Each node's requested machine name and the name Tailscale assigned (read back from its status). */
   tailscaleNames?: Partial<Record<TailscaleNode, { requested: string; assigned?: string }>>;
   steps: Partial<Record<StepId, StepRecord>>;

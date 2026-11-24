@@ -396,35 +396,44 @@ async function prerequisites(context: Context): Promise<StepResult> {
 /** Whether this run may enrol the edge or backup node. Reads only: nothing is started or changed. */
 async function enrolmentPending(context: Context, spec: ContainerName) {
   const node = await edgeTags(context, spec.service);
-  if (node?.running) return false;
+  if (node?.running) return;
   const id = await containerId(context, spec.service);
   const failure = await containerFailure(context, spec.service, true);
   const identity = failure ? failure.identity : await orphanedIdentity(context, spec);
   // One that cannot be read is left to the node's own step, which checks again before enrolling.
-  if (identity !== "none") return false;
+  if (identity !== "none") return;
   const { env } = context;
-  if (context.interactive || env.TS_API_KEY?.trim() || env.TS_OAUTH_CLIENT_SECRET?.trim()) return true;
   const keys = [
     env[spec.keyVariable],
     parseEnvFile(readEnv(context.envPath))[spec.keyVariable],
     id && (await createdWithKey(context, id)),
   ];
-  return keys.some((key) => key?.trim() && key.trim() !== failure?.rejectedKey);
+  if (keys.some((key) => key?.trim() && key.trim() !== failure?.rejectedKey)) return "supplied";
+  if (context.interactive || env.TS_API_KEY?.trim() || env.TS_OAUTH_CLIENT_SECRET?.trim()) return "available";
 }
 
 async function pendingContainers(context: Context) {
   const pending: EnrolledTag[] = [];
-  if (!context.options.skipEdge && (await enrolmentPending(context, edgeName(context))))
-    pending.push(ARK_EDGE_TAG);
-  if (context.options.backupNode && (await enrolmentPending(context, backupName(context))))
-    pending.push(ARK_BACKUP_TAG);
-  return pending;
+  const supplied: EnrolledTag[] = [];
+  const specs = [
+    ...(!context.options.skipEdge ? [edgeName(context)] : []),
+    ...(context.options.backupNode ? [backupName(context)] : []),
+  ];
+  for (const spec of specs) {
+    const key = await enrolmentPending(context, spec);
+    if (key) pending.push(spec.tag);
+    if (key === "supplied") supplied.push(spec.tag);
+  }
+  return { pending, supplied };
 }
 
 /** Reviews the tailnet policy. It pauses setup only over a node in `pending`. */
-async function reviewPolicy(context: Context, pending: EnrolledTag[]) {
+async function reviewPolicy(
+  context: Context,
+  { pending, supplied }: { pending: EnrolledTag[]; supplied?: EnrolledTag[] },
+) {
   if (context.keys.preparePolicy) {
-    await context.keys.preparePolicy({ pending, offerCredential: !context.state.sshConfirmation });
+    await context.keys.preparePolicy({ pending, supplied, offerCredential: !context.state.sshConfirmation });
     return;
   }
   if (pending.includes(ARK_VPS_TAG))
@@ -432,9 +441,9 @@ async function reviewPolicy(context: Context, pending: EnrolledTag[]) {
   await context.policyGate.unread(pending);
 }
 
-/** The last check before a node joins, however its key was supplied. */
-async function requirePolicyReview(context: Context, tag: EnrolledTag) {
-  if (context.policyGate.unresolved([tag])) await reviewPolicy(context, [tag]);
+/** The last check before a node joins with a key that setup did not mint. */
+async function reviewSuppliedKey(context: Context, tag: EnrolledTag) {
+  await reviewPolicy(context, { pending: [tag], supplied: [tag] });
 }
 
 async function tailscaleEnrolment(context: Context): Promise<StepResult> {
@@ -479,12 +488,17 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
   }
   delete context.state.sshConfirmation;
   context.save();
-  await reviewPolicy(context, [ARK_VPS_TAG]);
+  const { pending, supplied } = await pendingContainers(context);
+  const suppliedVpsKey = context.env.TS_VPS_AUTHKEY?.trim() || context.env.TS_VPS_AUTHKEY_FILE?.trim();
+  pending.unshift(ARK_VPS_TAG);
+  if (suppliedVpsKey) supplied.unshift(ARK_VPS_TAG);
+  await reviewPolicy(context, { pending, supplied });
   const key = await context.keys.acquire({ tag: ARK_VPS_TAG, variable: "TS_VPS_AUTHKEY", optional: false });
   if (!key?.file && !key?.key) throw new Error(`A ${ARK_VPS_TAG} key is required.`);
   context.redactor.add(key.key);
   let revoked: boolean | undefined;
   try {
+    if (!key.inMemoryOnly) await reviewSuppliedKey(context, ARK_VPS_TAG);
     const command = [context.bun, "scripts/install.ts", "--enroll-vps"];
     if (key.file) {
       await must(context, command, {
@@ -1148,7 +1162,7 @@ async function install(context: Context): Promise<StepResult> {
   ) {
     return { status: "done", fingerprint, message: "already hardened and installed with these settings" };
   }
-  context.ui.print("      Nothing from here on needs an answer; you can leave this running.");
+  context.ui.print("      Setup can run unattended unless a later tailnet policy review needs confirmation.");
   context.ui.print(
     `      Installing the platform; this can take several minutes. Detail: ${context.log.path}`,
   );
@@ -1551,12 +1565,17 @@ async function recoverContainerNode(
   if (before.status !== "running" && before.status !== "restarting") {
     const failure = await containerFailure(context, spec.service, true);
     if (!failure) return undefined;
-    // The old configuration is safe to start only if it preserves the known identity.
     if (failure.identity === "unknown" || failure.rejectedKey) return notUp(failure);
+    const startup = await containerEnv(context, id);
+    if (!startup) return notUp(failure);
+    const keyed = Boolean(startup.TS_AUTHKEY?.trim());
     if (typeof failure.identity === "object") {
-      const startup = await containerEnv(context, id);
-      const name = startup?.TS_HOSTNAME || before.hostName;
-      if (!startup || name !== failure.identity.hostName) return notUp(failure);
+      // Recreate keyless if needed to preserve the stored identity.
+      const name = startup.TS_HOSTNAME || before.hostName;
+      if (keyed || name !== failure.identity.hostName) return notUp(failure);
+    } else if (keyed) {
+      if (spec.node === "edge" && context.options.skipEdge) return notUp(failure);
+      await reviewSuppliedKey(context, spec.tag);
     }
     await exec(context, ["docker", "start", id], { env });
   }
@@ -1646,6 +1665,7 @@ function forgetRejectedKey(context: Context, spec: ContainerName, failure: Conta
 /** A container node's name: what compose passes to containerboot as TS_HOSTNAME on every start. */
 type ContainerName = {
   node: Exclude<TailscaleNode, "vps">;
+  tag: typeof ARK_EDGE_TAG | typeof ARK_BACKUP_TAG;
   service: string;
   /** The `.env` key behind TS_HOSTNAME in infra/platform/docker-compose.yml. */
   variable: "TS_EDGE_HOSTNAME" | "TS_BACKUP_HOSTNAME";
@@ -1660,6 +1680,7 @@ type ContainerName = {
 function edgeName(context: Context): ContainerName {
   return {
     node: "edge",
+    tag: ARK_EDGE_TAG,
     service: "edge-ts",
     variable: "TS_EDGE_HOSTNAME",
     keyVariable: "TS_EDGE_AUTHKEY",
@@ -1672,6 +1693,7 @@ function edgeName(context: Context): ContainerName {
 function backupName(context: Context): ContainerName {
   return {
     node: "backup",
+    tag: ARK_BACKUP_TAG,
     service: "backup-ts",
     variable: "TS_BACKUP_HOSTNAME",
     keyVariable: "TS_BACKUP_AUTHKEY",
@@ -1887,8 +1909,7 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
       };
     }
     context.redactor.add(key?.key);
-    // A key given directly does not pass through the key source's own review.
-    await requirePolicyReview(context, ARK_EDGE_TAG);
+    if (!key?.inMemoryOnly) await reviewSuppliedKey(context, ARK_EDGE_TAG);
     if (key?.key) {
       acquired = key;
       // API-minted keys are sent to the running daemon on stdin.
@@ -1896,7 +1917,7 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
     }
   } else {
     context.redactor.add(kept);
-    await requirePolicyReview(context, ARK_EDGE_TAG);
+    await reviewSuppliedKey(context, ARK_EDGE_TAG);
   }
   const transient = acquired?.inMemoryOnly ? acquired.key : undefined;
   let revoked: boolean | undefined;
@@ -2040,7 +2061,7 @@ async function backupNode(context: Context): Promise<StepResult> {
   let revoked: boolean | undefined;
   let name: string;
   try {
-    await requirePolicyReview(context, ARK_BACKUP_TAG);
+    if (!key.inMemoryOnly) await reviewSuppliedKey(context, ARK_BACKUP_TAG);
     configureName(context, spec, spec.desired);
     await upContainer(context, spec, { TS_BACKUP_AUTHKEY: key.inMemoryOnly ? "" : key.key });
     if (key.inMemoryOnly) await enrolContainer(context, "backup-ts", spec.desired, key.key);

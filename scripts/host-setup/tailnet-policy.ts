@@ -340,6 +340,8 @@ export type CatchAllRule = {
   tags: EnrolledTag[];
   /** The same rule with a narrower source, or undefined when no such rule remains. */
   replacement?: string;
+  /** An in-place source edit when a full replacement would drop application capabilities. */
+  sourceEdit?: string;
   /** The rule covers machines that carry other tags, which a narrower source may leave out. */
   coversOtherTags: boolean;
 };
@@ -472,12 +474,14 @@ function catchAllRule(
   if (everyone && !kept.includes("autogroup:member")) kept.unshift("autogroup:member");
   const shown = Object.entries(rule as Fields).filter(([key]) => SHOWN_FIELDS.has(key.toLowerCase()));
   const narrowed = shown.map(([key, value]) => [key, key === source[0] ? kept : value] as const);
+  const mixed = kind === "grant" && Boolean(field(rule, "app"));
   return {
     kind,
     text: inlineJson(Object.fromEntries(shown)),
     canonical: `${kind} ${canonicalJson(rule)}`,
     tags,
-    replacement: kept.length ? inlineJson(Object.fromEntries(narrowed)) : undefined,
+    replacement: !mixed && kept.length ? inlineJson(Object.fromEntries(narrowed)) : undefined,
+    sourceEdit: mixed ? inlineJson({ [source[0]]: kept }) : undefined,
     coversOtherTags: wide.length > 0,
   };
 }

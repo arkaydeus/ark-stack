@@ -8,6 +8,7 @@
 // they are registered with the redactor, never written to disk, `.env`, the state file or the log,
 // and only the one key a node needs is passed to its enrolment process, on stdin.
 import { ARK_BACKUP_TAG, ARK_EDGE_TAG, ARK_VPS_TAG } from "@ark-stack/shared";
+import { createHash } from "node:crypto";
 
 import type { PolicyGate } from "./policy-gate.ts";
 import type { Ui } from "./system.ts";
@@ -17,6 +18,7 @@ import {
   tailnetPolicyInstructions,
   type AcquiredKey,
   type KeyRequest,
+  type PolicyPreparation,
   type TailscaleKeySource,
 } from "./tailscale-keys.ts";
 
@@ -147,18 +149,12 @@ export class TailscaleApi {
   }
 
   private fail(what: string, response: ApiResponse, hint = ""): never {
-    let message = "";
-    try {
-      message = (JSON.parse(response.text) as { message?: string }).message ?? "";
-    } catch {
-      message = response.text.slice(0, 200);
-    }
     const scopes =
       response.status === 401 || response.status === 403
         ? ` The credential needs ${this.credential.kind === "oauth" ? `the OAuth scopes ${SETUP_OAUTH_SCOPES.join(", ")}` : "an admin's API access token"}.`
         : "";
     throw new TailscaleApiError(
-      `Tailscale API: ${what} failed (HTTP ${response.status}${message ? `: ${message}` : ""}).${scopes}${hint}`,
+      `Tailscale API: ${what} failed (HTTP ${response.status}).${scopes}${hint}`,
       response.status,
     );
   }
@@ -172,22 +168,26 @@ export class TailscaleApi {
     return { text: response.text, etag };
   }
 
-  /** Returns a problem description, or undefined when Tailscale accepts the policy and its tests. */
+  /** Throws a generic diagnostic if Tailscale rejects the policy or its tests. */
   async validatePolicy(text: string) {
     const response = await this.request("POST", "/acl/validate", {
       body: text,
       contentType: "application/hujson",
     });
-    let parsed: { message?: string; data?: unknown } = {};
+    if (response.status === 401 || response.status === 403)
+      this.fail("validating the tailnet policy", response);
+    // Tailscale can return policy-test diagnostics in a successful HTTP response.
+    let parsed: { message?: string; data?: unknown } | null = null;
     try {
       parsed = response.text.trim() ? (JSON.parse(response.text) as typeof parsed) : {};
     } catch {
-      parsed = { message: response.text.slice(0, 200) };
+      // A non-JSON response is also unverified.
     }
-    if (response.status === 200 && !parsed.message && !parsed.data) return undefined;
-    if (response.status === 401 || response.status === 403)
-      this.fail("validating the tailnet policy", response);
-    return `${parsed.message ?? `HTTP ${response.status}`}${parsed.data ? ` ${JSON.stringify(parsed.data)}` : ""}`;
+    if (response.status === 200 && parsed && !parsed.message && !parsed.data) return;
+    throw new TailscaleApiError(
+      `Tailscale rejected the merged policy or its tests (HTTP ${response.status}). Nothing was applied. Review the policy and its tests in Access controls, then rerun setup.`,
+      response.status,
+    );
   }
 
   async setPolicy(text: string, etag: string) {
@@ -258,18 +258,37 @@ export function apiKeySource(
 ) {
   const { ui } = options;
   const tags = [ARK_VPS_TAG, ARK_EDGE_TAG, ...(options.backup ? [ARK_BACKUP_TAG] : [])];
-  let prepared: Promise<void> | undefined;
+  // A successful read verifies an explicit Tailnet ID. Aliases such as "-" can only be
+  // tied to this API source for the current run.
+  const scope = /^T[A-Za-z0-9]+CNTRL$/.test(api.tailnet)
+    ? createHash("sha256")
+        .update(JSON.stringify([api.base, api.tailnet]))
+        .digest("hex")
+    : Symbol("tailnet");
 
   async function preparePolicy(pending: EnrolledTag[]) {
     const current = await api.getPolicy();
-    const merge = mergeArkPolicy(current.text, {
-      tags,
-      owners: ["autogroup:admin"],
-      requiredOwner: credential.kind === "oauth" ? credential.tag : undefined,
-    });
+    let merge: ReturnType<typeof mergeArkPolicy>;
+    try {
+      merge = mergeArkPolicy(current.text, {
+        tags,
+        owners: ["autogroup:admin"],
+        requiredOwner: credential.kind === "oauth" ? credential.tag : undefined,
+      });
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        // Native JSON parser errors can quote the policy.
+        // oxlint-disable-next-line eslint/preserve-caught-error -- The original error can contain private policy text.
+        throw new Error(
+          "Tailscale returned an invalid policy. Review it in Access controls, then rerun setup.",
+        );
+      }
+      throw error;
+    }
     // Before the policy changes, a key is minted or a node enrolled.
-    await options.gate.found(merge.catchAll, pending);
+    await options.gate.found(merge.catchAll, pending, scope);
     if (!merge.changed) {
+      options.gate.policyWriteDeferred(false);
       ui.print(`      The tailnet policy already has the Ark tag owners and the owner SSH rule.`);
       return;
     }
@@ -278,37 +297,35 @@ export function apiKeySource(
     ui.print("");
     for (const line of merge.inserted) ui.print(`        ${line}`);
     ui.print("");
-    const problem = await api.validatePolicy(merge.text);
-    if (problem) throw new Error(`Tailscale rejected the merged policy, so nothing was applied: ${problem}`);
-    ui.print("      Tailscale validated the merged policy.");
     let approved = options.approve;
     if (options.interactive) {
       const answer = await ui.ask("Apply this change to the tailnet policy? (yes/no)", "");
       approved = /^y(?:es)?$/i.test(answer.trim());
     }
     if (!approved) {
+      if (!pending.length) {
+        options.gate.policyWriteDeferred(true);
+        ui.print("      Ark policy additions are awaiting approval and will be listed in the summary.");
+        return;
+      }
       throw new Error(
         options.interactive
           ? "The tailnet policy change was declined, so nothing was applied. Re-run host:setup to review it again, or run it without a Tailscale credential to make the change by hand."
           : "The tailnet policy needs the change shown above. Re-run with --non-interactive and --approve-tailnet-policy to apply it, or interactively to review it.",
       );
     }
+    await api.validatePolicy(merge.text);
+    ui.print("      Tailscale validated the merged policy.");
     await api.setPolicy(merge.text, current.etag);
+    options.gate.policyWriteDeferred(false);
     ui.print("      Tailnet policy updated.");
   }
 
   const source: TailscaleKeySource = {
     id: "tailscale-api",
     policyInstructions: () => tailnetPolicyInstructions({ backup: options.backup }),
-    preparePolicy({ pending = [ARK_VPS_TAG] as EnrolledTag[] } = {}) {
-      // A node to enrol that an earlier review left open: read the policy again.
-      if (options.gate.unresolved(pending)) prepared = undefined;
-      // Otherwise once per run; a failure is retried by the next call (the next run).
-      prepared ??= preparePolicy(pending).catch((error: unknown) => {
-        prepared = undefined;
-        throw error;
-      });
-      return prepared;
+    preparePolicy({ pending = [ARK_VPS_TAG] }: PolicyPreparation = {}) {
+      return preparePolicy(pending);
     },
     async acquire(request: KeyRequest): Promise<AcquiredKey> {
       await source.preparePolicy!({ pending: [request.tag] });
@@ -412,20 +429,22 @@ export function automaticKeySource(options: AutomaticKeySourceOptions): Tailscal
   const source: TailscaleKeySource = {
     id: "automatic",
     policyInstructions: () => tailnetPolicyInstructions({ backup: options.backup }),
-    async preparePolicy({ pending = [ARK_VPS_TAG] as EnrolledTag[], offerCredential } = {}) {
+    async preparePolicy({ pending = [ARK_VPS_TAG], supplied = [], offerCredential }: PolicyPreparation = {}) {
       // With every node enrolled, a manual rerun needs no credential.
       const useSource = chosen || credentialFromEnv(env) || pending.length || offerCredential;
       const selected = useSource ? await resolve() : manual;
-      if (selected.preparePolicy) return selected.preparePolicy({ pending });
+      if (selected.preparePolicy) {
+        if (supplied.length) await options.gate.unread(supplied, true);
+        return selected.preparePolicy({ pending });
+      }
       if (pending.includes(ARK_VPS_TAG))
         for (const line of selected.policyInstructions()) ui.print(`      ${line}`);
       await options.gate.unread(pending);
     },
     async collect(request) {
       const selected = await resolve();
-      // Review any API policy change now. Mint keys only when the nodes are ready to enrol.
-      if (selected.preparePolicy) await selected.preparePolicy({ pending: [request.tag] });
-      else if (options.gate.unresolved([request.tag])) await options.gate.unread([request.tag]);
+      // The API source waits until enrolment to review the current policy and mint the key.
+      if (selected.collect) await options.gate.unread([request.tag]);
       return selected.collect?.(request);
     },
     async acquire(request, { allowPrompt = true } = {}) {

@@ -34,6 +34,13 @@ export type AcquiredKey = {
   inMemoryOnly?: boolean;
 };
 
+export type PolicyPreparation = {
+  pending?: EnrolledTag[];
+  /** Pending tags whose supplied keys cannot be tied to the API tailnet. */
+  supplied?: EnrolledTag[];
+  offerCredential?: boolean;
+};
+
 export interface TailscaleKeySource {
   readonly id: string;
   /** The tailnet policy the owner needs before keys can be used (printed once, before enrolment). */
@@ -44,7 +51,7 @@ export interface TailscaleKeySource {
    * prints `policyInstructions` and asks the owner. `pending` are the Ark tags still to be enrolled
    * in this run (default: a new host); with none, the review never stops setup.
    */
-  preparePolicy?(options?: { pending?: EnrolledTag[]; offerCredential?: boolean }): Promise<void>;
+  preparePolicy?(options?: PolicyPreparation): Promise<void>;
   /** Collect a manual answer before installation, or defer acquisition to enrolment. */
   collect?(request: KeyRequest): Promise<{ acquired: AcquiredKey | undefined } | undefined>;
   /** Returns a key, or `undefined` when an optional key was declined. */

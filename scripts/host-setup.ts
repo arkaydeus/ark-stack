@@ -148,6 +148,8 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
     return 1;
   }
   redactor.add(answers.dnsApiToken);
+  if (state.tailnetPolicy?.rules)
+    state.tailnetPolicy.rules = state.tailnetPolicy.rules.map((rule) => redactor.redact(rule));
   ui.print("");
   ui.print("Settings:");
   for (const line of describeAnswers(answers, parseEnvFile(readEnv(envPath)))) ui.print(line);
@@ -162,7 +164,15 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
   store.save(state);
 
   const save = () => store.save(state);
-  const gate = policyGate({ ui, interactive, options, state, save, resumeCommand });
+  const gate = policyGate({
+    ui,
+    interactive,
+    options,
+    state,
+    save,
+    resumeCommand,
+    redact: (text) => redactor.redact(text),
+  });
   const context: Context = {
     root: deps.root,
     stateDir,
