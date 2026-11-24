@@ -41,8 +41,7 @@ let edgePlatformArgs: string[] = [];
 // The edge node (edge-ts) and the admin node (tailscale) share this pin.
 const tailscaleImage =
   "tailscale/tailscale:v1.86.2@sha256:241d9518b7e0b6e533dbd0117fcea15acb4174249210837f52b71615949ce9d2";
-// edge-ts never reaches Tailscale's control plane in this run: login fails fast and tailscaled keeps
-// running, which is what a node without TS_EDGE_AUTHKEY does.
+// The login controls use a loopback endpoint and never contact a real control plane.
 const offlineLoginServer = "--login-server=http://127.0.0.1:9";
 const root = resolve(import.meta.dir, "..");
 const fixtures = join(import.meta.dir, "edge-test");
@@ -807,7 +806,6 @@ async function startProductionEdge(): Promise<Edge> {
     certDir: fixtureCerts.served,
     edgeDir,
     ports: ["127.0.0.1::80", "127.0.0.1::443", "127.0.0.1::41642/udp"],
-    edgeTsEnvironment: { TS_EXTRA_ARGS: `--shields-up ${offlineLoginServer}` },
   });
   // The production admin site proxies to api:3000 on the admin network.
   await docker("network", "connect", "--alias", "api", stack.networks.admin, `ark-edge-upstream-${suffix}`);
@@ -1109,7 +1107,7 @@ async function certificateReloadTest(report: Report) {
 
 type Inspected = {
   Id: string;
-  Config: { User: string; Env: string[] };
+  Config: { User: string; Env: string[]; Entrypoint: string[] };
   HostConfig: {
     NetworkMode: string;
     CapAdd: string[] | null;
@@ -1182,12 +1180,61 @@ async function namespaceTest(report: Report) {
     "kernel mode: tailscale0 exists in the namespace Caddy runs in",
     `edge sees ${caddyLinks.filter((name) => /^(eth|tailscale)/.test(name)).join(", ")}`,
   );
-  const prefs = JSON.parse(await tailscale(stack.edgeTs, "debug", "prefs")) as Record<string, unknown>;
+  const prefs = await waitFor("edge-ts preferences before login", async () => {
+    const text = await tailscale(stack.edgeTs, "debug", "prefs").catch(() => "");
+    return text ? (JSON.parse(text) as Record<string, unknown>) : undefined;
+  });
   expect(
     report,
-    prefs.ShieldsUp === true && prefs.CorpDNS === false,
-    "--shields-up through TS_EXTRA_ARGS and TS_ACCEPT_DNS=false reach tailscaled's prefs on v1.86.2",
-    `ShieldsUp ${prefs.ShieldsUp}, CorpDNS ${prefs.CorpDNS}`,
+    prefs.ShieldsUp === true && prefs.CorpDNS === false && prefs.WantRunning === false,
+    "keyless edge-ts waits for login with shields up and Docker DNS",
+    `ShieldsUp ${prefs.ShieldsUp}, CorpDNS ${prefs.CorpDNS}, WantRunning ${prefs.WantRunning}`,
+  );
+  const keyed = `ark-edge-keyed-${suffix}`;
+  containers.push(keyed);
+  const [shell, ...entrypoint] = owner.Config.Entrypoint;
+  await docker(
+    "run",
+    "-d",
+    "--name",
+    keyed,
+    "--network",
+    "none",
+    "--cap-drop",
+    "ALL",
+    "--env",
+    "TS_USERSPACE=true",
+    "--env",
+    "TS_AUTHKEY=tskey-auth-offline-fixture",
+    "--env",
+    `TS_HOSTNAME=${env.TS_HOSTNAME}`,
+    "--env",
+    `TS_STATE_DIR=${env.TS_STATE_DIR}`,
+    "--env",
+    `TS_SOCKET=${env.TS_SOCKET}`,
+    "--env",
+    `TS_ACCEPT_DNS=${env.TS_ACCEPT_DNS}`,
+    "--env",
+    `TS_TAILSCALED_EXTRA_ARGS=${env.TS_TAILSCALED_EXTRA_ARGS}`,
+    "--env",
+    `TS_EXTRA_ARGS=${env.TS_EXTRA_ARGS} ${offlineLoginServer}`,
+    "--entrypoint",
+    shell!,
+    tailscaleImage,
+    ...entrypoint,
+  );
+  const bootPrefs = await waitFor("containerboot to apply the shipped flags", async () => {
+    const text = await tailscale(keyed, "debug", "prefs").catch(() => "");
+    const value = text ? (JSON.parse(text) as Record<string, unknown>) : undefined;
+    return value?.WantRunning === true && value.ControlURL === "http://127.0.0.1:9" ? value : undefined;
+  });
+  expect(
+    report,
+    bootPrefs.ShieldsUp === true &&
+      bootPrefs.CorpDNS === false &&
+      (await docker("exec", keyed, "cat", "/proc/1/comm")) === "containerboot",
+    "key-present containerboot applies shields-up from the shipped TS_EXTRA_ARGS",
+    `ShieldsUp ${bootPrefs.ShieldsUp}, CorpDNS ${bootPrefs.CorpDNS}`,
   );
   const udp = await docker("exec", stack.edgeTs, "ss", "-lunp");
   const published = await stack.hostPort(41642, "udp");

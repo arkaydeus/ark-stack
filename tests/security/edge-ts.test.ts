@@ -67,7 +67,9 @@ describe("edge-ts", () => {
   test("waits for login with its preferences set when it has neither a key nor an identity", () => {
     const [shell, flag, script = ""] = edgeTs.entrypoint ?? [];
     expect([shell, flag]).toEqual(["/bin/sh", "-c"]);
-    expect(script).toContain('set --shields-up --accept-dns=false --hostname="$$TS_HOSTNAME"');
+    expect(script).toContain('"enabled":false,"shieldsUp":true,"acceptDNS":false');
+    expect(script).toContain('if [ -z "$$TS_AUTHKEY" ] && fresh_state; then');
+    expect(script).toContain("--config=$$config");
     expect(script).toContain("exec tailscaled ");
     expect(script.trimEnd()).toEndWith("exec /usr/local/bin/containerboot");
     expect(compose.services["backup-ts"]!.entrypoint).toEqual(edgeTs.entrypoint!);

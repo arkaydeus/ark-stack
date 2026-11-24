@@ -12,20 +12,49 @@ x-app: &app
   tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
   pids_limit: 256
 
-# The pinned image's containerboot gives up after 60 s without a login and exits, so a node that has
-# neither a key nor a stored identity would restart every minute (and strand edge-ts's dependents in
-# its old namespace). Such a node runs tailscaled alone and really waits for login; its preferences are
-# set first, so it never joins without them. With a key or an identity, containerboot runs as usual.
+# Start with networking disabled and shields up before tailscaled can reconnect a saved profile.
+# containerboot then applies the complete preferences and brings the node up. Fresh keyless nodes
+# run only tailscaled, since containerboot would time out waiting for login and restart the namespace.
 x-tailscale-entrypoint: &tailscale-entrypoint
   - /bin/sh
   - -c
   - |
-    if [ -z "$$TS_AUTHKEY" ] && ! grep -q '"_current-profile"' "$$TS_STATE_DIR/tailscaled.state" 2>/dev/null; then
-      (until tailscale --socket="$$TS_SOCKET" set --shields-up --accept-dns=false --hostname="$$TS_HOSTNAME"; do sleep 1; done) &
-      [ "$$TS_USERSPACE" = false ] || set -- --tun=userspace-networking
-      [ -z "$$TS_SOCKS5_SERVER" ] || set -- "$$@" "--socks5-server=$$TS_SOCKS5_SERVER"
-      exec tailscaled --socket="$$TS_SOCKET" --statedir="$$TS_STATE_DIR" "$$@" $$TS_TAILSCALED_EXTRA_ARGS
+    set -eu
+    state="$$TS_STATE_DIR/tailscaled.state"
+    config=/tmp/ark-tailscaled.json
+    # The pinned daemon writes an empty JSON object or a machine key before it has a profile.
+    fresh_state() {
+      [ -r "$$TS_STATE_DIR" ] && [ -x "$$TS_STATE_DIR" ] || return 1
+      [ ! -e "$$state" ] && [ ! -L "$$state" ] && return 0
+      [ -f "$$state" ] && [ ! -L "$$state" ] || return 1
+      machine=$$(awk '
+        { doc = doc $$0 "\n" }
+        END {
+          if (doc ~ /^[[:space:]]*\{[[:space:]]*\}[[:space:]]*$$/) print "empty"
+          else if (doc ~ /^[[:space:]]*\{[[:space:]]*"_machinekey"[[:space:]]*:[[:space:]]*"[A-Za-z0-9+\/=]+"[[:space:]]*\}[[:space:]]*$$/) {
+            split(doc, fields, "\"")
+            print fields[4]
+          } else exit 1
+        }
+      ' "$$state") || return 1
+      [ "$$machine" = empty ] || printf '%s' "$$machine" | base64 -d | grep -Eq '^privkey:[a-f0-9]{64}$$'
+    }
+    fresh=false
+    hostname=
+    if [ -z "$$TS_AUTHKEY" ] && fresh_state; then
+      fresh=true
+      case "$$TS_HOSTNAME" in
+        *[!a-zA-Z0-9-]*|'') ;;
+        *) hostname=',"hostname":"'"$$TS_HOSTNAME"'"' ;;
+      esac
     fi
+    printf '{"version":"alpha0","locked":false,"enabled":false,"shieldsUp":true,"acceptDNS":false%s}\n' "$$hostname" >"$$config"
+    if [ "$$fresh" = true ]; then
+      [ "$$TS_USERSPACE" = false ] || set -- --tun=userspace-networking
+      [ -z "$${TS_SOCKS5_SERVER:-}" ] || set -- "$$@" "--socks5-server=$$TS_SOCKS5_SERVER"
+      exec tailscaled --socket="$$TS_SOCKET" --statedir="$$TS_STATE_DIR" "$$@" $$TS_TAILSCALED_EXTRA_ARGS --config="$$config"
+    fi
+    export TS_TAILSCALED_EXTRA_ARGS="$$TS_TAILSCALED_EXTRA_ARGS --config=$$config"
     exec /usr/local/bin/containerboot
 
 services:

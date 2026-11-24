@@ -34,8 +34,8 @@ export type EdgeStackOptions = {
   /** Extra or replacement environment for the `edge` (Caddy) service, such as ARK_EDGE_GATE_TOKEN. */
   edgeEnvironment?: Record<string, string>;
   /**
-   * Replaces edge-ts's entrypoint and command. containerboot exits after its 60 s boot timeout when
-   * the node cannot log in, and the restart strands `edge`; long offline runs start tailscaled itself.
+   * Replaces edge-ts's entrypoint and command for tests that need custom daemon arguments.
+   * The shipped entrypoint already keeps a fresh, keyless node running while it waits for login.
    */
   edgeTsCommand?: string[];
   /**

@@ -1050,26 +1050,16 @@ function installEnv(context: Context, ssh: HostSshAccess, extra: Record<string, 
   });
 }
 
-/**
- * Seeds edge-ts's startup name from an existing identity before the installer recreates the container.
- * A container that cannot stay up never blocks this: its name is read from the state volume instead,
- * and the recreation that follows is what repairs it.
- */
+/** Protects the existing edge identity before the platform installer reconciles edge-ts. */
 async function keepEdgeName(context: Context) {
   const spec = edgeName(context);
-  if (!existsSync(context.envPath)) return;
-  // The recreation also discards the log that says Tailscale refused the container's key.
-  forgetRejectedEdgeKey(context, await containerFailure(context, spec.service));
-  if (parseEnvFile(readEnv(context.envPath))[spec.variable]) return;
   const node = await recoverContainerNode(context, spec);
+  forgetRejectedKey(context, spec, node?.failure);
   if (node?.failure?.identity === "unknown") {
-    // Recreating it would start it with a name that may not be its own.
-    throw new Error(
-      `${spec.service} cannot stay up and its stored identity could not be read, so setup will not recreate it.\n${node.failure.detail}`,
-    );
+    throw undetermined(spec.service, node.failure);
   }
   const name = node?.running ? node.status.Self?.HostName : storedName(node);
-  if (name && validName(name)) configureName(context, spec, name);
+  if (name && validName(name)) preserveName(context, spec, name);
   if (node?.failure?.crashed) {
     context.ui.print(
       `      ${spec.service} cannot stay up (${node.failure.summary}); the install recreates it and keeps its state volume.`,
@@ -1131,9 +1121,8 @@ async function install(context: Context): Promise<StepResult> {
     // edge and edge-l4 cannot start without edge-ts, so say why it is down if that is the reason.
     const edge = await containerFailure(context, "edge-ts").catch(() => undefined);
     if (!edge) throw error;
-    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${edge.detail}`, {
-      cause: error,
-    });
+    forgetRejectedKey(context, edgeName(context), edge);
+    throw undetermined("edge-ts", edge, error);
   }
   context.redactor.addEnv(readEnv(context.envPath));
   if (!(await apiHealthy(context)))
@@ -1242,8 +1231,10 @@ type ContainerFailure = {
   /** The key the container was created with was refused by Tailscale. */
   rejectedKey?: string;
   /** What the state volume holds: an identity, none, or it could not be read. */
-  identity: { hostName: string } | "none" | "unknown";
+  identity: StoredIdentity;
 };
+
+type StoredIdentity = { hostName: string; nodeId: string } | "none" | "unknown";
 
 const REJECTED_KEY =
   /(?:invalid|expired|revoked) (?:auth(?:orization)? )?key|auth ?key.*(?:expired|revoked|not found|already used)/i;
@@ -1291,34 +1282,89 @@ async function containerState(context: Context, id: string) {
   return { status, exitCode: Number(exitCode), restarts: Number(restarts), image, hostName };
 }
 
-// Prints only whether the state volume holds an enrolled node and its hostname preference. The private
-// keys in the state file stay inside the container.
 export const READ_IDENTITY = `
-state=/var/lib/tailscale/tailscaled.state
-[ -e "$state" ] || { echo none; exit 0; }
-value() { sed -n "s/^[[:space:]]*\\"$1\\": *\\"\\([^\\"]*\\)\\".*/\\1/p" | head -n 1; }
-profile=$(value _current-profile <"$state" | base64 -d) || exit 1
-if [ -z "$profile" ]; then
-  grep -q '"profile-' "$state" && exit 1
-  grep -q '"_daemon"' "$state" && exit 1
-  grep -q '^{' "$state" || exit 1
-  echo none; exit 0
-fi
-prefs=$(value "$profile" <"$state" | base64 -d) || exit 1
-[ -n "$prefs" ] || exit 1
-[ -n "$(printf '%s\\n' "$prefs" | value NodeID)" ] || { echo none; exit 0; }
-printf 'enrolled %s\\n' "$(printf '%s\\n' "$prefs" | value Hostname)"
+dir=/var/lib/tailscale
+state=$dir/tailscaled.state
+[ -r "$dir" ] && [ -x "$dir" ] || exit 1
+[ ! -L "$state" ] || exit 1
+[ -e "$state" ] || exit 44
+[ -f "$state" ] && exec cat "$state"
 `;
 
+function jsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function stateBytes(value: unknown) {
+  if (typeof value !== "string") throw new Error("Invalid state value");
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.toString("base64") !== value) throw new Error("Invalid state encoding");
+  return bytes;
+}
+
+function decodeStateValue(value: unknown) {
+  return new TextDecoder("utf-8", { fatal: true }).decode(stateBytes(value));
+}
+
+/** Parse the pinned daemon's store (a JSON map of base64 values) and its active preferences. */
+export function parseStoredIdentity(
+  result: { status: number; stdout: string },
+  fallback?: string,
+): StoredIdentity {
+  if (result.status === 44) return "none";
+  if (result.status !== 0) return "unknown";
+  try {
+    const store: unknown = JSON.parse(result.stdout);
+    if (!jsonObject(store)) return "unknown";
+    for (const value of Object.values(store)) if (value !== null) stateBytes(value);
+    if ("_machinekey" in store && !/^privkey:[0-9a-f]{64}$/.test(decodeStateValue(store["_machinekey"])))
+      return "unknown";
+    const keys = Object.keys(store);
+    if (keys.every((key) => key === "_machinekey")) return "none";
+    const profiles: unknown =
+      store["_profiles"] === undefined ? {} : JSON.parse(decodeStateValue(store["_profiles"]));
+    if (!jsonObject(profiles)) return "unknown";
+    const current = store["_current-profile"];
+    const key = current === undefined || current === null ? "" : decodeStateValue(current);
+    let profileNodeId: unknown;
+    if (key) {
+      if (!/^profile-[0-9a-f]+$/.test(key)) return "unknown";
+      const matches = Object.values(profiles).filter((value) => jsonObject(value) && value.Key === key);
+      if (matches.length !== 1 || !jsonObject(matches[0])) return "unknown";
+      profileNodeId = matches[0].NodeID;
+    } else if (Object.keys(profiles).length || keys.some((name) => name.startsWith("profile-"))) {
+      return "unknown";
+    }
+    const prefs: unknown = JSON.parse(decodeStateValue(store[key || "_daemon"]));
+    if (!jsonObject(prefs) || typeof prefs.Hostname !== "string" || !jsonObject(prefs.Config))
+      return "unknown";
+    const { NodeID, PrivateNodeKey } = prefs.Config;
+    if (
+      typeof NodeID !== "string" ||
+      !NodeID.trim() ||
+      typeof PrivateNodeKey !== "string" ||
+      !/^privkey:[0-9a-f]{64}$/.test(PrivateNodeKey) ||
+      PrivateNodeKey === `privkey:${"0".repeat(64)}` ||
+      (key && profileNodeId !== NodeID)
+    )
+      return "unknown";
+    const hostName = prefs.Hostname || fallback;
+    return hostName && validName(hostName) ? { hostName, nodeId: NodeID } : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 /**
- * Reads the enrolled node's hostname preference from the container's own (read-only) state volume, for
- * a container that cannot stay up. Without a preference Tailscale uses the container's hostname.
+ * Reads state through an isolated read-only mount. The raw file is captured only in memory because
+ * it contains private keys. Without a hostname preference Tailscale uses the container's hostname.
  */
 async function storedIdentity(
   context: Context,
-  id: string,
-  container: { image: string; hostName: string },
-): Promise<ContainerFailure["identity"]> {
+  mount: string,
+  image: string,
+  fallback?: string,
+): Promise<StoredIdentity> {
   const result = await exec(
     context,
     [
@@ -1330,19 +1376,36 @@ async function storedIdentity(
       "--read-only",
       "--cap-drop=ALL",
       "--security-opt=no-new-privileges",
-      `--volumes-from=${id}:ro`,
+      mount,
       "--entrypoint=/bin/sh",
-      container.image,
+      image,
       "-c",
       READ_IDENTITY,
     ],
+    { env: childEnv(context), onLine: undefined },
+  );
+  return parseStoredIdentity(result, fallback);
+}
+
+const platformCompose = new URL("../../infra/platform/docker-compose.yml", import.meta.url);
+
+/** Docker keeps the named volume when the last service container is removed. */
+async function orphanedIdentity(context: Context, spec: ContainerName): Promise<StoredIdentity> {
+  const volume = `ark-platform_ark_${spec.node}_ts_state`;
+  const names = await must(
+    context,
+    ["docker", "volume", "ls", "--format", "{{.Name}}", "--filter", `name=^${volume}$`],
     { env: childEnv(context) },
   );
-  const output = result.stdout.trim();
-  if (result.status !== 0) return "unknown";
-  if (output === "none") return "none";
-  const [kind, hostName = container.hostName] = output.split(" ");
-  return kind === "enrolled" && validName(hostName) ? { hostName } : "unknown";
+  if (!names.trim().split("\n").includes(volume)) return "none";
+  const { services } = Bun.YAML.parse(readFileSync(platformCompose, "utf8")) as {
+    services: Record<string, { image: string }>;
+  };
+  return storedIdentity(
+    context,
+    `--mount=type=volume,source=${volume},target=/var/lib/tailscale,readonly,volume-nocopy`,
+    services[spec.service]!.image,
+  );
 }
 
 function storedName(node: ContainerNode | undefined) {
@@ -1350,14 +1413,19 @@ function storedName(node: ContainerNode | undefined) {
   return typeof identity === "object" ? identity.hostName : undefined;
 }
 
-/** The auth key the container was created with. Never logged; the redactor learns it. */
-async function createdWithKey(context: Context, id: string) {
+/** The creation-time environment can contain credentials and is never logged. */
+async function containerEnv(context: Context, id: string) {
   const result = await exec(
     context,
     ["docker", "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", id],
     { env: childEnv(context), onLine: undefined },
   );
-  const key = parseEnvFile(result.stdout).TS_AUTHKEY?.trim();
+  return result.status === 0 ? parseEnvFile(result.stdout) : undefined;
+}
+
+/** The auth key the container was created with. Never logged; the redactor learns it. */
+async function createdWithKey(context: Context, id: string) {
+  const key = (await containerEnv(context, id))?.TS_AUTHKEY?.trim();
   if (key) context.redactor.add(key);
   return key;
 }
@@ -1391,7 +1459,7 @@ async function containerFailure(
       ].join("\n"),
     ),
     rejectedKey: key && lines.some((line) => REJECTED_KEY.test(line)) ? key : undefined,
-    identity: await storedIdentity(context, id, state),
+    identity: await storedIdentity(context, `--volumes-from=${id}:ro`, state.image, state.hostName),
   };
 }
 
@@ -1405,10 +1473,13 @@ function notUp(failure: ContainerFailure): ContainerNode {
   };
 }
 
-function undetermined(service: string, failure: ContainerFailure | undefined) {
+function undetermined(service: string, failure: ContainerFailure | undefined, cause?: unknown) {
+  const reason = failure?.identity === "unknown" ? " Its stored identity could not be read." : "";
+  const command = cause instanceof Error ? `\n${cause.message}` : "";
   return new Error(
-    `Could not determine whether ${service} is enrolled.${failure ? `\n${failure.detail}` : ""}
+    `Could not determine whether ${service} is enrolled.${reason}${command}${failure ? `\n${failure.detail}` : ""}
 See docs/operations/troubleshooting.md#host-setup-reports-that-edge-ts-or-backup-ts-cannot-stay-up, then rerun setup.`,
+    { cause },
   );
 }
 
@@ -1421,15 +1492,34 @@ async function recoverContainerNode(
   spec: ContainerName,
 ): Promise<ContainerNode | undefined> {
   let node = await edgeTags(context, spec.service);
-  if (node?.running || node?.rejected) return node;
   const id = await containerId(context, spec.service);
-  if (!id) return node;
+  if (!id) {
+    const identity = await orphanedIdentity(context, spec);
+    if (identity === "none") return node;
+    const condition = "container missing, state volume present";
+    return notUp({
+      crashed: true,
+      restarts: 0,
+      summary: condition,
+      detail: `${spec.service}: ${condition}.`,
+      identity,
+    });
+  }
   const env = childEnv(context);
   const before = await containerState(context, id);
-  // Start with the creation-time configuration. `up` could apply a pending rename here. Docker ignores
-  // a start while it is restarting the container itself.
-  if (!node && before.status !== "running" && before.status !== "restarting")
+  if (before.status === "running" && node?.running) return node;
+  if (before.status !== "running" && before.status !== "restarting") {
+    const failure = await containerFailure(context, spec.service, true);
+    if (!failure) return undefined;
+    // The old configuration is safe to start only if it preserves the known identity.
+    if (failure.identity === "unknown" || failure.rejectedKey) return notUp(failure);
+    if (typeof failure.identity === "object") {
+      const startup = await containerEnv(context, id);
+      const name = startup?.TS_HOSTNAME || before.hostName;
+      if (!startup || name !== failure.identity.hostName) return notUp(failure);
+    }
     await exec(context, ["docker", "start", id], { env });
+  }
   for (let attempt = 0; attempt < 10 && !node?.running && !node?.rejected; attempt++) {
     await context.sleep(1000);
     node = await edgeTags(context, spec.service);
@@ -1442,9 +1532,11 @@ async function recoverContainerNode(
     if (after.status !== "running" || after.restarts !== seen.restarts) node = undefined;
   }
   const settled = node?.running || node?.rejected || node?.status.BackendState === "NeedsLogin";
-  if (settled) return node;
+  if (node?.running) return node;
+  if (node?.rejected) forgetKey(context, spec, await createdWithKey(context, id));
   const failure = await containerFailure(context, spec.service, true);
   if (!failure) return node;
+  if (settled && failure.identity === "none") return node;
   if (before.status === "restarting" || failure.restarts !== before.restarts) failure.crashed = true;
   return notUp(failure);
 }
@@ -1460,27 +1552,55 @@ async function repairContainer(
   failure: ContainerFailure,
 ): Promise<ContainerNode | undefined> {
   if (!failure.crashed || failure.identity === "unknown") throw undetermined(spec.service, failure);
-  const name = typeof failure.identity === "object" ? failure.identity.hostName : spec.desired;
-  // A name already in .env is the operator's (or an earlier run's) choice.
-  if (!parseEnvFile(readEnv(context.envPath))[spec.variable]?.trim()) configureName(context, spec, name);
+  forgetRejectedKey(context, spec, failure);
+  if (typeof failure.identity === "object") preserveName(context, spec, failure.identity.hostName);
   context.ui.print(
     `      ${spec.service} cannot stay up (${failure.summary}); recreating it and keeping its state volume.`,
   );
   context.log.write(failure.detail);
-  const services = spec.node === "edge" ? [spec.service, "edge", "edge-l4"] : [spec.service];
-  const key = spec.node === "edge" ? "TS_EDGE_AUTHKEY" : "TS_BACKUP_AUTHKEY";
-  await must(context, compose(context, "up", "-d", "--force-recreate", ...services), {
-    env: childEnv(context, { [key]: "" }),
-  });
+  await upContainer(context, spec, { [spec.keyVariable]: "" }, ["--force-recreate"]);
   const node = await recoverContainerNode(context, spec);
   if (node?.failure) throw undetermined(spec.service, node.failure);
+  if (
+    typeof failure.identity === "object" &&
+    (!node?.running ||
+      node.status.Self?.ID !== failure.identity.nodeId ||
+      node.status.Self?.HostName !== failure.identity.hostName)
+  ) {
+    throw new Error(`Could not verify the existing ${spec.service} identity and hostname after recovery.`);
+  }
   return node;
 }
 
-/** A refused key is spent: drop it from .env (only that one) so the next run asks for another. */
-function forgetRejectedEdgeKey(context: Context, failure: ContainerFailure | undefined) {
-  const key = failure?.rejectedKey;
-  if (key && parseEnvFile(readEnv(context.envPath)).TS_EDGE_AUTHKEY?.trim() === key) emptyEdgeKey(context);
+/** Reconcile only the sidecar and the proxies that join its namespace. */
+async function upContainer(
+  context: Context,
+  spec: ContainerName,
+  extra: Record<string, string>,
+  flags: string[] = [],
+) {
+  const services = spec.node === "edge" ? [spec.service, "edge", "edge-l4"] : [spec.service];
+  try {
+    await must(context, compose(context, "up", "-d", "--no-deps", ...flags, ...services), {
+      env: childEnv(context, extra),
+    });
+  } catch (error) {
+    const failure = await containerFailure(context, spec.service, true).catch(() => undefined);
+    forgetRejectedKey(context, spec, failure);
+    throw undetermined(spec.service, failure, error);
+  }
+}
+
+function forgetKey(context: Context, spec: ContainerName, key: string | undefined) {
+  const current = readEnv(context.envPath);
+  if (key && parseEnvFile(current)[spec.keyVariable]?.trim() === key) {
+    writeEnv(context.envPath, setEnvValues(current, { [spec.keyVariable]: "" }));
+  }
+}
+
+/** Drop a spent key from disk if the operator has not replaced it. */
+function forgetRejectedKey(context: Context, spec: ContainerName, failure: ContainerFailure | undefined) {
+  forgetKey(context, spec, failure?.rejectedKey);
 }
 
 /** A container node's name: what compose passes to containerboot as TS_HOSTNAME on every start. */
@@ -1489,6 +1609,7 @@ type ContainerName = {
   service: string;
   /** The `.env` key behind TS_HOSTNAME in infra/platform/docker-compose.yml. */
   variable: "TS_EDGE_HOSTNAME" | "TS_BACKUP_HOSTNAME";
+  keyVariable: "TS_EDGE_AUTHKEY" | "TS_BACKUP_AUTHKEY";
   /** Compose's default when the key is empty: the name every earlier install used. */
   composeDefault: string;
   desired: string;
@@ -1501,6 +1622,7 @@ function edgeName(context: Context): ContainerName {
     node: "edge",
     service: "edge-ts",
     variable: "TS_EDGE_HOSTNAME",
+    keyVariable: "TS_EDGE_AUTHKEY",
     composeDefault: "ark-edge",
     desired: edgeHostname(context.answers),
     explicit: context.answers.tailscaleEdgeHostname !== undefined,
@@ -1512,6 +1634,7 @@ function backupName(context: Context): ContainerName {
     node: "backup",
     service: "backup-ts",
     variable: "TS_BACKUP_HOSTNAME",
+    keyVariable: "TS_BACKUP_AUTHKEY",
     composeDefault: "ark-backup",
     desired: backupHostname(context.answers),
     explicit: context.answers.tailscaleBackupHostname !== undefined,
@@ -1526,6 +1649,16 @@ function configuredName(context: Context, spec: ContainerName) {
 function configureName(context: Context, spec: ContainerName, name: string) {
   if (configuredName(context, spec) === name) return;
   writeEnv(context.envPath, setEnvValues(readEnv(context.envPath), { [spec.variable]: name }));
+}
+
+function preserveName(context: Context, spec: ContainerName, name: string) {
+  configureName(context, spec, name);
+  const setting = spec.node === "edge" ? "tailscaleEdgeHostname" : "tailscaleBackupHostname";
+  const requested = spec.node === "edge" ? context.answers.renameEdge : context.answers.renameBackup;
+  if (requested) return;
+  // .env and saved answers are startup defaults. Only a new explicit request can rename during recovery.
+  context.answers[setting] = name;
+  context.state.answers[setting] = name;
 }
 
 function validName(name: string | undefined) {
@@ -1561,10 +1694,8 @@ async function reconcileContainerName(
   );
   const recreate = startup.stdout.trim() !== requested || current !== requested;
   if (recreate) {
-    const services = spec.node === "edge" ? [spec.service, "edge", "edge-l4"] : [spec.service];
-    const key = spec.node === "edge" ? "TS_EDGE_AUTHKEY" : "TS_BACKUP_AUTHKEY";
     const force = startup.stdout.trim() === requested ? ["--force-recreate"] : [];
-    await must(context, compose(context, "up", "-d", ...force, ...services), { env: { ...env, [key]: "" } });
+    await upContainer(context, spec, { [spec.keyVariable]: "" }, force);
   }
   if (spec.node === "edge") await rejoinEdge(context);
   if (!recreate) return { name: saveTailscaleName(context, spec.node, requested, status), renamed: false };
@@ -1622,14 +1753,17 @@ async function remainingKeys(context: Context): Promise<StepResult> {
   // A container that cannot stay up but holds an identity is recreated with it and needs no key either.
   const needsKey = (node: ContainerNode | undefined) => !node?.running && !storedName(node);
   if (!context.options.skipEdge && !context.env.TS_EDGE_AUTHKEY?.trim()) {
-    const edge = await recoverContainerNode(context, edgeName(context));
-    forgetRejectedEdgeKey(context, edge?.failure);
+    const spec = edgeName(context);
+    const edge = await recoverContainerNode(context, spec);
+    forgetRejectedKey(context, spec, edge?.failure);
     if (edgeKeyWanted(context) && needsKey(edge))
       requests.push({ tag: ARK_EDGE_TAG, variable: "TS_EDGE_AUTHKEY", optional: true });
   }
   if (context.options.backupNode && !context.env.TS_BACKUP_AUTHKEY?.trim()) {
-    const backup = await recoverContainerNode(context, backupName(context));
-    if (needsKey(backup))
+    const spec = backupName(context);
+    const backup = await recoverContainerNode(context, spec);
+    forgetRejectedKey(context, spec, backup?.failure);
+    if (needsKey(backup) && !parseEnvFile(readEnv(context.envPath)).TS_BACKUP_AUTHKEY?.trim())
       requests.push({ tag: ARK_BACKUP_TAG, variable: "TS_BACKUP_AUTHKEY", optional: true });
   }
   const ready = new Map<string, AcquiredKey | undefined>();
@@ -1665,10 +1799,14 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
   const exact = (tags: string[]) => tags.length === 1 && tags[0] === ARK_EDGE_TAG;
   const spec = edgeName(context);
   let before = await recoverContainerNode(context, spec);
-  forgetRejectedEdgeKey(context, before?.failure);
   if (before?.failure) before = await repairContainer(context, spec, before.failure);
   if (before?.running && exact(before.tags)) {
-    const { name, renamed } = await reconcileContainerName(context, spec, ARK_EDGE_TAG, before.status);
+    const { name, renamed } = await reconcileContainerName(
+      context,
+      edgeName(context),
+      ARK_EDGE_TAG,
+      before.status,
+    );
     emptyEdgeKey(context);
     return {
       status: "done",
@@ -1726,9 +1864,7 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
     }
     // A new node joins with the chosen name; containerboot repeats it on every start.
     configureName(context, spec, spec.desired);
-    await must(context, compose(context, "up", "-d", "edge-ts", "edge", "edge-l4"), {
-      env: childEnv(context, transient ? { TS_EDGE_AUTHKEY: "" } : {}),
-    });
+    await upContainer(context, spec, transient ? { TS_EDGE_AUTHKEY: "" } : {});
     if (transient) await enrolContainer(context, "edge-ts", spec.desired, transient);
     await waitForNode(context, "edge-ts", ARK_EDGE_TAG);
     name = await recordTailscaleName(
@@ -1765,7 +1901,13 @@ async function waitForNode(context: Context, service: string, tag: string) {
     if (failure?.rejectedKey) after = notUp(failure);
   }
   if (after?.rejected) {
-    if (service === "edge-ts") emptyEdgeKey(context);
+    const spec = service === "edge-ts" ? edgeName(context) : backupName(context);
+    const id = await containerId(context, service);
+    forgetKey(
+      context,
+      spec,
+      after.failure?.rejectedKey ?? (id ? await createdWithKey(context, id) : undefined),
+    );
     throw new Error(
       `Tailscale rejected the ${service === "edge-ts" ? "edge" : "backup node"} auth key. Retry with a fresh one-off ${tag} key.`,
     );
@@ -1818,7 +1960,12 @@ async function backupNode(context: Context): Promise<StepResult> {
   let before = await recoverContainerNode(context, spec);
   if (before?.failure) before = await repairContainer(context, spec, before.failure);
   if (before?.running && before.tags.length === 1 && before.tags[0] === ARK_BACKUP_TAG) {
-    const { name, renamed } = await reconcileContainerName(context, spec, ARK_BACKUP_TAG, before.status);
+    const { name, renamed } = await reconcileContainerName(
+      context,
+      backupName(context),
+      ARK_BACKUP_TAG,
+      before.status,
+    );
     return {
       status: "done",
       message: renamed
@@ -1832,11 +1979,11 @@ async function backupNode(context: Context): Promise<StepResult> {
     );
   }
   context.ui.print(`      The backup node needs its own one-off key tagged ${ARK_BACKUP_TAG}.`);
-  const key = await context.keys.acquire({
-    tag: ARK_BACKUP_TAG,
-    variable: "TS_BACKUP_AUTHKEY",
-    optional: true,
-  });
+  const kept = parseEnvFile(readEnv(context.envPath)).TS_BACKUP_AUTHKEY?.trim();
+  const key =
+    kept && !context.env.TS_BACKUP_AUTHKEY?.trim()
+      ? { key: kept }
+      : await context.keys.acquire({ tag: ARK_BACKUP_TAG, variable: spec.keyVariable, optional: true });
   if (!key?.key) {
     return {
       status: "skipped",
@@ -1849,15 +1996,12 @@ async function backupNode(context: Context): Promise<StepResult> {
   let name: string;
   try {
     configureName(context, spec, spec.desired);
-    await must(context, compose(context, "up", "-d", "backup-ts"), {
-      env: childEnv(context, { TS_BACKUP_AUTHKEY: key.inMemoryOnly ? "" : key.key }),
-    });
+    await upContainer(context, spec, { TS_BACKUP_AUTHKEY: key.inMemoryOnly ? "" : key.key });
     if (key.inMemoryOnly) await enrolContainer(context, "backup-ts", spec.desired, key.key);
     await waitForNode(context, "backup-ts", ARK_BACKUP_TAG);
     if (!key.inMemoryOnly) {
-      await must(context, compose(context, "up", "-d", "backup-ts"), {
-        env: childEnv(context, { TS_BACKUP_AUTHKEY: "" }),
-      });
+      forgetKey(context, spec, key.key);
+      await upContainer(context, spec, { TS_BACKUP_AUTHKEY: "" });
       await waitForNode(context, "backup-ts", ARK_BACKUP_TAG);
     }
     name = await recordTailscaleName(
