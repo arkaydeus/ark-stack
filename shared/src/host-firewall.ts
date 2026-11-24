@@ -172,34 +172,108 @@ export function replaceHostSshAccess(rules: string, access: HostSshAccess) {
   return updated;
 }
 
-function normalizeFirewall(rules: string) {
+// The protocols in the baseline, by IANA number. nft prints the names from the local /etc/protocols
+// and falls back to numbers, so a container without that file lists the same rules differently.
+const PROTOCOL_NAMES: Record<string, string> = { 1: "icmp", 6: "tcp", 17: "udp", 58: "ipv6-icmp" };
+
+function canonicalFirewall(rules: string) {
   // nft aligns set elements across lines and may sort members of anonymous sets.
+  // Preserve section headers so even a single-rule chain is visible in diagnostics.
   return rules
+    .replace(/\bmeta l4proto (?:\d+(?![\w-])|\{[^}]*\})/g, (match) =>
+      match.replace(/(?<![\w-])\d+(?![\w-])/g, (number) => PROTOCOL_NAMES[number] ?? number),
+    )
     .replace(
-      /\{\s*([\w-]+(?:\s*,\s*[\w-]+)*)\s*\}/g,
-      (_set, elements: string) =>
-        `{${elements
-          .split(",")
-          .map((part) => part.trim())
-          .toSorted()
-          .join(",")}}`,
+      /^[ \t]*(?:table|chain|set|map) [^{\n]+\{|\{\s*([\w-]+(?:\s*,\s*[\w-]+)*)\s*\}/gm,
+      (match, elements: string | undefined) =>
+        elements
+          ? `{${elements
+              .split(",")
+              .map((part) => part.trim())
+              .toSorted()
+              .join(",")}}`
+          : match,
     )
     .replace(
       /\b(ip6?) saddr ([\da-f:.]+)(?=\s)/gi,
       (_match, family: string, address: string) =>
-        `${family} saddr ${family === "ip6" ? new URL(`http://[${address}]/`).hostname.slice(1, -1) : address}`,
-    )
-    .replace(/\s+/g, "");
+        `${family} saddr ${family === "ip6" && isIP(address) === 6 ? new URL(`http://[${address}]/`).hostname.slice(1, -1) : address}`,
+    );
+}
+
+/** Rule lines by table, set or chain, with one line for each element of a set. */
+function firewallSections(canonical: string) {
+  const sections = new Map<string, string[]>();
+  const open: string[] = [];
+  for (const line of canonical.split("\n").map((item) => item.trim())) {
+    if (line.endsWith("{")) {
+      open.push(line.slice(0, -1).trim());
+      sections.set(open.at(-1)!, []);
+    } else if (line === "}") open.pop();
+    else if (line) {
+      const elements = /^elements = \{([\w,-]+)\}$/.exec(line)?.[1];
+      const lines = elements ? elements.split(",").map((element) => `element ${element}`) : [line];
+      const section = sections.get(open.at(-1) ?? "");
+      if (section) section.push(...lines);
+      else sections.set(open.at(-1) ?? "", lines);
+    }
+  }
+  return sections;
+}
+
+// Defense in depth for expected rule text included in diagnostics.
+function redactAddresses(line: string) {
+  return line
+    .replace(/(?:[\da-f]*:){2,}[\da-f:.]*(?:\/\d+)?/gi, "<address>")
+    .replace(/\d+(?:\.\d+){3}(?:\/\d+)?/g, "<address>")
+    .replace(/\b0x[\da-f]+/gi, "<value>");
+}
+
+function without(lines: string[], other: string[]) {
+  const remaining = [...other];
+  return lines.filter((line) => {
+    const index = remaining.indexOf(line);
+    if (index >= 0) remaining.splice(index, 1);
+    return index < 0;
+  });
+}
+
+/** Reports drift using the expected baseline and counts from the installed table. */
+function firewallDifferences(installed: string, expected: string) {
+  const actual = firewallSections(canonicalFirewall(installed));
+  const desired = firewallSections(canonicalFirewall(expected));
+  // Installed rules and identifiers can encode addresses in arbitrary ways.
+  const differences = [...desired].flatMap(([label, wanted]) => {
+    const found = actual.get(label);
+    if (!found) return [`${label} is missing`];
+    if (found.join("\n") === wanted.join("\n")) return [];
+    if (label === "chain ssh_access") {
+      return [`${label} differs (installed rules: ${found.length}, expected: ${wanted.length})`];
+    }
+    const changes = without(wanted, found).map(
+      (line) => `${label} is missing ${JSON.stringify(redactAddresses(line).slice(0, 120))}`,
+    );
+    const added = without(found, wanted).length;
+    if (added) changes.push(`${label} has ${added} unexpected ${added === 1 ? "entry" : "entries"}`);
+    return changes.length ? changes : [`${label} has its rules in a different order`];
+  });
+  const extra = [...actual.keys()].filter((label) => !desired.has(label)).length;
+  if (extra) differences.push(`the listing has ${extra} unexpected ${extra === 1 ? "section" : "sections"}`);
+  if (!differences.length) return "the listing has a different structure";
+  const more = differences.length - 4;
+  return differences.slice(0, 4).join("; ") + (more > 0 ? `; and ${more} more` : "");
 }
 
 export function assertHostFirewall(installed: string, config: HostPortConfig, ssh?: HostSshAccess) {
-  const actual = normalizeFirewall(installed);
-  if (
-    actual !== normalizeFirewall(hostFirewallTable(config, ssh)) &&
-    !(ssh === undefined && actual === normalizeFirewall(hostFirewallTable(config, undefined, true)))
-  ) {
-    throw new Error("Installed ark_host rules differ from the enabled-service inventory or baseline.");
-  }
+  const normalize = (rules: string) => canonicalFirewall(rules).replace(/\s+/g, "");
+  const actual = normalize(installed);
+  const expected = hostFirewallTable(config, ssh);
+  const legacy = hostFirewallTable(config, undefined, true);
+  if (actual === normalize(expected) || (ssh === undefined && actual === normalize(legacy))) return;
+  const baseline = ssh === undefined && !/\bchain ssh_access \{/.test(installed) ? legacy : expected;
+  throw new Error(
+    `Installed ark_host rules differ from the enabled-service inventory or baseline: ${firewallDifferences(installed, baseline)}.`,
+  );
 }
 
 export function rebootRequiredMetrics(marker: string | null) {

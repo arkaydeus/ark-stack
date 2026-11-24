@@ -1,7 +1,8 @@
 // `mise run test:db-ingress`: syntax and live socket tests of the public port policies in §3.11.
 // Inside an isolated Docker network namespace, exercise the literal ark_front example and the
 // production renderers on the input and DNAT forward paths. Also test reconciler acknowledgements,
-// fail-closed recovery, the installer-owned metrics mount and the Prometheus alert rules.
+// fail-closed recovery, the installer-owned metrics mount and the Prometheus alert rules. Also check
+// that the shipped image's nft verifies an ark_host table created by the host's nft.
 //
 // Needs Docker with privileged containers (Docker Desktop or a Linux host). No Python.
 import { randomBytes } from "node:crypto";
@@ -17,6 +18,7 @@ import {
   renderFrontIngress,
   type IngressCounterSnapshot,
 } from "@ark-stack/shared";
+import { checkHostFirewallReadback } from "./host-hardening-test/readback.ts";
 // The Dockerfile runtime stage pin, which the database-ingress image builds on.
 import { bunImage } from "./test-images.ts";
 
@@ -36,8 +38,9 @@ const testImage = `ark-db-ingress-test:${suffix}`;
 const directory = await mkdtemp(join(tmpdir(), `ark-db-ingress-${suffix}-`));
 const containers: string[] = [];
 const stateVolume = `ark-db-ingress-state-${suffix}`;
+const images: string[] = [];
+const volumes = [stateVolume];
 let failures = 0;
-let builtImage = false;
 
 async function docker(args: string[], options: { stdin?: string; allowFailure?: boolean } = {}) {
   const child = Bun.spawn(["docker", ...args], {
@@ -58,8 +61,8 @@ async function docker(args: string[], options: { stdin?: string; allowFailure?: 
 
 async function cleanup() {
   if (containers.length) await docker(["rm", "--force", ...containers], { allowFailure: true });
-  await docker(["volume", "rm", "--force", stateVolume], { allowFailure: true });
-  if (builtImage) await docker(["image", "rm", testImage], { allowFailure: true });
+  await docker(["volume", "rm", "--force", ...volumes], { allowFailure: true });
+  if (images.length) await docker(["image", "rm", ...images], { allowFailure: true });
   await rm(directory, { recursive: true, force: true });
 }
 
@@ -160,7 +163,7 @@ RUN apt-get update \\
   && rm -rf /var/lib/apt/lists/*
 `,
   });
-  builtImage = true;
+  images.push(testImage);
   console.log("  built");
 
   // Bundle the real reconciler. Host workspace symlinks can point outside the bind mount.
@@ -376,7 +379,11 @@ cat /state/metrics/counters.json`,
     countersText.trim().slice(0, 300),
   );
 
-  // ------------------------------------------------------------------ 5. alert rules
+  // ------------------------------------------------------------------ 5. host firewall readback
+  section("The shipped image verifies an ark_host table created by Ubuntu 24.04's nft");
+  await checkHostFirewallReadback({ docker, check, root, directory, suffix, containers, images, volumes });
+
+  // ------------------------------------------------------------------ 6. alert rules
   section("infra/monitoring/alerts.yml (promtool)");
   for (const args of [
     ["check", "rules", "/monitoring/alerts.yml"],

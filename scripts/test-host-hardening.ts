@@ -5,11 +5,13 @@ import { join, resolve } from "node:path";
 
 import { MAIL_PUBLIC_TCP } from "@ark-stack/shared";
 import { EdgeTestRuntime } from "./edge-test/runtime.ts";
+import { buildIngressImage } from "./host-hardening-test/readback.ts";
 
 const root = resolve(import.meta.dir, "..");
 const suffix = crypto.randomUUID().slice(0, 12);
 const name = `ark-fd20-${suffix}`;
 const image = `${name}:vps`;
+const ingressImage = `${name}:database-ingress`;
 const vps = `${name}-vps`;
 const scanner = `${name}-scanner`;
 const directory = await mkdtemp(join(tmpdir(), `${name}-`));
@@ -66,14 +68,19 @@ async function applyPolicy(mode: "on" | "off") {
   }, "Host firewall reconciliation");
 }
 
-async function composeFixtures(fixtureImage: string, haproxyPin: string, mailImage: string) {
+async function composeFixtures(
+  fixtureImage: string,
+  reconcilerImage: string,
+  haproxyPin: string,
+  mailImage: string,
+) {
   const files = join(directory, "install-fixture");
   await Bun.write(
     join(files, "infra/platform/docker-compose.yml"),
     `name: ark-platform
 services:
   database-ingress:
-    image: ${fixtureImage}
+    image: ${reconcilerImage}
     network_mode: host
     cap_add: [NET_ADMIN]
     working_dir: /work
@@ -319,7 +326,7 @@ async function checkDhcpv6Renewal(acquired: number) {
   console.log("The DHCPv6 lease renewed through the host firewall.");
 }
 
-let builtImage = false;
+const builtImages: string[] = [];
 try {
   const result = await Bun.build({
     entrypoints: [
@@ -342,7 +349,9 @@ try {
     image,
     join(import.meta.dir, "host-hardening-test"),
   );
-  builtImage = true;
+  builtImages.push(image);
+  await buildIngressImage((args) => docker(...args), root, join(directory, "ingress-app"), ingressImage);
+  builtImages.push(ingressImage);
   // The scanner shares only the simulated VPS's WAN link. The nested daemon has its
   // own socket, data, bridges and nftables, and publishes no ports on the build machine.
   try {
@@ -458,6 +467,8 @@ EOF`,
   assert.ok(haproxyPin);
   const haproxyImage = await loadNestedImage(haproxyPin, "haproxy");
   const fixtureImage = await loadNestedImage(image, "worker");
+  // The reconciler runs the nft of the shipped image, against a table created by the VPS's nft.
+  const reconcilerImage = await loadNestedImage(ingressImage, "reconciler");
   await nested(
     "run",
     "-d",
@@ -507,7 +518,7 @@ EOF`,
   const mailImage = /^    image: (\S+)$/m.exec(mailCompose)?.[1];
   assert.ok(mailImage && mailImage.startsWith("stalwartlabs/stalwart@sha256:"));
   const mailImageId = await loadNestedImage(mailImage, "mail");
-  await composeFixtures(fixtureImage, haproxyPin, mailImageId);
+  await composeFixtures(fixtureImage, reconcilerImage, haproxyPin, mailImageId);
   const published = /ports: \[([^\]]+)\]/.exec(mailCompose)?.[1]?.match(/\d+:\d+/g);
   assert.deepEqual(
     published,
@@ -671,7 +682,7 @@ EOF`,
     ),
   );
 } catch (error) {
-  if (builtImage) {
+  if (builtImages.length) {
     const logs = await nested("logs", "--tail", "30", "mail").catch(() => "");
     if (logs) console.error(logs);
     const listenerLogs = await host("cat", "/tmp/listeners.log").catch(() => "");
@@ -682,11 +693,11 @@ EOF`,
   throw error;
 } finally {
   await runtime.cleanup();
-  if (builtImage) await hostImageRemove();
+  if (builtImages.length) await hostImageRemove();
   stopSignalHandlers();
 }
 
 async function hostImageRemove() {
-  const child = Bun.spawn(["docker", "image", "rm", image], { stdout: "ignore", stderr: "inherit" });
-  if (await child.exited) console.error(`Unable to remove disposable test image ${image}.`);
+  const child = Bun.spawn(["docker", "image", "rm", ...builtImages], { stdout: "ignore", stderr: "inherit" });
+  if (await child.exited) console.error(`Unable to remove disposable test images ${builtImages.join(", ")}.`);
 }

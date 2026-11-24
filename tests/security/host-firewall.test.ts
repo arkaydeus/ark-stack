@@ -9,6 +9,8 @@ import {
   renderHostFirewall,
   renderEdgeL4Generation,
   renderFrontIngress,
+  type HostPortConfig,
+  type HostSshAccess,
   updateHostFirewallPorts,
 } from "@ark-stack/shared";
 import { unexpectedPorts } from "../../scripts/host-audit.ts";
@@ -53,6 +55,101 @@ test("edge reconciliation updates public sets independently of the guided SSH al
   expect(() => assertHostFirewall(rules, config, access)).not.toThrow();
   expect(() => assertHostFirewall(rules, config)).toThrow();
   expect(updateHostFirewallPorts(config)).not.toMatch(/ssh_access|delete table/);
+});
+
+const installedTable = (config: HostPortConfig, access?: HostSshAccess) =>
+  renderHostFirewall(config, access).split("\n").slice(2).join("\n");
+
+function firewallProblem(rules: string, config: HostPortConfig, access?: HostSshAccess) {
+  try {
+    assertHostFirewall(rules, config, access);
+    return "";
+  } catch (error) {
+    return String(error);
+  }
+}
+
+test("the host firewall check accepts protocol numbers and names, and only the baseline's protocols", () => {
+  const config = { mailEnabled: true, sniPorts: [] };
+  const named = installedTable(config, { ports: [] });
+  // What nft lists without /etc/protocols, as in the database-ingress image.
+  const numeric = named
+    .replace("{ icmp, ipv6-icmp }", "{ 1, 58 }")
+    .replace("l4proto tcp", "l4proto 6")
+    .replace("l4proto udp", "l4proto 17");
+  expect(numeric).not.toMatch(/l4proto (?:tcp|udp|\{ icmp)/);
+  for (const rules of [
+    numeric,
+    named.replace("{ icmp, ipv6-icmp }", "{ ipv6-icmp, 1 }"),
+    named.replace("l4proto udp", "l4proto 17"),
+  ]) {
+    expect(firewallProblem(rules, config, { ports: [] })).toBe("");
+  }
+  for (const [from, to] of [
+    ["{ 1, 58 }", "{ 1, 132 }"],
+    ["{ 1, 58 }", "{ 1, 58, 132 }"],
+    ["{ 1, 58 }", "{ 1-58 }"],
+    ["{ 1, 58 }", "1"],
+    ["{ 1, 58 }", "!= { 1, 58 }"],
+    ["l4proto 6 ", "l4proto 17 "],
+    ["l4proto 6 ", "l4proto 132 "],
+    ["l4proto 6 ", "l4proto != 6 "],
+    ["l4proto 6 ", "l4proto 6-17 "],
+    ["l4proto 17 ", "l4proto 6 "],
+    ["l4proto 17 ", ""],
+    ["sport 547", "sport 17"],
+  ] as const) {
+    expect(numeric).toContain(from);
+    expect(firewallProblem(numeric.replace(from, to), config, { ports: [] })).toContain("rules differ");
+  }
+});
+
+test("a host firewall mismatch names the difference without administrator addresses", () => {
+  const config = { mailEnabled: true, sniPorts: [] };
+  const access = { ports: [22], source: "198.51.100.23" };
+  const rules = installedTable(config, access);
+  expect(firewallProblem(rules.replace("policy drop", "policy accept"), config, access)).toContain(
+    'chain input is missing "type filter hook input priority -5; policy drop;"; chain input has 1 unexpected entry',
+  );
+  expect(firewallProblem(rules.replace("{ 25, 80", "{ 80, 8080"), config, access)).toContain(
+    'set public_tcp is missing "element 25"; set public_tcp has 1 unexpected entry',
+  );
+  expect(firewallProblem(rules.replace("    jump ssh_access\n", ""), config, access)).toContain(
+    'chain input is missing "jump ssh_access"',
+  );
+  const loopback = 'iifname "lo" accept';
+  for (const added of [
+    "ip saddr 198.51.100.23 accept",
+    "ip saddr { 198.51.100.23, 203.0.113.0/24 } accept",
+    "ip6 saddr 2001:db8::17 accept",
+    "ip6 saddr { 2001:db8::17, ::ffff:198.51.100.23 } accept",
+    "@nh,96,32 0xc6336417 accept",
+    "jump allow_198_51_100_23",
+    "ip saddr @admin_198_51_100_23 accept",
+    'tcp dport 3306 accept comment "from 198-51-100-23.isp.example"',
+    'tcp dport 3306 log prefix "admin_0xc6336417" accept',
+    'tcp dport 3306 accept comment "ip6 saddr dead 198-51-100-23"',
+  ]) {
+    const error = firewallProblem(rules.replace(loopback, `${loopback}\n    ${added}`), config, access);
+    expect(error).toContain("chain input has 1 unexpected entry");
+    expect(error).not.toMatch(/198[._-]51[._-]100[._-]23|203\.0|2001:db8|c6336417/i);
+  }
+  for (const extra of [
+    "chain allow_198_51_100_23 {\n    accept\n  }",
+    "set admin_198_51_100_23 {\n    type ipv4_addr\n  }",
+    "map admin_0xc6336417 {\n    type ipv4_addr : verdict\n  }",
+  ]) {
+    const error = firewallProblem(
+      rules.replace("chain published {", `${extra}\n  chain published {`),
+      config,
+      access,
+    );
+    expect(error).toContain("the listing has 1 unexpected section");
+    expect(error).not.toMatch(/198_51_100_23|c6336417/i);
+  }
+  const ssh = firewallProblem(rules, config, { ports: [22, 2222], source: "203.0.113.9" });
+  expect(ssh).toContain("chain ssh_access differs (installed rules: 1, expected: 2)");
+  expect(ssh).not.toMatch(/198\.51|203\.0/);
 });
 
 test("retained SSH only exempts the matching host SSH socket from the local audit", () => {
