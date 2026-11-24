@@ -46,6 +46,7 @@ import {
 } from "../install-host-hardening.ts";
 import { backupHostname, edgeHostname, type Answers, type Options } from "./answers.ts";
 import { desiredConfiguration, readEnv, setEnvValues, writeEnv, writeHostFile } from "./env-file.ts";
+import { policySummary, type PolicyGate } from "./policy-gate.ts";
 import {
   selectProviderFirewall,
   type FirewallContext,
@@ -54,6 +55,7 @@ import {
 } from "./provider-firewall.ts";
 import type { SetupState, StepId, TailscaleNode } from "./state.ts";
 import {
+  SetupPaused,
   withoutSetupSecrets,
   withoutApiCredentials,
   type Redactor,
@@ -62,6 +64,7 @@ import {
   type SetupLog,
   type Ui,
 } from "./system.ts";
+import type { EnrolledTag } from "./tailnet-policy.ts";
 import type { AcquiredKey, KeyRequest, TailscaleKeySource } from "./tailscale-keys.ts";
 
 export const SUPPORTED_UBUNTU = ["22.04", "24.04", "26.04"];
@@ -97,6 +100,7 @@ export type Context = {
   interactive: boolean;
   env: Record<string, string | undefined>;
   keys: TailscaleKeySource;
+  policyGate: PolicyGate;
   firewalls: ProviderFirewall[];
   paths: HostPaths;
   isRoot: boolean;
@@ -114,9 +118,6 @@ export type StepResult = {
   note?: string;
   finish?: string;
 };
-
-/** The owner has not confirmed Tailscale SSH: stop before anything that could lock them out. */
-export class SetupPaused extends Error {}
 
 export type Step = { id: StepId; title: string; run: (context: Context) => Promise<StepResult> };
 
@@ -392,15 +393,58 @@ async function prerequisites(context: Context): Promise<StepResult> {
   };
 }
 
+/** Whether this run may enrol the edge or backup node. Reads only: nothing is started or changed. */
+async function enrolmentPending(context: Context, spec: ContainerName) {
+  const node = await edgeTags(context, spec.service);
+  if (node?.running) return false;
+  const id = await containerId(context, spec.service);
+  const failure = await containerFailure(context, spec.service, true);
+  const identity = failure ? failure.identity : await orphanedIdentity(context, spec);
+  // One that cannot be read is left to the node's own step, which checks again before enrolling.
+  if (identity !== "none") return false;
+  const { env } = context;
+  if (context.interactive || env.TS_API_KEY?.trim() || env.TS_OAUTH_CLIENT_SECRET?.trim()) return true;
+  const keys = [
+    env[spec.keyVariable],
+    parseEnvFile(readEnv(context.envPath))[spec.keyVariable],
+    id && (await createdWithKey(context, id)),
+  ];
+  return keys.some((key) => key?.trim() && key.trim() !== failure?.rejectedKey);
+}
+
+async function pendingContainers(context: Context) {
+  const pending: EnrolledTag[] = [];
+  if (!context.options.skipEdge && (await enrolmentPending(context, edgeName(context))))
+    pending.push(ARK_EDGE_TAG);
+  if (context.options.backupNode && (await enrolmentPending(context, backupName(context))))
+    pending.push(ARK_BACKUP_TAG);
+  return pending;
+}
+
+/** Reviews the tailnet policy. It pauses setup only over a node in `pending`. */
+async function reviewPolicy(context: Context, pending: EnrolledTag[]) {
+  if (context.keys.preparePolicy) {
+    await context.keys.preparePolicy({ pending, offerCredential: !context.state.sshConfirmation });
+    return;
+  }
+  if (pending.includes(ARK_VPS_TAG))
+    for (const line of context.keys.policyInstructions()) context.ui.print(`      ${line}`);
+  await context.policyGate.unread(pending);
+}
+
+/** The last check before a node joins, however its key was supplied. */
+async function requirePolicyReview(context: Context, tag: EnrolledTag) {
+  if (context.policyGate.unresolved([tag])) await reviewPolicy(context, [tag]);
+}
+
 async function tailscaleEnrolment(context: Context): Promise<StepResult> {
-  const enrolled = { enrolled: true, offerCredential: !context.state.sshConfirmation };
   const requested = context.answers.tailscaleHostname;
   // install.ts --enroll-vps joins with this name, or renames an enrolled node in place.
   const named = { TS_VPS_HOSTNAME: requested };
   const readName = () => tailscaleStatus(context);
   const status = await vpsTailscaleStatus(context);
   if (!(await tailscaleSshReady(context, status))) {
-    await context.keys.preparePolicy?.(enrolled);
+    await reviewPolicy(context, await pendingContainers(context));
     // Rename in place: never log out, re-enrol or touch the node's tags.
     const rename = status?.Self?.HostName !== requested;
     if (rename) await must(context, ["tailscale", "set", `--hostname=${requested}`]);
@@ -413,7 +457,7 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
     };
   }
   if (status && vpsNodeReady(status)) {
-    await context.keys.preparePolicy?.(enrolled);
+    await reviewPolicy(context, await pendingContainers(context));
     await must(context, [context.bun, "scripts/install.ts", "--enroll-vps"], {
       env: childEnv(context, named),
     });
@@ -435,11 +479,7 @@ async function tailscaleEnrolment(context: Context): Promise<StepResult> {
   }
   delete context.state.sshConfirmation;
   context.save();
-  if (context.keys.preparePolicy) await context.keys.preparePolicy();
-  else {
-    for (const line of context.keys.policyInstructions()) context.ui.print(`      ${line}`);
-    if (context.interactive) await context.ui.ask("Press Enter once the policy is saved", "");
-  }
+  await reviewPolicy(context, [ARK_VPS_TAG]);
   const key = await context.keys.acquire({ tag: ARK_VPS_TAG, variable: "TS_VPS_AUTHKEY", optional: false });
   if (!key?.file && !key?.key) throw new Error(`A ${ARK_VPS_TAG} key is required.`);
   context.redactor.add(key.key);
@@ -1846,13 +1886,18 @@ async function edgeEnrolment(context: Context): Promise<StepResult> {
         finish: EDGE_FINISH,
       };
     }
+    context.redactor.add(key?.key);
+    // A key given directly does not pass through the key source's own review.
+    await requirePolicyReview(context, ARK_EDGE_TAG);
     if (key?.key) {
-      context.redactor.add(key.key);
       acquired = key;
       // API-minted keys are sent to the running daemon on stdin.
       if (!key.inMemoryOnly) writeEnv(context.envPath, applyEdgeAuthKey(current, key.key).env);
     }
-  } else context.redactor.add(kept);
+  } else {
+    context.redactor.add(kept);
+    await requirePolicyReview(context, ARK_EDGE_TAG);
+  }
   const transient = acquired?.inMemoryOnly ? acquired.key : undefined;
   let revoked: boolean | undefined;
   let name: string;
@@ -1995,6 +2040,7 @@ async function backupNode(context: Context): Promise<StepResult> {
   let revoked: boolean | undefined;
   let name: string;
   try {
+    await requirePolicyReview(context, ARK_BACKUP_TAG);
     configureName(context, spec, spec.desired);
     await upContainer(context, spec, { TS_BACKUP_AUTHKEY: key.inMemoryOnly ? "" : key.key });
     if (key.inMemoryOnly) await enrolContainer(context, "backup-ts", spec.desired, key.key);
@@ -2678,7 +2724,8 @@ export async function summary(context: Context) {
       `  The domain wizard lists every record to create${answers.mailEnabled ? ", including MX, SPF, DKIM and DMARC for mail" : ""}.`,
     );
   }
-  const open: string[] = [];
+  const policy = policySummary(context.state);
+  const open: string[] = [...policy.unfinished];
   for (const step of STEPS) {
     const record = context.state.steps[step.id];
     // A step skipped without a note (the backup node nobody asked for) has nothing left to do.
@@ -2695,6 +2742,7 @@ export async function summary(context: Context) {
     open.push("      Re-run host:setup with --trusted-certificates, then reissue the certificates.");
   }
   lines.push("", open.length ? "Still to do:" : "Nothing was skipped.", ...open);
+  if (policy.accepted.length) lines.push("", ...policy.accepted);
   lines.push(
     "",
     "Recovery material: copy these .env values off the host now (they are not printed here):",

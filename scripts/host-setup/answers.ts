@@ -21,6 +21,10 @@ export type Options = {
   approveProviderFirewall: boolean;
   /** Apply the Tailscale API source's policy change without asking. */
   approveTailnetPolicy: boolean;
+  /** Continue although the tailnet policy has a catch-all rule that covers the Ark tags. */
+  acceptBroadTailnetPolicy: boolean;
+  /** The operator checked that the policy, which setup cannot read, has no such rule. */
+  tailnetPolicyReviewed: boolean;
   /** Enrol the backup node (backup-ts, tag:ark-backup) for a home backup target. */
   backupNode: boolean;
   help: boolean;
@@ -58,6 +62,8 @@ const BOOLEAN_FLAGS = new Set([
   "--provider-firewall-applied",
   "--approve-provider-firewall",
   "--approve-tailnet-policy",
+  "--accept-broad-tailnet-policy",
+  "--tailnet-policy-reviewed",
   "--backup-node",
   "--mail",
   "--no-mail",
@@ -100,6 +106,10 @@ Tailscale (environment only; read without echo otherwise):
   TS_EDGE_AUTHKEY                         one-off key for tag:ark-edge
   TS_BACKUP_AUTHKEY                       one-off key for tag:ark-backup (with --backup-node)
   --approve-tailnet-policy      ARK_SETUP_APPROVE_TAILNET_POLICY=1   Preapprove the shown change with --non-interactive
+  --tailnet-policy-reviewed     ARK_SETUP_TAILNET_POLICY_REVIEWED=1  You checked that the policy has no rule
+                                that lets an Ark tag reach every device (--non-interactive, pasted keys)
+  --accept-broad-tailnet-policy ARK_SETUP_ACCEPT_BROAD_TAILNET_POLICY=1   Continue with such a rule in place
+                                (--non-interactive; not implied by --approve-tailnet-policy)
   --backup-node                 ARK_SETUP_BACKUP_NODE=1              Also enrol backup-ts (tag:ark-backup)
 
 Provider firewall:
@@ -161,6 +171,8 @@ export function resolveOptions(flags: Flags, env: Record<string, string | undefi
     providerFirewall: typeof firewall === "string" && firewall.trim() ? firewall.trim() : undefined,
     approveProviderFirewall: flag("--approve-provider-firewall", "ARK_SETUP_APPROVE_PROVIDER_FIREWALL"),
     approveTailnetPolicy: flag("--approve-tailnet-policy", "ARK_SETUP_APPROVE_TAILNET_POLICY"),
+    acceptBroadTailnetPolicy: flag("--accept-broad-tailnet-policy", "ARK_SETUP_ACCEPT_BROAD_TAILNET_POLICY"),
+    tailnetPolicyReviewed: flag("--tailnet-policy-reviewed", "ARK_SETUP_TAILNET_POLICY_REVIEWED"),
     backupNode: flag("--backup-node", "ARK_SETUP_BACKUP_NODE"),
     help: flags.has("--help") || flags.has("-h"),
   };

@@ -1,7 +1,7 @@
 // The Tailscale API key source for the guided setup (part 2 of the automated installer).
 //
-// With one API credential, setup merges the Ark entries into the tailnet policy after showing the diff
-// and getting a yes, then mints one single-use, pre-approved, one-hour key per node and revokes it
+// With one API credential, setup checks the tailnet policy for a catch-all rule (policy-gate.ts), merges
+// the Ark entries into it after showing the added lines and getting a yes, then mints one single-use, pre-approved, one-hour key per node and revokes it
 // once the node has joined. Without a credential the manual source (tailscale-keys.ts) is used.
 //
 // The credential, the OAuth access token and every minted key live only in this process's memory:
@@ -9,8 +9,9 @@
 // and only the one key a node needs is passed to its enrolment process, on stdin.
 import { ARK_BACKUP_TAG, ARK_EDGE_TAG, ARK_VPS_TAG } from "@ark-stack/shared";
 
+import type { PolicyGate } from "./policy-gate.ts";
 import type { Ui } from "./system.ts";
-import { lineDiff, mergeArkPolicy } from "./tailnet-policy.ts";
+import { mergeArkPolicy, type EnrolledTag } from "./tailnet-policy.ts";
 import {
   manualKeySource,
   tailnetPolicyInstructions,
@@ -240,6 +241,7 @@ export class TailscaleApi {
 
 export type ApiKeySourceOptions = {
   ui: Ui;
+  gate: PolicyGate;
   interactive: boolean;
   /** Explicit non-interactive mode plus --approve-tailnet-policy or its environment equivalent. */
   approve: boolean;
@@ -258,14 +260,15 @@ export function apiKeySource(
   const tags = [ARK_VPS_TAG, ARK_EDGE_TAG, ...(options.backup ? [ARK_BACKUP_TAG] : [])];
   let prepared: Promise<void> | undefined;
 
-  async function preparePolicy() {
+  async function preparePolicy(pending: EnrolledTag[]) {
     const current = await api.getPolicy();
     const merge = mergeArkPolicy(current.text, {
       tags,
       owners: ["autogroup:admin"],
       requiredOwner: credential.kind === "oauth" ? credential.tag : undefined,
     });
-    for (const warning of merge.warnings) ui.print(`      Warning: ${warning}`);
+    // Before the policy changes, a key is minted or a node enrolled.
+    await options.gate.found(merge.catchAll, pending);
     if (!merge.changed) {
       ui.print(`      The tailnet policy already has the Ark tag owners and the owner SSH rule.`);
       return;
@@ -273,7 +276,7 @@ export function apiKeySource(
     ui.print("      Proposed tailnet policy change (only Ark entries are added; nothing else changes):");
     for (const line of merge.additions) ui.print(`        - ${line}`);
     ui.print("");
-    for (const line of lineDiff(current.text, merge.text)) ui.print(`        ${line}`);
+    for (const line of merge.inserted) ui.print(`        ${line}`);
     ui.print("");
     const problem = await api.validatePolicy(merge.text);
     if (problem) throw new Error(`Tailscale rejected the merged policy, so nothing was applied: ${problem}`);
@@ -297,16 +300,18 @@ export function apiKeySource(
   const source: TailscaleKeySource = {
     id: "tailscale-api",
     policyInstructions: () => tailnetPolicyInstructions({ backup: options.backup }),
-    preparePolicy() {
-      // Once per run; a failure is retried by the next call (the next run).
-      prepared ??= preparePolicy().catch((error: unknown) => {
+    preparePolicy({ pending = [ARK_VPS_TAG] as EnrolledTag[] } = {}) {
+      // A node to enrol that an earlier review left open: read the policy again.
+      if (options.gate.unresolved(pending)) prepared = undefined;
+      // Otherwise once per run; a failure is retried by the next call (the next run).
+      prepared ??= preparePolicy(pending).catch((error: unknown) => {
         prepared = undefined;
         throw error;
       });
       return prepared;
     },
     async acquire(request: KeyRequest): Promise<AcquiredKey> {
-      await source.preparePolicy!();
+      await source.preparePolicy!({ pending: [request.tag] });
       const minted = await api.createKey(request.tag, `ark-stack setup ${request.tag.slice(4)}`);
       ui.print(
         `      Minted a one-off ${request.tag} key through the Tailscale API (ID ${minted.id}, expires in one hour).`,
@@ -344,6 +349,7 @@ export function apiKeySource(
 export type AutomaticKeySourceOptions = {
   env: Record<string, string | undefined>;
   ui: Ui;
+  gate: PolicyGate;
   interactive: boolean;
   approve: boolean;
   backup: boolean;
@@ -406,19 +412,20 @@ export function automaticKeySource(options: AutomaticKeySourceOptions): Tailscal
   const source: TailscaleKeySource = {
     id: "automatic",
     policyInstructions: () => tailnetPolicyInstructions({ backup: options.backup }),
-    async preparePolicy({ enrolled, offerCredential } = {}) {
-      // A manual rerun with an enrolled VPS does not need to review or re-save policy.
-      if (enrolled && !credentialFromEnv(env) && !(interactive && offerCredential)) return;
-      const selected = await resolve();
-      if (selected.preparePolicy) return selected.preparePolicy();
-      if (enrolled) return;
-      for (const line of selected.policyInstructions()) ui.print(`      ${line}`);
-      if (interactive) await ui.ask("Press Enter once the policy is saved", "");
+    async preparePolicy({ pending = [ARK_VPS_TAG] as EnrolledTag[], offerCredential } = {}) {
+      // With every node enrolled, a manual rerun needs no credential.
+      const useSource = chosen || credentialFromEnv(env) || pending.length || offerCredential;
+      const selected = useSource ? await resolve() : manual;
+      if (selected.preparePolicy) return selected.preparePolicy({ pending });
+      if (pending.includes(ARK_VPS_TAG))
+        for (const line of selected.policyInstructions()) ui.print(`      ${line}`);
+      await options.gate.unread(pending);
     },
     async collect(request) {
       const selected = await resolve();
       // Review any API policy change now. Mint keys only when the nodes are ready to enrol.
-      await selected.preparePolicy?.();
+      if (selected.preparePolicy) await selected.preparePolicy({ pending: [request.tag] });
+      else if (options.gate.unresolved([request.tag])) await options.gate.unread([request.tag]);
       return selected.collect?.(request);
     },
     async acquire(request, { allowPrompt = true } = {}) {

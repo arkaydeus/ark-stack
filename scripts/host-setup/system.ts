@@ -10,6 +10,12 @@ import { isSecretKey, parseEnvFile, redactLogLine } from "@ark-stack/shared";
 
 import { promptHidden, readHidden } from "../install-edge-auth.ts";
 
+/**
+ * The owner has to do or confirm something first (a working Tailscale SSH session, a tailnet policy
+ * with a catch-all rule): setup stops before the step that depends on it and can be resumed.
+ */
+export class SetupPaused extends Error {}
+
 export type RunOptions = {
   env?: Record<string, string | undefined>;
   stdin?: string;
