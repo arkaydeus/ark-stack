@@ -178,23 +178,26 @@ const PROTOCOL_NAMES: Record<string, string> = { 1: "icmp", 6: "tcp", 17: "udp",
 
 function canonicalFirewall(rules: string) {
   // nft aligns set elements across lines and may sort members of anonymous sets.
+  // Preserve section headers so even a single-rule chain is visible in diagnostics.
   return rules
     .replace(/\bmeta l4proto (?:\d+(?![\w-])|\{[^}]*\})/g, (match) =>
       match.replace(/(?<![\w-])\d+(?![\w-])/g, (number) => PROTOCOL_NAMES[number] ?? number),
     )
     .replace(
-      /\{\s*([\w-]+(?:\s*,\s*[\w-]+)*)\s*\}/g,
-      (_set, elements: string) =>
-        `{${elements
-          .split(",")
-          .map((part) => part.trim())
-          .toSorted()
-          .join(",")}}`,
+      /^[ \t]*(?:table|chain|set|map) [^{\n]+\{|\{\s*([\w-]+(?:\s*,\s*[\w-]+)*)\s*\}/gm,
+      (match, elements: string | undefined) =>
+        elements
+          ? `{${elements
+              .split(",")
+              .map((part) => part.trim())
+              .toSorted()
+              .join(",")}}`
+          : match,
     )
     .replace(
       /\b(ip6?) saddr ([\da-f:.]+)(?=\s)/gi,
       (_match, family: string, address: string) =>
-        `${family} saddr ${family === "ip6" ? new URL(`http://[${address}]/`).hostname.slice(1, -1) : address}`,
+        `${family} saddr ${family === "ip6" && isIP(address) === 6 ? new URL(`http://[${address}]/`).hostname.slice(1, -1) : address}`,
     );
 }
 
@@ -218,7 +221,7 @@ function firewallSections(canonical: string) {
   return sections;
 }
 
-// An added rule can hold an administrator's address in any form nft prints, including a raw payload.
+// Defense in depth for expected rule text included in diagnostics.
 function redactAddresses(line: string) {
   return line
     .replace(/(?:[\da-f]*:){2,}[\da-f:.]*(?:\/\d+)?/gi, "<address>")
@@ -235,26 +238,27 @@ function without(lines: string[], other: string[]) {
   });
 }
 
-/** Names the differing sections for the operator. Text from the SSH chain is never included. */
+/** Reports drift using the expected baseline and counts from the installed table. */
 function firewallDifferences(installed: string, expected: string) {
   const actual = firewallSections(canonicalFirewall(installed));
   const desired = firewallSections(canonicalFirewall(expected));
-  const quote = (line: string) => JSON.stringify(redactAddresses(line).slice(0, 120));
-  const differences = [...new Set([...desired.keys(), ...actual.keys()])].flatMap((section) => {
-    const label = redactAddresses(section).slice(0, 80);
-    const found = actual.get(section);
-    const wanted = desired.get(section);
+  // Installed rules and identifiers can encode addresses in arbitrary ways.
+  const differences = [...desired].flatMap(([label, wanted]) => {
+    const found = actual.get(label);
     if (!found) return [`${label} is missing`];
-    if (!wanted) return [`${label} is unexpected`];
     if (found.join("\n") === wanted.join("\n")) return [];
-    if (section === "chain ssh_access") {
+    if (label === "chain ssh_access") {
       return [`${label} differs (installed rules: ${found.length}, expected: ${wanted.length})`];
     }
-    const missing = without(wanted, found).map((line) => `${label} is missing ${quote(line)}`);
-    const added = without(found, wanted).map((line) => `${label} has unexpected ${quote(line)}`);
-    const changes = [...missing, ...added];
+    const changes = without(wanted, found).map(
+      (line) => `${label} is missing ${JSON.stringify(redactAddresses(line).slice(0, 120))}`,
+    );
+    const added = without(found, wanted).length;
+    if (added) changes.push(`${label} has ${added} unexpected ${added === 1 ? "entry" : "entries"}`);
     return changes.length ? changes : [`${label} has its rules in a different order`];
   });
+  const extra = [...actual.keys()].filter((label) => !desired.has(label)).length;
+  if (extra) differences.push(`the listing has ${extra} unexpected ${extra === 1 ? "section" : "sections"}`);
   if (!differences.length) return "the listing has a different structure";
   const more = differences.length - 4;
   return differences.slice(0, 4).join("; ") + (more > 0 ? `; and ${more} more` : "");

@@ -1,7 +1,7 @@
 // Runs from scripts/test-db-ingress.ts. The host's nft creates ark_host and the nft in the shipped
 // database-ingress image verifies it, as on a hardened VPS. The two are different nft versions and
 // only the host has /etc/protocols, so they can print the same kernel rules differently.
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -25,6 +25,7 @@ const listArgs = ["nft", "-s", "-y", "list", "table", "inet", "ark_host"];
 const numericArgs = ["nft", "-s", "-y", "-p", "list", "table", "inet", "ark_host"];
 const caps = ["--user", "0:0", "--cap-drop", "ALL", "--cap-add", "NET_ADMIN", "--cap-add", "DAC_OVERRIDE"];
 const sshSource = "198.51.100.23";
+const route = { id: "rt_t003", listenPort: 20003, sourceCidrs: [], allowInternet: true };
 
 const cases: [string, HostPortConfig, HostSshAccess][] = [
   ["mail on, no SSH access", { mailEnabled: true, sniPorts: [] }, { ports: [] }],
@@ -55,13 +56,37 @@ const tampering: [string, string, string][] = [
   ["a changed rule protocol", tcpRule, tcpRule.replace("tcp", "sctp")],
   ["a negated protocol", udpRule, udpRule.replace("udp", "!= udp")],
   ["an added port", "elements = { 25,", "elements = { 24, 25,"],
-  ["an added SSH rule", "chain ssh_access {\n", `chain ssh_access {\n    tcp dport 2200 accept\n`],
+  ["a mixed-source SSH chain", "chain ssh_access {\n", "chain ssh_access {\n    tcp dport 2200 accept\n"],
+  ["a non-allow rule in the SSH chain", "chain ssh_access {\n", "chain ssh_access {\n    counter drop\n"],
   ["an added chain", "  chain published {", "  chain extra {\n    accept\n  }\n  chain published {"],
 ];
 
 function replaceOnce(text: string, from: string, to: string) {
   if (text.split(from).length !== 2) throw new Error(`The baseline does not contain "${from}" exactly once.`);
   return text.replace(from, to);
+}
+
+export async function waitForHostFirewallAcknowledgement(
+  readStatus: () => Promise<string>,
+  { id, hash }: { id: string; hash: string },
+  applied: boolean,
+  timeoutMs = 15_000,
+) {
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    const status = await readStatus();
+    const fields = status.split("\n");
+    if (
+      fields.includes(`request_id=${id}`) &&
+      fields.includes(`policy_hash=${hash}`) &&
+      fields.includes(`applied=${applied}`)
+    )
+      return status;
+    const remaining = deadline - performance.now();
+    if (remaining <= 0)
+      throw new Error(`Timed out waiting for firewall request ${id} with applied=${applied}.`);
+    await Bun.sleep(Math.min(250, remaining));
+  }
 }
 
 /**
@@ -112,9 +137,11 @@ export async function checkHostFirewallReadback(options: {
   const hostImage = `ark-host-nft-test:${suffix}`;
   const ingressImage = `ark-database-ingress-test:${suffix}`;
   const protocols = join(directory, "protocols");
+  const protocolMount = ["-v", `${protocols}:/etc/protocols:ro`];
+  const ingressApp = join(directory, "ingress-app");
 
   options.images.push(hostImage, ingressImage);
-  await buildIngressImage(docker, root, join(directory, "ingress-app"), ingressImage);
+  await buildIngressImage(docker, root, ingressApp, ingressImage);
   await docker([
     "build",
     "--quiet",
@@ -185,15 +212,13 @@ export async function checkHostFirewallReadback(options: {
       ["Ubuntu without /etc/protocols", unnamed],
       ["Ubuntu, numeric", await onHost(...numericArgs)],
       ["shipped image as built", await ingress(listArgs)],
-      [
-        "shipped image with /etc/protocols",
-        await ingress(listArgs, ["-v", `${protocols}:/etc/protocols:ro`]),
-      ],
+      ["shipped image with /etc/protocols", await ingress(listArgs, protocolMount)],
       ["shipped image, numeric", await ingress(numericArgs)],
     ]);
   };
-  const problem = (listing: string, config: HostPortConfig, ssh: HostSshAccess) => {
+  const problem = (listing: string, config: HostPortConfig, bootSsh?: HostSshAccess) => {
     try {
+      const ssh = bootSsh ?? (/\bchain ssh_access \{/.test(listing) ? readHostSshAccess(listing) : undefined);
       assertHostFirewall(listing, config, ssh);
       return "";
     } catch (error) {
@@ -204,22 +229,47 @@ export async function checkHostFirewallReadback(options: {
   for (const [name, config, ssh] of cases) {
     await load(renderHostFirewall(config, ssh));
     for (const [source, listing] of await listings()) {
-      const error = problem(listing, config, ssh) || problem(listing, config, readHostSshAccess(listing));
+      const error = problem(listing, config, ssh) || problem(listing, config);
       check(!error, `${name}: accepted as listed by ${source}`, error || "accepted");
     }
   }
-  const unnamed = (await listings()).get("shipped image, numeric")!;
-  check(
-    /\{ 1, 58 \}/.test(unnamed) && /l4proto 6 /.test(unnamed) && /l4proto 17 /.test(unnamed),
-    "the listings cover protocol numbers as well as names",
-    unnamed.match(/l4proto[^\n]*/g)?.join("; ") ?? "no protocol rules",
-  );
+  const baselineListings = await listings();
+  const withNumericProtocols = (listing: string) =>
+    listing
+      .replace("l4proto { icmp, ipv6-icmp }", "l4proto { 1, 58 }")
+      .replace("l4proto tcp ", "l4proto 6 ")
+      .replace("l4proto udp ", "l4proto 17 ");
+  for (const [image, named, numeric] of [
+    ["Ubuntu", baselineListings.get("Ubuntu with /etc/protocols")!, baselineListings.get("Ubuntu, numeric")!],
+    [
+      "shipped image",
+      baselineListings.get("shipped image with /etc/protocols")!,
+      await ingress(numericArgs, protocolMount),
+    ],
+  ]) {
+    check(
+      named.includes("l4proto { icmp, ipv6-icmp }") &&
+        named.includes("l4proto tcp ") &&
+        named.includes("l4proto udp ") &&
+        withNumericProtocols(named) === numeric,
+      `${image}: -p changes only the protocol names with /etc/protocols present`,
+      numeric.match(/l4proto[^\n]*/g)?.join("; ") ?? "no protocol rules",
+    );
+    const withoutProtocols = baselineListings.get(
+      image === "Ubuntu" ? "Ubuntu without /etc/protocols" : "shipped image, numeric",
+    );
+    check(
+      numeric === withoutProtocols,
+      `${image}: numeric readback matches without /etc/protocols`,
+      "full table",
+    );
+  }
 
   const [, config, ssh] = cases[2]!;
   const baseline = renderHostFirewall(config, ssh);
   for (const [name, from, to] of tampering) {
     await load(replaceOnce(baseline, from, to));
-    const errors = [...(await listings()).values()].map((listing) => problem(listing, config, ssh));
+    const errors = [...(await listings()).values()].map((listing) => problem(listing, config));
     check(
       errors.every((error) => error && !error.includes(sshSource)),
       `${name} is refused in every listing, without the SSH source`,
@@ -227,14 +277,23 @@ export async function checkHostFirewallReadback(options: {
     );
   }
 
+  const bootSsh = { ports: [] };
+  const openSsh = renderHostFirewall(config, { ports: [2200] });
+  await load(openSsh);
+  for (const [source, listing] of await listings()) {
+    check(
+      !problem(listing, config) && Boolean(problem(listing, config, bootSsh)),
+      `${source}: well-formed unsourced SSH passes reconciliation and differs from the boot rules`,
+      "one unsourced SSH allow rule",
+    );
+  }
+
   // The shipped reconciler applies and acknowledges a front policy in the same namespace.
-  const policy =
-    renderDbIngress() +
-    "\n" +
-    renderFrontIngress([{ id: "rt_t003", listenPort: 20003, sourceCidrs: [], allowInternet: true }], []);
+  const policy = renderDbIngress() + "\n" + renderFrontIngress([route], []);
+  const hash = sha256Hex(policy);
   const request = async () => {
     const id = crypto.randomUUID();
-    const body = JSON.stringify({ id, hash: sha256Hex(policy) });
+    const body = JSON.stringify({ id, hash });
     await docker(
       [
         "exec",
@@ -250,18 +309,11 @@ export async function checkHostFirewallReadback(options: {
       ["exec", "-i", host, "sh", "-ec", "cat >/state/front/r; mv /state/front/r /state/front/policy.request"],
       { stdin: body },
     );
-    return id;
+    return { id, hash };
   };
-  const acknowledgement = async (id: string, applied: boolean) => {
-    const deadline = Date.now() + 15_000;
-    let status: string;
-    do {
-      status = await onHost("sh", "-c", "cat /state/front/policy.status 2>/dev/null || true");
-      if (status.includes(`request_id=${id}`) && status.includes(`applied=${applied}\n`)) break;
-      await Bun.sleep(250);
-    } while (Date.now() < deadline);
-    return status;
-  };
+  const readStatus = () => onHost("sh", "-c", "cat /state/front/policy.status 2>/dev/null || true");
+  const acknowledgement = (pending: Awaited<ReturnType<typeof request>>, applied: boolean) =>
+    waitForHostFirewallAcknowledgement(readStatus, pending, applied);
   const guarded = async () => (await onHost("nft", "list", "tables")).includes("ark_front_guard");
   const reachable = async () =>
     (
@@ -273,7 +325,56 @@ export async function checkHostFirewallReadback(options: {
       )
     ).status === 0;
 
-  await load(baseline);
+  // Gate just the host table readback. The front policy transaction has already finished
+  // when this process starts, so the test can observe the guard during recovery.
+  const nftWrapper = join(directory, "nft");
+  await writeFile(
+    nftWrapper,
+    `#!/bin/sh
+set -eu
+if [ "$*" = "${numericArgs.slice(1).join(" ")}" ] && [ -e /state/hold-host-readback ]; then
+  touch /state/host-readback-paused
+  while [ -e /state/hold-host-readback ]; do sleep 0.05; done
+fi
+exec /usr/sbin/nft "$@"
+`,
+    { mode: 0o755 },
+  );
+  const startReconciler = async (image: string, name: string, mounts: string[] = []) => {
+    containers.push(name);
+    await docker([
+      "run",
+      "-d",
+      "--name",
+      name,
+      "--network",
+      `container:${host}`,
+      ...caps,
+      "--security-opt",
+      "no-new-privileges:true",
+      "--read-only",
+      "--tmpfs",
+      "/tmp:rw,noexec,nosuid,nodev,size=64m",
+      "-v",
+      `${volume}:/state`,
+      "-v",
+      `${nftWrapper}:/test-bin/nft:ro`,
+      ...mounts,
+      ...[
+        "ARK_HOST_HARDENING=1",
+        "ARK_MAIL_ENABLED=1",
+        "ARK_EDGE_SNI_PORTS=",
+        "ARK_PGBOUNCER_DIR=/state/pgbouncer",
+        "ARK_DB_INGRESS_METRICS_DIR=/state/metrics",
+        "ARK_FRONT_INGRESS_DIR=/state/front",
+      ].flatMap((value) => ["-e", value]),
+      image,
+      "sh",
+      "-ec",
+      'export PATH="/test-bin:$PATH"; exec bun /app/database-ingress.js',
+    ]);
+  };
+
   await docker([
     "exec",
     "-d",
@@ -283,50 +384,26 @@ export async function checkHostFirewallReadback(options: {
     'Bun.serve({ port: 80, hostname: "127.0.0.1", fetch: () => new Response("ok") })',
   ]);
   const reconciler = `ark-host-nft-reconciler-${suffix}`;
-  containers.push(reconciler);
-  let id = await request();
-  await docker([
-    "run",
-    "-d",
-    "--name",
-    reconciler,
-    "--network",
-    `container:${host}`,
-    ...caps,
-    "--security-opt",
-    "no-new-privileges:true",
-    "--read-only",
-    "--tmpfs",
-    "/tmp:rw,noexec,nosuid,nodev,size=64m",
-    "-v",
-    `${volume}:/state`,
-    ...[
-      "ARK_HOST_HARDENING=1",
-      "ARK_MAIL_ENABLED=1",
-      "ARK_EDGE_SNI_PORTS=",
-      "ARK_PGBOUNCER_DIR=/state/pgbouncer",
-      "ARK_DB_INGRESS_METRICS_DIR=/state/metrics",
-      "ARK_FRONT_INGRESS_DIR=/state/front",
-    ].flatMap((value) => ["-e", value]),
-    ingressImage,
-    "bun",
-    "/app/database-ingress.js",
-  ]);
-  let status = await acknowledgement(id, true);
+  let pending = await request();
+  await startReconciler(ingressImage, reconciler);
+  const showStatus = (status: string) => status.trim().replace(/\n/g, " ");
+  let status = await acknowledgement(pending, true);
   check(
-    status.includes("applied=true") && !(await guarded()),
-    "the shipped reconciler accepts the host's table and installs no guard",
-    status.replace(/\n/g, " "),
+    !(await guarded()),
+    "the shipped reconciler accepts the host's table with unsourced SSH and installs no guard",
+    showStatus(status),
   );
   check(await reachable(), "port 80 is reachable after the acknowledgement", "TCP 80 over loopback");
 
   await load(replaceOnce(baseline, icmpRule, "meta l4proto { icmp, sctp } accept"));
-  id = await request();
-  status = await acknowledgement(id, false);
+  pending = await request();
+  status = await acknowledgement(pending, false);
   check(
-    /chain input is missing .*ipv6-icmp/.test(status) && /132/.test(status) && !status.includes(sshSource),
-    "a different protocol is refused and named in the status",
-    status.replace(/\n/g, " "),
+    /chain input is missing .*ipv6-icmp/.test(status) &&
+      status.includes("chain input has 1 unexpected entry") &&
+      !status.includes(sshSource),
+    "a different protocol is refused and the missing baseline rule is named in the status",
+    showStatus(status),
   );
   check(
     (await guarded()) && !(await reachable()),
@@ -334,11 +411,85 @@ export async function checkHostFirewallReadback(options: {
     "TCP 80 over loopback",
   );
 
-  await load(baseline);
-  status = await acknowledgement(id, true);
-  check(
-    status.includes("applied=true") && !(await guarded()) && (await reachable()),
-    "the same request is retried and the guard removed once the table matches",
-    status.replace(/\n/g, " "),
+  const liveBaseline = renderHostFirewall(
+    { ...config, routes: [{ port: route.listenPort, policy: "internet" }] },
+    ssh,
   );
+  await onHost("touch", "/state/hold-host-readback");
+  try {
+    await onHost(
+      "timeout",
+      "15",
+      "sh",
+      "-ec",
+      "until [ -e /state/host-readback-paused ]; do sleep 0.05; done",
+    );
+    await load(liveBaseline);
+    check(
+      (await guarded()) && !(await reachable()) && (await readStatus()) === status,
+      "the retry keeps the guard and TCP 80 blocked while host readback is paused",
+      "the rejected acknowledgement remains current",
+    );
+  } finally {
+    await onHost("rm", "-f", "/state/hold-host-readback", "/state/host-readback-paused");
+  }
+  status = await acknowledgement(pending, true);
+  check(
+    !(await guarded()) && (await reachable()),
+    "the same request is retried and the guard removed once the table matches",
+    showStatus(status),
+  );
+
+  const addressParts = [sshSource, "198_51_100_23", "198-51-100-23", "0xc6336417"];
+  const privateRules = replaceOnce(
+    replaceOnce(
+      liveBaseline,
+      "  chain published {",
+      `  set admin_198_51_100_23 {
+    type ipv4_addr
+    elements = { ${sshSource} }
+  }
+  map admin_0xc6336417 {
+    type ipv4_addr : verdict
+  }
+  chain allow_198_51_100_23 {
+    return
+  }
+  chain published {`,
+    ),
+    loRule,
+    `${loRule}
+    ip saddr ${sshSource} log prefix "admin_0xc6336417" accept comment "from 198-51-100-23.isp.example"
+    ip saddr @admin_198_51_100_23 jump allow_198_51_100_23`,
+  );
+  const checkPrivateStatus = async (image: string, listing: string) => {
+    check(
+      listing.includes(`ip saddr ${sshSource} log prefix`) &&
+        addressParts.every((part) => listing.includes(part)),
+      `${image}: nft lists all address forms in the drift fixture`,
+      "a source, identifiers, a log prefix and a comment",
+    );
+    const privateRequest = await request();
+    const privateStatus = await acknowledgement(privateRequest, false);
+    check(
+      privateStatus.includes("chain input has 2 unexpected entries") &&
+        privateStatus.includes("the listing has 3 unexpected sections") &&
+        !addressParts.some((part) => privateStatus.includes(part)),
+      `${image}: live status reports the drift without any address forms`,
+      showStatus(privateStatus),
+    );
+    await load(liveBaseline);
+    await acknowledgement(privateRequest, true);
+  };
+
+  // Install and read the same fixture using each nft version. Run the same bundled
+  // reconciler with Ubuntu's nft so both listings go through the real status writer.
+  await docker(["exec", "-i", reconciler, "/usr/sbin/nft", "-f", "-"], {
+    stdin: withNumericProtocols(privateRules),
+  });
+  await checkPrivateStatus("shipped image", await ingress(numericArgs));
+  await docker(["rm", "-f", reconciler]);
+  await load(privateRules);
+  await startReconciler(hostImage, `${reconciler}-ubuntu`, ["-v", `${join(ingressApp, "app")}:/app:ro`]);
+  await checkPrivateStatus("Ubuntu", await onHost(...numericArgs));
 }

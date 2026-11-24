@@ -109,10 +109,10 @@ test("a host firewall mismatch names the difference without administrator addres
   const access = { ports: [22], source: "198.51.100.23" };
   const rules = installedTable(config, access);
   expect(firewallProblem(rules.replace("policy drop", "policy accept"), config, access)).toContain(
-    'chain input has unexpected "type filter hook input priority -5; policy accept;"',
+    'chain input is missing "type filter hook input priority -5; policy drop;"; chain input has 1 unexpected entry',
   );
   expect(firewallProblem(rules.replace("{ 25, 80", "{ 80, 8080"), config, access)).toContain(
-    'set public_tcp is missing "element 25"; set public_tcp has unexpected "element 8080"',
+    'set public_tcp is missing "element 25"; set public_tcp has 1 unexpected entry',
   );
   expect(firewallProblem(rules.replace("    jump ssh_access\n", ""), config, access)).toContain(
     'chain input is missing "jump ssh_access"',
@@ -124,21 +124,32 @@ test("a host firewall mismatch names the difference without administrator addres
     "ip6 saddr 2001:db8::17 accept",
     "ip6 saddr { 2001:db8::17, ::ffff:198.51.100.23 } accept",
     "@nh,96,32 0xc6336417 accept",
+    "jump allow_198_51_100_23",
+    "ip saddr @admin_198_51_100_23 accept",
+    'tcp dport 3306 accept comment "from 198-51-100-23.isp.example"',
+    'tcp dport 3306 log prefix "admin_0xc6336417" accept',
+    'tcp dport 3306 accept comment "ip6 saddr dead 198-51-100-23"',
   ]) {
     const error = firewallProblem(rules.replace(loopback, `${loopback}\n    ${added}`), config, access);
-    expect(error).toMatch(/chain input has unexpected "[^"]*accept"/);
-    expect(error).not.toMatch(/198\.51|203\.0|2001:db8|c6336417/i);
+    expect(error).toContain("chain input has 1 unexpected entry");
+    expect(error).not.toMatch(/198[._-]51[._-]100[._-]23|203\.0|2001:db8|c6336417/i);
+  }
+  for (const extra of [
+    "chain allow_198_51_100_23 {\n    accept\n  }",
+    "set admin_198_51_100_23 {\n    type ipv4_addr\n  }",
+    "map admin_0xc6336417 {\n    type ipv4_addr : verdict\n  }",
+  ]) {
+    const error = firewallProblem(
+      rules.replace("chain published {", `${extra}\n  chain published {`),
+      config,
+      access,
+    );
+    expect(error).toContain("the listing has 1 unexpected section");
+    expect(error).not.toMatch(/198_51_100_23|c6336417/i);
   }
   const ssh = firewallProblem(rules, config, { ports: [22, 2222], source: "203.0.113.9" });
   expect(ssh).toContain("chain ssh_access differs (installed rules: 1, expected: 2)");
   expect(ssh).not.toMatch(/198\.51|203\.0/);
-  expect(
-    firewallProblem(
-      rules.replace("chain published {", "chain 198.51.100.23 {\n  accept\n  }\n chain published {"),
-      config,
-      access,
-    ),
-  ).not.toContain("198.51");
 });
 
 test("retained SSH only exempts the matching host SSH socket from the local audit", () => {
