@@ -55,7 +55,7 @@ function expectExplanation(text: string) {
     "Not normally on, unless you added one: Hetzner, DigitalOcean, HOSTKEY, Vultr and Linode",
   );
   expect(words).toMatch(/Not sure\? Look for Firewall, Security group or Network ACL in the control panel/);
-  expect(words).toContain("A VM behind a router usually needs these ports forwarded to it instead");
+  expect(words).toContain("If the VPS is behind a router, set up any port forwards needed to reach it");
 }
 
 test.each([true, false])(
@@ -81,16 +81,19 @@ test.each([
   ["skip", "pending"],
   ["", "pending"],
   ["none", "pending"],
-])("the question covers a host with no firewall and what skip leaves; %p is %s", async (answer, status) => {
+])("the question covers firewall rules, router forwards and skipping (%p is %s)", async (answer, status) => {
   const { context, questions } = firewallContext(true, answer);
   const plan = await manualProviderFirewall.plan(RULES, context);
   const result = await manualProviderFirewall.apply(plan, context);
   expect(questions).toHaveLength(1);
   expect(questions[0]).toStartWith(
-    "Type yes once they are applied, or if your host has no separate firewall.",
+    "Type yes once they are applied (if you have a provider firewall) and any required router port forwards are in place.",
   );
   expect(questions[0]).toContain(
-    "Type skip to finish later: the install carries on, but this step and the final local audit stay unfinished",
+    "If neither is required, type yes. If any required rules or forwards are still pending, type skip.",
+  );
+  expect(questions[0]).toContain(
+    "The install carries on, but this step and the final local audit stay unfinished",
   );
   expect(result.status).toBe(status as typeof result.status);
   if (result.status === "pending") {
@@ -155,7 +158,11 @@ test("the production install guide has the same explanation and the outside chec
   const guide = await Bun.file(join(import.meta.dir, "../docs/getting-started/production-install.md")).text();
   const section = guide.split("\n### Provider firewall\n")[1]?.split("\n### ")[0] ?? "";
   expectExplanation(section.replace(/^- /gm, ""));
-  expect(section).toContain("sudo tcpdump -ni any 'tcp dst port 22222'");
-  expect(section).toContain("nc -vz -w 5 <public-ip> 22222");
+  expect(flat(section)).toContain(
+    "Answer yes once any applicable provider firewall rules and required router port forwards are in place. If neither is required, answer yes.",
+  );
+  expect(section).toContain("sudo tcpdump -ni any 'src host 198.51.100.23 and tcp dst port 22222'");
+  expect(section).toContain("nc -vz -w 5 203.0.113.10 22222");
+  expect(section).toContain("Look for a SYN (`Flags [S]`) from the test machine as `nc` runs.");
   expect(guide).not.toContain("and a provider firewall you control");
 });

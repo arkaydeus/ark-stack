@@ -126,27 +126,26 @@ Your host may run a separate firewall outside the VPS. Setup configures the fire
 - **Normally on:** AWS (security groups), Google Cloud (VPC firewall rules), Azure (network security groups) and Oracle Cloud (security lists or network security groups).
 - **Not normally on, unless you added one:** Hetzner, DigitalOcean, HOSTKEY, Vultr and Linode.
 - **Not sure?** Look for **Firewall**, **Security group** or **Network ACL** in the control panel.
-- **A VM behind a router** usually needs these ports forwarded to it instead.
+- **If the VPS is behind a router**, set up any port forwards needed to reach it.
 
 When setup asks:
 
-- **You have a provider firewall (or a router):** apply the printed rules there (or forward the ports), then answer `yes`.
-- **Your host has no separate firewall:** answer `yes`. There is nothing to apply.
-- **You want to do it later:** answer `skip`. The install carries on, but this step and the final local audit stay unfinished until you rerun setup and confirm.
+- Answer `yes` once any applicable provider firewall rules and required router port forwards are in place. If neither is required, answer `yes`.
+- If any required rules or forwards are still pending, answer `skip`. The install carries on, but this step and the final local audit stay unfinished until you rerun setup and confirm.
 
-To check from outside, capture on the VPS (install `tcpdump` with `apt` if it is missing) on a port Ark does not use:
-
-```sh
-sudo tcpdump -ni any 'tcp dst port 22222'
-```
-
-While that runs, connect from a different network:
+To check from outside, capture on the VPS on a port Ark does not use. Install `tcpdump` with `apt` if it is missing. Replace `198.51.100.23` with the external test machine's public source IP for this connection.
 
 ```sh
-nc -vz -w 5 <public-ip> 22222
+sudo tcpdump -ni any 'src host 198.51.100.23 and tcp dst port 22222'
 ```
 
-`nc` is expected to fail either way, because Ark opens nothing on that port; only the `tcpdump` output matters. A printed packet means nothing upstream blocked that port. Nothing printed suggests an upstream firewall, or a router that does not forward the port. Stop `tcpdump` with Ctrl+C.
+While the capture runs, connect from the test machine on a different network. Replace `203.0.113.10` with the VPS's public IP, using the same address family as the source IP in the capture filter.
+
+```sh
+nc -vz -w 5 203.0.113.10 22222
+```
+
+`nc` is expected to fail because Ark opens nothing on that port. Look for a SYN (`Flags [S]`) from the test machine as `nc` runs. That SYN shows the probe reached the VPS. If no matching SYN appears, check the addresses, upstream firewall rules and any router forwarding for the test port. Stop `tcpdump` with Ctrl+C.
 
 ### Provider firewall adapters
 
@@ -160,7 +159,7 @@ The firewall step passes the inventory's `providerRules` and any retained OpenSS
 - never modifies, detaches or deletes any other firewall. It refuses a firewall with the Ark name but without the label, or one also applied to other resources. It lists other firewalls applied to the server, because Hetzner allows whatever any of them allows;
 - makes no API change on a rerun with the same rules, and still shows notices about other attached firewalls. A rerun without a token reuses the recorded apply for the same host and rules and reports that it needs the token to verify at Hetzner. After public SSH is closed, the next approved run with a token removes the TCP 22 rule.
 
-**Any other provider (`manual`).** Prints the [explanation above](#provider-firewall) and the rules, then waits for `yes`, which also covers a host with no separate firewall (scripted: `--provider-firewall-applied`). It is the fallback on Hetzner without a token or an applicable recorded result. It reuses an earlier confirmation for the same VPS and rules.
+**Any other provider (`manual`).** Prints the [explanation above](#provider-firewall) and the rules. Confirm with `yes` (scripted: `--provider-firewall-applied`) once all applicable provider firewall rules and required router port forwards are in place. It is the fallback on Hetzner without a token or an applicable recorded result. It reuses an earlier confirmation for the same VPS and rules.
 
 **Adding a provider.** Add one module to `scripts/host-setup/provider-firewalls/` that returns a `ProviderFirewall`, as `hetzner.ts` does:
 

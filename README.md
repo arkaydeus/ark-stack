@@ -87,7 +87,7 @@ Locally, DNS checks are stubbed and certificates are self-signed, so endpoints e
 
 You need:
 
-- an Ubuntu 22.04, 24.04 or 26.04 LTS VPS with a public IPv4 address (IPv6 optional), control of the provider's firewall if your host has one, and working console or rescue access;
+- an Ubuntu 22.04, 24.04 or 26.04 LTS VPS with a public IPv4 address (IPv6 optional), a provider firewall you control, and working console or rescue access;
 - a Tailscale tailnet where you can edit the policy file and create auth keys (or an API access token, so setup does both for you), and your own (untagged) device on it for SSH;
 - a domain whose DNS you control, at Cloudflare (reviewed automatic publishing) or any other provider such as Namecheap (manual records);
 - an email address for the Let's Encrypt account.

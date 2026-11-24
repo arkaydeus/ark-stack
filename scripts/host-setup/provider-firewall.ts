@@ -84,7 +84,7 @@ const providerFirewallExplanation = [
   "    groups) and Oracle Cloud (security lists or network security groups).",
   "  Not normally on, unless you added one: Hetzner, DigitalOcean, HOSTKEY, Vultr and Linode.",
   "  Not sure? Look for Firewall, Security group or Network ACL in the control panel.",
-  "  A VM behind a router usually needs these ports forwarded to it instead.",
+  "  If the VPS is behind a router, set up any port forwards needed to reach it.",
 ];
 
 export const manualProviderFirewall: ProviderFirewall = {
@@ -115,7 +115,7 @@ export const manualProviderFirewall: ProviderFirewall = {
       "If your host has a separate firewall, apply these rules to it now (control panel or infrastructure code).",
     );
     const answer = await context.ui.ask(
-      "Type yes once they are applied, or if your host has no separate firewall. Type skip to finish later: the install carries on, but this step and the final local audit stay unfinished",
+      "Type yes once they are applied (if you have a provider firewall) and any required router port forwards are in place. If neither is required, type yes. If any required rules or forwards are still pending, type skip. The install carries on, but this step and the final local audit stay unfinished",
       "",
     );
     if (/^y(?:es)?$/i.test(answer.trim())) return { status: "applied" };
