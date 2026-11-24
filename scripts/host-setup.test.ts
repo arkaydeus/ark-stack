@@ -60,7 +60,10 @@ import {
   type HetznerRule,
 } from "./host-setup/provider-firewalls/hetzner.ts";
 import {
+  ENROL_CONTAINER,
+  READ_IDENTITY,
   detectSessionOrigin,
+  parseStoredIdentity,
   publicSshListeners,
   publicUfwSshRules,
   sshUserPolicy,
@@ -105,6 +108,34 @@ const PROVIDER_RULES = [
 const ok = (stdout = ""): RunResult => ({ status: 0, stdout, stderr: "" });
 const fail = (stderr = "", status = 1): RunResult => ({ status, stdout: "", stderr });
 
+type RestartLoop = {
+  logs: string;
+  /** The hostname preference in the state volume; undefined without an identity, null if unreadable. */
+  storedName?: string | null;
+  fixedBy: (created: { name: string; key: string }) => boolean;
+};
+
+const fixturePrivateKey = `privkey:${"1".repeat(64)}`;
+const encodeState = (value: string) => Buffer.from(value).toString("base64");
+const storedPrefs = (hostName: string, nodeId: string) =>
+  JSON.stringify({ Hostname: hostName, Config: { PrivateNodeKey: fixturePrivateKey, NodeID: nodeId } });
+function storedState(hostName: string, nodeId: string, prefs = storedPrefs(hostName, nodeId)) {
+  return JSON.stringify({
+    "_current-profile": encodeState("profile-1234"),
+    _profiles: encodeState(JSON.stringify({ "1234": { Key: "profile-1234", NodeID: nodeId } })),
+    "profile-1234": encodeState(prefs),
+  });
+}
+
+const flagsLog = (name: string) => `boot: 2026/11/24 Running 'tailscale up'
+Error: changing settings via 'tailscale up' requires mentioning all
+non-default flags. To proceed, either re-run your command with --reset or
+
+\ttailscale up --accept-dns=false --shields-up --hostname=${name}
+
+boot: 2026/11/24 failed to auth tailscale: tailscale up failed: exit status 1
+`;
+
 /** A simulated Ubuntu VPS. Each stub mutates this state the way the real command would. */
 class FakeHost {
   calls: string[] = [];
@@ -123,6 +154,14 @@ class FakeHost {
   edgeJoinTags = ["tag:ark-edge"];
   backup = { running: false, tags: [] as string[], hostName: "" };
   stoppedContainers = new Set<string>();
+  /** Containers Docker keeps restarting, until one is recreated and `fixedBy` holds for it. */
+  restartLoops = new Map<string, RestartLoop>();
+  orphanedState = new Map<string, string>();
+  failSidecarUp = false;
+  /** A diverged or stopped dependency would be reconciled by up without --no-deps. */
+  edgeDependencyStarts = 0;
+  /** containerboot exits when Tailscale refuses the key, instead of staying up to report it. */
+  crashOnRejectedKey = false;
   startupNames = new Map<string, string>();
   containerCreations: [string, string][] = [];
   firstContainerJoins: [string, string][] = [];
@@ -228,6 +267,7 @@ class FakeHost {
   }
 
   composeUp(service: string, env: RunOptions["env"], force = false) {
+    this.orphanedState.delete(service);
     const fromFile = parseEnvFile(readFileSync(this.envPath, "utf8"));
     const variable = service === "edge-ts" ? "TS_EDGE_AUTHKEY" : "TS_BACKUP_AUTHKEY";
     const key = env?.[variable] ?? fromFile[variable] ?? "";
@@ -243,6 +283,15 @@ class FakeHost {
     } else this.configuredKeys.delete(service);
     const node = this.container(service);
     this.restartContainer(service);
+    const loop = this.restartLoops.get(service);
+    if (loop && !loop.fixedBy({ name: startupName, key })) return;
+    this.restartLoops.delete(service);
+    if (!node.running && key && key === this.rejectEdgeKey && this.crashOnRejectedKey) {
+      this.restartLoops.set(service, {
+        logs: `backend error: invalid key: API key does not exist (${key})\nboot: failed to auth tailscale\n`,
+        fixedBy: (created) => created.key !== key,
+      });
+    }
     if (!node.running && key && key !== this.rejectEdgeKey) {
       this.joinContainer(service, startupName);
     }
@@ -526,6 +575,9 @@ class FakeHost {
     if (serviceExec) {
       const service = serviceExec[1]!;
       const command = serviceExec[2];
+      if (this.orphanedState.has(service)) return fail(`service ${service} does not exist`);
+      if (this.restartLoops.has(service))
+        return fail(`Error response from daemon: Container ${service} is restarting, wait until`);
       if (this.stoppedContainers.has(service)) return fail(`service ${service} is not running`);
       if (command === "printenv") {
         const name = this.startupNames.get(service);
@@ -538,9 +590,14 @@ class FakeHost {
       const Health = key && key === this.rejectEdgeKey ? ["invalid auth key"] : [];
       return ok(JSON.stringify({ BackendState: "NeedsLogin", Health }));
     }
-    const serviceUp = /up -d (?:--force-recreate )?(edge-ts|backup-ts)(?: edge edge-l4)?$/.exec(line);
+    const serviceUp =
+      /up -d (?:--no-deps )?(?:--force-recreate )?(edge-ts|backup-ts)(?: edge edge-l4)?$/.exec(line);
     if (serviceUp) {
-      this.composeUp(serviceUp[1]!, options.env, argv.includes("--force-recreate"));
+      const service = serviceUp[1]!;
+      if (argv.includes("edge") && !argv.includes("--no-deps")) this.edgeDependencyStarts++;
+      this.composeUp(service, options.env, argv.includes("--force-recreate"));
+      if (this.failSidecarUp && this.restartLoops.has(service))
+        return fail("cannot join the network namespace of a restarting container");
       return ok();
     }
     if (line.startsWith("docker ps -aq")) {
@@ -548,8 +605,50 @@ class FakeHost {
         .find((arg) => arg.startsWith("label=com.docker.compose.service="))!
         .split("=")
         .at(-1)!;
-      return ok(this.startupNames.has(service) || this.container(service).running ? service + "\n" : "");
+      return ok(
+        !this.orphanedState.has(service) &&
+          (this.startupNames.has(service) || this.container(service).running)
+          ? service + "\n"
+          : "",
+      );
     }
+    if (line.startsWith("docker volume ls ")) {
+      const service = argv.at(-1)!.includes("_edge_") ? "edge-ts" : "backup-ts";
+      return ok(this.orphanedState.has(service) ? `ark-platform_ark_${service.slice(0, -3)}_ts_state\n` : "");
+    }
+    if (line.startsWith("docker inspect --format {{.State.Status}} {{.State.ExitCode}}")) {
+      const service = argv.at(-1)!;
+      const image = `sha256:image ark-${service.replace("-ts", "")}`;
+      if (this.restartLoops.has(service)) return ok(`restarting 1 4143 ${image}\n`);
+      return ok(`${this.stoppedContainers.has(service) ? "exited" : "running"} 0 0 ${image}\n`);
+    }
+    if (line.startsWith("docker inspect --format {{range .Config.Env}}")) {
+      const service = argv.at(-1)!;
+      return ok(
+        `TS_USERSPACE=false\nTS_AUTHKEY=${this.configuredKeys.get(service) ?? ""}\nTS_HOSTNAME=${this.startupNames.get(service) ?? ""}\n`,
+      );
+    }
+    if (line.startsWith("docker logs --tail ")) {
+      return { status: 0, stdout: "", stderr: this.restartLoops.get(argv.at(-1)!)?.logs ?? "" };
+    }
+    if (line.startsWith("docker run --rm ")) {
+      expect(argv).toContain("--network=none");
+      expect(argv).toContain("--cap-drop=ALL");
+      expect(options.onLine).toBeUndefined();
+      const mount = argv.find((arg) => arg.startsWith("--mount=type=volume,source=ark-platform_ark_"));
+      if (mount) {
+        expect(mount).toContain("readonly,volume-nocopy");
+        return ok(this.orphanedState.get(mount.includes("_edge_") ? "edge-ts" : "backup-ts")!);
+      }
+      const from = argv.find((arg) => arg.startsWith("--volumes-from="))!;
+      expect(from).toEndWith(":ro");
+      const service = from.slice("--volumes-from=".length, -":ro".length);
+      const loop = this.restartLoops.get(service);
+      const stored = loop ? loop.storedName : this.container(service).hostName;
+      if (stored === null) return fail("cat: permission denied");
+      return ok(stored ? storedState(stored, this.containerSelf(service).ID) : "{}");
+    }
+    if (line.startsWith("docker start ") && this.restartLoops.has(argv.at(-1)!)) return ok();
     if (line.startsWith("docker start ")) {
       this.restartContainer(argv.at(-1)!);
       return ok();
@@ -1407,7 +1506,7 @@ describe("host:setup full run", () => {
       f.host.calls.indexOf("systemctl stop ssh.service"),
       installs[1]!,
       ...[
-        "up -d edge-ts edge edge-l4",
+        "up -d --no-deps edge-ts edge edge-l4",
         "scripts/edge-namespace.ts",
         "up --wait --wait-timeout 120 api domain-worker",
       ].map((needle) => f.host.calls.findIndex((call) => call === needle || call.endsWith(needle))),
@@ -1751,6 +1850,265 @@ describe("host:setup edge node", () => {
     expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_AUTHKEY).toBe("");
     expect((await setup(f, FULL, { TS_EDGE_AUTHKEY: EDGE_KEY + "-replacement" })).code).toBe(0);
   });
+
+  /** An edge node that joined before Compose passed TS_HOSTNAME: containerboot now exits on every start. */
+  function loopingEdge(f: Fixture, storedName: string, fixed = true) {
+    writeFileSync(f.host.envPath, "", { mode: 0o600 });
+    f.host.edge = { running: true, tags: ["tag:ark-edge"], hostName: storedName };
+    f.host.restartLoops.set("edge-ts", {
+      logs: flagsLog(storedName),
+      storedName,
+      fixedBy: ({ name }) => fixed && name === storedName,
+    });
+  }
+
+  test.each(["ark-edge", "custom-edge"])(
+    "a re-run recovers an enrolled edge-ts stuck in a restart loop and keeps its name %s",
+    async (name) => {
+      const f = fixture();
+      loopingEdge(f, name);
+      writeFileSync(f.host.envPath, "TS_EDGE_HOSTNAME=stale-edge\n", { mode: 0o600 });
+      const identity = f.host.containerSelf("edge-ts").ID;
+      // Where the failure left setup: the host node is enrolled, nothing is hardened.
+      f.host.enrolled = true;
+      f.host.runSsh = true;
+      const result = await setup(f, [...FULL, "--tailscale-hostname", "prod"], KEYS);
+      expect(result.code).toBe(0);
+      expect(f.host.installModes).toEqual(["harden", "platform"]);
+      expect(result.text).toContain(
+        "edge-ts cannot stay up (restarting, exit code 1, restarted 4143 times); the install recreates it",
+      );
+      expect(f.host.containerSelf("edge-ts")).toMatchObject({ ID: identity, HostName: name });
+      expect(f.host.containerCreations).toEqual([["edge-ts", name]]);
+      expect(f.host.firstContainerJoins).toEqual([]);
+      expect(f.host.containerKeys).toEqual([]);
+      // Docker ignores a start while it restarts the container itself.
+      expect(f.host.calls).not.toContain("docker start edge-ts");
+      expect(
+        f.host.calls.some(
+          (call) => /volume|prune|compose .* down/.test(call) && !/volume ls|--volumes-from/.test(call),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  test.each([false, true])(
+    "repairs edge-ts after a skipped install (explicit rename: %s)",
+    async (rename) => {
+      const f = fixture();
+      expect((await setup(f, [...FULL, "--tailscale-hostname", "prod"], KEYS)).code).toBe(0);
+      writeFileSync(
+        f.host.envPath,
+        setEnvValues(readFileSync(f.host.envPath, "utf8"), { TS_EDGE_HOSTNAME: "stale-edge" }),
+      );
+      const store = new StateStore(f.stateDir);
+      const saved = store.load();
+      delete saved.answers.tailscaleEdgeHostname;
+      store.save(saved);
+      const identity = f.host.containerSelf("edge-ts").ID;
+      let recreated = 0;
+      f.host.restartLoops.set("edge-ts", {
+        logs: flagsLog("prod-edge"),
+        storedName: "prod-edge",
+        fixedBy: ({ name, key }) => {
+          recreated++;
+          return name === "prod-edge" && key === "";
+        },
+      });
+      f.host.containerCreations.length = 0;
+      f.host.calls = [];
+      const result = await setup(f, rename ? [...FULL, "--tailscale-edge-hostname", "new-edge"] : FULL, {});
+      expect(result.code).toBe(0);
+      expect(recreated).toBe(1);
+      expect(result.text).toContain("recreating it and keeping its state volume");
+      expect(f.host.installModes).toEqual(["harden", "platform"]);
+      expect(f.host.containerSelf("edge-ts")).toMatchObject({
+        ID: identity,
+        HostName: rename ? "new-edge" : "prod-edge",
+      });
+      expect(f.host.containerCreations).toEqual(
+        rename
+          ? [
+              ["edge-ts", "prod-edge"],
+              ["edge-ts", "new-edge"],
+            ]
+          : [["edge-ts", "prod-edge"]],
+      );
+      expect(f.host.edgeDependencyStarts).toBe(0);
+      expect(f.host.calls.some((call) => call.endsWith("scripts/edge-namespace.ts"))).toBe(true);
+    },
+  );
+
+  test("gives up with the container's state and redacted log when recreating it does not help", async () => {
+    const f = fixture();
+    loopingEdge(f, "ark-edge", false);
+    f.host.failSidecarUp = true;
+    const key = "tskey-auth-kOLD00000CNTRL-oldSecretValue0123456789";
+    f.host.restartLoops.get("edge-ts")!.logs =
+      `boot: up --authkey=${key} at https://login.tailscale.com/a/abc123def\nboot: failed to create TUN\n`;
+    const result = await setup(f, FULL, KEYS);
+    expect(result.code).toBe(1);
+    expect(f.host.installModes).toEqual(["harden", "platform"]);
+    expect(result.state.steps.edge.status).toBe("failed");
+    expect(result.text).toContain("edge-ts container: restarting, exit code 1, restarted 4143 times.");
+    expect(result.text).toContain("boot: failed to create TUN");
+    expect(result.text).toContain("cannot join the network namespace");
+    expect(result.text).toContain("docs/operations/troubleshooting.md#");
+    for (const text of [result.text, result.log]) {
+      expect(text).not.toContain(key);
+      expect(text).not.toContain("abc123def");
+    }
+  });
+
+  test("does not recreate a looping edge-ts whose identity cannot be read, but still hardens", async () => {
+    const f = fixture();
+    loopingEdge(f, "ark-edge");
+    writeFileSync(f.host.envPath, "TS_EDGE_HOSTNAME=prod-edge\n", { mode: 0o600 });
+    f.host.restartLoops.get("edge-ts")!.storedName = null;
+    const result = await setup(f, FULL, KEYS);
+    expect(result.code).toBe(1);
+    expect(f.host.installModes).toEqual(["harden"]);
+    expect(f.host.containerCreations).toEqual([]);
+    expect(result.text).toContain("stored identity could not be read");
+    expect(result.text).toContain("exit code 1, restarted 4143 times");
+  });
+
+  test.each([false, true])(
+    "checks the retained edge state when the container is absent (readable: %s)",
+    async (readable) => {
+      const f = fixture();
+      writeFileSync(f.host.envPath, "TS_EDGE_HOSTNAME=\n", { mode: 0o600 });
+      f.host.edge = { running: true, tags: ["tag:ark-edge"], hostName: "retained-edge" };
+      const identity = f.host.containerSelf("edge-ts").ID;
+      f.host.orphanedState.set("edge-ts", readable ? storedState("retained-edge", identity) : "{");
+      const result = await setup(f, FULL, KEYS);
+      expect(result.code).toBe(readable ? 0 : 1);
+      expect(f.host.installModes).toEqual(readable ? ["harden", "platform"] : ["harden"]);
+      expect(f.host.containerCreations).toEqual(readable ? [["edge-ts", "retained-edge"]] : []);
+      if (readable)
+        expect(f.host.containerSelf("edge-ts")).toMatchObject({ ID: identity, HostName: "retained-edge" });
+      else {
+        expect(f.host.orphanedState.get("edge-ts")).toBe("{");
+        expect(result.text).toContain("stored identity could not be read");
+      }
+    },
+  );
+
+  test.each([false, true])(
+    "a rejected edge key is replaced after a failed join (Compose up fails: %s)",
+    async (upFails) => {
+      const f = fixture();
+      f.host.rejectEdgeKey = EDGE_KEY;
+      f.host.crashOnRejectedKey = true;
+      f.host.failSidecarUp = upFails;
+      const failed = await setup(f, FULL, KEYS);
+      expect(failed.code).toBe(1);
+      if (upFails) {
+        expect(failed.text).toContain("cannot join the network namespace");
+        expect(failed.text).toContain("exit code 1, restarted 4143 times");
+        expect(failed.text).toContain("failed to auth tailscale");
+        expect(failed.text).toContain("docs/operations/troubleshooting.md#");
+      } else expect(failed.text).toContain("Tailscale rejected the edge auth key");
+      expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_AUTHKEY).toBe("");
+      const replacement = `${EDGE_KEY}-replacement`;
+      const result = await setup(f, FULL, { TS_EDGE_AUTHKEY: replacement });
+      expect(result.code).toBe(0);
+      expect(f.host.edge.running).toBe(true);
+      for (const text of [failed.text, failed.log, result.text, result.log])
+        expect(text).not.toContain(EDGE_KEY);
+    },
+  );
+
+  test.each([
+    { name: "drops the rejected key from .env", inEnv: EDGE_KEY, kept: "" },
+    { name: "keeps a fresh key placed in .env since", inEnv: `${EDGE_KEY}-fresh`, kept: `${EDGE_KEY}-fresh` },
+  ])("a crash on a rejected key $name", async ({ inEnv, kept }) => {
+    const f = fixture();
+    writeFileSync(f.host.envPath, `TS_EDGE_AUTHKEY=${EDGE_KEY}\n`, { mode: 0o600 });
+    f.host.rejectEdgeKey = EDGE_KEY;
+    f.host.crashOnRejectedKey = true;
+    f.host.composeUp("edge-ts", {});
+    expect(f.host.restartLoops.has("edge-ts")).toBe(true);
+    writeFileSync(f.host.envPath, `TS_EDGE_AUTHKEY=${inEnv}\n`, { mode: 0o600 });
+    const ui = new ScriptedUi(true, [], []);
+    const asked: string[] = [];
+    const source = manualKeySource({ env: {}, ui, interactive: false });
+    await setup(
+      f,
+      FULL,
+      { TS_VPS_AUTHKEY: VPS_KEY },
+      {
+        keys: () => ({
+          ...source,
+          acquire: async (request, options) => {
+            asked.push(request.tag);
+            return request.tag === "tag:ark-vps" ? { key: VPS_KEY } : source.acquire(request, options);
+          },
+        }),
+      },
+    );
+    // Nothing joined with the rejected key; a fresh one in .env is used without asking.
+    expect(f.host.edge.running).toBe(Boolean(kept));
+    expect(asked.includes("tag:ark-edge")).toBe(!kept);
+    expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_EDGE_AUTHKEY).toBe("");
+  });
+
+  test("a looping backup-ts is recreated with its stored name and identity, without a key", async () => {
+    const f = fixture();
+    const args = [...FULL, "--backup-node"];
+    expect((await setup(f, args, { ...KEYS, TS_BACKUP_AUTHKEY: BACKUP_KEY })).code).toBe(0);
+    const identity = f.host.containerSelf("backup-ts").ID;
+    const name = f.host.backup.hostName;
+    writeFileSync(
+      f.host.envPath,
+      setEnvValues(readFileSync(f.host.envPath, "utf8"), { TS_BACKUP_HOSTNAME: "stale-backup" }),
+    );
+    f.host.restartLoops.set("backup-ts", {
+      logs: flagsLog(name),
+      storedName: name,
+      fixedBy: (created) => created.name === name && created.key === "",
+    });
+    f.host.containerKeys.length = 0;
+    const result = await setup(f, args, {});
+    expect(result.code).toBe(0);
+    expect(result.text).toContain("backup-ts cannot stay up");
+    expect(f.host.containerSelf("backup-ts")).toMatchObject({ ID: identity, HostName: name });
+    expect(f.host.containerKeys).toEqual([]);
+  });
+
+  test.each([false, true])(
+    "drops the spent backup key and accepts a replacement from .env (%s)",
+    async (replace) => {
+      const f = fixture();
+      const args = [...FULL, "--backup-node"];
+      expect((await setup(f, FULL, KEYS)).code).toBe(0);
+      writeFileSync(
+        f.host.envPath,
+        setEnvValues(readFileSync(f.host.envPath, "utf8"), { TS_BACKUP_AUTHKEY: BACKUP_KEY }),
+      );
+      f.host.rejectEdgeKey = BACKUP_KEY;
+      f.host.crashOnRejectedKey = true;
+      f.host.composeUp("backup-ts", {});
+      const fresh = `${BACKUP_KEY}-replacement`;
+      if (replace)
+        writeFileSync(
+          f.host.envPath,
+          setEnvValues(readFileSync(f.host.envPath, "utf8"), { TS_BACKUP_AUTHKEY: fresh }),
+        );
+      f.host.containerKeys.length = 0;
+      const result = await setup(f, args, {});
+      expect(result.code).toBe(0);
+      expect(f.host.backup.running).toBe(replace);
+      expect(f.host.containerKeys.map(({ key }) => key)).toEqual(replace ? [fresh] : []);
+      expect(parseEnvFile(readFileSync(f.host.envPath, "utf8")).TS_BACKUP_AUTHKEY).toBe("");
+      f.host.containerKeys.length = 0;
+      f.host.composeUp("backup-ts", {});
+      expect(f.host.containerKeys).toEqual([]);
+      expect(result.log).not.toContain(BACKUP_KEY);
+      expect(result.log).not.toContain(fixturePrivateKey);
+    },
+  );
+
   test("refuses an edge node that joined with the wrong tags", async () => {
     const f = fixture();
     f.host.edgeJoinTags = ["tag:ark-edge", "tag:server"];
@@ -1769,6 +2127,81 @@ describe("host:setup edge node", () => {
       "Edge node enrolment (tag:ark-edge): The edge node (edge-ts) has not joined",
     );
     expect(result.text).toContain("docs/getting-started/production-install.md#enrol-the-edge-node");
+  });
+});
+
+describe("Tailscale state volume reader", () => {
+  const hostname = "kept-name";
+  const nodeId = "n-fixture";
+  const profile = storedState(hostname, nodeId);
+  test.each([
+    { label: "missing file", state: undefined, identity: "none" },
+    { label: "empty store", state: "{}", identity: "none" },
+    {
+      label: "machine key only",
+      state: JSON.stringify({ _machinekey: encodeState(fixturePrivateKey) }),
+      identity: "none",
+    },
+    { label: "empty file", state: "", identity: "unknown" },
+    { label: "truncated store", state: "{", identity: "unknown" },
+    { label: "invalid store entry", state: profile.replace("{", '{"other":999,'), identity: "unknown" },
+    {
+      label: "truncated preferences",
+      state: storedState(hostname, nodeId, '{"Hostname":"kept-name"'),
+      identity: "unknown",
+    },
+    {
+      label: "missing profile entry",
+      state: JSON.stringify({ "_current-profile": encodeState("profile-1234") }),
+      identity: "unknown",
+    },
+    {
+      label: "profile without a node ID",
+      state: storedState(hostname, nodeId, storedPrefs(hostname, "")),
+      identity: "unknown",
+    },
+    {
+      label: "inactive profile",
+      state: JSON.stringify({ "profile-1234": encodeState(storedPrefs(hostname, nodeId)) }),
+      identity: "unknown",
+    },
+    {
+      label: "legacy preferences without a node ID",
+      state: JSON.stringify({ _daemon: encodeState("{}") }),
+      identity: "unknown",
+    },
+    {
+      label: "legacy enrolled preferences",
+      state: JSON.stringify({ _daemon: encodeState(storedPrefs(hostname, nodeId)) }),
+      identity: { hostName: hostname, nodeId },
+    },
+    { label: "enrolled profile", state: profile, identity: { hostName: hostname, nodeId } },
+    {
+      label: "enrolled profile with no saved hostname or container",
+      state: storedState("", nodeId),
+      identity: "unknown",
+    },
+    {
+      label: "enrolled profile using its container hostname",
+      state: storedState("", nodeId),
+      fallback: hostname,
+      identity: { hostName: hostname, nodeId },
+    },
+  ])("reads $label", async ({ state, identity, fallback }) => {
+    const directory = mkdtempSync(join(tmpdir(), "ark-ts-identity-"));
+    try {
+      if (state !== undefined) writeFileSync(join(directory, "tailscaled.state"), state);
+      const result = await runCommand([
+        "/bin/sh",
+        "-c",
+        READ_IDENTITY.replace("/var/lib/tailscale", '"$1"'),
+        "sh",
+        directory,
+      ]);
+      expect(parseStoredIdentity(result, fallback)).toEqual(identity);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 
@@ -3147,9 +3580,12 @@ for (const service of ["edge-ts", "backup-ts"]) {
       const platform = Bun.YAML.parse(
         readFileSync(join(repoRoot, "infra/platform/docker-compose.yml"), "utf8"),
       ) as {
-        services: Record<string, { image: string; hostname: string; environment: Record<string, string> }>;
+        services: Record<
+          string,
+          { image: string; hostname: string; entrypoint: string[]; environment: Record<string, string> }
+        >;
       };
-      const { image, hostname, environment } = platform.services[service]!;
+      const { image, hostname, entrypoint, environment } = platform.services[service]!;
       const file = join(f.root, "offline-compose.json");
       writeFileSync(
         file,
@@ -3158,6 +3594,7 @@ for (const service of ["edge-ts", "backup-ts"]) {
             [service]: {
               image,
               hostname,
+              entrypoint,
               environment: { ...environment, TS_USERSPACE: "true" },
               network_mode: "none",
             },
@@ -3182,6 +3619,8 @@ for (const service of ["edge-ts", "backup-ts"]) {
         });
       let inspected = false;
       const run: SetupDependencies["run"] = async (argv, options) => {
+        // Nothing created the real container yet, whatever the simulated install did.
+        if (argv[1] === "ps" && argv.some((arg) => arg.endsWith(`.service=${service}`))) return ok();
         if (argv[0] !== "docker" || !argv.includes(service)) return f.host.run(argv, options);
         const args = argv.slice(argv.indexOf("infra/platform/docker-compose.yml") + 1);
         if (args[0] === "up") return runDocker([...prefix, "up", "-d", service], options);
@@ -3253,6 +3692,442 @@ for (const service of ["edge-ts", "backup-ts"]) {
       }
     },
     30_000,
+  );
+}
+
+// Enrols, restarts and recreates the shipped services against a local coordination server on an
+// internal network (no internet, so no real tailnet), with every container and volume removed after.
+const HEADSCALE =
+  "headscale/headscale:0.26.1@sha256:ea9b5ee06274d757a4d52103de56cd11a9c393acb19d9a35f4b9fe52ada410de";
+for (const service of ["edge-ts", "backup-ts"]) {
+  test.skipIf(process.env.ARK_TEST_SETUP_DOCKER !== "1")(
+    `${service} waits for login, then keeps its identity and name through restarts and recreations`,
+    async () => {
+      const directory = mkdtempSync(join(tmpdir(), "ark-setup-ts-"));
+      const tag = service === "edge-ts" ? "tag:ark-edge" : "tag:ark-backup";
+      const variable = service === "edge-ts" ? "TS_EDGE" : "TS_BACKUP";
+      const platform = Bun.YAML.parse(
+        readFileSync(join(repoRoot, "infra/platform/docker-compose.yml"), "utf8"),
+      ) as {
+        services: Record<string, { image: string; volumes: string[]; environment: Record<string, string> }>;
+      };
+      const shipped = platform.services[service]!;
+      const login = "--login-server=https://hs";
+      const gate = join(directory, "gate");
+      mkdirSync(gate);
+      mkdirSync(join(directory, "hs"));
+      const certificate = await runCommand([
+        "openssl",
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-subj",
+        "/CN=hs",
+        "-addext",
+        "subjectAltName=DNS:hs",
+        "-keyout",
+        join(directory, "hs", "server.key"),
+        "-out",
+        join(gate, "ca.pem"),
+      ]);
+      assert.equal(certificate.status, 0, certificate.stderr);
+      copyFileSync(join(gate, "ca.pem"), join(directory, "hs", "server.pem"));
+      writeFileSync(
+        join(gate, "tailscale"),
+        `#!/bin/sh
+if [ "$2" = up ] && [ -e /tmp/hold-up ]; then
+  touch /tmp/up-waiting
+  while [ -e /tmp/hold-up ]; do sleep 0.1; done
+fi
+exec /usr/local/bin/tailscale "$@"
+`,
+        { mode: 0o755 },
+      );
+      writeFileSync(join(gate, "reply"), "#!/bin/sh\nprintf 'fixture-reachable\\n'\n", { mode: 0o755 });
+      const definition = {
+        ...shipped,
+        ports: [],
+        networks: ["test"],
+        volumes: [...shipped.volumes, `${gate}:/gate:ro`],
+        environment: {
+          ...shipped.environment,
+          PATH: "/gate:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          SSL_CERT_FILE: "/gate/ca.pem",
+          TS_EXTRA_ARGS: `${shipped.environment.TS_EXTRA_ARGS} ${login}`,
+        },
+      };
+      // What Compose created before #72: no TS_HOSTNAME, no --reset and the image's own entrypoint.
+      const { TS_HOSTNAME: _name, ...earlier } = shipped.environment;
+      const before72 = {
+        ...definition,
+        entrypoint: ["/usr/local/bin/containerboot"],
+        environment: { ...earlier, SSL_CERT_FILE: "/gate/ca.pem", TS_EXTRA_ARGS: `--shields-up ${login}` },
+      };
+      writeFileSync(
+        join(directory, "hs", "config.yaml"),
+        JSON.stringify({
+          server_url: "https://hs",
+          listen_addr: "0.0.0.0:443",
+          tls_cert_path: "/etc/headscale/server.pem",
+          tls_key_path: "/etc/headscale/server.key",
+          metrics_listen_addr: "127.0.0.1:9090",
+          grpc_listen_addr: "127.0.0.1:50443",
+          noise: { private_key_path: "/var/lib/headscale/noise.key" },
+          prefixes: { v4: "100.64.0.0/10", v6: "fd7a:115c:a1e0::/48", allocation: "sequential" },
+          derp: {
+            server: {
+              enabled: true,
+              region_id: 999,
+              region_code: "test",
+              region_name: "test",
+              stun_listen_addr: "0.0.0.0:3478",
+              private_key_path: "/var/lib/headscale/derp.key",
+              automatically_add_embedded_derp_region: true,
+            },
+            urls: [],
+            paths: [],
+            auto_update_enabled: false,
+          },
+          disable_check_updates: true,
+          database: { type: "sqlite", sqlite: { path: "/var/lib/headscale/db.sqlite" } },
+          dns: { magic_dns: false, base_domain: "example.test", override_local_dns: false },
+          unix_socket: "/var/run/headscale/headscale.sock",
+        }),
+      );
+      const sleeper = { image: shipped.image, entrypoint: ["sleep", "3600"] };
+      const subnet = `10.231.${crypto.getRandomValues(new Uint8Array(1))[0]}.0/24`;
+      const write = (name: string, node: object, revision = "old") => {
+        const path = join(directory, name);
+        writeFileSync(
+          path,
+          JSON.stringify({
+            services: {
+              [service]: node,
+              peer: {
+                image: shipped.image,
+                networks: ["test"],
+                volumes: [`${gate}:/gate:ro`],
+                environment: {
+                  SSL_CERT_FILE: "/gate/ca.pem",
+                  TS_STATE_DIR: "/tmp/peer-state",
+                  TS_AUTHKEY: "${FIXTURE_PEER_KEY:-}",
+                  TS_EXTRA_ARGS: `--shields-up ${login}`,
+                },
+              },
+              ...(service === "edge-ts"
+                ? {
+                    postgres: { ...sleeper, environment: { FIXTURE_REVISION: revision } },
+                    api: { ...sleeper, depends_on: ["postgres"] },
+                    edge: { ...sleeper, network_mode: "service:edge-ts", depends_on: ["edge-ts", "api"] },
+                    "edge-l4": { ...sleeper, network_mode: "service:edge-ts" },
+                  }
+                : {}),
+              hs: {
+                image: HEADSCALE,
+                command: "serve",
+                networks: ["test"],
+                volumes: [`${join(directory, "hs")}:/etc/headscale:ro`, "hs:/var/lib/headscale"],
+              },
+            },
+            networks: { test: { internal: true, ipam: { config: [{ subnet }] } } },
+            volumes: Object.fromEntries(
+              ["hs", ...shipped.volumes.map((volume) => volume.split(":")[0]!)].map((volume) => [volume, {}]),
+            ),
+          }),
+        );
+        return path;
+      };
+      const files = {
+        shipped: write("shipped.json", definition),
+        old: write("old.json", before72),
+        changedDependency: write("diverged.json", definition, "new"),
+      };
+      const project = `ark-setup-${crypto.randomUUID()}`;
+      const compose = (file: string, args: string[], options: RunOptions = {}) =>
+        runCommand(["docker", "compose", "-p", project, "-f", file, ...args], {
+          env: {
+            ...withoutSetupSecrets(process.env),
+            [`${variable}_AUTHKEY`]: "",
+            [`${variable}_HOSTNAME`]: "kept-name",
+            PATH: process.env.PATH,
+            ...options.env,
+          },
+          stdin: options.stdin,
+          timeoutMs: 100_000,
+        });
+      const must = async (file: string, args: string[], options?: RunOptions) => {
+        const result = await compose(file, args, options);
+        assert.equal(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
+        return result.stdout;
+      };
+      const docker = async (...args: string[]) => {
+        const result = await runCommand(["docker", ...args], { env: process.env, timeoutMs: 60_000 });
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout.trim();
+      };
+      const container = async (name = service) => (await must(files.shipped, ["ps", "-aq", name])).trim();
+      const until = async <T>(read: () => Promise<T | undefined>) => {
+        for (let attempt = 0; attempt < 60; attempt++) {
+          const value = await read();
+          if (value !== undefined) return value;
+          await Bun.sleep(500);
+        }
+        throw new Error("timed out");
+      };
+      const self = () =>
+        until(async () => {
+          const result = await compose(files.shipped, [
+            "exec",
+            "-T",
+            service,
+            "tailscale",
+            "status",
+            "--json",
+          ]);
+          try {
+            const status = JSON.parse(result.stdout);
+            return status.BackendState === "Running"
+              ? {
+                  id: status.Self.ID,
+                  key: status.Self.PublicKey,
+                  name: status.Self.HostName,
+                  tags: status.Self.Tags,
+                }
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        });
+      const prefs = async () =>
+        JSON.parse(await must(files.shipped, ["exec", "-T", service, "tailscale", "debug", "prefs"]));
+      const readState = async () => {
+        const id = await container();
+        const image = await docker("inspect", "--format", "{{.Image}}", id);
+        return runCommand([
+          "docker",
+          "run",
+          "--rm",
+          "--network=none",
+          "--read-only",
+          "--cap-drop=ALL",
+          `--volumes-from=${id}:ro`,
+          "--entrypoint=/bin/sh",
+          image,
+          "-c",
+          READ_IDENTITY,
+        ]);
+      };
+      const identity = async () => parseStoredIdentity(await readState());
+      const local = (...args: string[]) => must(files.shipped, ["exec", "-T", service, ...args]);
+      const freshKey = async (...tags: string[]) =>
+        JSON.parse(
+          await must(files.shipped, [
+            "exec",
+            "-T",
+            "hs",
+            "headscale",
+            "preauthkeys",
+            "create",
+            "-u",
+            "1",
+            ...tags,
+            "-o",
+            "json",
+          ]),
+        ).key as string;
+      const containerStamp = async (id: string) =>
+        docker("inspect", "--format", "{{.Id}} {{.State.Status}} {{.State.StartedAt}}", id);
+      try {
+        await must(files.shipped, ["up", "-d", "hs", service]);
+        // Without a key or an identity tailscaled runs alone, so containerboot's 60 s deadline is not armed.
+        expect(
+          await until(async () => {
+            const value = await prefs().catch(() => undefined);
+            return value?.ShieldsUp ? value : undefined;
+          }),
+        ).toMatchObject({ ShieldsUp: true, CorpDNS: false, WantRunning: false });
+        expect(await must(files.shipped, ["exec", "-T", service, "cat", "/proc/1/comm"])).toBe(
+          "tailscaled\n",
+        );
+        expect(await identity()).toBe("none");
+        await must(files.shipped, ["stop", service]);
+        expect(await docker("inspect", "--format", "{{.State.ExitCode}}", await container())).toBe("0");
+        await must(files.shipped, ["start", service]);
+        expect(await local("cat", "/proc/1/comm")).toBe("tailscaled\n");
+
+        await until(async () =>
+          (await compose(files.shipped, ["exec", "-T", "hs", "headscale", "users", "create", "owner"]))
+            .status === 0
+            ? true
+            : undefined,
+        );
+        const key = await freshKey("--tags", tag);
+        if (service === "edge-ts") {
+          await must(
+            files.shipped,
+            [
+              "exec",
+              "-T",
+              service,
+              "sh",
+              "-c",
+              ENROL_CONTAINER.replace("--shields-up", `--shields-up ${login}`),
+              "sh",
+              "/var/run/tailscale/tailscaled.sock",
+              "kept-name",
+            ],
+            { stdin: key },
+          );
+        } else {
+          await must(files.shipped, ["up", "-d", service], { env: { TS_BACKUP_AUTHKEY: key } });
+          await self();
+          expect(await local("cat", "/proc/1/comm")).toBe("containerboot\n");
+          await must(files.shipped, ["up", "-d", service]);
+        }
+        const enrolled = await self();
+        expect(enrolled).toMatchObject({ name: "kept-name", tags: [tag] });
+        expect(await identity()).toEqual({ hostName: "kept-name", nodeId: enrolled.id });
+
+        await must(files.shipped, ["restart", service]);
+        expect(await self()).toEqual(enrolled);
+        await must(files.shipped, ["up", "-d", "--force-recreate", service]);
+        expect(await self()).toEqual(enrolled);
+        // A preference nobody passes as a flag must not stop the next start.
+        await must(files.shipped, ["exec", "-T", service, "tailscale", "set", "--accept-routes"]);
+        await must(files.shipped, ["restart", service]);
+        expect(await self()).toEqual(enrolled);
+        expect(await prefs()).toMatchObject({ RouteAll: false, ShieldsUp: true, Hostname: "kept-name" });
+
+        // Exercise inbound TCP with a reachable peer as the positive control. Hold containerboot's
+        // CLI call so we can observe the daemon after startup but before any LocalAPI write.
+        await must(files.shipped, ["up", "-d", "peer"], { env: { FIXTURE_PEER_KEY: await freshKey() } });
+        await until(async () => {
+          const result = await compose(files.shipped, ["exec", "-T", "peer", "tailscale", "ip", "-4"]);
+          return result.status === 0 && result.stdout.trim() ? true : undefined;
+        });
+        const address = (await local("tailscale", "ip", "-4")).trim();
+        const listen = () =>
+          must(files.shipped, ["exec", "-d", service, "nc", "-lk", "-p", "18888", "-e", "/gate/reply"]);
+        const probe = async () =>
+          (
+            await compose(files.shipped, [
+              "exec",
+              "-T",
+              "peer",
+              "timeout",
+              "3",
+              "sh",
+              "-c",
+              'sleep 3 | tailscale nc "$1" 18888',
+              "sh",
+              address,
+            ])
+          ).stdout.includes("fixture-reachable");
+        await local("tailscale", "set", "--shields-up=false", "--accept-routes");
+        await listen();
+        await until(async () => ((await probe()) ? true : undefined));
+
+        const assertStartupShielded = async () => {
+          await until(async () =>
+            (await compose(files.shipped, ["exec", "-T", service, "test", "-f", "/tmp/up-waiting"]))
+              .status === 0
+              ? true
+              : undefined,
+          );
+          expect(await prefs()).toMatchObject({ ShieldsUp: true, WantRunning: false });
+          await listen();
+          expect(await probe()).toBe(false);
+          await local("rm", "/tmp/hold-up", "/tmp/up-waiting");
+          expect(await self()).toEqual(enrolled);
+          expect(await prefs()).toMatchObject({ ShieldsUp: true, WantRunning: true, RouteAll: false });
+          expect(await probe()).toBe(false);
+        };
+        await local("touch", "/tmp/hold-up");
+        await must(files.shipped, ["restart", service]);
+        await assertStartupShielded();
+
+        // Seed the pinned client's legacy store from its own enrolled preferences, with no
+        // current-profile pointer. Migration must happen under the same startup restriction.
+        const state = JSON.parse((await readState()).stdout) as Record<string, string>;
+        const active = Buffer.from(state["_current-profile"]!, "base64").toString();
+        const legacyPrefs = JSON.parse(Buffer.from(state[active]!, "base64").toString());
+        legacyPrefs.ShieldsUp = false;
+        legacyPrefs.WantRunning = true;
+        const legacy = JSON.stringify({
+          _machinekey: state["_machinekey"],
+          _daemon: encodeState(JSON.stringify(legacyPrefs)),
+        });
+        await local("touch", "/tmp/hold-up");
+        await must(files.shipped, ["stop", service]);
+        expect(await docker("inspect", "--format", "{{.State.ExitCode}}", await container())).toBe("0");
+        const seed = await runCommand(
+          [
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "--network=none",
+            "--cap-drop=ALL",
+            `--volumes-from=${await container()}`,
+            "--entrypoint=sh",
+            shipped.image,
+            "-c",
+            "cat >/var/lib/tailscale/tailscaled.state",
+          ],
+          { stdin: legacy },
+        );
+        expect(seed.status).toBe(0);
+        expect(await identity()).toEqual({ hostName: "kept-name", nodeId: enrolled.id });
+        await must(files.shipped, ["start", service]);
+        await assertStartupShielded();
+
+        // The reported failure: a container that does not pass the stored hostname exits on every start.
+        await must(files.old, ["up", "-d", service]);
+        const looping = await container();
+        await until(async () =>
+          (await docker("inspect", "--format", "{{.State.Status}}", looping)) === "restarting"
+            ? true
+            : undefined,
+        );
+        const logs = await runCommand(["docker", "logs", looping], { env: process.env });
+        expect(logs.stdout + logs.stderr).toContain("requires mentioning all");
+        expect(await identity()).toEqual({ hostName: "kept-name", nodeId: enrolled.id });
+        // The recovery: recreate it from the shipped definition with the stored name and no key.
+        if (service === "edge-ts") {
+          await must(files.shipped, ["up", "-d", "--no-deps", "api", "postgres"]);
+          await must(files.shipped, ["stop", "api"]);
+          const dependencies = await Promise.all(
+            ["api", "postgres"].map(async (name) => containerStamp(await container(name))),
+          );
+          await must(files.changedDependency, [
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            service,
+            "edge",
+            "edge-l4",
+          ]);
+          expect(
+            await Promise.all(["api", "postgres"].map(async (name) => containerStamp(await container(name)))),
+          ).toEqual(dependencies);
+          for (const proxy of ["edge", "edge-l4"])
+            expect(
+              await docker("inspect", "--format", "{{.HostConfig.NetworkMode}}", await container(proxy)),
+            ).toBe(`container:${await container()}`);
+        } else await must(files.shipped, ["up", "-d", "--force-recreate", "--no-deps", service]);
+        expect(await self()).toEqual(enrolled);
+      } finally {
+        const removed = await compose(files.shipped, ["down", "--volumes", "--remove-orphans"]);
+        expect(removed.status).toBe(0);
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+    240_000,
   );
 }
 

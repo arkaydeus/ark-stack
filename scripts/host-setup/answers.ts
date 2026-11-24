@@ -29,6 +29,9 @@ export type Options = {
 export type Answers = StoredAnswers & {
   /** A new Cloudflare token to write; `undefined` keeps whatever `.env` has. Never stored in state. */
   dnsApiToken?: string;
+  /** An explicit rename requested by flag or setup environment variable in this run. */
+  renameEdge?: boolean;
+  renameBackup?: boolean;
 };
 
 type Flags = Map<string, string | true>;
@@ -432,32 +435,33 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
     }
   }
   // The edge and backup names are not asked: they follow the machine name unless given explicitly.
-  const override = (
-    flag: string,
-    variable: string,
-    installedKey: string,
-    kept: string | undefined,
-    label: string,
-  ) => {
-    const value = hostnameOverride(flag, variable);
-    if (value !== undefined) return validateTailscaleHostname(value, `${label} (${flag} or ${variable})`);
+  const override = (requested: string | undefined, installedKey: string, kept: string | undefined) => {
+    if (requested !== undefined) return requested;
     const installed = dotenv[installedKey];
     if (installed) return validateTailscaleHostname(installed, installedKey);
     return kept;
   };
-  const tailscaleEdgeHostname = override(
+  const requestedName = (flag: string, variable: string, label: string) => {
+    const value = hostnameOverride(flag, variable);
+    return value === undefined
+      ? undefined
+      : validateTailscaleHostname(value, `${label} (${flag} or ${variable})`);
+  };
+  const renameEdge = requestedName(
     "--tailscale-edge-hostname",
     "ARK_SETUP_TAILSCALE_EDGE_HOSTNAME",
-    "TS_EDGE_HOSTNAME",
-    previous.tailscaleEdgeHostname,
     "Edge node name",
   );
-  const tailscaleBackupHostname = override(
+  const renameBackup = requestedName(
     "--tailscale-backup-hostname",
     "ARK_SETUP_TAILSCALE_BACKUP_HOSTNAME",
+    "Backup node name",
+  );
+  const tailscaleEdgeHostname = override(renameEdge, "TS_EDGE_HOSTNAME", previous.tailscaleEdgeHostname);
+  const tailscaleBackupHostname = override(
+    renameBackup,
     "TS_BACKUP_HOSTNAME",
     previous.tailscaleBackupHostname,
-    "Backup node name",
   );
   const names = { tailscaleHostname, tailscaleEdgeHostname, tailscaleBackupHostname };
   // Fails early if a derived name cannot be formed.
@@ -477,12 +481,14 @@ export async function resolveAnswers(sources: AnswerSources): Promise<Answers> {
     tailscaleHostname,
     ...(tailscaleEdgeHostname ? { tailscaleEdgeHostname } : {}),
     ...(tailscaleBackupHostname ? { tailscaleBackupHostname } : {}),
+    renameEdge: renameEdge !== undefined,
+    renameBackup: renameBackup !== undefined,
     dnsApiToken,
   };
 }
 
 export function storedAnswers(answers: Answers): StoredAnswers {
-  const { dnsApiToken: _secret, ...stored } = answers;
+  const { dnsApiToken: _secret, renameEdge: _edge, renameBackup: _backup, ...stored } = answers;
   return stored;
 }
 

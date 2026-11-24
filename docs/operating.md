@@ -107,7 +107,7 @@ The public edge has its own Tailscale node, `edge-ts` (`tag:ark-edge`, hostname 
 
 The existing admin node, `tailscale` with `tailnet-gateway` (profile `tailnet`, userspace, no capabilities), is unchanged and still serves the admin UI over the tailnet. The two nodes have separate state, keys and tags.
 
-**Enrolling the edge node.** The edge serves public traffic without a key. Until it joins, it just waits for login.
+**Enrolling the edge node.** The edge serves public traffic without a key. A fresh keyless node runs `tailscaled` and waits for login. With a key or saved profile, `containerboot` reapplies the Compose flags with `--reset` on every start. The daemon starts with shields up and tailnet networking disabled until those flags are applied.
 
 1. In the Tailscale admin console, add the tag to the tailnet policy file, owned by the admins who enrol hosts:
 
@@ -452,11 +452,11 @@ Third-party images (Caddy, HAProxy, Tailscale, PgBouncer, PostgreSQL, Stalwart a
    For the edge namespace (FD-05), the run then checks the following:
 
    - `edge-ts` has exactly `NET_ADMIN` and `NET_RAW` and `/dev/net/tun`. A control shows that tailscaled's iptables calls fail with `NET_ADMIN` alone. tailscaled uses legacy `ip6tables`, and a container cannot load kernel modules, so on a Linux host the `ip6table_filter` and `ip6table_nat` modules must already be loaded. Otherwise tailscaled logs `Table does not exist` and the check fails. CI loads them with `modprobe` first.
-   - `tailscale0` is in the namespace Caddy runs in. `--shields-up` and `TS_ACCEPT_DNS=false` reach tailscaled, and UDP 41642 is published.
+   - `tailscale0` is in the namespace Caddy runs in, and UDP 41642 is published. The test checks shields-up and Docker DNS while the fresh node waits for login. A separate key-present container checks that `containerboot` applies `--shields-up` from `TS_EXTRA_ARGS`.
    - A container on `edge-control` reaches `edge-admin:2019`. A container on `admin` aliased `api` cannot reach it by alias or by either `edge-ts` address.
    - `edge` comes back serving after `edge-ts` is changed through `docker compose up`, restarted in place, or recreated on its own. The last two go through the rejoin step that `mise run maintain` runs.
 
-   `edge-ts` uses an unreachable login server, so the run never contacts Tailscale. The run takes about 2 minutes.
+   The main fixture waits for login without a key. The key-present check uses an unreachable loopback login server in an isolated network namespace. The run takes about 2 minutes.
 
    For other images, run the matching task instead:
 

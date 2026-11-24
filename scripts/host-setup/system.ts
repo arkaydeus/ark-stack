@@ -110,9 +110,13 @@ export class Redactor {
 
   redact(text: string) {
     const known = [...this.secrets].toSorted((a, b) => b.length - a.length);
-    return redactLogLine(text, known)
-      .replace(/tskey-[A-Za-z0-9-]+/g, "<redacted>")
-      .replace(/(Setup token:\s*)\S+/gi, "$1<redacted>");
+    return (
+      redactLogLine(text, known)
+        .replace(/tskey-[A-Za-z0-9-]+/g, "<redacted>")
+        // Whoever opens a node's login link decides which tailnet it joins.
+        .replace(/(login\.tailscale\.com\/a\/)\w+/g, "$1<redacted>")
+        .replace(/(Setup token:\s*)\S+/gi, "$1<redacted>")
+    );
   }
 }
 
