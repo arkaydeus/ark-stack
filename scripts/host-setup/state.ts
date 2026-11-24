@@ -64,6 +64,22 @@ export type SetupState = {
   /** The admin origin this setup last wrote, so a changed hostname replaces it. */
   adminOrigin?: string;
   edgeKeyRetry?: boolean;
+  /** The latest review of the tailnet policy for a catch-all rule (policy-gate.ts). Never the policy itself. */
+  tailnetPolicy?: {
+    status: "clear" | "accepted" | "unconfirmed";
+    at: string;
+    /** Setup read the policy through the API; otherwise this is the operator's answer. */
+    read: boolean;
+    /** The matching rules setup read (network part only). */
+    rules?: string[];
+    /** Identifies exactly those rules: an acceptance no longer holds once they change. */
+    digest?: string;
+    /** Identifies the API and verified tailnet ID for a reusable acceptance. */
+    scope?: string;
+  };
+  /** The operator's attestation for supplied keys when the API policy was also reviewed. */
+  suppliedKeyPolicy?: { status: "clear" | "accepted" | "unconfirmed"; at: string };
+  tailnetPolicyWriteDeferred?: boolean;
   /** Each node's requested machine name and the name Tailscale assigned (read back from its status). */
   tailscaleNames?: Partial<Record<TailscaleNode, { requested: string; assigned?: string }>>;
   steps: Partial<Record<StepId, StepRecord>>;

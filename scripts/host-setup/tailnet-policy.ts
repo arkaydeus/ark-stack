@@ -5,9 +5,20 @@
 // missing Ark entries (tag owners, the owner-only SSH grant to tag:ark-vps and its `check` rule from
 // `sshPolicyExample`) and leaves every other byte, comment and trailing comma where it was. The
 // result is re-parsed and compared with the expected policy, so a bad edit is refused, never applied.
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
-import { ARK_VPS_TAG, parseHujson, sshPolicyExample, type TailnetGrant } from "@ark-stack/shared";
+import {
+  ARK_BACKUP_TAG,
+  ARK_EDGE_TAG,
+  ARK_VPS_TAG,
+  TAILSCALE_V4,
+  TAILSCALE_V6,
+  parseHujson,
+  parseIpLiteral,
+  sshPolicyExample,
+  type TailnetGrant,
+} from "@ark-stack/shared";
 
 type Span = { start: number; end: number };
 type JsonNode =
@@ -312,18 +323,205 @@ function expectedPolicy(policy: Policy, additions: ReturnType<typeof plannedAddi
   return next;
 }
 
-/** Catch-all rules that would let the Ark identities reach every device. Reported, never edited. */
-export function catchAllRules(policy: Policy) {
-  const found: string[] = [];
-  for (const grant of policy.grants ?? []) {
-    if (grant?.src?.includes("*") && grant.dst?.includes("*"))
-      found.push(`grant ${JSON.stringify({ src: grant.src, dst: grant.dst, ip: grant.ip })}`);
+// ---- Catch-all rules -----------------------------------------------------------------------------
+
+/** The Ark identities setup enrols, the internet-facing one first. */
+export const ENROLLED_TAGS = [ARK_EDGE_TAG, ARK_VPS_TAG, ARK_BACKUP_TAG] as const;
+export type EnrolledTag = (typeof ENROLLED_TAGS)[number];
+
+/** A rule that lets an Ark tag open connections to every device on the tailnet. */
+export type CatchAllRule = {
+  kind: "grant" | "acl";
+  /** The network part of the rule (selectors, ports and conditions), for display. */
+  text: string;
+  /** The whole rule in a canonical form, so any edit to it changes `rulesDigest`. Never stored or shown. */
+  canonical: string;
+  /** The Ark tags its source covers. */
+  tags: EnrolledTag[];
+  /** The same rule with a narrower source, or undefined when no such rule remains. */
+  replacement?: string;
+  /** An in-place source edit when a full replacement would drop application capabilities. */
+  sourceEdit?: string;
+  /** The rule covers machines that carry other tags, which a narrower source may leave out. */
+  coversOtherTags: boolean;
+};
+
+type Fields = Record<string, unknown>;
+const isObject = (value: unknown): value is Fields =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Tailscale matches policy keys whatever their case: older policies use "ACLs", "Users" and "Ports". */
+function field(object: unknown, ...names: string[]): [key: string, value: unknown] | undefined {
+  if (!isObject(object)) return undefined;
+  return Object.entries(object).find(([key]) => names.includes(key.toLowerCase()));
+}
+
+function strings(value: unknown): string[] {
+  const list = Array.isArray(value) ? value : [value];
+  return list.filter((item): item is string => typeof item === "string");
+}
+
+/** JSON with a space after `:` and `,`, as Tailscale's own policies are written. */
+export function inlineJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(inlineJson).join(", ")}]`;
+  if (!isObject(value)) return JSON.stringify(value);
+  return `{${Object.entries(value)
+    .map(([key, item]) => `${JSON.stringify(key)}: ${inlineJson(item)}`)
+    .join(", ")}}`;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (!isObject(value)) return JSON.stringify(value) ?? "null";
+  return `{${Object.keys(value)
+    .toSorted()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
+}
+
+type AddressRange = { version: 4 | 6; first: bigint; last: bigint };
+
+function addressNumber(text: string) {
+  const parsed = parseIpLiteral(text);
+  if (!parsed) return undefined;
+  let value = 0n;
+  for (const byte of parsed.bytes) value = (value << 8n) | BigInt(byte);
+  return { version: parsed.version, value };
+}
+
+/** An address, CIDR or `first-last` range. Anything else (tags, groups, IP sets) is undefined. */
+function addressRange(selector: string): AddressRange | undefined {
+  const [start = "", end, extra] = selector.split("-");
+  if (end !== undefined) {
+    const first = addressNumber(start);
+    const last = addressNumber(end);
+    if (extra !== undefined || !first || !last || first.version !== last.version) return undefined;
+    return { version: first.version, first: first.value, last: last.value };
   }
-  for (const acl of policy.acls ?? []) {
-    if (acl?.action === "accept" && acl.src?.includes("*") && acl.dst?.some((dst) => dst.startsWith("*:")))
-      found.push(`acl ${JSON.stringify({ action: acl.action, src: acl.src, dst: acl.dst })}`);
+  const [network = "", bits] = selector.split("/");
+  const base = addressNumber(network);
+  if (!base) return undefined;
+  const width = base.version === 4 ? 32 : 128;
+  if (bits !== undefined && !/^\d{1,3}$/.test(bits)) return undefined;
+  const prefix = bits === undefined ? width : Number(bits);
+  if (prefix > width) return undefined;
+  const size = 1n << BigInt(width - prefix);
+  const first = (base.value / size) * size;
+  return { version: base.version, first, last: first + size - 1n };
+}
+
+/** Every address Tailscale assigns to devices; a rule covers every device through either family. */
+const TAILNET_RANGES = [TAILSCALE_V4, TAILSCALE_V6].map((cidr) => addressRange(cidr)!);
+
+/** The selectors whose ranges together cover the whole tailnet. Host aliases are followed. */
+function tailnetWideRanges(policy: unknown, selectors: string[]) {
+  const hosts = field(policy, "hosts")?.[1];
+  const ranges = selectors.flatMap((selector) => {
+    const alias = isObject(hosts) && Object.hasOwn(hosts, selector) ? hosts[selector] : selector;
+    const range = addressRange(typeof alias === "string" ? alias : selector);
+    return range ? [{ selector, ...range }] : [];
+  });
+  const found = new Set<string>();
+  for (const tailnet of TAILNET_RANGES) {
+    const inside = ranges
+      .filter(
+        (range) =>
+          range.version === tailnet.version && range.first <= tailnet.last && range.last >= tailnet.first,
+      )
+      .toSorted((a, b) => (a.first < b.first ? -1 : a.first > b.first ? 1 : 0));
+    let next = tailnet.first;
+    for (const range of inside) {
+      if (range.first > next) break;
+      if (range.last >= next) next = range.last + 1n;
+    }
+    if (next > tailnet.last) for (const range of inside) found.add(range.selector);
   }
   return found;
+}
+
+function everyDevice(policy: unknown, destinations: string[]) {
+  if (destinations.includes("*")) return true;
+  // Every device belongs to a member or carries a tag.
+  if (
+    destinations.includes("autogroup:tagged") &&
+    destinations.some((selector) => /^autogroup:members?$/.test(selector))
+  )
+    return true;
+  return tailnetWideRanges(policy, destinations).size > 0;
+}
+
+/** Selectors that cover every Ark tag among others. */
+const WIDE_SOURCES = new Set(["*", "autogroup:danger-all", "autogroup:tagged"]);
+/** The parts of a rule that decide who may connect where; an `app` value can hold anything. */
+const SHOWN_FIELDS = new Set(["action", "src", "users", "proto", "dst", "ports", "ip", "via", "srcposture"]);
+
+function catchAllRule(
+  policy: unknown,
+  kind: CatchAllRule["kind"],
+  rule: unknown,
+  destinations: string[],
+): CatchAllRule | undefined {
+  const source = field(rule, "src", "users");
+  if (!source || !everyDevice(policy, destinations)) return undefined;
+  const sources = strings(source[1]);
+  const ranges = tailnetWideRanges(policy, sources);
+  const wide = sources.filter((selector) => WIDE_SOURCES.has(selector) || ranges.has(selector));
+  const tags = ENROLLED_TAGS.filter((tag) => wide.length || sources.includes(tag));
+  if (!tags.length) return undefined;
+  const isArkTag = (selector: string) => (ENROLLED_TAGS as readonly string[]).includes(selector);
+  const kept = sources.filter((selector) => !wide.includes(selector) && !isArkTag(selector));
+  const everyone = wide.some((selector) => selector !== "autogroup:tagged");
+  if (everyone && !kept.includes("autogroup:member")) kept.unshift("autogroup:member");
+  const shown = Object.entries(rule as Fields).filter(([key]) => SHOWN_FIELDS.has(key.toLowerCase()));
+  const narrowed = shown.map(([key, value]) => [key, key === source[0] ? kept : value] as const);
+  const mixed = kind === "grant" && Boolean(field(rule, "app"));
+  return {
+    kind,
+    text: inlineJson(Object.fromEntries(shown)),
+    canonical: `${kind} ${canonicalJson(rule)}`,
+    tags,
+    replacement: !mixed && kept.length ? inlineJson(Object.fromEntries(narrowed)) : undefined,
+    sourceEdit: mixed ? inlineJson({ [source[0]]: kept }) : undefined,
+    coversOtherTags: wide.length > 0,
+  };
+}
+
+/**
+ * The grants and accept ACLs that let an Ark tag open connections to every device. Reported, never
+ * edited. Not a policy evaluator: IP sets, posture conditions and `via` are not evaluated (a rule
+ * with a condition still counts), and rules are judged one at a time.
+ */
+export function catchAllRules(policy: unknown): CatchAllRule[] {
+  const found: (CatchAllRule | undefined)[] = [];
+  const list = (name: string) => {
+    const value = field(policy, name)?.[1];
+    return Array.isArray(value) ? value : [];
+  };
+  for (const grant of list("grants")) {
+    // Application capabilities alone open no connection (grants without `ip` need network access first).
+    if (!strings(field(grant, "ip")?.[1]).length && isObject(field(grant, "app")?.[1])) continue;
+    found.push(catchAllRule(policy, "grant", grant, strings(field(grant, "dst")?.[1])));
+  }
+  for (const acl of list("acls")) {
+    if (!strings(field(acl, "action")?.[1]).some((action) => /^(?:accept|allow)$/i.test(action))) continue;
+    const destinations = strings(field(acl, "dst", "ports")?.[1]).map((entry) =>
+      entry.slice(0, entry.includes(":") ? entry.lastIndexOf(":") : undefined).replace(/^\[|\]$/g, ""),
+    );
+    found.push(catchAllRule(policy, "acl", acl, destinations));
+  }
+  return found.filter((rule) => rule !== undefined);
+}
+
+/** Identifies a set of rules, whatever their order. Any change to one of them changes it. */
+export function rulesDigest(rules: CatchAllRule[]) {
+  return createHash("sha256")
+    .update(
+      rules
+        .map((rule) => rule.canonical)
+        .toSorted()
+        .join("\n"),
+    )
+    .digest("hex");
 }
 
 export type PolicyMerge = {
@@ -331,8 +529,10 @@ export type PolicyMerge = {
   changed: boolean;
   /** One line per Ark entry added. */
   additions: string[];
-  /** Owner content the setup does not change but the owner should review. */
-  warnings: string[];
+  /** The text added, with line numbers. The merge only inserts, so this is the whole change. */
+  inserted: string[];
+  /** The owner's rules that let an Ark tag reach every device. Setup never changes them. */
+  catchAll: CatchAllRule[];
 };
 
 /** Adds the missing Ark entries to the owner's HuJSON policy, preserving everything else. */
@@ -405,81 +605,29 @@ export function mergeArkPolicy(text: string, request: ArkPolicyRequest): PolicyM
       "Could not merge the Ark entries into the tailnet policy without changing other content.",
     );
   }
-  const warnings = catchAllRules(policy).map(
-    (rule) =>
-      `Your policy has a catch-all ${rule}. It lets tag:ark-edge and tag:ark-backup reach every device; narrow it before you create routes (docs/operating.md#tailnet-policy-snippet).`,
-  );
-  return { text: edits.length ? merged : text, changed: edits.length > 0, additions: lines, warnings };
+  return {
+    text: edits.length ? merged : text,
+    changed: edits.length > 0,
+    additions: lines,
+    inserted: insertedLines(source, edits),
+    catchAll: catchAllRules(policy),
+  };
 }
 
-// ---- Diff -----------------------------------------------------------------------------------------
-
-/** A unified-style line diff (`+` added, `-` removed, two lines of context). */
-export function lineDiff(before: string, after: string, context = 2): string[] {
-  const a = before.split("\n");
-  const b = after.split("\n");
-  let prefix = 0;
-  while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
-  let suffix = 0;
-  while (
-    suffix < a.length - prefix &&
-    suffix < b.length - prefix &&
-    a[a.length - 1 - suffix] === b[b.length - 1 - suffix]
-  )
-    suffix++;
-  const midA = a.slice(prefix, a.length - suffix);
-  const midB = b.slice(prefix, b.length - suffix);
-  const ops: { op: " " | "+" | "-"; line: string; at: number }[] = [];
-  for (let index = 0; index < prefix; index++) ops.push({ op: " ", line: a[index]!, at: index + 1 });
-  for (const item of middleOps(midA, midB)) ops.push({ ...item, at: prefix + item.at + 1 });
-  for (let index = a.length - suffix; index < a.length; index++)
-    ops.push({ op: " ", line: a[index]!, at: index - a.length + b.length + 1 });
-  const shown = new Set<number>();
-  ops.forEach((item, index) => {
-    if (item.op === " ") return;
-    for (let k = Math.max(0, index - context); k <= Math.min(ops.length - 1, index + context); k++)
-      shown.add(k);
-  });
+/** The inserted text only, so the owner's own policy content is neither shown nor logged. */
+function insertedLines(text: string, edits: Edit[]) {
   const out: string[] = [];
-  let previous = -2;
-  for (const index of [...shown].toSorted((x, y) => x - y)) {
-    if (index !== previous + 1) out.push(`@@ line ${ops[index]!.at}`);
-    out.push(`${ops[index]!.op} ${ops[index]!.line}`);
-    previous = index;
+  let added = 0;
+  for (const edit of edits.toSorted((a, b) => a.at - b.at)) {
+    const breaks = edit.text.split("\n").length - 1;
+    // A comma after the owner's last entry.
+    if (edit.text.trim() !== ",") {
+      const own = edit.text.replace(/^,?\n/, "");
+      const line = text.slice(0, edit.at).split("\n").length + added + (own === edit.text ? 0 : 1);
+      out.push(`@@ line ${line}`);
+      for (const item of own.trimEnd().split("\n")) out.push(`+ ${item}`);
+    }
+    added += breaks;
   }
   return out;
-}
-
-/** The changed middle as operations; `at` is the index in `b`. */
-function middleOps(a: string[], b: string[]) {
-  const ops: { op: " " | "+" | "-"; line: string; at: number }[] = [];
-  let i = 0;
-  let j = 0;
-  if (a.length * b.length <= 4_000_000) {
-    // Longest common subsequence (the merge only inserts, so the middle is usually small).
-    const table = Array.from({ length: a.length + 1 }, () => new Int32Array(b.length + 1));
-    for (let x = a.length - 1; x >= 0; x--)
-      for (let y = b.length - 1; y >= 0; y--)
-        table[x]![y] =
-          a[x] === b[y] ? table[x + 1]![y + 1]! + 1 : Math.max(table[x + 1]![y]!, table[x]![y + 1]!);
-    while (i < a.length || j < b.length) {
-      if (i < a.length && j < b.length && a[i] === b[j]) ops.push({ op: " ", line: a[i++]!, at: j++ });
-      else if (j < b.length && (i >= a.length || table[i]![j + 1]! >= table[i + 1]![j]!))
-        ops.push({ op: "+", line: b[j]!, at: j++ });
-      else ops.push({ op: "-", line: a[i++]!, at: j });
-    }
-    return ops;
-  }
-  // A very large policy: match each old line to its next occurrence (exact for pure insertions).
-  while (i < a.length) {
-    const found = b.indexOf(a[i]!, j);
-    if (found < 0) {
-      ops.push({ op: "-", line: a[i++]!, at: j });
-      continue;
-    }
-    while (j < found) ops.push({ op: "+", line: b[j]!, at: j++ });
-    ops.push({ op: " ", line: a[i++]!, at: j++ });
-  }
-  while (j < b.length) ops.push({ op: "+", line: b[j]!, at: j++ });
-  return ops;
 }

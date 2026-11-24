@@ -24,11 +24,11 @@ import {
   type Options,
 } from "./host-setup/answers.ts";
 import { readEnv } from "./host-setup/env-file.ts";
+import { policyGate, type PolicyGate } from "./host-setup/policy-gate.ts";
 import { providerFirewalls, type ProviderFirewall } from "./host-setup/provider-firewall.ts";
 import { StateStore, type SetupState } from "./host-setup/state.ts";
 import {
   STEPS,
-  SetupPaused,
   detectSessionOrigin,
   summary,
   type Context,
@@ -39,6 +39,7 @@ import {
   Redactor,
   SECRET_VARIABLES,
   SetupLog,
+  SetupPaused,
   TerminalUi,
   runCommand,
   withoutSetupSecrets,
@@ -71,6 +72,7 @@ export type SetupDependencies = {
     options: Options;
     redactor: Redactor;
     log: SetupLog;
+    gate: PolicyGate;
   }) => TailscaleKeySource;
   /** The Tailscale API base URL (tests point it at a mock server). */
   tailscaleApi?: string;
@@ -81,7 +83,7 @@ export type SetupDependencies = {
   out?: (text: string) => void;
 };
 
-/** 0: finished. 1: a step failed or the input was invalid. 2: paused for an SSH safety prerequisite. */
+/** 0: finished. 1: a step failed or the input was invalid. 2: paused for an SSH or tailnet policy prerequisite. */
 export async function runSetup(deps: SetupDependencies): Promise<number> {
   const out = deps.out ?? ((text: string) => process.stdout.write(text));
   let flags;
@@ -146,6 +148,8 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
     return 1;
   }
   redactor.add(answers.dnsApiToken);
+  if (state.tailnetPolicy?.rules)
+    state.tailnetPolicy.rules = state.tailnetPolicy.rules.map((rule) => redactor.redact(rule));
   ui.print("");
   ui.print("Settings:");
   for (const line of describeAnswers(answers, parseEnvFile(readEnv(envPath)))) ui.print(line);
@@ -159,6 +163,16 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
   state.answers = storedAnswers(answers);
   store.save(state);
 
+  const save = () => store.save(state);
+  const gate = policyGate({
+    ui,
+    interactive,
+    options,
+    state,
+    save,
+    resumeCommand,
+    redact: (text) => redactor.redact(text),
+  });
   const context: Context = {
     root: deps.root,
     stateDir,
@@ -169,7 +183,7 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
     log,
     redactor,
     state,
-    save: () => store.save(state),
+    save,
     answers,
     options,
     interactive,
@@ -186,7 +200,8 @@ export async function runSetup(deps: SetupDependencies): Promise<number> {
           log: (line) => log.write(line),
           apiBase: deps.tailscaleApi,
         }))
-    )({ env: deps.env, ui, interactive, options, redactor, log }),
+    )({ env: deps.env, ui, interactive, options, redactor, log, gate }),
+    policyGate: gate,
     firewalls: deps.firewalls ?? providerFirewalls,
     paths: deps.paths,
     isRoot: deps.isRoot,

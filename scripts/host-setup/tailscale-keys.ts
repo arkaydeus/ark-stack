@@ -6,6 +6,7 @@
 import { ARK_BACKUP_TAG, ARK_EDGE_TAG, ARK_VPS_TAG, sshPolicyExample } from "@ark-stack/shared";
 
 import type { Ui } from "./system.ts";
+import type { EnrolledTag } from "./tailnet-policy.ts";
 
 export type KeyRequest = {
   /** The single tag the key must carry. */
@@ -33,15 +34,24 @@ export type AcquiredKey = {
   inMemoryOnly?: boolean;
 };
 
+export type PolicyPreparation = {
+  pending?: EnrolledTag[];
+  /** Pending tags whose supplied keys cannot be tied to the API tailnet. */
+  supplied?: EnrolledTag[];
+  offerCredential?: boolean;
+};
+
 export interface TailscaleKeySource {
   readonly id: string;
   /** The tailnet policy the owner needs before keys can be used (printed once, before enrolment). */
   policyInstructions(): string[];
   /**
-   * Gets the tailnet policy ready before the first key is used (an API source shows the change,
-   * asks and applies it). Without it, setup prints `policyInstructions` and waits for the owner.
+   * Gets the tailnet policy ready before a key is used: checks it for a catch-all rule
+   * (policy-gate.ts), then an API source shows its change, asks and applies it. Without it, setup
+   * prints `policyInstructions` and asks the owner. `pending` are the Ark tags still to be enrolled
+   * in this run (default: a new host); with none, the review never stops setup.
    */
-  preparePolicy?(options?: { enrolled?: boolean; offerCredential?: boolean }): Promise<void>;
+  preparePolicy?(options?: PolicyPreparation): Promise<void>;
   /** Collect a manual answer before installation, or defer acquisition to enrolment. */
   collect?(request: KeyRequest): Promise<{ acquired: AcquiredKey | undefined } | undefined>;
   /** Returns a key, or `undefined` when an optional key was declined. */
@@ -68,8 +78,7 @@ export function tailnetPolicyInstructions({ backup = false }: { backup?: boolean
     `"autogroup:nonroot" lets you log in as any local user except root. After enrolment, interactive`,
     "setup offers to create the selected user if it is missing. For scripted runs, create the user",
     "with sudo access beforehand (adduser <name> && usermod -aG sudo <name>).",
-    `Add no grant with ${ARK_EDGE_TAG}${backup ? ` or ${ARK_BACKUP_TAG}` : ""} as the source, and check that no catch-all rule`,
-    '(such as "src": ["*"], "dst": ["*"]) covers it.',
+    `Add no grant with ${ARK_EDGE_TAG}${backup ? ` or ${ARK_BACKUP_TAG}` : ""} as the source.`,
   ];
 }
 

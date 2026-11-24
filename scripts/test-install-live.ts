@@ -10,6 +10,7 @@
 //   ARK_TEST_INSTALL_EDGE_AUTHKEY optional one-off key for tag:ark-edge (the edge step is skipped without it)
 //   ARK_TEST_INSTALL_TS_API_KEY   optional scratch-tailnet API access token instead of both keys: setup
 //                                 merges the policy (--approve-tailnet-policy), mints and revokes the keys
+//                                 (either way it passes --accept-broad-tailnet-policy: scratch tailnets only)
 //   ARK_TEST_INSTALL_HCLOUD_TOKEN optional Read & Write token of the scratch Hetzner Cloud project that
 //                                 holds the VPS: the Hetzner adapter applies the firewall
 //                                 (--approve-provider-firewall) and the rerun must change nothing
@@ -146,6 +147,8 @@ async function main() {
     ...(email ? ["--acme-email", email] : []),
     ...(edgeKey || tsApiKey ? [] : ["--skip-edge"]),
     ...(tsApiKey ? ["--approve-tailnet-policy"] : []),
+    // The scratch tailnet may still have Tailscale's default allow-all rule.
+    "--accept-broad-tailnet-policy",
     "--ssh-user",
     tsSsh.split("@")[0]!,
   ];
